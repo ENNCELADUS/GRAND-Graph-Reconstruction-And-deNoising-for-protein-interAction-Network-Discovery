@@ -10,12 +10,20 @@ import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
+from src.adapt import should_run_shot_adaptation
 from src.run.bootstrap import set_global_seed
 from src.run.stage_adapt import run_shot_adaptation_stage
 from src.run.stage_evaluate import run_evaluation_stage
 from src.run.stage_train import _build_stage_runtime, build_model, run_training_stage
-from src.adapt import should_run_shot_adaptation
-from src.utils.config import ConfigDict, as_bool, as_int, as_str, extract_model_kwargs, get_section
+from src.utils.config import (
+    ConfigDict,
+    as_bool,
+    as_int,
+    as_str,
+    as_str_list,
+    extract_model_kwargs,
+    get_section,
+)
 from src.utils.data_io import build_dataloaders
 from src.utils.device import resolve_device
 from src.utils.distributed import (
@@ -27,11 +35,9 @@ from src.utils.logging import generate_run_id, log_stage_event
 
 DataLoaderMap = dict[str, torch.utils.data.DataLoader[dict[str, object]]]
 
-STAGES_BY_MODE: dict[str, tuple[str, ...]] = {
-    "train_only": ("train",),
-    "full_pipeline": ("train", "evaluate"),
-    "eval_only": ("evaluate",),
-}
+DEFAULT_STAGES: tuple[str, ...] = ("train", "evaluate")
+ALLOWED_STAGES: tuple[str, ...] = DEFAULT_STAGES
+STAGE_ORDER: dict[str, int] = {stage: index for index, stage in enumerate(ALLOWED_STAGES)}
 
 
 def _ddp_find_unused_parameters(config: ConfigDict) -> bool:
@@ -52,26 +58,45 @@ def _ddp_find_unused_parameters(config: ConfigDict) -> bool:
     return strategy_type == "staged_unfreeze"
 
 
-def _selected_stages_for_mode(mode: str) -> tuple[str, ...]:
-    """Return ordered stages for one run mode."""
-    selected_stages = STAGES_BY_MODE.get(mode)
-    if selected_stages is None:
-        raise ValueError(f"Unsupported run mode: {mode}")
-    return selected_stages
+def _selected_stages(run_cfg: ConfigDict) -> tuple[str, ...]:
+    """Return validated ordered stages from ``run_config.stages``."""
+    raw_stages = run_cfg.get("stages", list(DEFAULT_STAGES))
+    configured_stages = tuple(
+        stage.lower() for stage in as_str_list(raw_stages, "run_config.stages")
+    )
+    if not configured_stages:
+        raise ValueError("run_config.stages must not be empty")
+    if len(set(configured_stages)) != len(configured_stages):
+        raise ValueError("run_config.stages must not contain duplicates")
+    unsupported = [stage for stage in configured_stages if stage not in STAGE_ORDER]
+    if unsupported:
+        raise ValueError(
+            "run_config.stages contains unsupported stage(s): "
+            f"{', '.join(sorted(set(unsupported)))}"
+        )
+    previous_order = -1
+    for stage in configured_stages:
+        stage_order = STAGE_ORDER[stage]
+        if stage_order < previous_order:
+            raise ValueError("run_config.stages must follow: train -> evaluate")
+        previous_order = stage_order
+    return configured_stages
 
 
-def _selected_stages_with_adaptation(mode: str, shot_enabled: bool) -> tuple[str, ...]:
-    """Return ordered stages for mode with optional SHOT adaptation."""
-    selected = _selected_stages_for_mode(mode)
-    if not shot_enabled:
-        return selected
-    if mode == "full_pipeline":
-        return ("train", "adapt", "evaluate")
-    if mode == "train_only":
-        return ("train", "adapt")
-    if mode == "eval_only":
-        return ("adapt", "evaluate")
-    return selected
+def _selected_stages_with_adaptation(
+    selected_stages: tuple[str, ...],
+    *,
+    shot_enabled: bool,
+) -> tuple[str, ...]:
+    """Return selected stages with optional SHOT adaptation before evaluation."""
+    if not shot_enabled or "evaluate" not in selected_stages:
+        return selected_stages
+    stages_with_adaptation: list[str] = []
+    for stage in selected_stages:
+        if stage == "evaluate":
+            stages_with_adaptation.append("adapt")
+        stages_with_adaptation.append(stage)
+    return tuple(stages_with_adaptation)
 
 
 def _log_event_for_stages(
@@ -88,18 +113,15 @@ def _log_event_for_stages(
 
 def _evaluation_checkpoint_path(
     *,
-    mode: str,
     train_checkpoint_path: Path | None,
     load_checkpoint_path: Path | None,
 ) -> Path:
-    """Resolve checkpoint path for evaluation-capable run modes."""
-    if mode == "full_pipeline":
-        if train_checkpoint_path is None:
-            raise RuntimeError("train checkpoint missing for full_pipeline evaluation")
+    """Resolve checkpoint path for evaluation stage."""
+    if train_checkpoint_path is not None:
         return train_checkpoint_path
-    if load_checkpoint_path is None:
-        raise ValueError("load_checkpoint_path is required for eval_only")
-    return load_checkpoint_path
+    if load_checkpoint_path is not None:
+        return load_checkpoint_path
+    raise ValueError("load_checkpoint_path is required when evaluate runs without train stage")
 
 
 def _len_or_unknown(value: object) -> int | str:
@@ -123,7 +145,7 @@ def execute_pipeline(
     resolve_device_fn: Callable[[str], torch.device] = resolve_device,
     distributed_data_parallel_cls: type[DistributedDataParallel] = DistributedDataParallel,
 ) -> None:
-    """Execute pipeline according to configured run mode."""
+    """Execute pipeline according to configured stages."""
     run_cfg = get_section(config, "run_config")
     device_cfg = get_section(config, "device_config")
     seed = as_int(run_cfg.get("seed", 0), "run_config.seed")
@@ -133,7 +155,7 @@ def execute_pipeline(
     )
     ddp_find_unused_parameters = _ddp_find_unused_parameters(config)
     try:
-        mode = as_str(run_cfg.get("mode", "full_pipeline"), "run_config.mode").lower()
+        selected_stages = _selected_stages(run_cfg)
         train_run_id = generate_run_id(run_cfg.get("train_run_id"))
         adapt_run_id = generate_run_id(run_cfg.get("adapt_run_id"))
         eval_run_id = generate_run_id(run_cfg.get("eval_run_id"))
@@ -149,12 +171,12 @@ def execute_pipeline(
             "adapt": adapt_run_id,
             "evaluate": eval_run_id,
         }
-        selected_stages = _selected_stages_with_adaptation(
-            mode=mode,
+        selected_stages_with_adaptation = _selected_stages_with_adaptation(
+            selected_stages,
             shot_enabled=should_run_shot_adaptation(config),
         )
         stage_loggers: dict[str, logging.Logger] = {}
-        for stage in selected_stages:
+        for stage in selected_stages_with_adaptation:
             _, _, stage_logger = _build_stage_runtime(
                 model_name=model_name,
                 stage=stage,
@@ -166,7 +188,7 @@ def execute_pipeline(
                 log_stage_event(
                     stage_logger,
                     "startup",
-                    mode=mode,
+                    stages=list(selected_stages),
                     run_id=stage_run_map[stage],
                     seed=seed,
                     rank=distributed_context.rank,
@@ -178,7 +200,7 @@ def execute_pipeline(
             device = torch.device("cuda", distributed_context.local_rank)
         if distributed_context.is_main_process:
             _log_event_for_stages(
-                stage_names=selected_stages,
+                stage_names=selected_stages_with_adaptation,
                 stage_loggers=stage_loggers,
                 event="device",
                 resolved_device=device,
@@ -192,7 +214,7 @@ def execute_pipeline(
         )
         if distributed_context.is_main_process:
             _log_event_for_stages(
-                stage_names=selected_stages,
+                stage_names=selected_stages_with_adaptation,
                 stage_loggers=stage_loggers,
                 event="data_ready",
                 train=_len_or_unknown(dataloaders["train"].dataset),
@@ -202,7 +224,7 @@ def execute_pipeline(
         model = build_model_fn(config).to(device)
         if distributed_context.is_main_process:
             log_stage_event(
-                stage_loggers[selected_stages[0]],
+                stage_loggers[selected_stages_with_adaptation[0]],
                 "model_init",
                 model=model_name,
                 params=sum(parameter.numel() for parameter in model.parameters()),
@@ -215,7 +237,7 @@ def execute_pipeline(
             )
         if distributed_context.is_main_process:
             _log_event_for_stages(
-                stage_names=selected_stages,
+                stage_names=selected_stages_with_adaptation,
                 stage_loggers=stage_loggers,
                 event="ddp_ready",
                 wrapped=distributed_context.is_distributed,
@@ -238,12 +260,15 @@ def execute_pipeline(
             if distributed_context.is_main_process:
                 log_stage_event(stage_loggers["train"], "end_training")
 
-        if "adapt" in selected_stages:
+        if "adapt" in selected_stages_with_adaptation:
             base_checkpoint = train_checkpoint_path
             if base_checkpoint is None:
                 base_checkpoint = load_checkpoint_path
             if base_checkpoint is None:
-                raise ValueError("load_checkpoint_path is required for eval_only SHOT adaptation")
+                raise ValueError(
+                    "load_checkpoint_path is required when evaluate runs with domain adaptation "
+                    "and no train stage"
+                )
             if distributed_context.is_main_process:
                 log_stage_event(stage_loggers["adapt"], "begin_adaptation")
             adapt_checkpoint_path = run_adaptation_stage_fn(
@@ -263,7 +288,6 @@ def execute_pipeline(
                 adapt_checkpoint_path
                 if adapt_checkpoint_path is not None
                 else _evaluation_checkpoint_path(
-                    mode=mode,
                     train_checkpoint_path=train_checkpoint_path,
                     load_checkpoint_path=load_checkpoint_path,
                 )

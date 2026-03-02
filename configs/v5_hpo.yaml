@@ -1,8 +1,7 @@
 run_config:
-  mode: "full_pipeline"  # full_pipeline | train_only | eval_only
+  stages: ["train", "evaluate"]
   seed: 47
   train_run_id: null
-  finetune_run_id: null
   eval_run_id: null
   load_checkpoint_path: null
   save_best_only: true
@@ -24,8 +23,6 @@ data_config:
   dataloader:
     train_dataset: "data/TMP/processed/pretrain_train_balanced.csv"
     valid_dataset: "data/TMP/processed/pretrain_val_balanced.csv"
-    finetune_train_dataset: "data/TMP/processed/finetune_train.csv"
-    finetune_val_dataset: "data/TMP/processed/finetune_val.csv"
     test_dataset: "data/TMP/processed/test.csv"
     num_workers: 4
     pin_memory: true
@@ -114,7 +111,7 @@ optimization:
     n_trials: 30
     timeout_minutes: 720
   execution:
-    trial_mode: "train_only"
+    trial_stages: ["train"]
     ddp_per_trial: false
     catch_oom_as_pruned: true
   storage:

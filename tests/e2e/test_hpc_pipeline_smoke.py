@@ -28,7 +28,7 @@ def test_hpc_config_artifact_is_valid() -> None:
     assert isinstance(training_cfg, dict)
     assert isinstance(evaluate_cfg, dict)
     assert isinstance(device_cfg, dict)
-    assert run_cfg["mode"] == "full_pipeline"
+    assert run_cfg["stages"] == ["train", "evaluate"]
     assert device_cfg["ddp_enabled"] is True
 
     logging_cfg = training_cfg["logging"]
@@ -73,8 +73,8 @@ def test_hpc_config_artifact_is_valid() -> None:
 @pytest.mark.e2e
 @pytest.mark.gpu
 @pytest.mark.slow
-def test_hpc_ddp_full_pipeline_smoke() -> None:
-    """Run optional full-pipeline torchrun smoke test for cluster environments."""
+def test_hpc_ddp_train_evaluate_smoke() -> None:
+    """Run optional train+evaluate torchrun smoke test for cluster environments."""
     if os.environ.get("RELIC_RUN_HPC_E2E", "0") != "1":
         pytest.skip("Set RELIC_RUN_HPC_E2E=1 to run HPC smoke test.")
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:

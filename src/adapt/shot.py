@@ -60,8 +60,7 @@ class OutputHeadFeatureHook:
         output_head = getattr(unwrapped, "output_head", None)
         if not isinstance(output_head, nn.Module):
             raise ValueError(
-                "SHOT requires model.output_head to exist as an nn.Module "
-                "for feature extraction"
+                "SHOT requires model.output_head to exist as an nn.Module for feature extraction"
             )
         self._features: torch.Tensor | None = None
         self._handle = output_head.register_forward_pre_hook(self._hook)
@@ -114,8 +113,8 @@ def parse_domain_adaptation_config(config: ConfigDict) -> DomainAdaptationConfig
         raise ValueError("training_config.domain_adaptation must be a mapping")
     adaptation_cfg = adaptation_raw
 
-    enabled = as_bool(adaptation_cfg.get("enabled", False), "domain_adaptation.enabled")
-    method = as_str(adaptation_cfg.get("method", "none"), "domain_adaptation.method").lower()
+    enabled = as_bool(adaptation_cfg.get("enabled", True), "domain_adaptation.enabled")
+    method = as_str(adaptation_cfg.get("method", "shot"), "domain_adaptation.method").lower()
     if method not in {"none", "shot"}:
         raise ValueError("domain_adaptation.method must be 'none' or 'shot'")
     if enabled and method != "shot":
@@ -222,8 +221,7 @@ def freeze_parameters_by_prefix(model: nn.Module, prefixes: Iterable[str]) -> in
 
     def _matches(name: str) -> bool:
         return any(
-            name.startswith(prefix) or name.startswith(f"module.{prefix}")
-            for prefix in normalized
+            name.startswith(prefix) or name.startswith(f"module.{prefix}") for prefix in normalized
         )
 
     trainable_count = 0

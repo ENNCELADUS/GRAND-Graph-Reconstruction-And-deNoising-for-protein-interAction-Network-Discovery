@@ -4,7 +4,7 @@ This document details the logging strategy and artifact structure for DIPPI. It 
 
 ## Execution Context
 
-* Run modes: `full_pipeline`, `train_only`, `eval_only`.
+* Run stages: `train`, `evaluate` (configured via `run_config.stages`).
 * Canonical HPC launcher: `scripts/v3.sh`.
 * Centralized loss path: both trainer and evaluator use `training_config.loss` (same `LossConfig` contract).
 * DDP behavior: rank 0 writes artifacts/logs; all ranks still participate in compute/synchronization.
@@ -15,14 +15,14 @@ All artifacts are stored under the `logs/` and `models/` directories, organized 
 
 ### Logging (`logs/`)
 
-*   **Train Logs**: `logs/{model}/train/<run_id>/`
+*   **Training Logs**: `logs/{model}/train/<run_id>/`
 *   **Evaluation Logs**: `logs/{model}/evaluate/<run_id>/`
 
 **Note**: The `<run_id>` is either provided in the config or automatically generated (timestamped) by the orchestrator.
 
 ### Checkpoints (`models/`)
 
-*   **Train Models**: `models/{model}/train/<run_id>/`
+*   **Training Models**: `models/{model}/train/<run_id>/`
 
 ## Artifact Types
 

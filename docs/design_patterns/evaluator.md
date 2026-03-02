@@ -51,9 +51,9 @@ with torch.no_grad():
 append_csv_row(...)
 ```
 
-### 2. Standalone Evaluation (Eval Only Mode)
+### 2. Standalone Evaluation (Evaluate Stage Only)
 
-When running in `eval_only` mode, the orchestrator:
+When `run_config.stages` contains only `["evaluate"]`, the orchestrator:
 1.  Loads the configuration and metrics list.
 2.  Instantiates the Evaluator.
 3.  Loads the checkpoint.

@@ -15,7 +15,7 @@ from src.utils.config import ConfigDict
 
 def _base_config() -> ConfigDict:
     return {
-        "run_config": {"mode": "train_only"},
+        "run_config": {"stages": ["train"]},
         "device_config": {"ddp_enabled": False},
         "data_config": {},
         "model_config": {

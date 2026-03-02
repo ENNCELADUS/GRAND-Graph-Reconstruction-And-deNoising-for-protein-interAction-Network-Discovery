@@ -5,7 +5,7 @@ This document describes how to run automatic HPO and phase-1 NAS-lite on top of 
 ## Scope
 
 - Optuna is the only optimization backend in this repository.
-- Existing `src.run` pipeline modes stay unchanged.
+- Existing `src.run` pipeline stage execution remains config-driven.
 - NAS-lite phase-1 is architecture-parameter search (not full neural architecture search graph mutation).
 
 ## New Modules
@@ -25,7 +25,7 @@ Use `configs/v5_hpo.yaml` as the reference. New top-level sections:
 Key defaults:
 
 - `optimization.backend = optuna`
-- `optimization.execution.trial_mode = train_only`
+- `optimization.execution.trial_stages = ["train"]`
 - `optimization.execution.ddp_per_trial = false`
 - `optimization.execution.catch_oom_as_pruned = true`
 

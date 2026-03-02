@@ -47,6 +47,14 @@ def test_parse_domain_adaptation_defaults() -> None:
     assert parsed.scheduler.scheduler_type == "shot_poly"
 
 
+def test_parse_domain_adaptation_defaults_when_section_missing() -> None:
+    parsed = parse_domain_adaptation_config({"training_config": {}})
+
+    assert parsed.enabled is True
+    assert parsed.method == "shot"
+    assert parsed.target_split == "test"
+
+
 def test_parse_domain_adaptation_invalid_method_raises() -> None:
     config = _base_config()
     training_cfg = config["training_config"]

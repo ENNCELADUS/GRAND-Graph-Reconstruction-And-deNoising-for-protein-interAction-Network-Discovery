@@ -151,7 +151,11 @@ class _FakeOptunaModule:
 
 def _base_config() -> ConfigDict:
     return {
-        "run_config": {"mode": "full_pipeline", "seed": 7, "save_best_only": True},
+        "run_config": {
+            "stages": ["train", "evaluate"],
+            "seed": 7,
+            "save_best_only": True,
+        },
         "device_config": {"device": "cpu", "ddp_enabled": False, "use_mixed_precision": False},
         "data_config": {},
         "model_config": {
@@ -177,7 +181,7 @@ def _base_config() -> ConfigDict:
             "direction": "maximize",
             "budget": {"n_trials": 3, "timeout_minutes": 1},
             "execution": {
-                "trial_mode": "train_only",
+                "trial_stages": ["train"],
                 "ddp_per_trial": False,
                 "catch_oom_as_pruned": True,
             },

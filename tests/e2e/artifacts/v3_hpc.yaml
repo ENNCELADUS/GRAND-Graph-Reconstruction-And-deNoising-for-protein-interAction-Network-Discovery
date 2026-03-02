@@ -1,7 +1,8 @@
 run_config:
-  mode: "full_pipeline"
+  stages: ["train", "evaluate"]
   seed: 47
   train_run_id: "hpc_e2e_train"
+  adapt_run_id: null
   eval_run_id: "hpc_e2e_eval"
   load_checkpoint_path: null
   save_best_only: true

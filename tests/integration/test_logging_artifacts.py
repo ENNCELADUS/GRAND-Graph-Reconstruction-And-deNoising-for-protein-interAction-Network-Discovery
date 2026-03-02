@@ -56,13 +56,15 @@ class _TinyModel(nn.Module):
         return {"logits": self.linear(x)}
 
 
-def _base_config(mode: str = "full_pipeline") -> ConfigDict:
+def _base_config(stages: list[str] | None = None) -> ConfigDict:
     """Create a minimal valid config for pipeline stage artifact tests."""
+    stage_list = ["train", "evaluate"] if stages is None else stages
     return {
         "run_config": {
-            "mode": mode,
+            "stages": stage_list,
             "seed": 7,
             "train_run_id": "train_case",
+            "adapt_run_id": "adapt_case",
             "eval_run_id": "eval_case",
             "load_checkpoint_path": None,
             "save_best_only": True,
@@ -90,6 +92,7 @@ def _base_config(mode: str = "full_pipeline") -> ConfigDict:
             "scheduler": {"type": "none"},
             "loss": {"type": "bce_with_logits", "pos_weight": 1.0, "label_smoothing": 0.0},
             "strategy": {"type": "none"},
+            "domain_adaptation": {"enabled": False, "method": "none", "target_split": "test"},
         },
         "evaluate": {"metrics": ["auprc", "auroc"]},
     }
@@ -137,7 +140,7 @@ def test_execute_pipeline_writes_stage_logs_and_strict_csv_headers(
     monkeypatch.setattr(run_module, "cleanup_distributed", fake_cleanup_distributed)
     monkeypatch.setattr(run_module, "resolve_device", fake_resolve_device)
 
-    run_module.execute_pipeline(_base_config(mode="full_pipeline"))
+    run_module.execute_pipeline(_base_config(stages=["train", "evaluate"]))
 
     train_log = tmp_path / "logs" / "v3" / "train" / "train_case" / "log.log"
     eval_log = tmp_path / "logs" / "v3" / "evaluate" / "eval_case" / "log.log"
@@ -171,7 +174,7 @@ def test_non_main_process_does_not_write_stage_artifacts(tmp_path: Path) -> None
     previous_cwd = Path.cwd()
     try:
         os.chdir(tmp_path)
-        config = _base_config(mode="train_only")
+        config = _base_config(stages=["train"])
         dataloaders = _fake_dataloaders()
         model = _TinyModel()
         distributed_context = DistributedContext(

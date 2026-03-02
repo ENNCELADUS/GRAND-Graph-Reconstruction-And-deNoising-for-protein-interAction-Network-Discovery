@@ -1,9 +1,8 @@
 run_config:
-  mode: "full_pipeline"  # full_pipeline | train_only | eval_only
+  stages: ["train", "evaluate"]
   seed: 47
   train_run_id: null
   adapt_run_id: null
-  finetune_run_id: null
   eval_run_id: null
   load_checkpoint_path: null
   save_best_only: true
@@ -15,36 +14,36 @@ device_config:
 
 data_config:
   benchmark:
-    name: "TMP"
-    root_dir: "data/TMP"
-    processed_dir: "data/TMP/processed"
+    name: "PRING"
+    root_dir: "data/PRING"
+    species: "human"
+    split_strategy: "BFS"  # BFS | DFS | RANDOM_WALK
+    processed_dir: "data/PRING/species_processed_data/human/BFS"
   embeddings:
     source: "esm3"
-    cache_dir: "data/embeddings/esm3"
+    cache_dir: "data/embeddings/esm3_1024"
   max_sequence_length: 1024
   dataloader:
-    train_dataset: "data/TMP/processed/pretrain_train_balanced.csv"
-    valid_dataset: "data/TMP/processed/pretrain_val_balanced.csv"
-    finetune_train_dataset: "data/TMP/processed/finetune_train.csv"
-    finetune_val_dataset: "data/TMP/processed/finetune_val.csv"
-    test_dataset: "data/TMP/processed/test.csv"
+    train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi.txt"
+    valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi.txt"
+    test_dataset: "data/PRING/species_processed_data/human/BFS/human_test_ppi.txt"
     num_workers: 4
     pin_memory: true
     drop_last: true
     sampling:
-      strategy: "none"  # none | ohem
-      warmup_epochs: 2
-      pool_multiplier: 16
-      cap_protein: 2
+      strategy: "ohem"  # none | ohem
+      warmup_epochs: 5
+      pool_multiplier: 4
+      cap_protein: 4
 
 model_config:
   model: "v5"
   input_dim: 1536
-  d_model: 192
+  d_model: 256
   encoder_layers: 2
   cross_attn_layers: 2
   n_heads: 8
-  pair_dim: 96
+  pair_dim: 128
   cnn_dim: 64
   cnn_blocks: 2
   interaction_map:
@@ -67,7 +66,7 @@ model_config:
 
 training_config:
   epochs: 20
-  batch_size: 16
+  batch_size: 32
   early_stopping_patience: 5
   monitor_metric: "auprc"
   logging:
@@ -93,8 +92,8 @@ training_config:
   strategy:
     type: "none"
   domain_adaptation:
-    enabled: false
-    method: "none"  # none | shot
+    enabled: true
+    method: "shot"  # none | shot
     target_split: "test"
     epochs: 15
     beta: 0.3

@@ -31,15 +31,13 @@ RELIC uses a config-driven pipeline. Ensure your environment is active:
 ```bash
 conda activate relic
 
-# Run the full pipeline (train -> evaluate)
+# Run configured stages from YAML (default: train -> evaluate)
 python -m src.run --config configs/v3.yaml
 
-# Run training only
-python -m src.run --config configs/v3.yaml --mode train_only
-
-# Run evaluation only (requires trained checkpoint)
-# Note: Checkpoints are now stored in models/v3/train/<RUN_ID>/
-python -m src.run --config configs/v3.yaml --mode eval_only --load_checkpoint_path models/v3/train/<RUN_ID>/best_model.pth
+# To run only selected stages, edit `run_config.stages` in YAML, e.g.:
+# stages: ["train"] or stages: ["evaluate"].
+# If stages includes evaluate and domain_adaptation.enabled=true, SHOT runs before evaluation.
+# Checkpoints are stored in models/v3/<stage>/<RUN_ID>/.
 ```
 
 ## Documentation

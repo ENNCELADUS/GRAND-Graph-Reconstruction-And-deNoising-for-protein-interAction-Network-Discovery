@@ -1,4 +1,4 @@
-"""Integration tests for pipeline modes using fixtures and mocks."""
+"""Integration tests for stage-based pipeline orchestration."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def base_config() -> ConfigDict:
     """Build minimal valid config for execute_pipeline orchestration."""
     return {
         "run_config": {
-            "mode": "full_pipeline",
+            "stages": ["train", "evaluate"],
             "seed": 7,
             "train_run_id": "train_run",
             "adapt_run_id": "adapt_run",
@@ -64,7 +64,13 @@ def base_config() -> ConfigDict:
         },
         "data_config": {},
         "model_config": {"model": "v3"},
-        "training_config": {},
+        "training_config": {
+            "domain_adaptation": {
+                "enabled": False,
+                "method": "none",
+                "target_split": "test",
+            }
+        },
         "evaluate": {"metrics": ["accuracy"]},
     }
 
@@ -149,7 +155,7 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
     return calls
 
 
-def test_execute_pipeline_full_pipeline(
+def test_execute_pipeline_all_stages(
     base_config: ConfigDict,
     patched_pipeline: PipelineCalls,
 ) -> None:
@@ -157,9 +163,7 @@ def test_execute_pipeline_full_pipeline(
 
     assert patched_pipeline.training == [("train", "train_run")]
     assert patched_pipeline.adaptation == []
-    assert patched_pipeline.evaluation == [
-        (Path("artifacts/train_best_model.pth"), "eval_run"),
-    ]
+    assert patched_pipeline.evaluation == [(Path("artifacts/train_best_model.pth"), "eval_run")]
 
 
 def test_execute_pipeline_train_only(
@@ -168,7 +172,7 @@ def test_execute_pipeline_train_only(
 ) -> None:
     run_cfg = base_config["run_config"]
     assert isinstance(run_cfg, dict)
-    run_cfg["mode"] = "train_only"
+    run_cfg["stages"] = ["train"]
 
     run_module.execute_pipeline(base_config)
 
@@ -177,13 +181,13 @@ def test_execute_pipeline_train_only(
     assert patched_pipeline.evaluation == []
 
 
-def test_execute_pipeline_eval_only(
+def test_execute_pipeline_evaluate_only(
     base_config: ConfigDict,
     patched_pipeline: PipelineCalls,
 ) -> None:
     run_cfg = base_config["run_config"]
     assert isinstance(run_cfg, dict)
-    run_cfg["mode"] = "eval_only"
+    run_cfg["stages"] = ["evaluate"]
     run_cfg["load_checkpoint_path"] = "artifacts/eval_input_model.pth"
 
     run_module.execute_pipeline(base_config)
@@ -193,7 +197,7 @@ def test_execute_pipeline_eval_only(
     assert patched_pipeline.evaluation == [(Path("artifacts/eval_input_model.pth"), "eval_run")]
 
 
-def test_execute_pipeline_full_pipeline_with_shot(
+def test_execute_pipeline_all_stages_with_shot(
     base_config: ConfigDict,
     patched_pipeline: PipelineCalls,
 ) -> None:
@@ -212,13 +216,13 @@ def test_execute_pipeline_full_pipeline_with_shot(
     assert patched_pipeline.evaluation == [(Path("artifacts/adapt_best_model.pth"), "eval_run")]
 
 
-def test_execute_pipeline_eval_only_with_shot(
+def test_execute_pipeline_evaluate_only_with_shot(
     base_config: ConfigDict,
     patched_pipeline: PipelineCalls,
 ) -> None:
     run_cfg = base_config["run_config"]
     assert isinstance(run_cfg, dict)
-    run_cfg["mode"] = "eval_only"
+    run_cfg["stages"] = ["evaluate"]
     run_cfg["load_checkpoint_path"] = "artifacts/eval_input_model.pth"
     training_cfg = base_config["training_config"]
     assert isinstance(training_cfg, dict)
@@ -231,19 +235,17 @@ def test_execute_pipeline_eval_only_with_shot(
     run_module.execute_pipeline(base_config)
 
     assert patched_pipeline.training == []
-    assert patched_pipeline.adaptation == [
-        (Path("artifacts/eval_input_model.pth"), "adapt_run")
-    ]
+    assert patched_pipeline.adaptation == [(Path("artifacts/eval_input_model.pth"), "adapt_run")]
     assert patched_pipeline.evaluation == [(Path("artifacts/adapt_best_model.pth"), "eval_run")]
 
 
-def test_execute_pipeline_train_only_with_shot(
+def test_execute_pipeline_train_only_with_shot_skips_adaptation(
     base_config: ConfigDict,
     patched_pipeline: PipelineCalls,
 ) -> None:
     run_cfg = base_config["run_config"]
     assert isinstance(run_cfg, dict)
-    run_cfg["mode"] = "train_only"
+    run_cfg["stages"] = ["train"]
     training_cfg = base_config["training_config"]
     assert isinstance(training_cfg, dict)
     training_cfg["domain_adaptation"] = {
@@ -255,20 +257,28 @@ def test_execute_pipeline_train_only_with_shot(
     run_module.execute_pipeline(base_config)
 
     assert patched_pipeline.training == [("train", "train_run")]
-    assert patched_pipeline.adaptation == [(Path("artifacts/train_best_model.pth"), "adapt_run")]
+    assert patched_pipeline.adaptation == []
     assert patched_pipeline.evaluation == []
 
 
-@pytest.mark.parametrize("deprecated_mode", ["pretrain_only", "finetune_from_pretrain"])
-def test_execute_pipeline_removed_modes_raise(
+@pytest.mark.parametrize(
+    "invalid_stages,error",
+    [
+        (["evaluate", "train"], "must follow"),
+        (["train", "train"], "duplicates"),
+        (["pretrain"], "unsupported"),
+    ],
+)
+def test_execute_pipeline_invalid_stages_raise(
     base_config: ConfigDict,
     patched_pipeline: PipelineCalls,
-    deprecated_mode: str,
+    invalid_stages: list[str],
+    error: str,
 ) -> None:
     run_cfg = base_config["run_config"]
     assert isinstance(run_cfg, dict)
-    run_cfg["mode"] = deprecated_mode
-    with pytest.raises(ValueError, match="Unsupported run mode"):
+    run_cfg["stages"] = invalid_stages
+    with pytest.raises(ValueError, match=error):
         run_module.execute_pipeline(base_config)
 
 
@@ -278,7 +288,7 @@ def test_execute_pipeline_staged_unfreeze_enables_ddp_find_unused(
 ) -> None:
     run_cfg = base_config["run_config"]
     assert isinstance(run_cfg, dict)
-    run_cfg["mode"] = "train_only"
+    run_cfg["stages"] = ["train"]
 
     device_cfg = base_config["device_config"]
     assert isinstance(device_cfg, dict)

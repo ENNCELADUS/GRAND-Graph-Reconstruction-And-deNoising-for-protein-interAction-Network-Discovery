@@ -34,7 +34,7 @@ def _configure_root_logging() -> None:
 
 
 def execute_pipeline(config: ConfigDict) -> None:
-    """Execute pipeline according to configured run mode."""
+    """Execute pipeline according to configured stages."""
     _execute_pipeline_impl(
         config=config,
         build_dataloaders_fn=build_dataloaders,

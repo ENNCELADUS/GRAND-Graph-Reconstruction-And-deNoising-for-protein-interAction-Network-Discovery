@@ -52,7 +52,7 @@ def test_local_cpu_config_artifact_is_valid() -> None:
     assert isinstance(run_cfg, dict)
     assert isinstance(device_cfg, dict)
     assert isinstance(training_cfg, dict)
-    assert run_cfg["mode"] == "full_pipeline"
+    assert run_cfg["stages"] == ["train", "evaluate"]
     assert device_cfg["device"] == "cpu"
     assert device_cfg["ddp_enabled"] is False
     assert device_cfg["use_mixed_precision"] is False
@@ -94,7 +94,7 @@ def test_local_cpu_config_artifact_is_valid() -> None:
 
 @pytest.mark.e2e
 @pytest.mark.slow
-def test_local_cpu_full_pipeline_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_local_cpu_train_evaluate_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Run optional local full-pipeline smoke test on CPU."""
     if os.environ.get("RELIC_RUN_LOCAL_E2E", "0") != "1":
         pytest.skip("Set RELIC_RUN_LOCAL_E2E=1 to run local CPU E2E smoke test.")

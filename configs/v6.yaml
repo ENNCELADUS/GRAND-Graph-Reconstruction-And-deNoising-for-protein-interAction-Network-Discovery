@@ -1,9 +1,8 @@
 run_config:
-  mode: "full_pipeline"  # full_pipeline | train_only | eval_only
+  stages: ["train", "evaluate"]
   seed: 47
   train_run_id: null
   adapt_run_id: null
-  finetune_run_id: null
   eval_run_id: null
   load_checkpoint_path: null
   save_best_only: true
@@ -15,30 +14,27 @@ device_config:
 
 data_config:
   benchmark:
-    name: "TMP"
-    root_dir: "data/TMP"
-    processed_dir: "data/TMP/processed"
+    name: "PRING"
+    root_dir: "data/PRING"
+    species: "human"
+    split_strategy: "BFS"  # BFS | DFS | RANDOM_WALK
+    processed_dir: "data/PRING/species_processed_data/human/BFS"
   embeddings:
     source: "esm3"
-    cache_dir: "data/embeddings/esm3"
-    sequence_file: "data/TMP/processed/proteins.csv"
-    id_column: "protein_id"
-    sequence_column: "sequence"
+    cache_dir: "data/embeddings/esm3_1024"
   max_sequence_length: 1024
   dataloader:
-    train_dataset: "data/TMP/processed/pretrain_train_balanced.csv"
-    valid_dataset: "data/TMP/processed/pretrain_val_balanced.csv"
-    finetune_train_dataset: "data/TMP/processed/finetune_train.csv"
-    finetune_val_dataset: "data/TMP/processed/finetune_val.csv"
-    test_dataset: "data/TMP/processed/test.csv"
+    train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi.txt"
+    valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi.txt"
+    test_dataset: "data/PRING/species_processed_data/human/BFS/human_test_ppi.txt"
     num_workers: 4
     pin_memory: true
     drop_last: true
     sampling:
       strategy: "ohem"  # none | ohem
-      warmup_epochs: 2
-      pool_multiplier: 16
-      cap_protein: 2
+      warmup_epochs: 5
+      pool_multiplier: 4
+      cap_protein: 4
 
 model_config:
   model: "v6"
@@ -92,21 +88,9 @@ training_config:
     label_smoothing: 0.02
   strategy:
     type: "none"
-  finetune:
-    epochs: 30
-    monitor_metric: "auprc"
-    optimizer:
-      lr: 0.000006
-    loss:
-      pos_weight: 7.0
-      label_smoothing: 0.005
-    strategy:
-      type: "staged_unfreeze"
-      unfreeze_epoch: 3
-      initial_trainable_prefixes: ["output_head"]
   domain_adaptation:
-    enabled: false
-    method: "none"  # none | shot
+    enabled: true
+    method: "shot"  # none | shot
     target_split: "test"
     epochs: 15
     beta: 0.3

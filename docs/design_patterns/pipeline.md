@@ -6,7 +6,7 @@ The DIPPI pipeline is a centralized, config-driven orchestration system controll
 
 1. **Centralized Orchestration**: The `run.py` module acts as the chief orchestrator. It manages the global state (configuration, seeds, devices) and drives the execution flow. Cross-module interactions are mediated by the orchestrator, not by direct calls between components.
 2. **Config-Driven Execution**: All behaviors—model hyperparameters, training duration, optimization strategies, and data paths—are defined in a YAML configuration file.
-3. **Stage-Based Workflow**: The pipeline supports train and evaluate stages, selected by run mode.
+3. **Stage-Based Workflow**: The pipeline supports explicit stage selection via `run_config.stages`.
 
 ## Pipeline Stages
 
@@ -15,7 +15,7 @@ The DIPPI pipeline is a centralized, config-driven orchestration system controll
 Before any training begins, the orchestrator performs the following:
 
 *   **Config Loading**: Parses the YAML configuration using `src/utils/config.py`.
-*   **Run ID Management**: Assigns unique IDs for train and eval runs. If not provided, timestamps are generated automatically. See [Logging Overview](logging_overview.md) for naming conventions.
+*   **Run ID Management**: Assigns unique IDs for train/adapt/evaluate runs. If not provided, timestamps are generated automatically. See [Logging Overview](logging_overview.md) for naming conventions.
 *   **Device & Seeding**: Sets random seeds for reproducibility and initializes computation devices (CPU/GPU/DDP) via `src/utils/device.py` and `src/utils/distributed.py`.
 *   **Data Loading**: Instantiates data loaders using `src/utils/data_io.py`.
 *   **Stage Logging Bootstrap**: Creates stage loggers and artifact directories early so setup/runtime events are persisted in `log.log`.
@@ -28,7 +28,7 @@ The orchestrator selects and instantiates the model architecture based on the `m
 
 ### 3. Train Stage
 
-**Role**: Train the model from scratch (or initial weights) on a dataset.
+**Role**: Train the model on the configured train/valid split.
 
 **Workflow**:
 1.  **Trainer Instantiation**: A generic `Trainer` is created with stage optimizer/scheduler config and centralized loss config (`training_config.loss`).
@@ -59,13 +59,15 @@ The orchestrator selects and instantiates the model architecture based on the `m
   * `split,auroc,auprc,accuracy,sensitivity,specificity,precision,recall,f1,mcc`
 * No `test_` prefixes are used in persisted eval CSV columns.
 
-## Run Modes
+## Run Stages
 
-The pipeline supports three strict execution modes defined in `run_config.mode`:
+Execution is controlled by ordered `run_config.stages`, for example:
 
-*   `full_pipeline`: Runs training, then automatically loads the resulting best model for evaluation.
-*   `train_only`: Runs training and saves the best model.
-*   `eval_only`: Loads a checkpoint and runs the evaluation protocol.
+*   `["train", "evaluate"]`
+*   `["train"]`
+*   `["evaluate"]`
+
+When `evaluate` is selected and `training_config.domain_adaptation.enabled=true`, SHOT adaptation is inserted automatically before evaluation.
 
 ## Launcher Disposition
 

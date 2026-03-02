@@ -92,14 +92,14 @@ def run_optimization(
     )
     _write_optuna_artifacts(output_dir=output_dir, result=result)
     if not skip_final_full_pipeline:
-        best_train_run_id = run_best_full_pipeline(
+        best_pipeline_run_id = run_best_full_pipeline(
             base_config=config,
             search_space=search_space,
             best_values=result.best_params,
             study_name=result.study_name,
             run_pipeline_fn=PIPELINE_EXECUTE_FN,
         )
-        LOGGER.info("Completed best full pipeline run: %s", best_train_run_id)
+        LOGGER.info("Completed best staged pipeline run: %s", best_pipeline_run_id)
 
 
 def main() -> None:
