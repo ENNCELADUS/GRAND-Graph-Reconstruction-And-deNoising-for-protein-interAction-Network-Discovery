@@ -208,6 +208,8 @@ class Trainer:
         """Run read-only scoring on the candidate pool and select hard examples."""
         if self.ohem_strategy is None:
             raise ValueError("OHEM strategy is not configured")
+        batch_size = int(self._required_batch_tensor(batch, "label").size(0))
+        chunk_size = max(1, min(batch_size, self.ohem_strategy.target_batch_size))
         mining_loss_config = LossConfig(
             loss_type=self.loss_config.loss_type,
             pos_weight=1.0,
@@ -220,22 +222,30 @@ class Trainer:
                 enabled=self.use_amp,
             ),
         ):
-            mining_output = self._forward_model(batch)
-            mining_logits = mining_output["logits"]
-            mining_loss = binary_classification_loss(
-                logits=mining_logits,
-                labels=self._required_batch_tensor(batch, "label").float(),
-                loss_config=mining_loss_config,
-                reduction="none",
-            )
+            chunk_losses: list[torch.Tensor] = []
+            for chunk_start in range(0, batch_size, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, batch_size)
+                chunk_batch = self._slice_batch_rows(
+                    batch=batch,
+                    start=chunk_start,
+                    end=chunk_end,
+                )
+                chunk_output = self._forward_model(chunk_batch)
+                chunk_logits = chunk_output["logits"]
+                chunk_loss = binary_classification_loss(
+                    logits=chunk_logits,
+                    labels=self._required_batch_tensor(chunk_batch, "label").float(),
+                    loss_config=mining_loss_config,
+                    reduction="none",
+                )
+                chunk_losses.append(chunk_loss)
+            mining_loss = torch.cat(chunk_losses, dim=0)
             selected_indices = self.ohem_strategy.select(
                 losses=mining_loss,
                 epoch_index=epoch_index,
                 protein_a_ids=self._optional_tensor(batch.get("protein_a_id")),
                 protein_b_ids=self._optional_tensor(batch.get("protein_b_id")),
             )
-        del mining_output
-        del mining_logits
         del mining_loss
         return selected_indices
 
@@ -265,6 +275,31 @@ class Trainer:
             else:
                 selected_batch[key] = value
         return selected_batch
+
+    def _slice_batch_rows(
+        self,
+        batch: BatchInput,
+        start: int,
+        end: int,
+    ) -> BatchDict:
+        """Slice row-aligned batch fields across a half-open sample window."""
+        sliced_batch: BatchDict = {}
+        label = self._required_batch_tensor(batch, "label")
+        batch_size = int(label.size(0))
+        for key, value in batch.items():
+            is_row_tensor = (
+                isinstance(value, torch.Tensor)
+                and value.dim() > 0
+                and int(value.size(0)) == batch_size
+            )
+            if is_row_tensor:
+                tensor_value = cast(torch.Tensor, value)
+                sliced_batch[key] = tensor_value[start:end]
+            elif isinstance(value, (list, tuple)) and len(value) == batch_size:
+                sliced_batch[key] = value[start:end]
+            else:
+                sliced_batch[key] = value
+        return sliced_batch
 
     def _ohem_selected_batch_loss(
         self,

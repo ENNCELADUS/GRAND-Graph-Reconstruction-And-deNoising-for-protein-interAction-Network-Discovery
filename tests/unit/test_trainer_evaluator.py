@@ -241,7 +241,7 @@ def test_ohem_disables_pos_weight_for_selected_batch_loss() -> None:
     assert torch.isclose(loss, expected, atol=1e-6)
 
 
-def test_ohem_training_uses_two_phase_forward_and_reduced_backward_batch() -> None:
+def test_ohem_training_mines_in_chunks_and_reduces_backward_batch() -> None:
     model = OHEMProbeModel()
     loader = DataLoader(TinyDataset(), batch_size=4, shuffle=False, collate_fn=_collate)
     trainer = Trainer(
@@ -258,7 +258,7 @@ def test_ohem_training_uses_two_phase_forward_and_reduced_backward_batch() -> No
 
     trainer.train_one_epoch(loader, epoch_index=0)
 
-    assert model.forward_batch_sizes == [4, 2]
+    assert model.forward_batch_sizes == [2, 2, 2]
 
 
 def test_training_csv_schema_header_order_regression() -> None:
