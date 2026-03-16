@@ -1,0 +1,51 @@
+W0314 00:03:38.619000 46958 site-packages/torch/distributed/run.py:792] 
+W0314 00:03:38.619000 46958 site-packages/torch/distributed/run.py:792] *****************************************
+W0314 00:03:38.619000 46958 site-packages/torch/distributed/run.py:792] Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+W0314 00:03:38.619000 46958 site-packages/torch/distributed/run.py:792] *****************************************
+INFO:src.run:Loaded config: configs/v3.yaml
+INFO:src.utils.distributed:Initialized distributed process group (backend=nccl rank=0 local_rank=0 world_size=4).
+2026-03-14 00:03:43 INFO Startup | Rank: 0 | Run Id: 20260308_002906 | Seed: 47 | Stages: ['evaluate'] | World Size: 4
+2026-03-14 00:03:43 INFO Startup | Rank: 0 | Run Id: 20260308_002906 | Seed: 47 | Stages: ['evaluate'] | World Size: 4
+2026-03-14 00:03:43 INFO Device | Resolved Device: cuda:0
+2026-03-14 00:03:43 INFO Device | Resolved Device: cuda:0
+[rank1]:[W314 00:03:43.247191013 ProcessGroupNCCL.cpp:4561] [PG ID 0 PG GUID 0 Rank 1]  using GPU 1 to perform barrier as devices used by this process are currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. Specify device_ids in barrier() to force use of a particular device, or call init_process_group() with a device_id.
+[rank0]:[W314 00:03:43.249129538 ProcessGroupNCCL.cpp:4561] [PG ID 0 PG GUID 0 Rank 0]  using GPU 0 to perform barrier as devices used by this process are currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. Specify device_ids in barrier() to force use of a particular device, or call init_process_group() with a device_id.
+[rank3]:[W314 00:03:43.250495084 ProcessGroupNCCL.cpp:4561] [PG ID 0 PG GUID 0 Rank 3]  using GPU 3 to perform barrier as devices used by this process are currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. Specify device_ids in barrier() to force use of a particular device, or call init_process_group() with a device_id.
+[rank2]:[W314 00:03:43.250821733 ProcessGroupNCCL.cpp:4561] [PG ID 0 PG GUID 0 Rank 2]  using GPU 2 to perform barrier as devices used by this process are currently unknown. This can potentially cause a hang if this rank to GPU mapping is incorrect. Specify device_ids in barrier() to force use of a particular device, or call init_process_group() with a device_id.
+2026-03-14 00:04:20 INFO Data Ready | Test: 54126 | Train: 97555 | Valid: 24389
+2026-03-14 00:04:20 INFO Data Ready | Test: 54126 | Train: 97555 | Valid: 24389
+2026-03-14 00:04:20 INFO Model Init | Model: v3 | Params: 26439937
+2026-03-14 00:04:23 INFO DDP Ready | Wrapped: True
+2026-03-14 00:04:23 INFO DDP Ready | Wrapped: True
+2026-03-14 00:04:23 INFO Begin Adaptation
+2026-03-14 00:04:23 INFO Stage Start | Checkpoint: models/v3/train/20260308_002906/best_model.pth | Method: shot | Run Id: 20260308_002906
+2026-03-14 00:04:23 INFO Checkpoint Loaded | Path: models/v3/train/20260308_002906/best_model.pth
+2026-03-14 00:04:23 INFO Adapt Config | Beta: 0.3000 | Epochs: 15 | Target Split: test | Trainable Params: 26011136
+WARNING:py.warnings:/public/home/wangar2023/.conda/envs/relic/lib/python3.11/site-packages/torch/optim/lr_scheduler.py:227: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+  warnings.warn(
+
+2026-03-14 00:12:25 INFO Epoch Done | Diversity Loss: -0.6577 | Entropy Loss: 0.3362 | Epoch: 1 | LR: 0.0001 | Pseudo Ce Loss: 0.3167 | Time: 482.2804 | Total Loss: -0.2265
+2026-03-14 00:20:47 INFO Epoch Done | Diversity Loss: -0.6642 | Entropy Loss: 0.2569 | Epoch: 2 | LR: 0.0001 | Pseudo Ce Loss: 0.1997 | Time: 502.0011 | Total Loss: -0.3474
+2026-03-14 00:28:56 INFO Epoch Done | Diversity Loss: -0.6588 | Entropy Loss: 0.2232 | Epoch: 3 | LR: 0.0000 | Pseudo Ce Loss: 0.1771 | Time: 489.1609 | Total Loss: -0.3825
+2026-03-14 00:36:46 INFO Epoch Done | Diversity Loss: -0.6527 | Entropy Loss: 0.2026 | Epoch: 4 | LR: 0.0000 | Pseudo Ce Loss: 0.1647 | Time: 470.0491 | Total Loss: -0.4006
+2026-03-14 00:44:56 INFO Epoch Done | Diversity Loss: -0.6475 | Entropy Loss: 0.1888 | Epoch: 5 | LR: 0.0000 | Pseudo Ce Loss: 0.1647 | Time: 489.3782 | Total Loss: -0.4093
+2026-03-14 00:52:34 INFO Epoch Done | Diversity Loss: -0.6433 | Entropy Loss: 0.1806 | Epoch: 6 | LR: 0.0000 | Pseudo Ce Loss: 0.1590 | Time: 458.3812 | Total Loss: -0.4150
+2026-03-14 01:00:37 INFO Epoch Done | Diversity Loss: -0.6411 | Entropy Loss: 0.1736 | Epoch: 7 | LR: 0.0000 | Pseudo Ce Loss: 0.1513 | Time: 483.2818 | Total Loss: -0.4221
+2026-03-14 01:08:42 INFO Epoch Done | Diversity Loss: -0.6397 | Entropy Loss: 0.1692 | Epoch: 8 | LR: 0.0000 | Pseudo Ce Loss: 0.1490 | Time: 484.9768 | Total Loss: -0.4258
+2026-03-14 01:16:48 INFO Epoch Done | Diversity Loss: -0.6403 | Entropy Loss: 0.1661 | Epoch: 9 | LR: 0.0000 | Pseudo Ce Loss: 0.1465 | Time: 485.4412 | Total Loss: -0.4302
+2026-03-14 01:24:56 INFO Epoch Done | Diversity Loss: -0.6383 | Entropy Loss: 0.1627 | Epoch: 10 | LR: 0.0000 | Pseudo Ce Loss: 0.1426 | Time: 488.1063 | Total Loss: -0.4328
+2026-03-14 01:33:12 INFO Epoch Done | Diversity Loss: -0.6383 | Entropy Loss: 0.1603 | Epoch: 11 | LR: 0.0000 | Pseudo Ce Loss: 0.1409 | Time: 496.3449 | Total Loss: -0.4357
+2026-03-14 01:41:07 INFO Epoch Done | Diversity Loss: -0.6371 | Entropy Loss: 0.1569 | Epoch: 12 | LR: 0.0000 | Pseudo Ce Loss: 0.1402 | Time: 475.1643 | Total Loss: -0.4381
+2026-03-14 01:48:50 INFO Epoch Done | Diversity Loss: -0.6387 | Entropy Loss: 0.1560 | Epoch: 13 | LR: 0.0000 | Pseudo Ce Loss: 0.1404 | Time: 462.2365 | Total Loss: -0.4405
+2026-03-14 01:56:54 INFO Epoch Done | Diversity Loss: -0.6382 | Entropy Loss: 0.1542 | Epoch: 14 | LR: 0.0000 | Pseudo Ce Loss: 0.1375 | Time: 483.9038 | Total Loss: -0.4428
+2026-03-14 02:04:36 INFO Epoch Done | Diversity Loss: -0.6375 | Entropy Loss: 0.1529 | Epoch: 15 | LR: 0.0000 | Pseudo Ce Loss: 0.1349 | Time: 462.1493 | Total Loss: -0.4441
+2026-03-14 02:04:36 INFO Checkpoint Saved | Path: models/v3/adapt/20260308_002906/best_model.pth
+2026-03-14 02:04:36 INFO Stage Done | Run Id: 20260308_002906
+2026-03-14 02:04:36 INFO End Adaptation
+2026-03-14 02:04:36 INFO Begin Evaluation
+2026-03-14 02:04:36 INFO Stage Start | Checkpoint: models/v3/adapt/20260308_002906/best_model.pth | Run Id: 20260308_002906
+2026-03-14 02:04:36 INFO Checkpoint Loaded | Path: models/v3/adapt/20260308_002906/best_model.pth
+2026-03-14 02:13:19 INFO Evaluation Metrics | Accuracy: 0.6030 | AUPRC: 0.5344 | Auroc: 0.5715 | F1: 0.6381 | Mcc: 0.2099 | Precision: 0.5864 | Recall: 0.6999 | Sensitivity: 0.6999 | Specificity: 0.5060 | Split: test
+2026-03-14 02:13:19 INFO CSV Written | Path: logs/v3/evaluate/20260308_002906/evaluate.csv
+2026-03-14 02:13:19 INFO Stage Done | Run Id: 20260308_002906
+2026-03-14 02:13:33 INFO End Evaluation

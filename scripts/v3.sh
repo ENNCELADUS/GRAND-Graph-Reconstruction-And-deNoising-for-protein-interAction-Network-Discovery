@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J V3
-#SBATCH -p critical
-#SBATCH -A hexm-critical
+#SBATCH -p hexm
+#SBATCH -A hexm
 #SBATCH -N 1
 #SBATCH -t 4-00:00:00
 #SBATCH --mem=300G

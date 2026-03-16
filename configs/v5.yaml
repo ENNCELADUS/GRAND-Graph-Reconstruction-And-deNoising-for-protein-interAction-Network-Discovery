@@ -33,7 +33,7 @@ data_config:
     sampling:
       strategy: "ohem"  # none | ohem
       warmup_epochs: 5
-      pool_multiplier: 4
+      pool_multiplier: 8
       cap_protein: 4
 
 model_config:
@@ -65,8 +65,8 @@ model_config:
     cnn_dropout: 0.10
 
 training_config:
-  epochs: 20
-  batch_size: 16
+  epochs: 50
+  batch_size: 8
   early_stopping_patience: 5
   monitor_metric: "auprc"
   logging:
@@ -92,10 +92,10 @@ training_config:
   strategy:
     type: "none"
   domain_adaptation:
-    enabled: true
+    enabled: false
     method: "shot"  # none | shot
     target_split: "test"
-    epochs: 15
+    epochs: 5
     beta: 0.3
     entropy_weight: 1.0
     diversity_weight: 1.0

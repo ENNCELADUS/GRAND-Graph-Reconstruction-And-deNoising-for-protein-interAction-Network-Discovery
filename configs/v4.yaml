@@ -82,8 +82,8 @@ training_config:
   strategy:
     type: "none"
   domain_adaptation:
-    enabled: true
-    method: "shot"  # none | shot
+    enabled: false
+    method: "none"  # none | shot
     target_split: "test"
     epochs: 15
     beta: 0.3
