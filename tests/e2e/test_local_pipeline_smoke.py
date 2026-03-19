@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import os
+import pickle
 from csv import DictReader
 from pathlib import Path
 
 import pytest
 import src.run as run_module
+import torch
 from src.utils.config import ConfigDict, load_config
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -39,7 +42,164 @@ def _resolve_data_paths(config: ConfigDict) -> ConfigDict:
     dataloader_cfg["train_dataset"] = _to_absolute_path(str(dataloader_cfg["train_dataset"]))
     dataloader_cfg["valid_dataset"] = _to_absolute_path(str(dataloader_cfg["valid_dataset"]))
     dataloader_cfg["test_dataset"] = _to_absolute_path(str(dataloader_cfg["test_dataset"]))
+    topology_cfg = config.get("topology_evaluate", {})
+    if isinstance(topology_cfg, dict) and "report_baselines" in topology_cfg:
+        topology_cfg["report_baselines"] = _to_absolute_path(str(topology_cfg["report_baselines"]))
     return config
+
+
+def _write_split(path: Path, rows: list[tuple[str, str, int]]) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for protein_a, protein_b, label in rows:
+            handle.write(f"{protein_a}\t{protein_b}\t{label}\n")
+
+
+def _write_embedding_cache(
+    cache_dir: Path,
+    *,
+    input_dim: int,
+    max_sequence_length: int,
+) -> None:
+    embeddings = {
+        "P1": torch.ones((2, input_dim), dtype=torch.float32),
+        "P2": torch.full((2, input_dim), 2.0, dtype=torch.float32),
+        "P3": torch.full((2, input_dim), 3.0, dtype=torch.float32),
+    }
+    index: dict[str, str] = {}
+    for protein_id, tensor in embeddings.items():
+        relative_path = f"embeddings/{protein_id}.pt"
+        output_path = cache_dir / relative_path
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(tensor, output_path)
+        index[protein_id] = relative_path
+    (cache_dir / "index.json").write_text(json.dumps(index), encoding="utf-8")
+    (cache_dir / "metadata.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "source": "esm3",
+                "model_name": "esm3_sm_open_v1",
+                "input_dim": input_dim,
+                "max_sequence_length": max_sequence_length,
+                "format": "torch_pt_per_protein",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _tiny_topology_config(tmp_path: Path) -> ConfigDict:
+    benchmark_root = tmp_path / "benchmark"
+    processed_dir = benchmark_root / "human" / "BFS"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+
+    train_path = processed_dir / "human_train_ppi.txt"
+    valid_path = processed_dir / "human_val_ppi.txt"
+    test_path = processed_dir / "human_test_ppi.txt"
+    all_test_path = processed_dir / "all_test_ppi.txt"
+    _write_split(train_path, [("P1", "P2", 1), ("P1", "P3", 0), ("P2", "P3", 1)])
+    _write_split(valid_path, [("P1", "P2", 1), ("P1", "P3", 0)])
+    _write_split(test_path, [("P1", "P2", 1), ("P2", "P3", 1)])
+    _write_split(all_test_path, [("P1", "P2", 1), ("P1", "P3", 0), ("P2", "P3", 1)])
+
+    import networkx as nx
+
+    gt_graph = nx.Graph()
+    gt_graph.add_edges_from([("P1", "P2"), ("P2", "P3")])
+    with (processed_dir / "human_test_graph.pkl").open("wb") as handle:
+        pickle.dump(gt_graph, handle)
+    with (processed_dir / "test_sampled_nodes.pkl").open("wb") as handle:
+        pickle.dump({3: [["P1", "P2", "P3"]]}, handle)
+
+    cache_dir = tmp_path / "cache"
+    _write_embedding_cache(cache_dir=cache_dir, input_dim=4, max_sequence_length=8)
+
+    return {
+        "run_config": {
+            "stages": ["train", "evaluate", "topology_evaluate"],
+            "seed": 7,
+            "train_run_id": "tiny_e2e_train",
+            "adapt_run_id": None,
+            "eval_run_id": "tiny_e2e_eval",
+            "topology_eval_run_id": "tiny_e2e_topology",
+            "load_checkpoint_path": None,
+            "save_best_only": True,
+        },
+        "device_config": {
+            "device": "cpu",
+            "ddp_enabled": False,
+            "use_mixed_precision": False,
+        },
+        "data_config": {
+            "benchmark": {
+                "name": "PRING",
+                "root_dir": str(benchmark_root),
+                "species": "human",
+                "split_strategy": "BFS",
+                "processed_dir": str(processed_dir),
+            },
+            "embeddings": {
+                "source": "esm3",
+                "cache_dir": str(cache_dir),
+                "model_name": "esm3_sm_open_v1",
+                "device": "cpu",
+            },
+            "max_sequence_length": 8,
+            "dataloader": {
+                "train_dataset": str(train_path),
+                "valid_dataset": str(valid_path),
+                "test_dataset": str(test_path),
+                "num_workers": 0,
+                "pin_memory": False,
+                "drop_last": False,
+                "sampling": {"strategy": "none"},
+            },
+        },
+        "model_config": {
+            "model": "v3",
+            "input_dim": 4,
+            "d_model": 4,
+            "encoder_layers": 1,
+            "cross_attn_layers": 1,
+            "n_heads": 2,
+            "mlp_head": {
+                "hidden_dims": [4],
+                "dropout": 0.0,
+                "activation": "gelu",
+                "norm": "layernorm",
+            },
+            "regularization": {
+                "dropout": 0.0,
+                "token_dropout": 0.0,
+                "cross_attention_dropout": 0.0,
+                "stochastic_depth": 0.0,
+            },
+        },
+        "training_config": {
+            "epochs": 1,
+            "batch_size": 2,
+            "early_stopping_patience": 1,
+            "monitor_metric": "auprc",
+            "logging": {"validation_metrics": ["auprc", "auroc"], "heartbeat_every_n_steps": 2},
+            "optimizer": {"type": "adamw", "lr": 0.0001},
+            "scheduler": {"type": "none"},
+            "loss": {"type": "bce_with_logits", "pos_weight": 1.0, "label_smoothing": 0.0},
+            "strategy": {"type": "none"},
+            "domain_adaptation": {"enabled": False, "method": "none", "target_split": "test"},
+        },
+        "evaluate": {
+            "decision_threshold": {"mode": "best_f1_on_valid"},
+            "metrics": ["auprc", "auroc", "accuracy", "f1", "precision", "recall"],
+        },
+        "topology_evaluate": {
+            "inference_batch_size": 2,
+            "decision_threshold": {"mode": "best_f1_on_valid"},
+            "save_pair_predictions": True,
+            "report_baselines": str(
+                REPO_ROOT / "src" / "topology" / "baselines" / "pring_human_table2.json"
+            ),
+        },
+    }
 
 
 @pytest.mark.e2e
@@ -129,3 +289,22 @@ def test_local_cpu_train_evaluate_smoke(tmp_path: Path, monkeypatch: pytest.Monk
         "Learning Rate",
     ]
     assert eval_header == run_module.EVAL_CSV_COLUMNS
+
+
+@pytest.mark.e2e
+def test_local_cpu_train_evaluate_topology_tiny_smoke(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Run a tiny end-to-end topology pipeline without the full Human all-test surface."""
+    monkeypatch.chdir(tmp_path)
+    run_module.execute_pipeline(config=_tiny_topology_config(tmp_path))
+
+    train_log_dir = tmp_path / "logs" / "v3" / "train" / "tiny_e2e_train"
+    eval_log_dir = tmp_path / "logs" / "v3" / "evaluate" / "tiny_e2e_eval"
+    topology_log_dir = tmp_path / "logs" / "v3" / "topology_evaluate" / "tiny_e2e_topology"
+    assert (train_log_dir / "training_step.csv").exists()
+    assert (eval_log_dir / "evaluate.csv").exists()
+    assert (topology_log_dir / "all_test_ppi_pred.txt").exists()
+    assert (topology_log_dir / "topology_metrics.json").exists()
+    assert (topology_log_dir / "topology_metrics.csv").exists()

@@ -12,6 +12,7 @@ from src.run.pipeline_orchestrator import _ddp_find_unused_parameters
 from src.run.pipeline_orchestrator import execute_pipeline as _execute_pipeline_impl
 from src.run.stage_adapt import ADAPT_CSV_COLUMNS, run_shot_adaptation_stage
 from src.run.stage_evaluate import EVAL_CSV_COLUMNS, _metrics_from_config, run_evaluation_stage
+from src.run.stage_topology_evaluate import TOPOLOGY_CSV_COLUMNS, run_topology_evaluation_stage
 from src.run.stage_train import (
     _training_validation_metrics,
     build_model,
@@ -42,6 +43,7 @@ def execute_pipeline(config: ConfigDict) -> None:
         run_training_stage_fn=run_training_stage,
         run_adaptation_stage_fn=run_shot_adaptation_stage,
         run_evaluation_stage_fn=run_evaluation_stage,
+        run_topology_evaluation_stage_fn=run_topology_evaluation_stage,
         initialize_distributed_fn=initialize_distributed,
         cleanup_distributed_fn=cleanup_distributed,
         resolve_device_fn=resolve_device,
@@ -61,6 +63,7 @@ def main() -> None:
 __all__ = [
     "ADAPT_CSV_COLUMNS",
     "EVAL_CSV_COLUMNS",
+    "TOPOLOGY_CSV_COLUMNS",
     "_configure_root_logging",
     "_ddp_find_unused_parameters",
     "_metrics_from_config",
@@ -78,6 +81,7 @@ __all__ = [
     "resolve_device",
     "run_shot_adaptation_stage",
     "run_evaluation_stage",
+    "run_topology_evaluation_stage",
     "run_training_stage",
     "set_global_seed",
 ]

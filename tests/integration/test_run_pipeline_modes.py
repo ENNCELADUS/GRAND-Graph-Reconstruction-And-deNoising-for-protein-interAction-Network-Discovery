@@ -42,6 +42,7 @@ class PipelineCalls:
     training: list[tuple[str, str]] = field(default_factory=list)
     adaptation: list[tuple[Path, str]] = field(default_factory=list)
     evaluation: list[tuple[Path, str]] = field(default_factory=list)
+    topology_evaluation: list[tuple[Path, str]] = field(default_factory=list)
 
 
 @pytest.fixture
@@ -54,6 +55,7 @@ def base_config() -> ConfigDict:
             "train_run_id": "train_run",
             "adapt_run_id": "adapt_run",
             "eval_run_id": "eval_run",
+            "topology_eval_run_id": "topology_eval_run",
             "load_checkpoint_path": "artifacts/input_checkpoint.pth",
             "save_best_only": True,
         },
@@ -72,6 +74,7 @@ def base_config() -> ConfigDict:
             }
         },
         "evaluate": {"metrics": ["accuracy"]},
+        "topology_evaluate": {"save_pair_predictions": True},
     }
 
 
@@ -133,6 +136,19 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         calls.adaptation.append((checkpoint_path, run_id))
         return Path("artifacts/adapt_best_model.pth")
 
+    def fake_run_topology_evaluation_stage(
+        config: ConfigDict,
+        model: nn.Module,
+        device: torch.device,
+        dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        run_id: str,
+        checkpoint_path: Path,
+        distributed_context: DistributedContext,
+    ) -> dict[str, float]:
+        del config, model, device, dataloaders, distributed_context
+        calls.topology_evaluation.append((checkpoint_path, run_id))
+        return {"graph_sim": 1.0}
+
     def fake_initialize_distributed(ddp_enabled: bool) -> DistributedContext:
         del ddp_enabled
         return DistributedContext(ddp_enabled=False, is_distributed=False)
@@ -149,6 +165,11 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
     monkeypatch.setattr(run_module, "run_training_stage", fake_run_training_stage)
     monkeypatch.setattr(run_module, "run_shot_adaptation_stage", fake_run_adaptation_stage)
     monkeypatch.setattr(run_module, "run_evaluation_stage", fake_run_evaluation_stage)
+    monkeypatch.setattr(
+        run_module,
+        "run_topology_evaluation_stage",
+        fake_run_topology_evaluation_stage,
+    )
     monkeypatch.setattr(run_module, "initialize_distributed", fake_initialize_distributed)
     monkeypatch.setattr(run_module, "cleanup_distributed", fake_cleanup_distributed)
     monkeypatch.setattr(run_module, "resolve_device", fake_resolve_device)
@@ -164,6 +185,7 @@ def test_execute_pipeline_all_stages(
     assert patched_pipeline.training == [("train", "train_run")]
     assert patched_pipeline.adaptation == []
     assert patched_pipeline.evaluation == [(Path("artifacts/train_best_model.pth"), "eval_run")]
+    assert patched_pipeline.topology_evaluation == []
 
 
 def test_execute_pipeline_train_only(
@@ -179,6 +201,7 @@ def test_execute_pipeline_train_only(
     assert patched_pipeline.training == [("train", "train_run")]
     assert patched_pipeline.adaptation == []
     assert patched_pipeline.evaluation == []
+    assert patched_pipeline.topology_evaluation == []
 
 
 def test_execute_pipeline_evaluate_only(
@@ -195,6 +218,7 @@ def test_execute_pipeline_evaluate_only(
     assert patched_pipeline.training == []
     assert patched_pipeline.adaptation == []
     assert patched_pipeline.evaluation == [(Path("artifacts/eval_input_model.pth"), "eval_run")]
+    assert patched_pipeline.topology_evaluation == []
 
 
 def test_execute_pipeline_all_stages_with_shot(
@@ -214,6 +238,7 @@ def test_execute_pipeline_all_stages_with_shot(
     assert patched_pipeline.training == [("train", "train_run")]
     assert patched_pipeline.adaptation == [(Path("artifacts/train_best_model.pth"), "adapt_run")]
     assert patched_pipeline.evaluation == [(Path("artifacts/adapt_best_model.pth"), "eval_run")]
+    assert patched_pipeline.topology_evaluation == []
 
 
 def test_execute_pipeline_evaluate_only_with_shot(
@@ -237,6 +262,7 @@ def test_execute_pipeline_evaluate_only_with_shot(
     assert patched_pipeline.training == []
     assert patched_pipeline.adaptation == [(Path("artifacts/eval_input_model.pth"), "adapt_run")]
     assert patched_pipeline.evaluation == [(Path("artifacts/adapt_best_model.pth"), "eval_run")]
+    assert patched_pipeline.topology_evaluation == []
 
 
 def test_execute_pipeline_train_only_with_shot_skips_adaptation(
@@ -259,6 +285,43 @@ def test_execute_pipeline_train_only_with_shot_skips_adaptation(
     assert patched_pipeline.training == [("train", "train_run")]
     assert patched_pipeline.adaptation == []
     assert patched_pipeline.evaluation == []
+    assert patched_pipeline.topology_evaluation == []
+
+
+def test_execute_pipeline_topology_evaluate_only(
+    base_config: ConfigDict,
+    patched_pipeline: PipelineCalls,
+) -> None:
+    run_cfg = base_config["run_config"]
+    assert isinstance(run_cfg, dict)
+    run_cfg["stages"] = ["topology_evaluate"]
+    run_cfg["load_checkpoint_path"] = "artifacts/topology_input_model.pth"
+
+    run_module.execute_pipeline(base_config)
+
+    assert patched_pipeline.training == []
+    assert patched_pipeline.adaptation == []
+    assert patched_pipeline.evaluation == []
+    assert patched_pipeline.topology_evaluation == [
+        (Path("artifacts/topology_input_model.pth"), "topology_eval_run")
+    ]
+
+
+def test_execute_pipeline_train_evaluate_and_topology(
+    base_config: ConfigDict,
+    patched_pipeline: PipelineCalls,
+) -> None:
+    run_cfg = base_config["run_config"]
+    assert isinstance(run_cfg, dict)
+    run_cfg["stages"] = ["train", "evaluate", "topology_evaluate"]
+
+    run_module.execute_pipeline(base_config)
+
+    assert patched_pipeline.training == [("train", "train_run")]
+    assert patched_pipeline.evaluation == [(Path("artifacts/train_best_model.pth"), "eval_run")]
+    assert patched_pipeline.topology_evaluation == [
+        (Path("artifacts/train_best_model.pth"), "topology_eval_run")
+    ]
 
 
 @pytest.mark.parametrize(

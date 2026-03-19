@@ -4,6 +4,7 @@ run_config:
   train_run_id: null
   adapt_run_id: null
   eval_run_id: null
+  topology_eval_run_id: null
   load_checkpoint_path: null
   save_best_only: true
 
@@ -114,6 +115,13 @@ evaluate:
     - "recall"
     - "f1"
     - "mcc"
+
+topology_evaluate:
+  inference_batch_size: 32
+  decision_threshold:
+    mode: "best_f1_on_valid"
+  save_pair_predictions: true
+  report_baselines: "src/topology/baselines/pring_human_table2.json"
 
 optimization:
   enabled: true

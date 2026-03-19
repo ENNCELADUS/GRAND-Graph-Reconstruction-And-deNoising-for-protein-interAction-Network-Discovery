@@ -14,6 +14,7 @@ from src.adapt import should_run_shot_adaptation
 from src.run.bootstrap import set_global_seed
 from src.run.stage_adapt import run_shot_adaptation_stage
 from src.run.stage_evaluate import run_evaluation_stage
+from src.run.stage_topology_evaluate import run_topology_evaluation_stage
 from src.run.stage_train import _build_stage_runtime, build_model, run_training_stage
 from src.utils.config import (
     ConfigDict,
@@ -36,7 +37,7 @@ from src.utils.logging import generate_run_id, log_stage_event
 DataLoaderMap = dict[str, torch.utils.data.DataLoader[dict[str, object]]]
 
 DEFAULT_STAGES: tuple[str, ...] = ("train", "evaluate")
-ALLOWED_STAGES: tuple[str, ...] = DEFAULT_STAGES
+ALLOWED_STAGES: tuple[str, ...] = ("train", "evaluate", "topology_evaluate")
 STAGE_ORDER: dict[str, int] = {stage: index for index, stage in enumerate(ALLOWED_STAGES)}
 
 
@@ -89,7 +90,9 @@ def _selected_stages(run_cfg: ConfigDict) -> tuple[str, ...]:
     for stage in configured_stages:
         stage_order = STAGE_ORDER[stage]
         if stage_order < previous_order:
-            raise ValueError("run_config.stages must follow: train -> evaluate")
+            raise ValueError(
+                "run_config.stages must follow: train -> evaluate -> topology_evaluate"
+            )
         previous_order = stage_order
     return configured_stages
 
@@ -151,6 +154,10 @@ def execute_pipeline(
     run_training_stage_fn: Callable[..., Path] = run_training_stage,
     run_adaptation_stage_fn: Callable[..., Path] = run_shot_adaptation_stage,
     run_evaluation_stage_fn: Callable[..., dict[str, float]] = run_evaluation_stage,
+    run_topology_evaluation_stage_fn: Callable[
+        ...,
+        dict[str, float],
+    ] = run_topology_evaluation_stage,
     initialize_distributed_fn: Callable[[bool], DistributedContext] = initialize_distributed,
     cleanup_distributed_fn: Callable[[DistributedContext], None] = cleanup_distributed,
     resolve_device_fn: Callable[[str], torch.device] = resolve_device,
@@ -170,6 +177,7 @@ def execute_pipeline(
         train_run_id = generate_run_id(run_cfg.get("train_run_id"))
         adapt_run_id = generate_run_id(run_cfg.get("adapt_run_id"))
         eval_run_id = generate_run_id(run_cfg.get("eval_run_id"))
+        topology_eval_run_id = generate_run_id(run_cfg.get("topology_eval_run_id"))
         load_checkpoint_value = run_cfg.get("load_checkpoint_path")
         load_checkpoint_path = (
             Path(str(load_checkpoint_value))
@@ -181,6 +189,7 @@ def execute_pipeline(
             "train": train_run_id,
             "adapt": adapt_run_id,
             "evaluate": eval_run_id,
+            "topology_evaluate": topology_eval_run_id,
         }
         selected_stages_with_adaptation = _selected_stages_with_adaptation(
             selected_stages,
@@ -316,5 +325,28 @@ def execute_pipeline(
             )
             if distributed_context.is_main_process:
                 log_stage_event(stage_loggers["evaluate"], "end_evaluation")
+
+        if "topology_evaluate" in selected_stages:
+            topology_checkpoint_path = (
+                adapt_checkpoint_path
+                if adapt_checkpoint_path is not None
+                else _evaluation_checkpoint_path(
+                    train_checkpoint_path=train_checkpoint_path,
+                    load_checkpoint_path=load_checkpoint_path,
+                )
+            )
+            if distributed_context.is_main_process:
+                log_stage_event(stage_loggers["topology_evaluate"], "begin_topology_evaluation")
+            run_topology_evaluation_stage_fn(
+                config=config,
+                model=model,
+                device=device,
+                dataloaders=dataloaders,
+                run_id=topology_eval_run_id,
+                checkpoint_path=topology_checkpoint_path,
+                distributed_context=distributed_context,
+            )
+            if distributed_context.is_main_process:
+                log_stage_event(stage_loggers["topology_evaluate"], "end_topology_evaluation")
     finally:
         cleanup_distributed_fn(distributed_context)
