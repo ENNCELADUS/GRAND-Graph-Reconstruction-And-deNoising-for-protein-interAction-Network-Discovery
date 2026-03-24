@@ -6,7 +6,6 @@ import csv
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
 
 from src.optimize.search_space import SearchParameter, apply_search_parameters
 from src.utils.config import (
@@ -137,10 +136,13 @@ def run_best_full_pipeline(
         search_space=search_space,
     )
     run_cfg = get_section(final_config, "run_config")
-    run_cfg["stages"] = list(_final_stages_for_best_pipeline(run_cfg))
-    run_cfg["train_run_id"] = f"{run_id_prefix}_best_train"
-    run_cfg["eval_run_id"] = f"{run_id_prefix}_best_eval"
-    if "topology_evaluate" in cast(list[str], run_cfg["stages"]):
+    final_stages = _final_stages_for_best_pipeline(run_cfg)
+    run_cfg["stages"] = list(final_stages)
+    if "train" in final_stages:
+        run_cfg["train_run_id"] = f"{run_id_prefix}_best_train"
+    if "evaluate" in final_stages:
+        run_cfg["eval_run_id"] = f"{run_id_prefix}_best_eval"
+    if "topology_evaluate" in final_stages:
         run_cfg["topology_eval_run_id"] = f"{run_id_prefix}_best_topology"
 
     if not ddp_per_trial:
@@ -273,15 +275,9 @@ def _parse_trial_stages(execution_cfg: Mapping[str, object]) -> tuple[str, ...]:
 
 
 def _final_stages_for_best_pipeline(run_cfg: ConfigDict) -> tuple[str, ...]:
-    """Return final best-pipeline stages, preserving optional topology evaluation."""
+    """Return configured best-pipeline stages without appending implicit stages."""
     raw_stages = run_cfg.get("stages", ["train", "evaluate"])
-    configured_stages = tuple(
-        stage.lower() for stage in as_str_list(raw_stages, "run_config.stages")
-    )
-    final_stages = ["train", "evaluate"]
-    if "topology_evaluate" in configured_stages:
-        final_stages.append("topology_evaluate")
-    return tuple(final_stages)
+    return tuple(stage.lower() for stage in as_str_list(raw_stages, "run_config.stages"))
 
 
 def _objective_training_stage(run_cfg: ConfigDict) -> str:

@@ -23,7 +23,15 @@ from src.optimize.distributed import (
 )
 from src.optimize.search_space import extend_with_nas_lite, parse_search_space
 from src.optimize.trial_runner import run_best_full_pipeline
-from src.utils.config import ConfigDict, as_bool, as_int, as_str, load_config
+from src.utils.config import (
+    ConfigDict,
+    as_bool,
+    as_int,
+    as_str,
+    as_str_list,
+    get_section,
+    load_config,
+)
 from src.utils.distributed import DistributedContext, cleanup_distributed, initialize_distributed
 from src.utils.logging import generate_run_id
 
@@ -77,6 +85,9 @@ def run_optimization(
 ) -> None:
     """Execute optimization according to ``optimization`` config section."""
     optimization_cfg = _resolve_optimization_config(config)
+    if "train" not in _configured_run_stages(config):
+        PIPELINE_EXECUTE_FN(config)
+        return
     backend_name = (
         backend_override.lower().strip()
         if isinstance(backend_override, str) and backend_override.strip()
@@ -173,6 +184,26 @@ def _resolve_optimization_config(config: ConfigDict) -> ConfigDict:
     if not enabled:
         raise ValueError("optimization.enabled must be true to run optimization")
     return optimization_cfg
+
+
+def should_run_optimization(config: ConfigDict) -> bool:
+    """Return whether launcher scripts should dispatch into optimization mode."""
+    optimization_raw = config.get("optimization")
+    if not isinstance(optimization_raw, dict):
+        return False
+    optimization_cfg = cast(ConfigDict, optimization_raw)
+    if not as_bool(optimization_cfg.get("enabled", False), "optimization.enabled"):
+        return False
+    return "train" in _configured_run_stages(config)
+
+
+def _configured_run_stages(config: ConfigDict) -> tuple[str, ...]:
+    """Return normalized configured run stages."""
+    run_cfg = get_section(config, "run_config")
+    return tuple(
+        stage.lower()
+        for stage in as_str_list(run_cfg.get("stages", ["train", "evaluate"]), "run_config.stages")
+    )
 
 
 def _resolve_optimization_run_id_prefix(optimization_cfg: ConfigDict) -> str:

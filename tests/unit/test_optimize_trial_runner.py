@@ -100,6 +100,9 @@ def test_run_best_full_pipeline_preserves_ddp_when_requested() -> None:
         device_cfg = config["device_config"]
         assert isinstance(device_cfg, dict)
         observed["ddp_enabled"] = device_cfg["ddp_enabled"]
+        run_cfg = config["run_config"]
+        assert isinstance(run_cfg, dict)
+        observed["stages"] = list(run_cfg["stages"])
 
     run_best_full_pipeline(
         base_config=base_config,
@@ -111,6 +114,7 @@ def test_run_best_full_pipeline_preserves_ddp_when_requested() -> None:
     )
 
     assert observed["ddp_enabled"] is True
+    assert observed["stages"] == ["train"]
 
 
 def test_run_best_full_pipeline_preserves_topology_stage_when_requested() -> None:

@@ -308,6 +308,41 @@ def test_run_optimization_writes_trials_and_best_params(
     assert rows[2]["run_id"] == "20260320_110811_t0002"
 
 
+def test_should_run_optimization_requires_train_stage() -> None:
+    config = _base_config()
+    run_cfg = cast(ConfigDict, config["run_config"])
+    run_cfg["stages"] = ["evaluate", "topology_evaluate"]
+
+    assert optimize_run.should_run_optimization(config) is False
+
+
+def test_run_optimization_executes_pipeline_directly_when_stages_exclude_train() -> None:
+    config = _base_config()
+    run_cfg = cast(ConfigDict, config["run_config"])
+    run_cfg["stages"] = ["evaluate", "topology_evaluate"]
+    run_cfg["load_checkpoint_path"] = "models/v3/train/existing/best_model.pth"
+    observed: dict[str, object] = {}
+
+    def _recording_pipeline(cfg: ConfigDict) -> None:
+        cfg_run = cast(ConfigDict, cfg["run_config"])
+        observed["stages"] = list(cast(list[str], cfg_run["stages"]))
+        observed["load_checkpoint_path"] = cfg_run["load_checkpoint_path"]
+
+    previous_execute_fn = optimize_run.PIPELINE_EXECUTE_FN
+    optimize_run.PIPELINE_EXECUTE_FN = _recording_pipeline
+    try:
+        optimize_run.run_optimization(
+            config=config,
+            backend_override=None,
+            skip_final_full_pipeline=False,
+        )
+    finally:
+        optimize_run.PIPELINE_EXECUTE_FN = previous_execute_fn
+
+    assert observed["stages"] == ["evaluate", "topology_evaluate"]
+    assert observed["load_checkpoint_path"] == "models/v3/train/existing/best_model.pth"
+
+
 def test_optuna_backend_marks_pruned_trials(tmp_path: Path) -> None:
     config = _base_config()
     optimization_cfg = cast(ConfigDict, config["optimization"])
