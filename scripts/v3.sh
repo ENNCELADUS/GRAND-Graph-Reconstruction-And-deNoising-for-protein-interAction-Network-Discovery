@@ -16,7 +16,6 @@ set -euo pipefail
 
 cd /public/home/wangar2023/relic/
 source ~/.bashrc
-uv sync --group dev
 CONFIG_PATH="${1:-configs/v3.yaml}"
 
 # Automatically detect number of GPUs from SLURM allocation
@@ -26,7 +25,7 @@ echo "Detected $NGPUS GPUs"
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-OPTIMIZATION_ENABLED=$(uv run python - <<PY
+OPTIMIZATION_ENABLED=$(uv run --locked python - <<PY
 import yaml
 from pathlib import Path
 
@@ -40,7 +39,7 @@ PY
 )
 
 if [ "$OPTIMIZATION_ENABLED" = "1" ]; then
-  uv run torchrun --standalone --nproc_per_node="$NGPUS" --module src.optimize.run --config "$CONFIG_PATH"
+  uv run --locked torchrun --standalone --nproc_per_node="$NGPUS" --module src.optimize.run --config "$CONFIG_PATH"
 else
-  uv run torchrun --standalone --nproc_per_node="$NGPUS" --module src.run --config "$CONFIG_PATH"
+  uv run --locked torchrun --standalone --nproc_per_node="$NGPUS" --module src.run --config "$CONFIG_PATH"
 fi
