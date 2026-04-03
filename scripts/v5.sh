@@ -18,6 +18,11 @@ cd /public/home/wangar2023/relic/
 source ~/.bashrc
 CONFIG_PATH="${1:-configs/v5.yaml}"
 
+if [ ! -d ".venv" ]; then
+  echo "Missing .venv. Run 'uv sync --group dev --locked' on the login node before sbatch."
+  exit 1
+fi
+
 # Automatically detect number of GPUs from SLURM allocation
 NGPUS=$(nvidia-smi -L | wc -l)
 echo "Detected $NGPUS GPUs"
@@ -25,4 +30,4 @@ echo "Detected $NGPUS GPUs"
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 
-uv run --locked torchrun --standalone --nproc_per_node="$NGPUS" --module src.run --config "$CONFIG_PATH"
+uv run --locked --no-sync --offline python -m torch.distributed.run --standalone --nproc_per_node="$NGPUS" --module src.run --config "$CONFIG_PATH"
