@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.optim import Optimizer
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader
 
 from src.embed import ensure_embeddings_ready
@@ -167,6 +168,32 @@ def _move_chunk_to_device(
 
 def _forward_model(model: nn.Module, batch: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Execute one forward pass under the standard model output contract."""
+    if model.training and torch.is_grad_enabled():
+        emb_a = batch.get("emb_a")
+        emb_b = batch.get("emb_b")
+        len_a = batch.get("len_a")
+        len_b = batch.get("len_b")
+        if (
+            emb_a is not None
+            and emb_b is not None
+            and len_a is not None
+            and len_b is not None
+        ):
+            logits = checkpoint(
+                lambda emb_a, emb_b, len_a, len_b: model(
+                    emb_a=emb_a,
+                    emb_b=emb_b,
+                    len_a=len_a,
+                    len_b=len_b,
+                )["logits"],
+                emb_a,
+                emb_b,
+                len_a,
+                len_b,
+                use_reentrant=False,
+            )
+            return {"logits": cast(torch.Tensor, logits)}
+
     output = model(**batch)
     if not isinstance(output, dict):
         raise ValueError("Model forward output must be a dictionary")

@@ -15,6 +15,7 @@ import src.run.stage_topology_finetune as topology_finetune_stage
 import torch
 from src.embed import EmbeddingCacheManifest
 from src.run.stage_topology_finetune import (
+    _forward_model,
     _load_supervision_graphs,
     _resolve_sampling_node_bounds,
     run_topology_finetuning_stage,
@@ -227,6 +228,54 @@ def test_resolve_sampling_node_bounds_caps_subgraphs_to_20_nodes() -> None:
 
     assert min_nodes == 20
     assert max_nodes == 20
+
+
+def test_forward_model_uses_activation_checkpointing_during_training(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = torch.nn.Linear(4, 1)
+    model.train()
+    observed_checkpoint_calls: list[bool] = []
+
+    def _fake_checkpoint(
+        function: object,
+        *args: object,
+        use_reentrant: bool,
+    ) -> torch.Tensor:
+        del use_reentrant
+        observed_checkpoint_calls.append(True)
+        return function(*args)  # type: ignore[misc]
+
+    class _ToyModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.projection = model
+
+        def forward(
+            self,
+            emb_a: torch.Tensor,
+            emb_b: torch.Tensor,
+            len_a: torch.Tensor,
+            len_b: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            del len_a, len_b
+            return {"logits": self.projection((emb_a + emb_b).mean(dim=1))}
+
+    monkeypatch.setattr(topology_finetune_stage, "checkpoint", _fake_checkpoint)
+
+    output = _forward_model(
+        model=_ToyModel().train(),
+        batch={
+            "emb_a": torch.ones((2, 3, 4), dtype=torch.float32),
+            "emb_b": torch.ones((2, 3, 4), dtype=torch.float32),
+            "len_a": torch.tensor([3, 3], dtype=torch.long),
+            "len_b": torch.tensor([3, 3], dtype=torch.long),
+            "label": torch.tensor([1.0, 0.0], dtype=torch.float32),
+        },
+    )
+    output["logits"].sum().backward()
+
+    assert observed_checkpoint_calls == [True]
 
 
 def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path: Path) -> None:
