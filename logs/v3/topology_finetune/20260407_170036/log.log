@@ -1,0 +1,16 @@
+2026-04-07 17:00:36 INFO Startup | Rank: 0 | Run Id: 20260407_170036 | Seed: 47 | Stages: ['topology_finetune', 'evaluate', 'topology_evaluate'] | World Size: 4
+2026-04-07 17:00:36 INFO Device | Resolved Device: cuda:0
+2026-04-07 17:05:38 INFO Data Ready | Test: 54126 | Train: 97555 | Valid: 24389
+2026-04-07 17:05:39 INFO Model Init | Model: v3 | Params: 26439937
+2026-04-07 17:05:48 INFO DDP Ready | Wrapped: True
+2026-04-07 17:05:48 INFO Begin Topology Finetuning
+2026-04-07 17:05:48 INFO Stage Start | Checkpoint: models/v3/train/20260308_002906/best_model.pth | Run Id: 20260407_170036
+2026-04-07 17:06:25 INFO Finetune Config | Epochs: 15 | Internal Validation Subgraphs: 32 | Monitor: val_auprc | Pair Batch Size: 16 | Subgraphs Per Epoch: 256
+2026-04-07 17:28:52 INFO Best Saved | Epoch: 1 | Monitor: val_auprc | Value: 0.9298
+2026-04-07 17:28:52 INFO Epoch Done | Epoch: 1 | Internal Val Graph Sim: 0.2103 | Train Loss: 1.1604 | Val AUPRC: 0.9298
+2026-04-07 17:51:28 INFO Epoch Done | Epoch: 2 | Internal Val Graph Sim: 0.1807 | Train Loss: 1.1038 | Val AUPRC: 0.9119
+2026-04-07 18:14:10 INFO Epoch Done | Epoch: 3 | Internal Val Graph Sim: 0.2066 | Train Loss: 0.8450 | Val AUPRC: 0.9107
+2026-04-07 18:38:03 INFO Epoch Done | Epoch: 4 | Internal Val Graph Sim: 0.2051 | Train Loss: 0.8233 | Val AUPRC: 0.9089
+2026-04-07 18:38:03 INFO Early Stop | Epoch: 4
+2026-04-07 18:38:03 INFO Stage Done | Run Id: 20260407_170036
+2026-04-07 18:38:03 INFO End Topology Finetuning
