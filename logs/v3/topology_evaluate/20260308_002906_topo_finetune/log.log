@@ -1,0 +1,12 @@
+2026-04-04 01:29:37 INFO Startup | Rank: 0 | Run Id: 20260308_002906_topo_finetune | Seed: 47 | Stages: ['topology_finetune', 'evaluate', 'topology_evaluate'] | World Size: 4
+2026-04-04 01:29:37 INFO Device | Resolved Device: cuda:0
+2026-04-04 01:30:20 INFO Data Ready | Test: 54126 | Train: 97555 | Valid: 24389
+2026-04-04 01:30:23 INFO DDP Ready | Wrapped: True
+2026-04-04 03:25:24 INFO Begin Topology Evaluation
+2026-04-04 03:25:24 INFO Stage Start | Checkpoint: models/v3/topology_finetune/20260308_002906_topo_finetune/best_model.pth | Run Id: 20260308_002906_topo_finetune
+2026-04-04 03:28:18 INFO Decision Threshold | Mode: best_f1_on_valid | Value: 0.0142
+2026-04-04 08:04:10 INFO Pair Predictions Written | Path: logs/v3/topology_evaluate/20260308_002906_topo_finetune/all_test_ppi_pred.txt
+2026-04-04 08:26:51 INFO Topology Metrics Written | Path: logs/v3/topology_evaluate/20260308_002906_topo_finetune/topology_metrics.json
+2026-04-04 08:26:51 INFO Comparison Report Skipped | Reason: missing_baselines:src/topology/baselines/pring_human_table2.json
+2026-04-04 08:26:51 INFO Stage Done | Run Id: 20260308_002906_topo_finetune
+2026-04-04 08:26:51 INFO End Topology Evaluation
