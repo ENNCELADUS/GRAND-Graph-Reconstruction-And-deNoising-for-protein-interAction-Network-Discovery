@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
     Returns:
         Parsed CLI namespace with the config path.
     """
-    parser = argparse.ArgumentParser(description="Run RELIC training/evaluation pipeline.")
+    parser = argparse.ArgumentParser(description="Run GRAND training/evaluation pipeline.")
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML.")
     return parser.parse_args()
 

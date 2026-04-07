@@ -1,4 +1,4 @@
-"""Public package exports for RELIC."""
+"""Public package exports for GRAND."""
 
 from src.evaluate import Evaluator
 from src.model import V3, V4, V5

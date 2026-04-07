@@ -2,10 +2,10 @@ run_config:
   stages: ["topology_finetune", "evaluate", "topology_evaluate"]
   seed: 47
   train_run_id: "20260308_002906"
-  topology_finetune_run_id: null
+  topology_finetune_run_id: "20260308_002906_topo_finetune"
   adapt_run_id: null
-  eval_run_id: null
-  topology_eval_run_id: null
+  eval_run_id: "20260308_002906_topo_finetune"
+  topology_eval_run_id: "20260308_002906_topo_finetune"
   load_checkpoint_path: "models/v3/train/20260308_002906/best_model.pth"
   save_best_only: true
 
@@ -87,27 +87,27 @@ training_config:
     enabled: false
 
 topology_finetune:
-  epochs: 15
-  subgraphs_per_epoch: 256
-  validation_subgraphs: 32
+  epochs: 20
+  subgraphs_per_epoch: 100
+  validation_subgraphs: 20
   min_nodes: 20
   max_nodes: 20
   strategy: "mixed"
   pair_batch_size: 16
   decision_threshold: 0.5
-  monitor_metric: "val_auprc"
-  early_stopping_patience: 3
+  monitor_metric: "internal_val_graph_sim"
+  early_stopping_patience: 5
   optimizer:
-    lr: 3.0e-6
-    weight_decay: 3.0e-3
+    lr: 1.0e-5
+    weight_decay: 0.01
   losses:
-    alpha: 0.25
-    beta: 0.20
-    gamma: 0.10
-    delta: 0.10
-    histogram_sigma: 1.5
-    degree_bins: 32
-    clustering_bins: 48
+    alpha: 0.5
+    beta: 1.0
+    gamma: 0.3
+    delta: 0.3
+    histogram_sigma: 1.0
+    degree_bins: 64
+    clustering_bins: 100
 
 evaluate:
   decision_threshold:

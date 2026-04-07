@@ -61,7 +61,7 @@ PIPELINE_EXECUTE_FN = _resolve_pipeline_execute_fn()
 
 def parse_args() -> argparse.Namespace:
     """Parse optimize CLI arguments."""
-    parser = argparse.ArgumentParser(description="Run RELIC optimization workflow")
+    parser = argparse.ArgumentParser(description="Run GRAND optimization workflow")
     parser.add_argument("--config", type=str, required=True, help="Path to base config YAML")
     parser.add_argument(
         "--backend",
@@ -96,7 +96,7 @@ def run_optimization(
     if backend_name != "optuna":
         raise ValueError("optimization.backend must be 'optuna'")
 
-    study_name = as_str(optimization_cfg.get("study_name", "relic_hpo"), "optimization.study_name")
+    study_name = as_str(optimization_cfg.get("study_name", "grand_hpo"), "optimization.study_name")
     run_id_prefix = _resolve_optimization_run_id_prefix(optimization_cfg)
     output_dir = Path("artifacts") / "hpo" / study_name
     output_dir.mkdir(parents=True, exist_ok=True)

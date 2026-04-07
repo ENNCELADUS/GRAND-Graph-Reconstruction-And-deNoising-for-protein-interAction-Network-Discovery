@@ -1,10 +1,10 @@
-# RELIC — Refined Embeddings via Latent Interaction Constraints for Protein–Protein Interactions
+# GRAND — Graph Reconstruction And deNoising for protein interAction Network Discovery
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](#requirements--dependencies)
 [![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 [![Tests](https://img.shields.io/badge/tests-pytest-0A1E2B?style=flat-square)](#testing)
 
-RELIC predicts protein–protein interactions (PPI) by combining ESM-3 embeddings with purpose-built neural architectures and rigorous evaluation pipelines.
+GRAND reconstructs protein interaction networks from protein features using graph structure learning (GSL) with topology-aware training objectives. Unlike traditional pairwise PPI predictors, GRAND optimizes directly on graph-level metrics (topology + function) to produce biologically realistic interactomes.
 
 ## Quick Install
 
@@ -12,8 +12,8 @@ Recommended to use **uv** for environment management:
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/ENNCELADUS/RELIC-Refined-Embeddings-via-Latent-Interaction-Constraints.git ./relic
-cd relic
+git clone https://github.com/ENNCELADUS/GRAND-Graph-Reconstruction-And-deNoising-for-protein-interAction-Network-Discovery.git ./grand
+cd grand
 
 # 2. Install dependencies into .venv
 uv sync --group dev
@@ -21,7 +21,7 @@ uv sync --group dev
 
 ## Quick Usage
 
-RELIC uses a config-driven pipeline. Run commands through `uv run` so the project-local `.venv` is used:
+GRAND uses a config-driven pipeline. Run commands through `uv run` so the project-local `.venv` is used:
 
 ```bash
 # Run configured stages from YAML (default: train -> evaluate)

@@ -1,6 +1,6 @@
 # HPO + NAS-lite Workflow
 
-This document describes how to run automatic HPO and phase-1 NAS-lite on top of the existing RELIC pipeline.
+This document describes how to run automatic HPO and phase-1 NAS-lite on top of the existing GRAND pipeline.
 
 ## Scope
 
@@ -57,7 +57,7 @@ Per-trial logs/checkpoints reuse existing pipeline contracts:
 ## Optional Dependencies
 
 ```bash
-# In relic environment
+# In grand environment
 pip install optuna
 ```
 

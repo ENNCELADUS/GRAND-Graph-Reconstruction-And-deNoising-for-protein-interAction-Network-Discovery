@@ -282,7 +282,7 @@ def _maybe_write_comparison_report(
         output_dir=output_dir,
         baselines=baselines,
         model_name=model_name,
-        model_category="RELIC",
+        model_category="GRAND",
         strategy_metrics=strategy_metrics,
     )
     log_stage_event(

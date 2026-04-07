@@ -1,4 +1,4 @@
-"""Optuna backend adapter for RELIC optimization workflow."""
+"""Optuna backend adapter for GRAND optimization workflow."""
 
 from __future__ import annotations
 
@@ -104,7 +104,7 @@ def run_optuna_optimization(
         Study result summary.
     """
     optuna = optuna_module if optuna_module is not None else _import_optuna()
-    study_name = as_str(optimization_cfg.get("study_name", "relic_hpo"), "optimization.study_name")
+    study_name = as_str(optimization_cfg.get("study_name", "grand_hpo"), "optimization.study_name")
     objective_metric = as_str(
         optimization_cfg.get("objective_metric", "val_auprc"),
         "optimization.objective_metric",
@@ -257,7 +257,7 @@ def _resolve_storage_url(*, storage_cfg: ConfigDict) -> str | None:
         raise ValueError("optimization.storage.type must be sqlite or none")
 
     storage_url = as_str(
-        storage_cfg.get("url", "sqlite:///artifacts/hpo/relic_hpo.db"),
+        storage_cfg.get("url", "sqlite:///artifacts/hpo/grand_hpo.db"),
         "optimization.storage.url",
     )
     if storage_url.startswith("sqlite:///"):

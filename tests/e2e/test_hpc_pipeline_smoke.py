@@ -75,8 +75,8 @@ def test_hpc_config_artifact_is_valid() -> None:
 @pytest.mark.slow
 def test_hpc_ddp_train_evaluate_smoke() -> None:
     """Run optional train+evaluate torchrun smoke test for cluster environments."""
-    if os.environ.get("RELIC_RUN_HPC_E2E", "0") != "1":
-        pytest.skip("Set RELIC_RUN_HPC_E2E=1 to run HPC smoke test.")
+    if os.environ.get("GRAND_RUN_HPC_E2E", "0") != "1":
+        pytest.skip("Set GRAND_RUN_HPC_E2E=1 to run HPC smoke test.")
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("HPC smoke test requires at least 2 CUDA devices.")
 

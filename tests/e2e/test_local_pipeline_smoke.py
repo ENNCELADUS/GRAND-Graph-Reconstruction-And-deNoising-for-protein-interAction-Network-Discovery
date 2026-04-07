@@ -256,8 +256,8 @@ def test_local_cpu_config_artifact_is_valid() -> None:
 @pytest.mark.slow
 def test_local_cpu_train_evaluate_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Run optional local full-pipeline smoke test on CPU."""
-    if os.environ.get("RELIC_RUN_LOCAL_E2E", "0") != "1":
-        pytest.skip("Set RELIC_RUN_LOCAL_E2E=1 to run local CPU E2E smoke test.")
+    if os.environ.get("GRAND_RUN_LOCAL_E2E", "0") != "1":
+        pytest.skip("Set GRAND_RUN_LOCAL_E2E=1 to run local CPU E2E smoke test.")
 
     monkeypatch.chdir(tmp_path)
     config = _resolve_data_paths(load_config(CONFIG_PATH))

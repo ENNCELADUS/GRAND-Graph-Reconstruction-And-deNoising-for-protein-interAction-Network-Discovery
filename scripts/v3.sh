@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-cd /public/home/wangar2023/relic/
+cd /public/home/wangar2023/grand/
 source ~/.bashrc
 CONFIG_PATH="${1:-configs/v3.yaml}"
 

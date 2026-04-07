@@ -29,7 +29,7 @@ DEFAULT_ID_COLUMNS = (
 )
 DEFAULT_SEQUENCE_COLUMNS = ("sequence", "seq", "protein_sequence")
 FASTA_UNIPROT_PATTERN = re.compile(r"\|([^|]+)\|")
-EMBED_PROGRESS_LOGGER_NAME = "relic.embed.progress"
+EMBED_PROGRESS_LOGGER_NAME = "grand.embed.progress"
 
 
 @dataclass(frozen=True)

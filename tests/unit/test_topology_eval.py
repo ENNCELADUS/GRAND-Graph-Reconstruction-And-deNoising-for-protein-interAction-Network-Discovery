@@ -151,7 +151,7 @@ def test_build_human_table2_rows_merges_baselines_and_v3() -> None:
     rows = build_human_table2_rows(
         baselines=baselines,
         model_name="v3",
-        model_category="RELIC",
+        model_category="GRAND",
         strategy_metrics=v3_metrics,
     )
 
@@ -231,7 +231,7 @@ def test_load_baselines_and_write_reports(tmp_path: Path) -> None:
         output_dir=output_dir,
         baselines=baselines,
         model_name="v3",
-        model_category="RELIC",
+        model_category="GRAND",
         strategy_metrics=strategy_metrics,
     )
 
