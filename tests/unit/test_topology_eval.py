@@ -7,7 +7,10 @@ from pathlib import Path
 
 import networkx as nx
 import pytest
-from src.run.stage_topology_evaluate import write_topology_predictions
+from src.run.stage_topology_evaluate import (
+    _ordered_predictions_from_shards,
+    write_topology_predictions,
+)
 from src.topology.metrics import (
     compute_graph_similarity,
     compute_relative_density,
@@ -92,6 +95,26 @@ def test_write_topology_predictions_emits_pring_format(tmp_path: Path) -> None:
         "P3\tP4\t0",
         "P5\tP6\t1",
     ]
+
+
+def test_ordered_predictions_from_shards_restores_original_pair_order() -> None:
+    ordered_predictions = _ordered_predictions_from_shards(
+        total_records=5,
+        shard_payloads=[
+            {"indices": [0, 2, 4], "predictions": [1, 0, 1]},
+            {"indices": [1, 3], "predictions": [0, 1]},
+        ],
+    )
+
+    assert ordered_predictions == [1, 0, 0, 1, 1]
+
+
+def test_ordered_predictions_from_shards_rejects_incomplete_results() -> None:
+    with pytest.raises(ValueError, match="Missing topology predictions"):
+        _ordered_predictions_from_shards(
+            total_records=3,
+            shard_payloads=[{"indices": [0, 2], "predictions": [1, 0]}],
+        )
 
 
 def test_build_human_table2_rows_merges_baselines_and_v3() -> None:

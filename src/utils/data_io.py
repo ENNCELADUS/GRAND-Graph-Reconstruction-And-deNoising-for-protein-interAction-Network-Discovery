@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -78,6 +79,8 @@ class PRINGPairDataset(Dataset[dict[str, torch.Tensor]]):
         max_sequence_length: int,
         cache_dir: Path,
         embedding_index: dict[str, str],
+        *,
+        cache_embeddings_in_memory: bool = False,
     ) -> None:
         if input_dim <= 0:
             raise ValueError("input_dim must be positive")
@@ -89,6 +92,8 @@ class PRINGPairDataset(Dataset[dict[str, torch.Tensor]]):
         self._max_sequence_length = int(max_sequence_length)
         self._cache_dir = cache_dir
         self._embedding_index = dict(embedding_index)
+        self._cache_embeddings_in_memory = cache_embeddings_in_memory
+        self._embedding_cache: dict[str, torch.Tensor] = {}
         proteins = sorted(
             {record.protein_a for record in self._records}
             | {record.protein_b for record in self._records}
@@ -97,6 +102,7 @@ class PRINGPairDataset(Dataset[dict[str, torch.Tensor]]):
 
         required_ids = {record.protein_a for record in self._records}
         required_ids.update(record.protein_b for record in self._records)
+        self._required_ids = frozenset(required_ids)
         missing_ids = sorted(
             protein_id for protein_id in required_ids if protein_id not in self._embedding_index
         )
@@ -115,15 +121,53 @@ class PRINGPairDataset(Dataset[dict[str, torch.Tensor]]):
         """Return binary labels for all records."""
         return [int(record.label) for record in self._records]
 
+    def protein_ids(self, indices: Sequence[int] | None = None) -> list[str]:
+        """Return sorted protein IDs referenced by the dataset or a record subset."""
+        if indices is None:
+            return sorted(self._required_ids)
+
+        protein_ids: set[str] = set()
+        for index in indices:
+            record = self._records[index]
+            protein_ids.add(record.protein_a)
+            protein_ids.add(record.protein_b)
+        return sorted(protein_ids)
+
+    def pair_records(self) -> list[PPIPairRecord]:
+        """Return a copy of parsed pair records."""
+        return list(self._records)
+
+    def preload_embeddings(self, protein_ids: Iterable[str] | None = None) -> int:
+        """Load selected embeddings into memory and return the cache size."""
+        for protein_id in protein_ids or self.protein_ids():
+            self._embedding_cache.setdefault(
+                protein_id,
+                load_cached_embedding(
+                    cache_dir=self._cache_dir,
+                    index=self._embedding_index,
+                    protein_id=protein_id,
+                    expected_input_dim=self._input_dim,
+                    max_sequence_length=self._max_sequence_length,
+                ),
+            )
+        return len(self._embedding_cache)
+
     def _load_embedding(self, protein_id: str) -> torch.Tensor:
         """Load one cached embedding tensor for a protein ID."""
-        return load_cached_embedding(
+        cached_embedding = self._embedding_cache.get(protein_id)
+        if cached_embedding is not None:
+            return cached_embedding
+
+        embedding = load_cached_embedding(
             cache_dir=self._cache_dir,
             index=self._embedding_index,
             protein_id=protein_id,
             expected_input_dim=self._input_dim,
             max_sequence_length=self._max_sequence_length,
         )
+        if self._cache_embeddings_in_memory:
+            self._embedding_cache[protein_id] = embedding
+        return embedding
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         """Return one dataset example."""

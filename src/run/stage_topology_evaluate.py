@@ -6,11 +6,13 @@ import json
 import logging
 import pickle
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, cast
 
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.utils.data import DataLoader, Subset
 
 from src.embed import ensure_embeddings_ready
 from src.evaluate import Evaluator
@@ -68,8 +70,13 @@ def write_topology_predictions(
 def _move_batch_to_device(batch: Mapping[str, object], device: torch.device) -> dict[str, object]:
     """Move tensor values in a batch to the target device."""
     prepared: dict[str, object] = {}
+    non_blocking = device.type == "cuda"
     for key, value in batch.items():
-        prepared[key] = value.to(device) if isinstance(value, torch.Tensor) else value
+        prepared[key] = (
+            value.to(device, non_blocking=non_blocking)
+            if isinstance(value, torch.Tensor)
+            else value
+        )
     return prepared
 
 
@@ -113,7 +120,8 @@ def _build_topology_loader(
     *,
     config: ConfigDict,
     split_path: Path,
-) -> tuple[DataLoader[dict[str, object]], list[tuple[str, str]]]:
+    distributed_context: DistributedContext,
+) -> tuple[DataLoader[dict[str, object]], list[tuple[str, str]], list[int], int]:
     """Build deterministic topology inference loader for embedding-backed models."""
     model_cfg = get_section(config, "model_config")
     data_cfg = get_section(config, "data_config")
@@ -143,19 +151,37 @@ def _build_topology_loader(
         max_sequence_length=max_sequence_length,
         cache_dir=embedding_cache.cache_dir,
         embedding_index=embedding_cache.index,
+        cache_embeddings_in_memory=as_bool(
+            topology_cfg.get("cache_embeddings_in_memory", True),
+            "topology_evaluate.cache_embeddings_in_memory",
+        ),
     )
+    all_records = [(record.protein_a, record.protein_b) for record in dataset.pair_records()]
+    local_indices = _rank_shard_indices(
+        total_records=len(all_records),
+        distributed_context=distributed_context,
+    )
+    preload_embeddings = as_bool(
+        topology_cfg.get("preload_embeddings", True),
+        "topology_evaluate.preload_embeddings",
+    )
+    if preload_embeddings:
+        dataset.preload_embeddings(dataset.protein_ids(indices=local_indices))
     batch_size = as_int(
         topology_cfg.get("inference_batch_size", training_cfg.get("batch_size", 8)),
         "topology_evaluate.inference_batch_size",
     )
+    num_workers = as_int(
+        dataloader_cfg.get("num_workers", 0),
+        "data_config.dataloader.num_workers",
+    )
+    if preload_embeddings:
+        num_workers = 0
     loader = DataLoader(
-        dataset=dataset,
+        dataset=Subset(dataset, local_indices),
         batch_size=batch_size,
         shuffle=False,
-        num_workers=as_int(
-            dataloader_cfg.get("num_workers", 0),
-            "data_config.dataloader.num_workers",
-        ),
+        num_workers=num_workers,
         pin_memory=as_bool(
             dataloader_cfg.get("pin_memory", False),
             "data_config.dataloader.pin_memory",
@@ -163,8 +189,23 @@ def _build_topology_loader(
         drop_last=False,
         collate_fn=_collate_batch,
     )
-    records = [(record.protein_a, record.protein_b) for record in dataset._records]
-    return cast(DataLoader[dict[str, object]], loader), records
+    return (
+        cast(DataLoader[dict[str, object]], loader),
+        all_records,
+        local_indices,
+        len(dataset._embedding_cache),
+    )
+
+
+def _rank_shard_indices(
+    *,
+    total_records: int,
+    distributed_context: DistributedContext,
+) -> list[int]:
+    """Return deterministic record indices assigned to the current rank."""
+    if not distributed_context.is_distributed:
+        return list(range(total_records))
+    return list(range(distributed_context.rank, total_records, distributed_context.world_size))
 
 
 def _predict_topology_labels(
@@ -173,26 +214,85 @@ def _predict_topology_labels(
     data_loader: DataLoader[dict[str, object]],
     device: torch.device,
     decision_threshold: float,
-) -> tuple[list[float], list[int]]:
+    use_amp: bool,
+) -> list[int]:
     """Predict probabilities and thresholded labels for all topology pairs."""
-    probabilities: list[float] = []
     predictions: list[int] = []
-    with torch.no_grad():
+    autocast_context = (
+        torch.autocast(device_type=device.type, enabled=True)
+        if use_amp and device.type in {"cpu", "cuda"}
+        else nullcontext()
+    )
+    with torch.inference_mode(), autocast_context:
         for batch in data_loader:
             prepared_batch = _move_batch_to_device(batch=batch, device=device)
             output = _forward_model(model=model, batch=prepared_batch)
             logits = output["logits"]
             reduced_logits = (
-                logits.squeeze(-1)
-                if logits.dim() > 1 and logits.size(-1) == 1
-                else logits
+                logits.squeeze(-1) if logits.dim() > 1 and logits.size(-1) == 1 else logits
             )
             batch_probabilities = torch.sigmoid(reduced_logits).detach().cpu().tolist()
-            probabilities.extend(float(value) for value in batch_probabilities)
             predictions.extend(
                 int(float(value) >= decision_threshold) for value in batch_probabilities
             )
-    return probabilities, predictions
+    return predictions
+
+
+def _ordered_predictions_from_shards(
+    *,
+    total_records: int,
+    shard_payloads: Sequence[Mapping[str, Sequence[int]]],
+) -> list[int]:
+    """Restore original prediction order from rank-local shards."""
+    ordered: list[int | None] = [None] * total_records
+    for shard_payload in shard_payloads:
+        indices = [int(index) for index in shard_payload["indices"]]
+        predictions = [int(prediction) for prediction in shard_payload["predictions"]]
+        if len(indices) != len(predictions):
+            raise ValueError("Shard indices and predictions must have matching lengths")
+        for index, prediction in zip(indices, predictions, strict=True):
+            if index < 0 or index >= total_records:
+                raise ValueError(f"Shard index out of bounds: {index}")
+            if ordered[index] is not None:
+                raise ValueError(f"Duplicate prediction for pair index {index}")
+            ordered[index] = prediction
+
+    missing_indices = [index for index, prediction in enumerate(ordered) if prediction is None]
+    if missing_indices:
+        preview = ", ".join(str(index) for index in missing_indices[:10])
+        raise ValueError(f"Missing topology predictions for indices: {preview}")
+    return [int(prediction) for prediction in ordered if prediction is not None]
+
+
+def _gather_ordered_predictions(
+    *,
+    local_indices: Sequence[int],
+    local_predictions: Sequence[int],
+    total_records: int,
+    distributed_context: DistributedContext,
+) -> list[int]:
+    """Gather local predictions from all ranks and restore original order on rank 0."""
+    if not distributed_context.is_distributed:
+        return [int(prediction) for prediction in local_predictions]
+    if not dist.is_initialized():
+        raise RuntimeError("Distributed topology evaluation requires an initialized process group")
+
+    gathered_payloads: list[dict[str, list[int]]] = [
+        {"indices": [], "predictions": []} for _ in range(distributed_context.world_size)
+    ]
+    dist.all_gather_object(
+        object_list=gathered_payloads,
+        obj={
+            "indices": [int(index) for index in local_indices],
+            "predictions": [int(prediction) for prediction in local_predictions],
+        },
+    )
+    if not distributed_context.is_main_process:
+        return []
+    return _ordered_predictions_from_shards(
+        total_records=total_records,
+        shard_payloads=gathered_payloads,
+    )
 
 
 def _json_safe_details(
@@ -330,32 +430,64 @@ def run_topology_evaluation_stage(
         device_cfg.get("use_mixed_precision", False),
         "device_config.use_mixed_precision",
     )
-    threshold_probe = Evaluator(
-        metrics=["f1"],
-        loss_config=_build_loss_config(training_cfg),
-        use_amp=use_amp,
-    )
-    decision_threshold, threshold_mode = _resolve_decision_threshold(
-        eval_cfg=threshold_cfg,
-        evaluator=threshold_probe,
-        model=model,
-        dataloaders=dataloaders,
-        device=device,
-    )
+    threshold_mode = "broadcast"
+    decision_threshold = 0.5
+    if distributed_context.is_main_process:
+        threshold_probe = Evaluator(
+            metrics=["f1"],
+            loss_config=_build_loss_config(training_cfg),
+            use_amp=use_amp,
+        )
+        decision_threshold, threshold_mode = _resolve_decision_threshold(
+            eval_cfg=threshold_cfg,
+            evaluator=threshold_probe,
+            model=model,
+            dataloaders=dataloaders,
+            device=device,
+        )
+        log_stage_event(logger, "decision_threshold", mode=threshold_mode, value=decision_threshold)
 
-    if not distributed_context.is_main_process:
-        distributed_barrier(distributed_context)
-        return {}
+    if distributed_context.is_distributed:
+        if not dist.is_initialized():
+            raise RuntimeError(
+                "Distributed topology evaluation requires an initialized process group"
+            )
+        threshold_tensor = torch.tensor([decision_threshold], dtype=torch.float32, device=device)
+        dist.broadcast(threshold_tensor, src=0)
+        decision_threshold = float(threshold_tensor.item())
 
-    log_stage_event(logger, "decision_threshold", mode=threshold_mode, value=decision_threshold)
     all_test_path, gt_graph_path, sampled_nodes_path = _topology_paths(config)
-    topology_loader, records = _build_topology_loader(config=config, split_path=all_test_path)
-    _, predictions = _predict_topology_labels(
+    topology_loader, records, local_indices, cached_embedding_count = _build_topology_loader(
+        config=config,
+        split_path=all_test_path,
+        distributed_context=distributed_context,
+    )
+    if distributed_context.is_main_process:
+        log_stage_event(
+            logger,
+            "topology_inference_ready",
+            pair_count=len(records),
+            local_pair_count=len(local_indices),
+            cached_embedding_count=cached_embedding_count,
+            distributed=distributed_context.is_distributed,
+            world_size=distributed_context.world_size,
+        )
+    local_predictions = _predict_topology_labels(
         model=model,
         data_loader=topology_loader,
         device=device,
         decision_threshold=decision_threshold,
+        use_amp=use_amp,
     )
+    predictions = _gather_ordered_predictions(
+        local_indices=local_indices,
+        local_predictions=local_predictions,
+        total_records=len(records),
+        distributed_context=distributed_context,
+    )
+    if not distributed_context.is_main_process:
+        distributed_barrier(distributed_context)
+        return {}
 
     prediction_path = log_dir / "all_test_ppi_pred.txt"
     if as_bool(

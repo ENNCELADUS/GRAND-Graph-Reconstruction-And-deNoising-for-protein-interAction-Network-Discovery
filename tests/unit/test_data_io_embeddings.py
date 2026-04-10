@@ -256,6 +256,51 @@ def test_build_dataloaders_calls_ensure_embeddings_ready(
     assert called["value"] is True
 
 
+def test_pring_pair_dataset_preloads_unique_embeddings_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    split_path = tmp_path / "pairs.txt"
+    _write_split(
+        split_path,
+        [("P1", "P2", 1), ("P1", "P3", 0), ("P2", "P3", 1)],
+    )
+
+    load_counts: dict[str, int] = {}
+
+    def _fake_load_cached_embedding(
+        cache_dir: Path,
+        index: dict[str, str],
+        protein_id: str,
+        expected_input_dim: int | None = None,
+        max_sequence_length: int | None = None,
+    ) -> torch.Tensor:
+        del cache_dir, index, expected_input_dim, max_sequence_length
+        load_counts[protein_id] = load_counts.get(protein_id, 0) + 1
+        fill_value = float(len(protein_id))
+        return torch.full((2, 4), fill_value, dtype=torch.float32)
+
+    monkeypatch.setattr(data_io, "load_cached_embedding", _fake_load_cached_embedding)
+
+    dataset = data_io.PRINGPairDataset(
+        file_path=split_path,
+        input_dim=4,
+        max_sequence_length=8,
+        cache_dir=tmp_path / "cache",
+        embedding_index={"P1": "p1.pt", "P2": "p2.pt", "P3": "p3.pt"},
+        cache_embeddings_in_memory=True,
+    )
+
+    cached_count = dataset.preload_embeddings()
+    first_item = dataset[0]
+    second_item = dataset[1]
+
+    assert cached_count == 3
+    assert load_counts == {"P1": 1, "P2": 1, "P3": 1}
+    assert tuple(first_item["emb_a"].shape) == (2, 4)
+    assert tuple(second_item["emb_b"].shape) == (2, 4)
+
+
 def test_build_dataloaders_failfast_when_cache_missing_for_non_main_rank(tmp_path: Path) -> None:
     benchmark_root = tmp_path / "benchmark"
     benchmark_root.mkdir(parents=True, exist_ok=True)
