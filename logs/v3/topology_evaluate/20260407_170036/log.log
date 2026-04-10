@@ -1,7 +1,0 @@
-2026-04-07 17:00:36 INFO Startup | Rank: 0 | Run Id: 20260407_170036 | Seed: 47 | Stages: ['topology_finetune', 'evaluate', 'topology_evaluate'] | World Size: 4
-2026-04-07 17:00:36 INFO Device | Resolved Device: cuda:0
-2026-04-07 17:05:38 INFO Data Ready | Test: 54126 | Train: 97555 | Valid: 24389
-2026-04-07 17:05:48 INFO DDP Ready | Wrapped: True
-2026-04-07 18:47:09 INFO Begin Topology Evaluation
-2026-04-07 18:47:09 INFO Stage Start | Checkpoint: models/v3/topology_finetune/20260407_170036/best_model.pth | Run Id: 20260407_170036
-2026-04-07 18:50:54 INFO Decision Threshold | Mode: best_f1_on_valid | Value: 0.0937
