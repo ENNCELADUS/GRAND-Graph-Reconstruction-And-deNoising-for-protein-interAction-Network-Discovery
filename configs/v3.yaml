@@ -1,12 +1,12 @@
 run_config:
-  stages: ["topology_evaluate"]
+  stages: ["topology_finetune", "evaluate", "topology_evaluate"]
   seed: 47
   train_run_id: 20260308_002906
   topology_finetune_run_id: null
   adapt_run_id: null
   eval_run_id: null
-  topology_eval_run_id: 20260407_170036
-  load_checkpoint_path: "models/v3/topology_finetune/20260407_170036/best_model.pth"
+  topology_eval_run_id: null
+  load_checkpoint_path: "models/v3/train/20260308_002906/best_model.pth"
   save_best_only: true
 
 device_config:
