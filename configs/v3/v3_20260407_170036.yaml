@@ -87,31 +87,27 @@ training_config:
     enabled: false
 
 topology_finetune:
-  # Experiment goal for the next topology finetune:
-  # - best checkpoint should emerge after epoch 1
-  # - if epoch 1 remains best, treat the run as not sufficiently finetunable
-  # - only keep the config if downstream classification stays near the April run
-  epochs: 12
-  subgraphs_per_epoch: 160
+  epochs: 15
+  subgraphs_per_epoch: 256
   validation_subgraphs: 32
   min_nodes: 20
   max_nodes: 20
   strategy: "mixed"
   pair_batch_size: 16
   decision_threshold: 0.5
-  monitor_metric: "val_loss"
-  early_stopping_patience: 4
+  monitor_metric: "val_auprc"
+  early_stopping_patience: 3
   optimizer:
-    lr: 6.0e-6
-    weight_decay: 6.0e-3
+    lr: 3.0e-6
+    weight_decay: 3.0e-3
   losses:
-    alpha: 0.35
-    beta: 0.45
-    gamma: 0.15
-    delta: 0.15
-    histogram_sigma: 1.25
-    degree_bins: 48
-    clustering_bins: 64
+    alpha: 0.25
+    beta: 0.20
+    gamma: 0.10
+    delta: 0.10
+    histogram_sigma: 1.5
+    degree_bins: 32
+    clustering_bins: 48
 
 evaluate:
   decision_threshold:

@@ -17,6 +17,8 @@ from src.embed import EmbeddingCacheManifest
 from src.run.stage_topology_finetune import (
     _forward_model,
     _load_supervision_graphs,
+    _resolve_monitor_mode,
+    _resolve_monitor_value,
     _resolve_sampling_node_bounds,
     run_topology_finetuning_stage,
 )
@@ -228,6 +230,26 @@ def test_resolve_sampling_node_bounds_caps_subgraphs_to_20_nodes() -> None:
 
     assert min_nodes == 20
     assert max_nodes == 20
+
+
+def test_resolve_monitor_mode_uses_min_for_val_loss() -> None:
+    assert _resolve_monitor_mode("val_loss") == "min"
+    assert _resolve_monitor_mode("val_auprc") == "max"
+
+
+def test_resolve_monitor_value_reads_val_loss() -> None:
+    monitor_value = _resolve_monitor_value(
+        monitor_metric="val_loss",
+        val_pair_stats={"val_loss": 0.42, "val_auprc": 0.91},
+        internal_val_topology_stats={
+            "graph_sim": 0.2,
+            "relative_density": 1.1,
+            "deg_dist_mmd": 0.3,
+            "cc_mmd": 0.4,
+        },
+    )
+
+    assert monitor_value == pytest.approx(0.42)
 
 
 def test_forward_model_uses_activation_checkpointing_during_training(

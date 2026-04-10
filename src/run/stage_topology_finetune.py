@@ -86,6 +86,36 @@ def _topology_finetune_config(config: ConfigDict) -> ConfigDict:
     return cast(ConfigDict, finetune_cfg)
 
 
+def _resolve_monitor_mode(monitor_metric: str) -> str:
+    """Return the optimization direction for a topology finetune monitor."""
+    if monitor_metric == "val_loss":
+        return "min"
+    return "max"
+
+
+def _resolve_monitor_value(
+    *,
+    monitor_metric: str,
+    val_pair_stats: Mapping[str, float],
+    internal_val_topology_stats: Mapping[str, float],
+) -> float:
+    """Resolve the scalar value used for checkpoint selection and early stopping."""
+    return float(
+        {
+            "val_loss": float(val_pair_stats.get("val_loss", 0.0)),
+            "internal_val_graph_sim": internal_val_topology_stats["graph_sim"],
+            "val_graph_sim": internal_val_topology_stats["graph_sim"],
+            "internal_val_relative_density": -abs(
+                internal_val_topology_stats["relative_density"] - 1.0
+            ),
+            "val_relative_density": -abs(
+                internal_val_topology_stats["relative_density"] - 1.0
+            ),
+            "val_auprc": float(val_pair_stats.get("val_auprc", 0.0)),
+        }.get(monitor_metric, internal_val_topology_stats["graph_sim"])
+    )
+
+
 def _load_supervision_graphs(*, config: ConfigDict) -> tuple[nx.Graph, nx.Graph]:
     """Build train/validation supervision graphs without leaking validation edges."""
     data_cfg = get_section(config, "data_config")
@@ -593,7 +623,10 @@ def run_topology_finetuning_stage(
         use_amp=use_amp,
     )
     loss_weights = _parse_loss_weights(config)
-    early_stopping = EarlyStopping(patience=patience, mode="max")
+    early_stopping = EarlyStopping(
+        patience=patience,
+        mode=_resolve_monitor_mode(monitor_metric),
+    )
     best_checkpoint_path = model_dir / "best_model.pth"
     metrics_path = log_dir / "topology_finetune_metrics.json"
     csv_path = log_dir / "topology_finetune_step.csv"
@@ -672,18 +705,10 @@ def run_topology_finetuning_stage(
             device=device,
         )
 
-        monitor_value = float(
-            {
-                "internal_val_graph_sim": internal_val_topology_stats["graph_sim"],
-                "val_graph_sim": internal_val_topology_stats["graph_sim"],
-                "internal_val_relative_density": -abs(
-                    internal_val_topology_stats["relative_density"] - 1.0
-                ),
-                "val_relative_density": -abs(
-                    internal_val_topology_stats["relative_density"] - 1.0
-                ),
-                "val_auprc": float(val_pair_stats.get("val_auprc", 0.0)),
-            }.get(monitor_metric, internal_val_topology_stats["graph_sim"])
+        monitor_value = _resolve_monitor_value(
+            monitor_metric=monitor_metric,
+            val_pair_stats=val_pair_stats,
+            internal_val_topology_stats=internal_val_topology_stats,
         )
         should_stop = False
         if distributed_context.is_main_process:
