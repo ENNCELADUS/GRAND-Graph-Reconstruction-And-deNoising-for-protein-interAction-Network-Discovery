@@ -271,7 +271,7 @@ def _gather_ordered_predictions(
     total_records: int,
     distributed_context: DistributedContext,
 ) -> list[int]:
-    """Gather local predictions from all ranks and restore original order on rank 0."""
+    """Gather local predictions from all ranks and restore original order on every rank."""
     if not distributed_context.is_distributed:
         return [int(prediction) for prediction in local_predictions]
     if not dist.is_initialized():
@@ -287,8 +287,6 @@ def _gather_ordered_predictions(
             "predictions": [int(prediction) for prediction in local_predictions],
         },
     )
-    if not distributed_context.is_main_process:
-        return []
     return _ordered_predictions_from_shards(
         total_records=total_records,
         shard_payloads=gathered_payloads,
@@ -485,12 +483,9 @@ def run_topology_evaluation_stage(
         total_records=len(records),
         distributed_context=distributed_context,
     )
-    if not distributed_context.is_main_process:
-        distributed_barrier(distributed_context)
-        return {}
 
     prediction_path = log_dir / "all_test_ppi_pred.txt"
-    if as_bool(
+    if distributed_context.is_main_process and as_bool(
         topology_cfg.get("save_pair_predictions", True),
         "topology_evaluate.save_pair_predictions",
     ):
@@ -517,39 +512,40 @@ def run_topology_evaluation_stage(
         test_graph_nodes=test_graph_nodes,
     )
 
-    with (log_dir / "graph_eval_results.pkl").open("wb") as handle:
-        pickle.dump(topology_result["details"], handle)
-    with (log_dir / "topology_metrics.json").open("w", encoding="utf-8") as handle:
-        data_cfg = get_section(config, "data_config")
-        benchmark_cfg = get_section(data_cfg, "benchmark")
-        json.dump(
-            {
-                "model": model_name,
-                "run_id": run_id,
-                "species": as_str(
-                    benchmark_cfg.get("species", "human"),
-                    "data_config.benchmark.species",
-                ),
-                "split_strategy": as_str(
-                    benchmark_cfg.get("split_strategy", "BFS"),
-                    "data_config.benchmark.split_strategy",
-                ).upper(),
-                "decision_threshold": decision_threshold,
-                "summary": topology_result["summary"],
-                "per_node_size": _json_safe_per_node_size(topology_result["per_node_size"]),
-                "details": _json_safe_details(topology_result["details"]),
-            },
-            handle,
-            indent=2,
-            sort_keys=True,
+    if distributed_context.is_main_process:
+        with (log_dir / "graph_eval_results.pkl").open("wb") as handle:
+            pickle.dump(topology_result["details"], handle)
+        with (log_dir / "topology_metrics.json").open("w", encoding="utf-8") as handle:
+            data_cfg = get_section(config, "data_config")
+            benchmark_cfg = get_section(data_cfg, "benchmark")
+            json.dump(
+                {
+                    "model": model_name,
+                    "run_id": run_id,
+                    "species": as_str(
+                        benchmark_cfg.get("species", "human"),
+                        "data_config.benchmark.species",
+                    ),
+                    "split_strategy": as_str(
+                        benchmark_cfg.get("split_strategy", "BFS"),
+                        "data_config.benchmark.split_strategy",
+                    ).upper(),
+                    "decision_threshold": decision_threshold,
+                    "summary": topology_result["summary"],
+                    "per_node_size": _json_safe_per_node_size(topology_result["per_node_size"]),
+                    "details": _json_safe_details(topology_result["details"]),
+                },
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
+        _write_topology_metrics_csv(
+            csv_path=log_dir / "topology_metrics.csv",
+            per_node_size=topology_result["per_node_size"],
+            summary=topology_result["summary"],
         )
-    _write_topology_metrics_csv(
-        csv_path=log_dir / "topology_metrics.csv",
-        per_node_size=topology_result["per_node_size"],
-        summary=topology_result["summary"],
-    )
-    log_stage_event(logger, "topology_metrics_written", path=log_dir / "topology_metrics.json")
-    _maybe_write_comparison_report(config=config, model_name=model_name, logger=logger)
-    log_stage_event(logger, "stage_done", run_id=run_id)
+        log_stage_event(logger, "topology_metrics_written", path=log_dir / "topology_metrics.json")
+        _maybe_write_comparison_report(config=config, model_name=model_name, logger=logger)
+        log_stage_event(logger, "stage_done", run_id=run_id)
     distributed_barrier(distributed_context)
     return cast(dict[str, float], topology_result["summary"])

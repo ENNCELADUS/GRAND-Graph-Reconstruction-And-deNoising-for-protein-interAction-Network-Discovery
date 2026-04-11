@@ -7,6 +7,8 @@ import pickle
 from pathlib import Path
 from typing import cast
 
+import pytest
+import src.run.stage_topology_evaluate as topology_stage
 import torch
 from src.run.stage_topology_evaluate import run_topology_evaluation_stage
 from src.run.stage_train import build_model
@@ -241,3 +243,58 @@ def test_run_topology_evaluation_stage_writes_expected_artifacts(tmp_path: Path)
     log_text = (log_dir / "log.log").read_text(encoding="utf-8")
     assert "Decision Threshold" in log_text
     assert "best_f1_on_valid" in log_text
+
+
+def test_run_topology_evaluation_stage_non_main_rank_computes_topology_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_topology_config(tmp_path)
+    checkpoint_path = Path(str(config["run_config"]["load_checkpoint_path"]))  # type: ignore[index]
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    model = build_model(config)
+    torch.save(model.state_dict(), checkpoint_path)
+    dataloaders = build_dataloaders(config=config)
+
+    monkeypatch.setattr(topology_stage.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(topology_stage.dist, "broadcast", lambda tensor, src: None)
+    monkeypatch.setattr(
+        topology_stage,
+        "_build_topology_loader",
+        lambda **_: (
+            cast(DataLoader[dict[str, object]], dataloaders["test"]),
+            [("P1", "P2"), ("P1", "P3"), ("P2", "P3")],
+            [1],
+            3,
+        ),
+    )
+    monkeypatch.setattr(topology_stage, "_predict_topology_labels", lambda **_: [0])
+    monkeypatch.setattr(
+        topology_stage,
+        "_gather_ordered_predictions",
+        lambda **_: [1, 0, 1],
+    )
+    monkeypatch.setattr(topology_stage, "distributed_barrier", lambda context: None)
+
+    previous_cwd = Path.cwd()
+    try:
+        __import__("os").chdir(tmp_path)
+        summary = run_topology_evaluation_stage(
+            config=config,
+            model=model,
+            device=torch.device("cpu"),
+            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            run_id="topology_non_main",
+            checkpoint_path=checkpoint_path,
+            distributed_context=DistributedContext(
+                ddp_enabled=True,
+                is_distributed=True,
+                rank=1,
+                local_rank=1,
+                world_size=2,
+            ),
+        )
+    finally:
+        __import__("os").chdir(previous_cwd)
+
+    assert "graph_sim" in summary
