@@ -145,6 +145,32 @@ def _evaluation_checkpoint_path(
     raise ValueError("load_checkpoint_path is required when evaluate runs without train stage")
 
 
+def _topology_finetune_checkpoint_path(
+    *,
+    config: ConfigDict,
+    train_checkpoint_path: Path | None,
+    load_checkpoint_path: Path | None,
+) -> Path | None:
+    """Resolve checkpoint path for topology fine-tuning."""
+    finetune_cfg = config.get("topology_finetune", {})
+    if finetune_cfg is None:
+        finetune_cfg = {}
+    if not isinstance(finetune_cfg, dict):
+        raise ValueError("topology_finetune must be a mapping")
+    init_mode = as_str(
+        finetune_cfg.get("init_mode", "warm_start"),
+        "topology_finetune.init_mode",
+    ).lower()
+    if init_mode == "scratch":
+        return None
+    if init_mode != "warm_start":
+        raise ValueError("topology_finetune.init_mode must be 'warm_start' or 'scratch'")
+    return _evaluation_checkpoint_path(
+        train_checkpoint_path=train_checkpoint_path,
+        load_checkpoint_path=load_checkpoint_path,
+    )
+
+
 def _len_or_unknown(value: object) -> int | str:
     """Return ``len(value)`` when available, otherwise ``'unknown'``."""
     try:
@@ -292,7 +318,8 @@ def execute_pipeline(
                 log_stage_event(stage_loggers["train"], "end_training")
 
         if "topology_finetune" in selected_stages:
-            base_checkpoint = _evaluation_checkpoint_path(
+            topology_finetune_checkpoint_input = _topology_finetune_checkpoint_path(
+                config=config,
                 train_checkpoint_path=train_checkpoint_path,
                 load_checkpoint_path=load_checkpoint_path,
             )
@@ -304,7 +331,7 @@ def execute_pipeline(
                 device=device,
                 dataloaders=dataloaders,
                 run_id=topology_finetune_run_id,
-                checkpoint_path=base_checkpoint,
+                checkpoint_path=topology_finetune_checkpoint_input,
                 distributed_context=distributed_context,
             )
             if distributed_context.is_main_process:

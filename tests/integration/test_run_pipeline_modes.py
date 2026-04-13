@@ -40,7 +40,7 @@ class PipelineCalls:
     """Recorded mocked pipeline calls."""
 
     training: list[tuple[str, str]] = field(default_factory=list)
-    topology_finetuning: list[tuple[Path, str]] = field(default_factory=list)
+    topology_finetuning: list[tuple[Path | None, str]] = field(default_factory=list)
     adaptation: list[tuple[Path, str]] = field(default_factory=list)
     evaluation: list[tuple[Path, str]] = field(default_factory=list)
     topology_evaluation: list[tuple[Path, str]] = field(default_factory=list)
@@ -130,7 +130,7 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
         run_id: str,
-        checkpoint_path: Path,
+        checkpoint_path: Path | None,
         distributed_context: DistributedContext,
     ) -> Path:
         del config, model, device, dataloaders, distributed_context
@@ -394,6 +394,47 @@ def test_execute_pipeline_train_then_topology_finetune_uses_train_checkpoint(
         (Path("artifacts/topology_finetune_best_model.pth"), "eval_run")
     ]
     assert patched_pipeline.topology_evaluation == []
+
+
+def test_execute_pipeline_topology_finetune_scratch_does_not_require_checkpoint(
+    base_config: ConfigDict,
+    patched_pipeline: PipelineCalls,
+) -> None:
+    run_cfg = base_config["run_config"]
+    assert isinstance(run_cfg, dict)
+    run_cfg["stages"] = ["topology_finetune", "evaluate"]
+    run_cfg["topology_finetune_run_id"] = "topology_ft_run"
+    run_cfg["load_checkpoint_path"] = None
+
+    base_config["topology_finetune"] = {"init_mode": "scratch"}
+
+    run_module.execute_pipeline(base_config)
+
+    assert patched_pipeline.training == []
+    assert patched_pipeline.topology_finetuning == [(None, "topology_ft_run")]
+    assert patched_pipeline.evaluation == [
+        (Path("artifacts/topology_finetune_best_model.pth"), "eval_run")
+    ]
+
+
+def test_execute_pipeline_train_then_topology_finetune_scratch_ignores_train_checkpoint(
+    base_config: ConfigDict,
+    patched_pipeline: PipelineCalls,
+) -> None:
+    run_cfg = base_config["run_config"]
+    assert isinstance(run_cfg, dict)
+    run_cfg["stages"] = ["train", "topology_finetune", "evaluate"]
+    run_cfg["topology_finetune_run_id"] = "topology_ft_run"
+
+    base_config["topology_finetune"] = {"init_mode": "scratch"}
+
+    run_module.execute_pipeline(base_config)
+
+    assert patched_pipeline.training == [("train", "train_run")]
+    assert patched_pipeline.topology_finetuning == [(None, "topology_ft_run")]
+    assert patched_pipeline.evaluation == [
+        (Path("artifacts/topology_finetune_best_model.pth"), "eval_run")
+    ]
 
 
 @pytest.mark.parametrize(

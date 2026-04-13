@@ -75,7 +75,6 @@ TOPOLOGY_FINETUNE_CSV_COLUMNS = [
     "Internal Val cc_mmd",
     "Learning Rate",
 ]
-MAX_TOPOLOGY_FINETUNE_SUBGRAPH_NODES = 20
 
 
 def _topology_finetune_config(config: ConfigDict) -> ConfigDict:
@@ -167,16 +166,60 @@ def _parse_loss_weights(config: ConfigDict) -> TopologyLossWeights:
 
 
 def _resolve_sampling_node_bounds(finetune_cfg: ConfigDict) -> tuple[int, int]:
-    """Resolve memory-bounded subgraph node limits for topology fine-tuning."""
-    max_nodes = min(
-        as_int(finetune_cfg.get("max_nodes", 20), "topology_finetune.max_nodes"),
-        MAX_TOPOLOGY_FINETUNE_SUBGRAPH_NODES,
-    )
-    min_nodes = min(
-        as_int(finetune_cfg.get("min_nodes", max_nodes), "topology_finetune.min_nodes"),
-        max_nodes,
-    )
+    """Resolve subgraph node limits for topology fine-tuning."""
+    max_nodes = as_int(finetune_cfg.get("max_nodes", 20), "topology_finetune.max_nodes")
+    min_nodes = as_int(finetune_cfg.get("min_nodes", max_nodes), "topology_finetune.min_nodes")
+    if min_nodes <= 0:
+        raise ValueError("topology_finetune.min_nodes must be positive")
+    if max_nodes <= 0:
+        raise ValueError("topology_finetune.max_nodes must be positive")
+    if min_nodes > max_nodes:
+        raise ValueError("topology_finetune.min_nodes must be <= topology_finetune.max_nodes")
     return min_nodes, max_nodes
+
+
+def _resolve_init_mode(finetune_cfg: ConfigDict) -> str:
+    """Return topology fine-tuning initialization mode."""
+    init_mode = as_str(
+        finetune_cfg.get("init_mode", "warm_start"),
+        "topology_finetune.init_mode",
+    ).lower()
+    if init_mode not in {"warm_start", "scratch"}:
+        raise ValueError("topology_finetune.init_mode must be 'warm_start' or 'scratch'")
+    return init_mode
+
+
+def _build_internal_validation_node_sets(
+    *,
+    finetune_cfg: ConfigDict,
+    graph: nx.Graph,
+    seed: int,
+) -> list[tuple[str, ...]]:
+    """Build node sets used for internal topology validation."""
+    validation_mode = as_str(
+        finetune_cfg.get("validation_mode", "whole_graph"),
+        "topology_finetune.validation_mode",
+    ).lower()
+    if validation_mode == "whole_graph":
+        return [tuple(sorted(graph.nodes))]
+    if validation_mode != "sampled":
+        raise ValueError(
+            "topology_finetune.validation_mode must be 'whole_graph' or 'sampled'"
+        )
+
+    min_nodes, max_nodes = _resolve_sampling_node_bounds(finetune_cfg)
+    sampled_subgraphs = sample_training_subgraphs(
+        graph=graph,
+        num_subgraphs=as_int(
+            finetune_cfg.get("validation_subgraphs", 8),
+            "topology_finetune.validation_subgraphs",
+        ),
+        min_nodes=min_nodes,
+        max_nodes=max_nodes,
+        strategy=as_str(finetune_cfg.get("strategy", "mixed"), "topology_finetune.strategy"),
+        seed=seed,
+    )
+    return [tuple(nodes) for nodes in sampled_subgraphs]
 
 
 def _move_chunk_to_device(
@@ -533,7 +576,7 @@ def run_topology_finetuning_stage(
     device: torch.device,
     dataloaders: dict[str, DataLoader[dict[str, object]]],
     run_id: str,
-    checkpoint_path: Path,
+    checkpoint_path: Path | None,
     distributed_context: DistributedContext,
 ) -> Path:
     """Fine-tune a pairwise scorer with PRING graph-topology losses."""
@@ -544,12 +587,24 @@ def run_topology_finetuning_stage(
         run_id=run_id,
         distributed_context=distributed_context,
     )
-    checkpoint_path = Path(checkpoint_path)
-    if distributed_context.is_main_process:
-        log_stage_event(logger, "stage_start", run_id=run_id, checkpoint=checkpoint_path)
-    _load_checkpoint(model=model, checkpoint_path=checkpoint_path, device=device)
-
     finetune_cfg = _topology_finetune_config(config)
+    init_mode = _resolve_init_mode(finetune_cfg)
+    checkpoint_path_resolved = Path(checkpoint_path) if checkpoint_path is not None else None
+    if distributed_context.is_main_process:
+        log_stage_event(
+            logger,
+            "stage_start",
+            run_id=run_id,
+            checkpoint=checkpoint_path_resolved,
+            init_mode=init_mode,
+        )
+    if init_mode == "warm_start":
+        if checkpoint_path_resolved is None:
+            raise ValueError(
+                "checkpoint_path is required when topology_finetune.init_mode='warm_start'"
+            )
+        _load_checkpoint(model=model, checkpoint_path=checkpoint_path_resolved, device=device)
+
     run_cfg = get_section(config, "run_config")
     data_cfg = get_section(config, "data_config")
     model_cfg = get_section(config, "model_config")
@@ -631,16 +686,9 @@ def run_topology_finetuning_stage(
     metrics_path = log_dir / "topology_finetune_metrics.json"
     csv_path = log_dir / "topology_finetune_step.csv"
     best_metrics: dict[str, float] = {}
-    min_nodes, max_nodes = _resolve_sampling_node_bounds(finetune_cfg)
-    sampled_internal_val_subgraphs = sample_training_subgraphs(
+    internal_validation_node_sets = _build_internal_validation_node_sets(
+        finetune_cfg=finetune_cfg,
         graph=internal_val_graph,
-        num_subgraphs=as_int(
-            finetune_cfg.get("validation_subgraphs", 8),
-            "topology_finetune.validation_subgraphs",
-        ),
-        min_nodes=min_nodes,
-        max_nodes=max_nodes,
-        strategy=as_str(finetune_cfg.get("strategy", "mixed"), "topology_finetune.strategy"),
         seed=as_int(run_cfg.get("seed", 0), "run_config.seed") + 100_000,
     )
 
@@ -651,7 +699,7 @@ def run_topology_finetuning_stage(
             epochs=epochs,
             monitor=monitor_metric,
             subgraphs_per_epoch=finetune_cfg.get("subgraphs_per_epoch", 16),
-            internal_validation_subgraphs=len(sampled_internal_val_subgraphs),
+            internal_validation_subgraphs=len(internal_validation_node_sets),
             pair_batch_size=pair_batch_size,
         )
 
@@ -695,7 +743,7 @@ def run_topology_finetuning_stage(
         internal_val_topology_stats = _evaluate_internal_validation_subgraphs(
             model=model,
             graph=internal_val_graph,
-            sampled_subgraphs=sampled_internal_val_subgraphs,
+            sampled_subgraphs=internal_validation_node_sets,
             cache_dir=embedding_cache.cache_dir,
             embedding_index=embedding_cache.index,
             input_dim=input_dim,

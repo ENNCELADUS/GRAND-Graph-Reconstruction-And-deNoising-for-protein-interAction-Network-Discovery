@@ -6,7 +6,7 @@ run_config:
   adapt_run_id: null
   eval_run_id: null
   topology_eval_run_id: null
-  load_checkpoint_path: null
+  load_checkpoint_path: "models/v3/train/20260308_002906/best_model.pth"
   save_best_only: true
 
 device_config:
@@ -87,19 +87,17 @@ training_config:
     enabled: false
 
 topology_finetune:
-  init_mode: "scratch"
-  epochs: 30
-  # Match the pairwise-train supervision scale:
-  # ceil(85,824 train pairs / C(20, 2)) = ceil(85,824 / 190) = 452 subgraphs.
-  subgraphs_per_epoch: 452
-  validation_mode: "sampled"
-  min_nodes: 20
-  max_nodes: 20
+  init_mode: "warm_start"
+  epochs: 15
+  subgraphs_per_epoch: 111
+  validation_mode: "whole_graph"
+  min_nodes: 40
+  max_nodes: 40
   strategy: "mixed"
   pair_batch_size: 16
   decision_threshold: 0.5
   monitor_metric: "internal_val_graph_sim"
-  early_stopping_patience: 5
+  early_stopping_patience: 3
   optimizer:
     lr: 3.0e-6
     weight_decay: 3.0e-3

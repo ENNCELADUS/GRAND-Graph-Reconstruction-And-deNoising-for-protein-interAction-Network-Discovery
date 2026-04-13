@@ -15,6 +15,7 @@ import src.run.stage_topology_finetune as topology_finetune_stage
 import torch
 from src.embed import EmbeddingCacheManifest
 from src.run.stage_topology_finetune import (
+    _build_internal_validation_node_sets,
     _forward_model,
     _load_supervision_graphs,
     _resolve_monitor_mode,
@@ -223,13 +224,26 @@ def test_load_supervision_graphs_excludes_val_edges_and_keeps_all_train_nodes(
 def test_resolve_sampling_node_bounds_caps_subgraphs_to_20_nodes() -> None:
     min_nodes, max_nodes = _resolve_sampling_node_bounds(
         {
-            "min_nodes": 64,
-            "max_nodes": 200,
+            "min_nodes": 30,
+            "max_nodes": 50,
         }
     )
 
-    assert min_nodes == 20
-    assert max_nodes == 20
+    assert min_nodes == 30
+    assert max_nodes == 50
+
+
+def test_build_internal_validation_node_sets_uses_whole_graph_by_default() -> None:
+    graph = nx.Graph()
+    graph.add_nodes_from(["P3", "P1", "P2"])
+
+    node_sets = _build_internal_validation_node_sets(
+        finetune_cfg={"validation_subgraphs": 64},
+        graph=graph,
+        seed=11,
+    )
+
+    assert node_sets == [("P1", "P2", "P3")]
 
 
 def test_resolve_monitor_mode_uses_min_for_val_loss() -> None:
@@ -404,3 +418,49 @@ def test_run_topology_finetuning_stage_allows_embedding_generation_on_non_main_r
         os.chdir(previous_cwd)
 
     assert observed_allow_generation == [True]
+
+
+def test_run_topology_finetuning_stage_supports_scratch_initialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["epochs"] = 0
+    topology_cfg["init_mode"] = "scratch"
+
+    model = build_model(config)
+    dataloaders = build_dataloaders(config=config)
+    observed_checkpoint_loads: list[Path] = []
+
+    def _fake_load_checkpoint(
+        *,
+        model: torch.nn.Module,
+        checkpoint_path: Path,
+        device: torch.device,
+    ) -> None:
+        del model, device
+        observed_checkpoint_loads.append(checkpoint_path)
+
+    monkeypatch.setattr(topology_finetune_stage, "_load_checkpoint", _fake_load_checkpoint)
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        best_checkpoint = run_topology_finetuning_stage(
+            config=config,
+            model=model,
+            device=torch.device("cpu"),
+            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            run_id="topology_ft_case",
+            checkpoint_path=tmp_path / "missing_checkpoint.pth",
+            distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+        )
+    finally:
+        os.chdir(previous_cwd)
+
+    assert best_checkpoint == Path(
+        "models/v3/topology_finetune/topology_ft_case/best_model.pth"
+    )
+    assert observed_checkpoint_loads == []
