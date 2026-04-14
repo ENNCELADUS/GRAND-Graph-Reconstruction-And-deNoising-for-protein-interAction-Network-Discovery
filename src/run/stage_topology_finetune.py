@@ -644,10 +644,6 @@ def run_topology_finetuning_stage(
         finetune_cfg.get("pair_batch_size", training_cfg.get("batch_size", 8)),
         "topology_finetune.pair_batch_size",
     )
-    decision_threshold = as_float(
-        finetune_cfg.get("decision_threshold", 0.5),
-        "topology_finetune.decision_threshold",
-    )
     epochs = as_int(
         finetune_cfg.get("epochs", training_cfg.get("epochs", 1)),
         "topology_finetune.epochs",
