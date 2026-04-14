@@ -45,6 +45,13 @@ ALLOWED_STAGES: tuple[str, ...] = (
     "topology_evaluate",
 )
 STAGE_ORDER: dict[str, int] = {stage: index for index, stage in enumerate(ALLOWED_STAGES)}
+_STAGE_RUN_ID_KEYS: tuple[tuple[str, str], ...] = (
+    ("train", "train_run_id"),
+    ("topology_finetune", "topology_finetune_run_id"),
+    ("adapt", "adapt_run_id"),
+    ("evaluate", "eval_run_id"),
+    ("topology_evaluate", "topology_eval_run_id"),
+)
 
 
 def _ddp_find_unused_parameters(config: ConfigDict) -> bool:
@@ -179,6 +186,39 @@ def _len_or_unknown(value: object) -> int | str:
         return "unknown"
 
 
+def _resolve_stage_run_map(
+    *,
+    run_cfg: ConfigDict,
+    distributed_context: DistributedContext,
+) -> dict[str, str]:
+    """Resolve one shared run-id mapping for all stages and ranks."""
+    if not distributed_context.is_distributed or not torch.distributed.is_initialized():
+        return {
+            stage: generate_run_id(run_cfg.get(config_key))
+            for stage, config_key in _STAGE_RUN_ID_KEYS
+        }
+
+    payload: list[object] = [{}]
+    if distributed_context.is_main_process:
+        payload[0] = {
+            stage: generate_run_id(run_cfg.get(config_key))
+            for stage, config_key in _STAGE_RUN_ID_KEYS
+        }
+    torch.distributed.broadcast_object_list(payload, src=0)
+
+    raw_stage_run_map = payload[0]
+    if not isinstance(raw_stage_run_map, dict):
+        raise ValueError("Broadcast stage run IDs must be a mapping")
+
+    stage_run_map: dict[str, str] = {}
+    for stage, _ in _STAGE_RUN_ID_KEYS:
+        value = raw_stage_run_map.get(stage)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"Broadcast stage run ID for '{stage}' must be a non-empty string")
+        stage_run_map[stage] = value
+    return stage_run_map
+
+
 def execute_pipeline(
     config: ConfigDict,
     *,
@@ -208,11 +248,15 @@ def execute_pipeline(
     ddp_find_unused_parameters = _ddp_find_unused_parameters(config)
     try:
         selected_stages = _selected_stages(run_cfg)
-        train_run_id = generate_run_id(run_cfg.get("train_run_id"))
-        topology_finetune_run_id = generate_run_id(run_cfg.get("topology_finetune_run_id"))
-        adapt_run_id = generate_run_id(run_cfg.get("adapt_run_id"))
-        eval_run_id = generate_run_id(run_cfg.get("eval_run_id"))
-        topology_eval_run_id = generate_run_id(run_cfg.get("topology_eval_run_id"))
+        stage_run_map = _resolve_stage_run_map(
+            run_cfg=run_cfg,
+            distributed_context=distributed_context,
+        )
+        train_run_id = stage_run_map["train"]
+        topology_finetune_run_id = stage_run_map["topology_finetune"]
+        adapt_run_id = stage_run_map["adapt"]
+        eval_run_id = stage_run_map["evaluate"]
+        topology_eval_run_id = stage_run_map["topology_evaluate"]
         load_checkpoint_value = run_cfg.get("load_checkpoint_path")
         load_checkpoint_path = (
             Path(str(load_checkpoint_value))
@@ -220,13 +264,6 @@ def execute_pipeline(
             else None
         )
         model_name, _ = extract_model_kwargs(config)
-        stage_run_map: dict[str, str] = {
-            "train": train_run_id,
-            "topology_finetune": topology_finetune_run_id,
-            "adapt": adapt_run_id,
-            "evaluate": eval_run_id,
-            "topology_evaluate": topology_eval_run_id,
-        }
         selected_stages_with_adaptation = _selected_stages_with_adaptation(
             selected_stages,
             shot_enabled=should_run_shot_adaptation(config),

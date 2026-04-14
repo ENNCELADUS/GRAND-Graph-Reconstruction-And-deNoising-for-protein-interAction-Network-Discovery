@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import src.run as run_module
+import src.run.pipeline_orchestrator as pipeline_orchestrator
 import torch
 from src.utils.config import ConfigDict
 from src.utils.distributed import DistributedContext
@@ -223,6 +224,69 @@ def test_execute_pipeline_train_only(
     assert patched_pipeline.adaptation == []
     assert patched_pipeline.evaluation == []
     assert patched_pipeline.topology_evaluation == []
+
+
+def test_execute_pipeline_distributed_worker_reuses_main_run_ids(
+    base_config: ConfigDict,
+    patched_pipeline: PipelineCalls,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_cfg = base_config["run_config"]
+    assert isinstance(run_cfg, dict)
+    run_cfg["stages"] = ["train"]
+    run_cfg["train_run_id"] = None
+
+    monkeypatch.setattr(
+        run_module,
+        "initialize_distributed",
+        lambda ddp_enabled: DistributedContext(
+            ddp_enabled=ddp_enabled,
+            is_distributed=True,
+            rank=1,
+            local_rank=1,
+            world_size=2,
+        ),
+    )
+    monkeypatch.setattr(
+        run_module,
+        "DistributedDataParallel",
+        lambda model, **kwargs: model,
+    )
+    monkeypatch.setattr(pipeline_orchestrator.torch.distributed, "is_initialized", lambda: True)
+
+    def fake_broadcast_object_list(payload: list[object], src: int) -> None:
+        del src
+        payload[0] = {
+            "train": "shared_train_run",
+            "topology_finetune": "shared_topology_run",
+            "adapt": "shared_adapt_run",
+            "evaluate": "shared_eval_run",
+            "topology_evaluate": "shared_topology_eval_run",
+        }
+
+    monkeypatch.setattr(
+        pipeline_orchestrator.torch.distributed,
+        "broadcast_object_list",
+        fake_broadcast_object_list,
+    )
+    generated_run_ids = iter(
+        [
+            "rank1_train_run",
+            "rank1_topology_run",
+            "rank1_adapt_run",
+            "rank1_eval_run",
+            "rank1_topology_eval_run",
+        ]
+    )
+    monkeypatch.setattr(
+        pipeline_orchestrator,
+        "generate_run_id",
+        lambda existing_value: next(generated_run_ids),
+    )
+
+    run_module.execute_pipeline(base_config)
+
+    assert patched_pipeline.training == [("train", "shared_train_run")]
 
 
 def test_execute_pipeline_evaluate_only(
