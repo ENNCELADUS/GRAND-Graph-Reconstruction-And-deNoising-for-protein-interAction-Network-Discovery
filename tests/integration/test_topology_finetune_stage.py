@@ -6,6 +6,7 @@ import json
 import os
 import pickle
 from collections.abc import Sequence
+from csv import DictReader
 from pathlib import Path
 from typing import cast
 
@@ -26,8 +27,8 @@ from src.run.stage_topology_finetune import (
     run_topology_finetuning_stage,
 )
 from src.run.stage_train import build_model
-from src.topology.finetune_data import SubgraphPairChunk
-from src.utils.config import ConfigDict
+from src.topology.finetune_data import EdgeCoverEpochPlan, SubgraphPairChunk
+from src.utils.config import ConfigDict, load_config
 from src.utils.data_io import build_dataloaders
 from src.utils.distributed import DistributedContext
 from torch.utils.data import DataLoader
@@ -186,11 +187,12 @@ def _build_finetune_config(tmp_path: Path) -> ConfigDict:
         },
         "topology_finetune": {
             "epochs": 1,
-            "subgraphs_per_epoch": 3,
-            "validation_subgraphs": 2,
+            "validation_mode": "whole_graph",
             "min_nodes": 3,
             "max_nodes": 4,
             "strategy": "mixed",
+            "overlap_penalty": 0.5,
+            "bce_negative_ratio": 0,
             "pair_batch_size": 2,
             "decision_threshold": 0.5,
             "optimizer": {"lr": 1e-3, "weight_decay": 0.0},
@@ -241,7 +243,22 @@ def test_build_internal_validation_node_sets_uses_whole_graph_by_default() -> No
     graph.add_nodes_from(["P3", "P1", "P2"])
 
     node_sets = _build_internal_validation_node_sets(
-        finetune_cfg={"validation_subgraphs": 64},
+        finetune_cfg={"validation_subgraphs": 64, "min_nodes": 2, "max_nodes": 3},
+        graph=graph,
+        seed=11,
+    )
+
+    assert len(node_sets) == 64
+    assert all(2 <= len(nodes) <= 3 for nodes in node_sets)
+    assert all(set(nodes).issubset({"P1", "P2", "P3"}) for nodes in node_sets)
+
+
+def test_build_internal_validation_node_sets_supports_explicit_whole_graph_mode() -> None:
+    graph = nx.Graph()
+    graph.add_nodes_from(["P3", "P1", "P2"])
+
+    node_sets = _build_internal_validation_node_sets(
+        finetune_cfg={"validation_mode": "whole_graph"},
         graph=graph,
         seed=11,
     )
@@ -424,6 +441,54 @@ def test_predict_hard_subgraph_streams_pair_chunks_for_inference(
     assert sorted(pred_subgraph.edges()) == [("P1", "P2"), ("P2", "P3")]
 
 
+def test_run_topology_finetuning_stage_uses_edge_cover_sampling_by_default(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    model = build_model(config)
+    checkpoint_path = Path(str(config["run_config"]["load_checkpoint_path"]))  # type: ignore[index]
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), checkpoint_path)
+    dataloaders = build_dataloaders(config=config)
+    observed_training_calls: list[dict[str, object]] = []
+
+    def _fake_sample_edge_cover_subgraphs(**kwargs: object) -> EdgeCoverEpochPlan:
+        observed_training_calls.append(dict(kwargs))
+        return EdgeCoverEpochPlan(
+            subgraphs=(("P1", "P2", "P3"),),
+            total_positive_edges=2,
+            covered_positive_edges=2,
+            positive_edge_coverage_ratio=1.0,
+            mean_positive_edge_reuse=1.0,
+        )
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "sample_edge_cover_subgraphs",
+        _fake_sample_edge_cover_subgraphs,
+    )
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        run_topology_finetuning_stage(
+            config=config,
+            model=model,
+            device=torch.device("cpu"),
+            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            run_id="topology_ft_case",
+            checkpoint_path=checkpoint_path,
+            distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+        )
+    finally:
+        os.chdir(previous_cwd)
+
+    assert len(observed_training_calls) == 1
+    assert observed_training_calls[0]["num_subgraphs"] == 0
+    assert observed_training_calls[0]["overlap_penalty"] == pytest.approx(0.5)
+
+
 def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path: Path) -> None:
     config = _build_finetune_config(tmp_path)
     model = build_model(config)
@@ -455,6 +520,12 @@ def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path
     assert (log_dir / "topology_finetune_step.csv").exists()
     assert (log_dir / "topology_finetune_metrics.json").exists()
     assert (log_dir / "log.log").exists()
+    with (log_dir / "topology_finetune_step.csv").open("r", encoding="utf-8", newline="") as handle:
+        header = DictReader(handle).fieldnames
+    assert header is not None
+    assert "Planned Subgraphs" in header
+    assert "Positive Edge Coverage Ratio" in header
+    assert "Mean Positive Edge Reuse" in header
 
     updated_state = torch.load(best_checkpoint_path, map_location="cpu")
     assert any(
@@ -536,6 +607,7 @@ def test_run_topology_finetuning_stage_supports_scratch_initialization(
     assert isinstance(topology_cfg, dict)
     topology_cfg["epochs"] = 0
     topology_cfg["init_mode"] = "scratch"
+    topology_cfg["overlap_penalty"] = 0.25
 
     model = build_model(config)
     dataloaders = build_dataloaders(config=config)
@@ -569,3 +641,53 @@ def test_run_topology_finetuning_stage_supports_scratch_initialization(
 
     assert best_checkpoint == Path("models/v3/topology_finetune/topology_ft_case/best_model.pth")
     assert observed_checkpoint_loads == []
+
+
+def test_run_topology_finetuning_stage_generates_missing_ratio_supervision_files(
+    tmp_path: Path,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["epochs"] = 0
+    topology_cfg["bce_negative_ratio"] = 5
+    topology_cfg["supervision_train_dataset"] = str(
+        tmp_path / "benchmark" / "human" / "BFS" / "human_train_ppi_ratio5_exclusive.txt"
+    )
+    topology_cfg["supervision_valid_dataset"] = str(
+        tmp_path / "benchmark" / "human" / "BFS" / "human_val_ppi_ratio5_exclusive.txt"
+    )
+
+    model = build_model(config)
+    dataloaders = build_dataloaders(config=config)
+    checkpoint_path = Path(str(config["run_config"]["load_checkpoint_path"]))  # type: ignore[index]
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), checkpoint_path)
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        run_topology_finetuning_stage(
+            config=config,
+            model=model,
+            device=torch.device("cpu"),
+            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            run_id="topology_ft_case",
+            checkpoint_path=checkpoint_path,
+            distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+        )
+    finally:
+        os.chdir(previous_cwd)
+
+    train_supervision_path = Path(str(topology_cfg["supervision_train_dataset"]))
+    valid_supervision_path = Path(str(topology_cfg["supervision_valid_dataset"]))
+    assert train_supervision_path.exists()
+    assert valid_supervision_path.exists()
+
+
+def test_v3_configs_use_sampled_internal_validation_mode() -> None:
+    for config_path in (Path("configs/v3.yaml"), Path("configs/v3.1.yaml")):
+        config = load_config(config_path)
+        topology_cfg = config["topology_finetune"]
+        assert isinstance(topology_cfg, dict)
+        assert topology_cfg["validation_mode"] == "sampled"
