@@ -85,18 +85,44 @@ def _build_finetune_config(tmp_path: Path) -> ConfigDict:
             ("P1", "P3", 0),
             ("P2", "P3", 1),
             ("P2", "P4", 0),
+            ("P4", "P5", 0),
+            ("P5", "P6", 0),
         ],
     )
-    _write_split(valid_path, [("P1", "P2", 1), ("P1", "P4", 0), ("P3", "P4", 1)])
-    _write_split(test_path, [("P1", "P2", 1), ("P2", "P4", 0)])
+    _write_split(
+        valid_path,
+        [("P1", "P2", 1), ("P1", "P4", 0), ("P3", "P4", 1), ("P3", "P6", 0)],
+    )
+    _write_split(
+        test_path,
+        [("P1", "P2", 1), ("P2", "P4", 0), ("P1", "P6", 0), ("P7", "P8", 0), ("P9", "P10", 0)],
+    )
+    (benchmark_root / "human_ppi.txt").write_text(
+        "\n".join(
+            [
+                "P1\tP2",
+                "P2\tP3",
+                "P3\tP4",
+                "P1\tP4",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
     train_graph = nx.Graph()
-    train_graph.add_nodes_from(["P1", "P2", "P3", "P4", "P5"])
+    train_graph.add_nodes_from(["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10"])
     train_graph.add_edges_from([("P1", "P2"), ("P2", "P3"), ("P3", "P4")])
     with (processed_dir / "human_train_graph.pkl").open("wb") as handle:
         pickle.dump(train_graph, handle)
     with (processed_dir / "human_BFS_split.pkl").open("wb") as handle:
-        pickle.dump({"train": {"P1", "P2", "P3", "P4", "P5"}, "test": {"PX"}}, handle)
+        pickle.dump(
+            {
+                "train": {"P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10"},
+                "test": {"PX"},
+            },
+            handle,
+        )
 
     cache_dir = tmp_path / "cache"
     _write_embedding_cache(
@@ -107,6 +133,11 @@ def _build_finetune_config(tmp_path: Path) -> ConfigDict:
             "P3": torch.full((2, 4), 3.0, dtype=torch.float32),
             "P4": torch.full((2, 4), 4.0, dtype=torch.float32),
             "P5": torch.full((2, 4), 5.0, dtype=torch.float32),
+            "P6": torch.full((2, 4), 6.0, dtype=torch.float32),
+            "P7": torch.full((2, 4), 7.0, dtype=torch.float32),
+            "P8": torch.full((2, 4), 8.0, dtype=torch.float32),
+            "P9": torch.full((2, 4), 9.0, dtype=torch.float32),
+            "P10": torch.full((2, 4), 10.0, dtype=torch.float32),
         },
         input_dim=4,
         max_sequence_length=8,
@@ -214,12 +245,23 @@ def test_load_supervision_graphs_excludes_val_edges_and_keeps_all_train_nodes(
 
     train_graph, internal_val_graph = _load_supervision_graphs(config=config)
 
-    assert set(train_graph.nodes) == {"P1", "P2", "P3", "P4", "P5"}
+    assert set(train_graph.nodes) == {"P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10"}
     assert {tuple(sorted(edge)) for edge in train_graph.edges} == {
         ("P1", "P2"),
         ("P2", "P3"),
     }
-    assert set(internal_val_graph.nodes) == {"P1", "P2", "P3", "P4", "P5"}
+    assert set(internal_val_graph.nodes) == {
+        "P1",
+        "P2",
+        "P3",
+        "P4",
+        "P5",
+        "P6",
+        "P7",
+        "P8",
+        "P9",
+        "P10",
+    }
     assert {tuple(sorted(edge)) for edge in internal_val_graph.edges} == {
         ("P1", "P2"),
         ("P3", "P4"),
@@ -560,9 +602,9 @@ def test_run_topology_finetuning_stage_allows_embedding_generation_on_non_main_r
             cache_dir=Path(str(config["data_config"]["embeddings"]["cache_dir"])),  # type: ignore[index]
             index={
                 protein_id: f"embeddings/{protein_id}.pt"
-                for protein_id in ("P1", "P2", "P3", "P4", "P5")
+                for protein_id in ("P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10")
             },
-            required_ids=frozenset({"P1", "P2", "P3", "P4", "P5"}),
+            required_ids=frozenset({"P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10"}),
         )
 
     monkeypatch.setattr(

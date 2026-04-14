@@ -90,7 +90,7 @@ topology_finetune:
   init_mode: "warm_start"
   epochs: 15
   subgraphs_per_epoch: 452
-  validation_mode: "whole_graph"
+  validation_mode: "sampled"
   min_nodes: 20
   max_nodes: 20
   strategy: "mixed"

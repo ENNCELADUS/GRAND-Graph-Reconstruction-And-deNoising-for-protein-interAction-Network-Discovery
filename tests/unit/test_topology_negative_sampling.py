@@ -149,6 +149,9 @@ def test_write_exclusive_ratio_supervision_files_keeps_validation_positives_out_
                 "P5\tP6",
                 "P7\tP8",
                 "P9\tP10",
+                "P11\tP12",
+                "P13\tP14",
+                "P15\tP16",
                 "",
             ]
         ),
@@ -183,6 +186,9 @@ def test_write_exclusive_ratio_supervision_files_keeps_validation_positives_out_
         "\n".join(
             [
                 "P9\tP10\t1",
+                "P11\tP12\t1",
+                "P13\tP14\t1",
+                "P15\tP16\t1",
                 "P2\tP5\t0",
                 "",
             ]

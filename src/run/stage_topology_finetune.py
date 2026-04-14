@@ -27,10 +27,13 @@ from src.run.stage_train import (
     _save_checkpoint,
 )
 from src.topology.finetune_data import (
+    ExplicitNegativePairLookup,
     SubgraphPairChunk,
+    build_explicit_negative_lookup,
     build_pair_supervision_graph,
     iter_subgraph_pair_chunks,
     load_split_node_ids,
+    sample_edge_cover_subgraphs,
     sample_training_subgraphs,
 )
 from src.topology.finetune_losses import (
@@ -45,6 +48,7 @@ from src.topology.metrics import (
     compute_relative_density,
     degree_distribution,
 )
+from src.topology.negative_sampling import ensure_ratio_supervision_files
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -74,6 +78,11 @@ TOPOLOGY_FINETUNE_CSV_COLUMNS = [
     "Internal Val relative_density",
     "Internal Val deg_dist_mmd",
     "Internal Val cc_mmd",
+    "Planned Subgraphs",
+    "Covered Positive Edges",
+    "Total Positive Edges",
+    "Positive Edge Coverage Ratio",
+    "Mean Positive Edge Reuse",
     "Learning Rate",
 ]
 
@@ -119,6 +128,38 @@ def _load_supervision_graphs(*, config: ConfigDict) -> tuple[nx.Graph, nx.Graph]
     data_cfg = get_section(config, "data_config")
     benchmark_cfg = get_section(data_cfg, "benchmark")
     dataloader_cfg = get_section(data_cfg, "dataloader")
+    finetune_cfg = _topology_finetune_config(config)
+    processed_dir = Path(str(benchmark_cfg.get("processed_dir", "")))
+    species = as_str(benchmark_cfg.get("species", "human"), "data_config.benchmark.species")
+    split_strategy = as_str(
+        benchmark_cfg.get("split_strategy", "BFS"),
+        "data_config.benchmark.split_strategy",
+    ).upper()
+    split_path = processed_dir / f"{species}_{split_strategy}_split.pkl"
+    train_pair_path = Path(
+        str(finetune_cfg.get("supervision_train_dataset", dataloader_cfg.get("train_dataset", "")))
+    )
+    valid_pair_path = Path(
+        str(finetune_cfg.get("supervision_valid_dataset", dataloader_cfg.get("valid_dataset", "")))
+    )
+    train_nodes = load_split_node_ids(split_path=split_path, split_name="train")
+    train_graph = build_pair_supervision_graph(
+        pair_path=train_pair_path,
+        node_ids=train_nodes,
+    )
+    internal_val_graph = build_pair_supervision_graph(
+        pair_path=valid_pair_path,
+        node_ids=train_nodes,
+    )
+    return train_graph, internal_val_graph
+
+
+def _load_train_negative_lookup(*, config: ConfigDict) -> ExplicitNegativePairLookup:
+    """Load explicit train negatives used for masked BCE supervision."""
+    data_cfg = get_section(config, "data_config")
+    benchmark_cfg = get_section(data_cfg, "benchmark")
+    dataloader_cfg = get_section(data_cfg, "dataloader")
+    finetune_cfg = _topology_finetune_config(config)
     processed_dir = Path(str(benchmark_cfg.get("processed_dir", "")))
     species = as_str(benchmark_cfg.get("species", "human"), "data_config.benchmark.species")
     split_strategy = as_str(
@@ -127,15 +168,10 @@ def _load_supervision_graphs(*, config: ConfigDict) -> tuple[nx.Graph, nx.Graph]
     ).upper()
     split_path = processed_dir / f"{species}_{split_strategy}_split.pkl"
     train_nodes = load_split_node_ids(split_path=split_path, split_name="train")
-    train_graph = build_pair_supervision_graph(
-        pair_path=Path(str(dataloader_cfg.get("train_dataset", ""))),
-        node_ids=train_nodes,
+    train_pair_path = Path(
+        str(finetune_cfg.get("supervision_train_dataset", dataloader_cfg.get("train_dataset", "")))
     )
-    internal_val_graph = build_pair_supervision_graph(
-        pair_path=Path(str(dataloader_cfg.get("valid_dataset", ""))),
-        node_ids=train_nodes,
-    )
-    return train_graph, internal_val_graph
+    return build_explicit_negative_lookup(pair_path=train_pair_path, node_ids=train_nodes)
 
 
 def _parse_loss_weights(config: ConfigDict) -> TopologyLossWeights:
@@ -177,6 +213,26 @@ def _resolve_sampling_node_bounds(finetune_cfg: ConfigDict) -> tuple[int, int]:
     return min_nodes, max_nodes
 
 
+def _resolve_overlap_penalty(finetune_cfg: ConfigDict) -> float:
+    """Return overlap penalty for edge-cover sampling."""
+    overlap_penalty_raw = finetune_cfg.get("overlap_penalty")
+    if overlap_penalty_raw is None:
+        epoch_sampling_cfg = finetune_cfg.get("epoch_sampling", {})
+        if epoch_sampling_cfg is None:
+            epoch_sampling_cfg = {}
+        if not isinstance(epoch_sampling_cfg, dict):
+            raise ValueError("topology_finetune.epoch_sampling must be a mapping")
+        overlap_penalty_raw = epoch_sampling_cfg.get("overlap_penalty", 0.5)
+
+    overlap_penalty = as_float(
+        overlap_penalty_raw,
+        "topology_finetune.overlap_penalty",
+    )
+    if overlap_penalty < 0.0:
+        raise ValueError("topology_finetune.overlap_penalty must be >= 0")
+    return overlap_penalty
+
+
 def _resolve_init_mode(finetune_cfg: ConfigDict) -> str:
     """Return topology fine-tuning initialization mode."""
     init_mode = as_str(
@@ -188,6 +244,17 @@ def _resolve_init_mode(finetune_cfg: ConfigDict) -> str:
     return init_mode
 
 
+def _resolve_bce_negative_ratio(finetune_cfg: ConfigDict) -> int:
+    """Return the per-subgraph negative-to-positive BCE ratio."""
+    negative_ratio = as_int(
+        finetune_cfg.get("bce_negative_ratio", 5),
+        "topology_finetune.bce_negative_ratio",
+    )
+    if negative_ratio < 0:
+        raise ValueError("topology_finetune.bce_negative_ratio must be >= 0")
+    return negative_ratio
+
+
 def _build_internal_validation_node_sets(
     *,
     finetune_cfg: ConfigDict,
@@ -196,7 +263,7 @@ def _build_internal_validation_node_sets(
 ) -> list[tuple[str, ...]]:
     """Build node sets used for internal topology validation."""
     validation_mode = as_str(
-        finetune_cfg.get("validation_mode", "whole_graph"),
+        finetune_cfg.get("validation_mode", "sampled"),
         "topology_finetune.validation_mode",
     ).lower()
     if validation_mode == "whole_graph":
@@ -217,6 +284,44 @@ def _build_internal_validation_node_sets(
         seed=seed,
     )
     return [tuple(nodes) for nodes in sampled_subgraphs]
+
+
+def _prepare_topology_supervision_datasets(*, config: ConfigDict) -> None:
+    """Materialize configured ratio-supervision datasets before stage startup."""
+    finetune_cfg = _topology_finetune_config(config)
+    train_output_raw = finetune_cfg.get("supervision_train_dataset")
+    valid_output_raw = finetune_cfg.get("supervision_valid_dataset")
+    if train_output_raw is None or valid_output_raw is None:
+        return
+
+    negative_ratio = _resolve_bce_negative_ratio(finetune_cfg)
+    if negative_ratio <= 0:
+        return
+
+    data_cfg = get_section(config, "data_config")
+    benchmark_cfg = get_section(data_cfg, "benchmark")
+    dataloader_cfg = get_section(data_cfg, "dataloader")
+    run_cfg = get_section(config, "run_config")
+
+    species = as_str(benchmark_cfg.get("species", "human"), "data_config.benchmark.species")
+    processed_dir = Path(str(benchmark_cfg.get("processed_dir", "")))
+    split_dir = Path(str(train_output_raw)).parent
+    manifest = ensure_ratio_supervision_files(
+        split_dir=split_dir,
+        global_positive_path=processed_dir.parent / f"{species}_ppi.txt",
+        train_input_path=Path(str(dataloader_cfg.get("train_dataset", ""))),
+        valid_input_path=Path(str(dataloader_cfg.get("valid_dataset", ""))),
+        test_input_path=Path(str(dataloader_cfg.get("test_dataset", ""))),
+        negative_ratio=negative_ratio,
+        seed=as_int(run_cfg.get("seed", 0), "run_config.seed"),
+        train_output_path=Path(str(train_output_raw)),
+        valid_output_path=Path(str(valid_output_raw)),
+        test_output_path=Path(
+            str(split_dir / f"{species}_test_ppi_ratio{negative_ratio}_exclusive.txt")
+        ),
+    )
+    finetune_cfg["supervision_train_dataset"] = str(manifest.train_output_path)
+    finetune_cfg["supervision_valid_dataset"] = str(manifest.valid_output_path)
 
 
 def _resolve_internal_validation_threshold(
@@ -254,12 +359,16 @@ def _move_chunk_to_device(
     device: torch.device,
 ) -> dict[str, torch.Tensor]:
     """Convert a chunk object into model-ready tensors on device."""
+    bce_label = chunk.bce_label if chunk.bce_label is not None else chunk.label
+    bce_mask = chunk.bce_mask if chunk.bce_mask is not None else torch.ones_like(chunk.label)
     return {
         "emb_a": chunk.emb_a.to(device),
         "emb_b": chunk.emb_b.to(device),
         "len_a": chunk.len_a.to(device),
         "len_b": chunk.len_b.to(device),
         "label": chunk.label.to(device),
+        "bce_label": bce_label.to(device),
+        "bce_mask": bce_mask.to(device),
         "pair_index_a": chunk.pair_index_a.to(device),
         "pair_index_b": chunk.pair_index_b.to(device),
     }
@@ -305,10 +414,15 @@ def _concat_logits_and_pairs(
     max_sequence_length: int,
     pair_batch_size: int,
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    negative_lookup: ExplicitNegativePairLookup | None = None,
+    negative_ratio: int = 1,
+    seed: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Forward one sampled subgraph and collect all pair logits and labels."""
     logits_list: list[torch.Tensor] = []
     labels_list: list[torch.Tensor] = []
+    bce_labels_list: list[torch.Tensor] = []
+    bce_mask_list: list[torch.Tensor] = []
     pair_index_a_list: list[torch.Tensor] = []
     pair_index_b_list: list[torch.Tensor] = []
 
@@ -320,6 +434,9 @@ def _concat_logits_and_pairs(
         input_dim=input_dim,
         max_sequence_length=max_sequence_length,
         pair_batch_size=pair_batch_size,
+        negative_lookup=negative_lookup,
+        negative_ratio=negative_ratio,
+        seed=seed,
     ):
         batch = _move_chunk_to_device(chunk=chunk, device=device)
         output = _forward_model(model=model, batch=batch)
@@ -328,12 +445,16 @@ def _concat_logits_and_pairs(
             logits = logits.squeeze(-1)
         logits_list.append(logits)
         labels_list.append(batch["label"].float())
+        bce_labels_list.append(batch["bce_label"].float())
+        bce_mask_list.append(batch["bce_mask"].float())
         pair_index_a_list.append(batch["pair_index_a"])
         pair_index_b_list.append(batch["pair_index_b"])
 
     return (
         torch.cat(logits_list, dim=0),
         torch.cat(labels_list, dim=0),
+        torch.cat(bce_labels_list, dim=0),
+        torch.cat(bce_mask_list, dim=0),
         torch.cat(pair_index_a_list, dim=0),
         torch.cat(pair_index_b_list, dim=0),
     )
@@ -517,21 +638,28 @@ def _fit_epoch(
     pair_batch_size: int,
     use_amp: bool,
     scaler: torch.amp.GradScaler,
+    negative_lookup: ExplicitNegativePairLookup | None,
 ) -> dict[str, float]:
     """Run one fine-tuning epoch over sampled train subgraphs."""
     finetune_cfg = _topology_finetune_config(config)
     min_nodes, max_nodes = _resolve_sampling_node_bounds(finetune_cfg)
-    sampled_subgraphs = sample_training_subgraphs(
+    subgraphs_per_epoch = as_int(
+        finetune_cfg.get("subgraphs_per_epoch", 0),
+        "topology_finetune.subgraphs_per_epoch",
+    )
+    strategy = as_str(finetune_cfg.get("strategy", "mixed"), "topology_finetune.strategy")
+    overlap_penalty = _resolve_overlap_penalty(finetune_cfg)
+    negative_ratio = _resolve_bce_negative_ratio(finetune_cfg)
+    epoch_plan = sample_edge_cover_subgraphs(
         graph=graph,
-        num_subgraphs=as_int(
-            finetune_cfg.get("subgraphs_per_epoch", 16),
-            "topology_finetune.subgraphs_per_epoch",
-        ),
+        num_subgraphs=subgraphs_per_epoch,
         min_nodes=min_nodes,
         max_nodes=max_nodes,
-        strategy=as_str(finetune_cfg.get("strategy", "mixed"), "topology_finetune.strategy"),
+        strategy=strategy,
         seed=rank_seed + epoch_index,
+        overlap_penalty=overlap_penalty,
     )
+    sampled_subgraphs = epoch_plan.subgraphs
     loss_cfg = _build_loss_config(get_section(config, "training_config"))
     aggregates = {
         "bce": 0.0,
@@ -540,13 +668,25 @@ def _fit_epoch(
         "degree_mmd": 0.0,
         "clustering_mmd": 0.0,
         "total": 0.0,
+        "planned_subgraphs": float(len(sampled_subgraphs)),
+        "covered_positive_edges": float(epoch_plan.covered_positive_edges),
+        "total_positive_edges": float(epoch_plan.total_positive_edges),
+        "positive_edge_coverage_ratio": epoch_plan.positive_edge_coverage_ratio,
+        "mean_positive_edge_reuse": epoch_plan.mean_positive_edge_reuse,
     }
 
     model.train()
-    for nodes in sampled_subgraphs:
+    for subgraph_index, nodes in enumerate(sampled_subgraphs):
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type=device.type, enabled=use_amp):
-            logits, labels, pair_index_a, pair_index_b = _concat_logits_and_pairs(
+            (
+                logits,
+                labels,
+                bce_labels,
+                bce_mask,
+                pair_index_a,
+                pair_index_b,
+            ) = _concat_logits_and_pairs(
                 model=model,
                 graph=graph,
                 nodes=nodes,
@@ -556,13 +696,21 @@ def _fit_epoch(
                 max_sequence_length=max_sequence_length,
                 pair_batch_size=pair_batch_size,
                 device=device,
+                negative_lookup=negative_lookup,
+                negative_ratio=negative_ratio,
+                seed=(rank_seed + epoch_index) * 1000 + subgraph_index,
             )
-            bce_loss = binary_classification_loss(
+            per_pair_bce = binary_classification_loss(
                 logits=logits,
-                labels=labels,
+                labels=bce_labels,
                 loss_config=loss_cfg,
-                reduction="mean",
+                reduction="none",
             )
+            bce_mask_sum = bce_mask.sum()
+            if float(bce_mask_sum.detach().item()) <= 0.0:
+                bce_loss = torch.zeros((), dtype=per_pair_bce.dtype, device=per_pair_bce.device)
+            else:
+                bce_loss = (per_pair_bce * bce_mask).sum() / bce_mask_sum
             pred_adjacency, target_adjacency = _subgraph_adjacencies(
                 num_nodes=len(nodes),
                 logits=logits,
@@ -592,7 +740,18 @@ def _fit_epoch(
         aggregates["total"] += float(total_loss.detach().item())
 
     denominator = float(max(1, len(sampled_subgraphs)))
-    return {name: value / denominator for name, value in aggregates.items()}
+    averaged_keys = {
+        "bce",
+        "graph_similarity",
+        "relative_density",
+        "degree_mmd",
+        "clustering_mmd",
+        "total",
+    }
+    return {
+        name: (value / denominator if name in averaged_keys else value)
+        for name, value in aggregates.items()
+    }
 
 
 def run_topology_finetuning_stage(
@@ -664,9 +823,11 @@ def run_topology_finetuning_stage(
         "device_config.use_mixed_precision",
     )
 
+    _prepare_topology_supervision_datasets(config=config)
     train_path = Path(str(dataloader_cfg.get("train_dataset", "")))
     valid_path = Path(str(dataloader_cfg.get("valid_dataset", "")))
     train_graph, internal_val_graph = _load_supervision_graphs(config=config)
+    train_negative_lookup = _load_train_negative_lookup(config=config)
     allow_embedding_generation = (
         dist.is_available() and dist.is_initialized()
         if distributed_context.is_distributed
@@ -704,6 +865,7 @@ def run_topology_finetuning_stage(
         use_amp=use_amp,
     )
     loss_weights = _parse_loss_weights(config)
+    overlap_penalty = _resolve_overlap_penalty(finetune_cfg)
     early_stopping = EarlyStopping(
         patience=patience,
         mode=_resolve_monitor_mode(monitor_metric),
@@ -724,9 +886,9 @@ def run_topology_finetuning_stage(
             "finetune_config",
             epochs=epochs,
             monitor=monitor_metric,
-            subgraphs_per_epoch=finetune_cfg.get("subgraphs_per_epoch", 16),
             internal_validation_subgraphs=len(internal_validation_node_sets),
             pair_batch_size=pair_batch_size,
+            overlap_penalty=overlap_penalty,
         )
 
     for epoch in range(epochs):
@@ -748,6 +910,7 @@ def run_topology_finetuning_stage(
             pair_batch_size=pair_batch_size,
             use_amp=use_amp,
             scaler=scaler,
+            negative_lookup=train_negative_lookup,
         )
         train_stats = {
             name: _all_reduce_mean(
@@ -812,6 +975,11 @@ def run_topology_finetuning_stage(
                     ],
                     "Internal Val deg_dist_mmd": internal_val_topology_stats["deg_dist_mmd"],
                     "Internal Val cc_mmd": internal_val_topology_stats["cc_mmd"],
+                    "Planned Subgraphs": int(train_stats["planned_subgraphs"]),
+                    "Covered Positive Edges": int(train_stats["covered_positive_edges"]),
+                    "Total Positive Edges": int(train_stats["total_positive_edges"]),
+                    "Positive Edge Coverage Ratio": train_stats["positive_edge_coverage_ratio"],
+                    "Mean Positive Edge Reuse": train_stats["mean_positive_edge_reuse"],
                     "Learning Rate": float(optimizer.param_groups[0]["lr"]),
                 },
                 fieldnames=TOPOLOGY_FINETUNE_CSV_COLUMNS,
@@ -831,6 +999,11 @@ def run_topology_finetuning_stage(
                     ],
                     "internal_val_deg_dist_mmd": internal_val_topology_stats["deg_dist_mmd"],
                     "internal_val_cc_mmd": internal_val_topology_stats["cc_mmd"],
+                    "planned_subgraphs": train_stats["planned_subgraphs"],
+                    "covered_positive_edges": train_stats["covered_positive_edges"],
+                    "total_positive_edges": train_stats["total_positive_edges"],
+                    "positive_edge_coverage_ratio": train_stats["positive_edge_coverage_ratio"],
+                    "mean_positive_edge_reuse": train_stats["mean_positive_edge_reuse"],
                 }
                 metrics_path.write_text(
                     json.dumps(best_metrics, indent=2, sort_keys=True),
@@ -850,6 +1023,11 @@ def run_topology_finetuning_stage(
                 train_loss=train_stats["total"],
                 val_auprc=float(val_pair_stats.get("val_auprc", 0.0)),
                 internal_val_graph_sim=internal_val_topology_stats["graph_sim"],
+                planned_subgraphs=int(train_stats["planned_subgraphs"]),
+                covered_positive_edges=int(train_stats["covered_positive_edges"]),
+                total_positive_edges=int(train_stats["total_positive_edges"]),
+                positive_edge_coverage_ratio=train_stats["positive_edge_coverage_ratio"],
+                mean_positive_edge_reuse=train_stats["mean_positive_edge_reuse"],
             )
 
         if distributed_context.is_distributed:
