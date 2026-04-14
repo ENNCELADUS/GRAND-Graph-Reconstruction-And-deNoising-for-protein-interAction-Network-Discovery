@@ -79,8 +79,10 @@ training_config:
     anneal_strategy: "cos"
   loss:
     type: "bce_with_logits"
-    pos_weight: 1.0
-    label_smoothing: 0.05
+    # topology_finetune reinterprets missing within-subgraph pairs as negatives,
+    # so scratch runs need extra positive pressure and less target smoothing.
+    pos_weight: 3.0
+    label_smoothing: 0.0
   strategy:
     type: "none"
   domain_adaptation:
@@ -97,17 +99,20 @@ topology_finetune:
   max_nodes: 20
   strategy: "mixed"
   pair_batch_size: 16
-  decision_threshold: 0.5
+  decision_threshold:
+    mode: "best_f1_on_valid"
   monitor_metric: "internal_val_graph_sim"
   early_stopping_patience: 5
   optimizer:
     lr: 3.0e-6
     weight_decay: 3.0e-3
   losses:
-    alpha: 0.25
-    beta: 0.20
-    gamma: 0.10
-    delta: 0.10
+    # Scratch regime: keep topology as a weak structural prior until BCE learns
+    # a usable pairwise scorer. Relative-density was dominating the old setup.
+    alpha: 0.08
+    beta: 0.03
+    gamma: 0.02
+    delta: 0.02
     histogram_sigma: 1.5
     degree_bins: 32
     clustering_bins: 48

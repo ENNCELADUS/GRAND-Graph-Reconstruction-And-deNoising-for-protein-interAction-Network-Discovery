@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 
 from src.embed import ensure_embeddings_ready
 from src.evaluate import Evaluator
+from src.run.stage_evaluate import _resolve_decision_threshold
 from src.run.stage_train import (
     _build_loss_config,
     _build_stage_runtime,
@@ -218,6 +219,35 @@ def _build_internal_validation_node_sets(
     return [tuple(nodes) for nodes in sampled_subgraphs]
 
 
+def _resolve_internal_validation_threshold(
+    *,
+    config: ConfigDict,
+    evaluator: Evaluator,
+    model: nn.Module,
+    dataloaders: dict[str, DataLoader[dict[str, object]]],
+    device: torch.device,
+) -> tuple[float, str]:
+    """Resolve the hard threshold used for internal topology validation."""
+    finetune_cfg = _topology_finetune_config(config)
+    evaluate_cfg = config.get("evaluate", {})
+    if not isinstance(evaluate_cfg, dict):
+        raise ValueError("evaluate must be a mapping")
+
+    threshold_cfg: ConfigDict = {
+        "decision_threshold": finetune_cfg.get(
+            "decision_threshold",
+            cast(ConfigDict, evaluate_cfg).get("decision_threshold", 0.5),
+        )
+    }
+    return _resolve_decision_threshold(
+        eval_cfg=threshold_cfg,
+        evaluator=evaluator,
+        model=model,
+        dataloaders=dataloaders,
+        device=device,
+    )
+
+
 def _move_chunk_to_device(
     *,
     chunk: SubgraphPairChunk,
@@ -363,8 +393,10 @@ def _predict_hard_subgraph(
     device: torch.device,
 ) -> nx.Graph:
     """Predict one hard-thresholded node-induced subgraph."""
-    logits, _, pair_index_a, pair_index_b = _concat_logits_and_pairs(
-        model=model,
+    node_tuple = tuple(nodes)
+    pred_subgraph = nx.Graph()
+    pred_subgraph.add_nodes_from(node_tuple)
+    for chunk in iter_subgraph_pair_chunks(
         graph=graph,
         nodes=nodes,
         cache_dir=cache_dir,
@@ -372,17 +404,19 @@ def _predict_hard_subgraph(
         input_dim=input_dim,
         max_sequence_length=max_sequence_length,
         pair_batch_size=pair_batch_size,
-        device=device,
-    )
-    node_tuple = tuple(nodes)
-    pred_subgraph = nx.Graph()
-    pred_subgraph.add_nodes_from(node_tuple)
-    probabilities = torch.sigmoid(logits).detach().cpu()
-    rows = pair_index_a.detach().cpu().tolist()
-    cols = pair_index_b.detach().cpu().tolist()
-    for row_idx, col_idx, probability in zip(rows, cols, probabilities.tolist(), strict=True):
-        if probability >= threshold:
-            pred_subgraph.add_edge(node_tuple[row_idx], node_tuple[col_idx])
+    ):
+        batch = _move_chunk_to_device(chunk=chunk, device=device)
+        output = _forward_model(model=model, batch=batch)
+        logits = output["logits"]
+        if logits.dim() > 1 and logits.size(-1) == 1:
+            logits = logits.squeeze(-1)
+
+        probabilities = torch.sigmoid(logits).detach().cpu().tolist()
+        rows = chunk.pair_index_a.tolist()
+        cols = chunk.pair_index_b.tolist()
+        for row_idx, col_idx, probability in zip(rows, cols, probabilities, strict=True):
+            if float(probability) >= threshold:
+                pred_subgraph.add_edge(node_tuple[row_idx], node_tuple[col_idx])
     return pred_subgraph
 
 
@@ -668,6 +702,11 @@ def run_topology_finetuning_stage(
         loss_config=_build_loss_config(training_cfg),
         use_amp=use_amp,
     )
+    threshold_probe = Evaluator(
+        metrics=["f1"],
+        loss_config=_build_loss_config(training_cfg),
+        use_amp=use_amp,
+    )
     loss_weights = _parse_loss_weights(config)
     early_stopping = EarlyStopping(
         patience=patience,
@@ -731,6 +770,13 @@ def run_topology_finetuning_stage(
                 device=device,
                 prefix="val",
             )
+        decision_threshold, _ = _resolve_internal_validation_threshold(
+            config=config,
+            evaluator=threshold_probe,
+            model=model,
+            dataloaders=dataloaders,
+            device=device,
+        )
         internal_val_topology_stats = _evaluate_internal_validation_subgraphs(
             model=model,
             graph=internal_val_graph,

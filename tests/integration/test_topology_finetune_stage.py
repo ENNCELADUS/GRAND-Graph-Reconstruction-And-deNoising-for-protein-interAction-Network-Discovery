@@ -14,16 +14,19 @@ import pytest
 import src.run.stage_topology_finetune as topology_finetune_stage
 import torch
 from src.embed import EmbeddingCacheManifest
+from src.evaluate import Evaluator
 from src.run.stage_topology_finetune import (
     _build_internal_validation_node_sets,
     _forward_model,
     _load_supervision_graphs,
+    _resolve_internal_validation_threshold,
     _resolve_monitor_mode,
     _resolve_monitor_value,
     _resolve_sampling_node_bounds,
     run_topology_finetuning_stage,
 )
 from src.run.stage_train import build_model
+from src.topology.finetune_data import SubgraphPairChunk
 from src.utils.config import ConfigDict
 from src.utils.data_io import build_dataloaders
 from src.utils.distributed import DistributedContext
@@ -246,6 +249,43 @@ def test_build_internal_validation_node_sets_uses_whole_graph_by_default() -> No
     assert node_sets == [("P1", "P2", "P3")]
 
 
+def test_resolve_internal_validation_threshold_uses_validation_selected_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["decision_threshold"] = {"mode": "best_f1_on_valid"}
+
+    observed_calls: list[str] = []
+
+    class _ThresholdProbe:
+        def select_best_f1_threshold(
+            self,
+            *,
+            model: torch.nn.Module,
+            data_loader: DataLoader[dict[str, object]],
+            device: torch.device,
+        ) -> float:
+            del model, data_loader, device
+            observed_calls.append("called")
+            return 0.125
+
+    dataloaders = build_dataloaders(config=config)
+    threshold, mode = _resolve_internal_validation_threshold(
+        config=config,
+        evaluator=cast(Evaluator, _ThresholdProbe()),
+        model=build_model(config).eval(),
+        dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+        device=torch.device("cpu"),
+    )
+
+    assert threshold == pytest.approx(0.125)
+    assert mode == "best_f1_on_valid"
+    assert observed_calls == ["called"]
+
+
 def test_resolve_monitor_mode_uses_min_for_val_loss() -> None:
     assert _resolve_monitor_mode("val_loss") == "min"
     assert _resolve_monitor_mode("val_auprc") == "max"
@@ -312,6 +352,76 @@ def test_forward_model_uses_activation_checkpointing_during_training(
     output["logits"].sum().backward()
 
     assert observed_checkpoint_calls == [True]
+
+
+def test_predict_hard_subgraph_streams_pair_chunks_for_inference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _ToyModel(torch.nn.Module):
+        def forward(
+            self,
+            emb_a: torch.Tensor,
+            emb_b: torch.Tensor,
+            len_a: torch.Tensor,
+            len_b: torch.Tensor,
+            **_: object,
+        ) -> dict[str, torch.Tensor]:
+            del emb_b, len_a, len_b
+            if emb_a.size(0) == 2:
+                logits = torch.tensor([10.0, -10.0], dtype=torch.float32)
+            else:
+                logits = torch.tensor([10.0], dtype=torch.float32)
+            return {"logits": logits}
+
+    node_tuple = ("P1", "P2", "P3")
+
+    def _chunk_stream(**_: object) -> Sequence[SubgraphPairChunk]:
+        return [
+            SubgraphPairChunk(
+                nodes=node_tuple,
+                emb_a=torch.ones((2, 1, 4), dtype=torch.float32),
+                emb_b=torch.ones((2, 1, 4), dtype=torch.float32),
+                len_a=torch.tensor([1, 1], dtype=torch.long),
+                len_b=torch.tensor([1, 1], dtype=torch.long),
+                label=torch.tensor([1.0, 0.0], dtype=torch.float32),
+                pair_index_a=torch.tensor([0, 0], dtype=torch.long),
+                pair_index_b=torch.tensor([1, 2], dtype=torch.long),
+            ),
+            SubgraphPairChunk(
+                nodes=node_tuple,
+                emb_a=torch.ones((1, 1, 4), dtype=torch.float32),
+                emb_b=torch.ones((1, 1, 4), dtype=torch.float32),
+                len_a=torch.tensor([1], dtype=torch.long),
+                len_b=torch.tensor([1], dtype=torch.long),
+                label=torch.tensor([1.0], dtype=torch.float32),
+                pair_index_a=torch.tensor([1], dtype=torch.long),
+                pair_index_b=torch.tensor([2], dtype=torch.long),
+            ),
+        ]
+
+    monkeypatch.setattr(topology_finetune_stage, "iter_subgraph_pair_chunks", _chunk_stream)
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_concat_logits_and_pairs",
+        lambda **_: (_ for _ in ()).throw(
+            AssertionError("streaming inference should not concatenate all pair tensors")
+        ),
+    )
+
+    pred_subgraph = topology_finetune_stage._predict_hard_subgraph(
+        model=_ToyModel().eval(),
+        graph=nx.Graph(),
+        nodes=node_tuple,
+        cache_dir=Path("."),
+        embedding_index={protein_id: f"{protein_id}.pt" for protein_id in node_tuple},
+        input_dim=4,
+        max_sequence_length=8,
+        pair_batch_size=2,
+        threshold=0.5,
+        device=torch.device("cpu"),
+    )
+
+    assert sorted(pred_subgraph.edges()) == [("P1", "P2"), ("P2", "P3")]
 
 
 def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path: Path) -> None:
