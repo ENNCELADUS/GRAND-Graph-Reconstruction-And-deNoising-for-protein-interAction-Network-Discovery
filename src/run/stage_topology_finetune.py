@@ -107,9 +107,7 @@ def _resolve_monitor_value(
             "internal_val_relative_density": -abs(
                 internal_val_topology_stats["relative_density"] - 1.0
             ),
-            "val_relative_density": -abs(
-                internal_val_topology_stats["relative_density"] - 1.0
-            ),
+            "val_relative_density": -abs(internal_val_topology_stats["relative_density"] - 1.0),
             "val_auprc": float(val_pair_stats.get("val_auprc", 0.0)),
         }.get(monitor_metric, internal_val_topology_stats["graph_sim"])
     )
@@ -203,9 +201,7 @@ def _build_internal_validation_node_sets(
     if validation_mode == "whole_graph":
         return [tuple(sorted(graph.nodes))]
     if validation_mode != "sampled":
-        raise ValueError(
-            "topology_finetune.validation_mode must be 'whole_graph' or 'sampled'"
-        )
+        raise ValueError("topology_finetune.validation_mode must be 'whole_graph' or 'sampled'")
 
     min_nodes, max_nodes = _resolve_sampling_node_bounds(finetune_cfg)
     sampled_subgraphs = sample_training_subgraphs(
@@ -246,12 +242,7 @@ def _forward_model(model: nn.Module, batch: Mapping[str, torch.Tensor]) -> dict[
         emb_b = batch.get("emb_b")
         len_a = batch.get("len_a")
         len_b = batch.get("len_b")
-        if (
-            emb_a is not None
-            and emb_b is not None
-            and len_a is not None
-            and len_b is not None
-        ):
+        if emb_a is not None and emb_b is not None and len_a is not None and len_b is not None:
             logits = checkpoint(
                 lambda emb_a, emb_b, len_a, len_b: model(
                     emb_a=emb_a,
@@ -777,9 +768,7 @@ def run_topology_finetuning_stage(
                     "Internal Val relative_density": internal_val_topology_stats[
                         "relative_density"
                     ],
-                    "Internal Val deg_dist_mmd": internal_val_topology_stats[
-                        "deg_dist_mmd"
-                    ],
+                    "Internal Val deg_dist_mmd": internal_val_topology_stats["deg_dist_mmd"],
                     "Internal Val cc_mmd": internal_val_topology_stats["cc_mmd"],
                     "Learning Rate": float(optimizer.param_groups[0]["lr"]),
                 },
@@ -798,9 +787,7 @@ def run_topology_finetuning_stage(
                     "internal_val_relative_density": internal_val_topology_stats[
                         "relative_density"
                     ],
-                    "internal_val_deg_dist_mmd": internal_val_topology_stats[
-                        "deg_dist_mmd"
-                    ],
+                    "internal_val_deg_dist_mmd": internal_val_topology_stats["deg_dist_mmd"],
                     "internal_val_cc_mmd": internal_val_topology_stats["cc_mmd"],
                 }
                 metrics_path.write_text(

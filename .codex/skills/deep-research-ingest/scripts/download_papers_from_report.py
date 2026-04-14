@@ -10,7 +10,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-
 URL_PATTERN = re.compile(r"https?://[^\s`)>]+")
 YEAR_PATTERN = re.compile(r"\b(19|20)\d{2}\b")
 TITLE_PATTERN = re.compile(r"^\s*(?:\d+\)\s*)?\*\*Full title:\*\*\s*(.+?)\s*$")
@@ -270,7 +269,9 @@ def download_pdf(url: str, destination: pathlib.Path, timeout: int) -> None:
         content_type = (response.headers.get("Content-Type") or "").lower()
 
     if b"%PDF" not in data[:1024] and "application/pdf" not in content_type:
-        raise ValueError(f"response did not look like a PDF (content-type={content_type or 'unknown'})")
+        raise ValueError(
+            f"response did not look like a PDF (content-type={content_type or 'unknown'})"
+        )
 
     temp_path = destination.with_suffix(destination.suffix + ".part")
     temp_path.write_bytes(data)
@@ -285,7 +286,9 @@ def load_entries(report_path: pathlib.Path) -> list[PaperEntry]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Download PDFs from a Deep Research markdown report.")
+    parser = argparse.ArgumentParser(
+        description="Download PDFs from a Deep Research markdown report."
+    )
     parser.add_argument(
         "--report",
         default="notes/03_Projects/deep-research-report.md",
@@ -336,7 +339,9 @@ def main() -> int:
         print(f"ERROR: report not found: {report_path}", file=sys.stderr)
         return 1
 
-    entries = [entry for entry in load_entries(report_path) if match_section(entry.section, args.section)]
+    entries = [
+        entry for entry in load_entries(report_path) if match_section(entry.section, args.section)
+    ]
     if args.limit is not None:
         entries = entries[: args.limit]
 
@@ -385,8 +390,7 @@ def main() -> int:
         return 0
 
     print(
-        f"DONE: downloaded={downloaded} skipped={skipped} failed={failed} "
-        f"from report={report_path}"
+        f"DONE: downloaded={downloaded} skipped={skipped} failed={failed} from report={report_path}"
     )
     return 0 if downloaded or skipped else 1
 

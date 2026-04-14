@@ -26,7 +26,6 @@ from src.model.v3 import (
     _to_mapping,
 )
 
-
 # ---------------------------------------------------------------------------
 # Cross-attention layer (identical to V3 — shared weights, bidirectional)
 # ---------------------------------------------------------------------------
@@ -123,6 +122,7 @@ class CrossAttentionLayer(nn.Module):
 # Rich pooling
 # ---------------------------------------------------------------------------
 
+
 class RichPooling(nn.Module):
     """CLS + mean + attention + max pooling with learned gated fusion.
 
@@ -189,6 +189,7 @@ class RichPooling(nn.Module):
 # Interaction cross-attention with rich pooling
 # ---------------------------------------------------------------------------
 
+
 class InteractionCrossAttention(nn.Module):
     """Stacked cross-attention encoder with rich CLS + gated pooling."""
 
@@ -254,6 +255,7 @@ class InteractionCrossAttention(nn.Module):
 # ---------------------------------------------------------------------------
 # V3_1 top-level model
 # ---------------------------------------------------------------------------
+
 
 class V3_1(nn.Module):
     """V3.1 model — V3 with rich per-protein pooling (CLS+mean+attn+max+gate).

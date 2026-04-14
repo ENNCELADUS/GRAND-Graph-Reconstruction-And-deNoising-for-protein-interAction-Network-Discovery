@@ -199,7 +199,7 @@ def _build_finetune_config(tmp_path: Path) -> ConfigDict:
                 "histogram_sigma": 1.0,
             },
         },
-}
+    }
 
 
 def test_load_supervision_graphs_excludes_val_edges_and_keeps_all_train_nodes(
@@ -339,9 +339,7 @@ def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path
         os.chdir(previous_cwd)
 
     log_dir = tmp_path / "logs" / "v3" / "topology_finetune" / "topology_ft_case"
-    assert best_checkpoint == Path(
-        "models/v3/topology_finetune/topology_ft_case/best_model.pth"
-    )
+    assert best_checkpoint == Path("models/v3/topology_finetune/topology_ft_case/best_model.pth")
     best_checkpoint_path = tmp_path / best_checkpoint
     assert best_checkpoint_path.exists()
     assert (log_dir / "topology_finetune_step.csv").exists()
@@ -350,8 +348,7 @@ def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path
 
     updated_state = torch.load(best_checkpoint_path, map_location="cpu")
     assert any(
-        not torch.allclose(initial_state[name], updated_state[name])
-        for name in initial_state
+        not torch.allclose(initial_state[name], updated_state[name]) for name in initial_state
     )
 
 
@@ -460,7 +457,5 @@ def test_run_topology_finetuning_stage_supports_scratch_initialization(
     finally:
         os.chdir(previous_cwd)
 
-    assert best_checkpoint == Path(
-        "models/v3/topology_finetune/topology_ft_case/best_model.pth"
-    )
+    assert best_checkpoint == Path("models/v3/topology_finetune/topology_ft_case/best_model.pth")
     assert observed_checkpoint_loads == []

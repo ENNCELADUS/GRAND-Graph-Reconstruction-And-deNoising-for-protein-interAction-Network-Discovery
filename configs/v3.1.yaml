@@ -1,7 +1,7 @@
 run_config:
-  stages: ["topology_finetune", "evaluate", "topology_evaluate"]
+  stages: ["train", "evaluate", "topology_finetune", "topology_evaluate"]
   seed: 47
-  train_run_id: 20260308_002906
+  train_run_id: null
   topology_finetune_run_id: null
   adapt_run_id: null
   eval_run_id: null
@@ -87,7 +87,7 @@ training_config:
     enabled: false
 
 topology_finetune:
-  init_mode: "scratch"
+  init_mode: "warm_start"
   epochs: 30
   subgraphs_per_epoch: 452
   validation_mode: "sampled"

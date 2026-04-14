@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-import pytest
 import torch
-
 from src.run import build_model
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _base_config(model_name: str = "v3.1") -> dict[str, object]:
     return {
@@ -56,6 +54,7 @@ def _make_batch(
 # Pipeline wiring
 # ---------------------------------------------------------------------------
 
+
 def test_build_model_v3_1_via_factory() -> None:
     """build_model('v3.1') must return a V3_1 instance."""
     model = build_model(_base_config("v3.1"))
@@ -65,6 +64,7 @@ def test_build_model_v3_1_via_factory() -> None:
 # ---------------------------------------------------------------------------
 # Instantiation
 # ---------------------------------------------------------------------------
+
 
 def test_v3_1_instantiation() -> None:
     """V3_1 must instantiate without error from standard config."""
@@ -93,6 +93,7 @@ def test_v3_1_has_rich_pooling_submodule() -> None:
 # ---------------------------------------------------------------------------
 # Forward pass — output shapes
 # ---------------------------------------------------------------------------
+
 
 def test_v3_1_forward_logits_shape() -> None:
     """Forward pass must return logits of shape (batch, 1)."""
@@ -152,6 +153,7 @@ def test_v3_1_forward_no_labels_no_loss_key() -> None:
 # RichPooling module
 # ---------------------------------------------------------------------------
 
+
 def test_rich_pooling_output_shape() -> None:
     """RichPooling must return (batch, d_model) regardless of seq_len."""
     from src.model.v3_1 import RichPooling
@@ -190,6 +192,7 @@ def test_rich_pooling_respects_padding_mask() -> None:
 # Padding / variable-length sequences
 # ---------------------------------------------------------------------------
 
+
 def test_v3_1_forward_variable_lengths() -> None:
     """V3_1 must handle variable-length sequences without error."""
     from src.model.v3_1 import V3_1
@@ -216,6 +219,7 @@ def test_v3_1_forward_variable_lengths() -> None:
 # ---------------------------------------------------------------------------
 # Training mode — gradients flow
 # ---------------------------------------------------------------------------
+
 
 def test_v3_1_gradients_flow() -> None:
     """Loss.backward() must produce non-None gradients for all parameters."""
