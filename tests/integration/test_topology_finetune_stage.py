@@ -697,6 +697,40 @@ def test_run_topology_finetuning_stage_supports_scratch_initialization(
     assert observed_checkpoint_loads == []
 
 
+def test_run_topology_finetuning_stage_requires_prepared_supervision_files(
+    tmp_path: Path,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["init_mode"] = "scratch"
+    topology_cfg["supervision_train_dataset"] = str(
+        tmp_path / "benchmark" / "human" / "BFS" / "missing_train_ratio5.txt"
+    )
+    topology_cfg["supervision_valid_dataset"] = str(
+        tmp_path / "benchmark" / "human" / "BFS" / "missing_valid_ratio5.txt"
+    )
+
+    model = build_model(config)
+    dataloaders = build_dataloaders(config=config)
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        with pytest.raises(FileNotFoundError, match="prepare them offline"):
+            run_topology_finetuning_stage(
+                config=config,
+                model=model,
+                device=torch.device("cpu"),
+                dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+                run_id="topology_ft_case",
+                checkpoint_path=None,
+                distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+            )
+    finally:
+        os.chdir(previous_cwd)
+
+
 def test_prepare_topology_supervision_from_config_generates_missing_ratio_supervision_files(
     tmp_path: Path,
 ) -> None:

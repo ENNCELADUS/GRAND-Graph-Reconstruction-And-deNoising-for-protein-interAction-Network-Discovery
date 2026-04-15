@@ -16,6 +16,7 @@ from torch.nn.utils.rnn import pad_sequence
 from src.embed import load_cached_embedding
 
 SUPPORTED_SAMPLING_STRATEGIES = {"BFS", "DFS", "RANDOM_WALK", "MIXED"}
+BASE_SAMPLING_STRATEGIES: tuple[str, ...] = ("BFS", "DFS", "RANDOM_WALK")
 TOPOLOGY_EVAL_NODE_SIZES: tuple[int, ...] = (20, 40, 60, 80, 100, 120, 140, 160, 180, 200)
 TOPOLOGY_EVAL_SAMPLES_PER_SIZE = 50
 
@@ -178,6 +179,26 @@ def _sample_target_size(
     return rng.randint(min_nodes, upper_bound)
 
 
+def _normalize_sampling_strategy(strategy: str) -> str:
+    """Return a validated uppercase sampling strategy."""
+    normalized_strategy = strategy.upper()
+    if normalized_strategy in SUPPORTED_SAMPLING_STRATEGIES:
+        return normalized_strategy
+    supported = ", ".join(sorted(SUPPORTED_SAMPLING_STRATEGIES))
+    raise ValueError(f"Unsupported subgraph sampling strategy: {strategy} ({supported})")
+
+
+def _choose_sampling_strategy(
+    *,
+    strategy: str,
+    rng: random.Random,
+) -> str:
+    """Resolve one concrete sampling strategy, expanding MIXED lazily."""
+    if strategy == "MIXED":
+        return rng.choice(list(BASE_SAMPLING_STRATEGIES))
+    return strategy
+
+
 def _fallback_complete_nodes(
     *,
     nodes_in_order: list[str],
@@ -196,15 +217,22 @@ def _fallback_complete_nodes(
     return tuple(nodes_in_order)
 
 
-def _sample_bfs_nodes(graph: nx.Graph, target_size: int, rng: random.Random) -> tuple[str, ...]:
-    """Sample one node set by randomized breadth-first expansion."""
+def _sample_frontier_nodes(
+    *,
+    graph: nx.Graph,
+    target_size: int,
+    rng: random.Random,
+    depth_first: bool,
+) -> tuple[str, ...]:
+    """Sample nodes by randomized frontier expansion with restart fallback."""
     graph_nodes = list(graph.nodes)
-    queue: deque[str] = deque([rng.choice(graph_nodes)])
+    frontier: deque[str] | list[str]
+    frontier = [rng.choice(graph_nodes)] if depth_first else deque([rng.choice(graph_nodes)])
     visited: set[str] = set()
     nodes_in_order: list[str] = []
 
-    while queue and len(nodes_in_order) < target_size:
-        node = queue.popleft()
+    while frontier and len(nodes_in_order) < target_size:
+        node = frontier.pop() if depth_first else frontier.popleft()
         if node in visited:
             continue
         visited.add(node)
@@ -213,12 +241,12 @@ def _sample_bfs_nodes(graph: nx.Graph, target_size: int, rng: random.Random) -> 
         rng.shuffle(neighbors)
         for neighbor in neighbors:
             if neighbor not in visited:
-                queue.append(neighbor)
+                frontier.append(neighbor)
 
-        if not queue and len(nodes_in_order) < target_size:
+        if not frontier and len(nodes_in_order) < target_size:
             unseen = [candidate for candidate in graph_nodes if candidate not in visited]
             if unseen:
-                queue.append(rng.choice(unseen))
+                frontier.append(rng.choice(unseen))
 
     return _fallback_complete_nodes(
         nodes_in_order=nodes_in_order,
@@ -228,35 +256,23 @@ def _sample_bfs_nodes(graph: nx.Graph, target_size: int, rng: random.Random) -> 
     )
 
 
-def _sample_dfs_nodes(graph: nx.Graph, target_size: int, rng: random.Random) -> tuple[str, ...]:
-    """Sample one node set by randomized depth-first expansion."""
-    graph_nodes = list(graph.nodes)
-    stack = [rng.choice(graph_nodes)]
-    visited: set[str] = set()
-    nodes_in_order: list[str] = []
-
-    while stack and len(nodes_in_order) < target_size:
-        node = stack.pop()
-        if node in visited:
-            continue
-        visited.add(node)
-        nodes_in_order.append(node)
-        neighbors = list(graph.neighbors(node))
-        rng.shuffle(neighbors)
-        for neighbor in neighbors:
-            if neighbor not in visited:
-                stack.append(neighbor)
-
-        if not stack and len(nodes_in_order) < target_size:
-            unseen = [candidate for candidate in graph_nodes if candidate not in visited]
-            if unseen:
-                stack.append(rng.choice(unseen))
-
-    return _fallback_complete_nodes(
-        nodes_in_order=nodes_in_order,
-        graph_nodes=graph_nodes,
+def _sample_bfs_nodes(graph: nx.Graph, target_size: int, rng: random.Random) -> tuple[str, ...]:
+    """Sample one node set by randomized breadth-first expansion."""
+    return _sample_frontier_nodes(
+        graph=graph,
         target_size=target_size,
         rng=rng,
+        depth_first=False,
+    )
+
+
+def _sample_dfs_nodes(graph: nx.Graph, target_size: int, rng: random.Random) -> tuple[str, ...]:
+    """Sample one node set by randomized depth-first expansion."""
+    return _sample_frontier_nodes(
+        graph=graph,
+        target_size=target_size,
+        rng=rng,
+        depth_first=True,
     )
 
 
@@ -300,32 +316,12 @@ def _build_bfs_order(
     rng: random.Random,
 ) -> list[str]:
     """Return a randomized BFS traversal order from the seed nodes."""
-    queue: deque[str] = deque(seed_nodes)
-    visited = set(seed_nodes)
-    order: list[str] = list(seed_nodes)
-    graph_nodes = list(graph.nodes)
-
-    while len(order) < graph.number_of_nodes():
-        while queue and len(order) < graph.number_of_nodes():
-            node = queue.popleft()
-            neighbors = [neighbor for neighbor in graph.neighbors(node) if neighbor not in visited]
-            rng.shuffle(neighbors)
-            for neighbor in neighbors:
-                visited.add(neighbor)
-                queue.append(neighbor)
-                order.append(neighbor)
-
-        if len(order) >= graph.number_of_nodes():
-            break
-        unseen = [candidate for candidate in graph_nodes if candidate not in visited]
-        if not unseen:
-            break
-        restart = rng.choice(unseen)
-        visited.add(restart)
-        queue.append(restart)
-        order.append(restart)
-
-    return order
+    return _build_frontier_order(
+        graph=graph,
+        seed_nodes=seed_nodes,
+        rng=rng,
+        depth_first=False,
+    )
 
 
 def _build_dfs_order(
@@ -335,19 +331,36 @@ def _build_dfs_order(
     rng: random.Random,
 ) -> list[str]:
     """Return a randomized DFS traversal order from the seed nodes."""
-    stack = list(reversed(seed_nodes))
+    return _build_frontier_order(
+        graph=graph,
+        seed_nodes=seed_nodes,
+        rng=rng,
+        depth_first=True,
+    )
+
+
+def _build_frontier_order(
+    *,
+    graph: nx.Graph,
+    seed_nodes: Sequence[str],
+    rng: random.Random,
+    depth_first: bool,
+) -> list[str]:
+    """Return a randomized BFS/DFS traversal order with restart fallback."""
+    frontier: deque[str] | list[str]
+    frontier = list(reversed(seed_nodes)) if depth_first else deque(seed_nodes)
     visited = set(seed_nodes)
     order: list[str] = list(seed_nodes)
     graph_nodes = list(graph.nodes)
 
     while len(order) < graph.number_of_nodes():
-        while stack and len(order) < graph.number_of_nodes():
-            node = stack.pop()
+        while frontier and len(order) < graph.number_of_nodes():
+            node = frontier.pop() if depth_first else frontier.popleft()
             neighbors = [neighbor for neighbor in graph.neighbors(node) if neighbor not in visited]
             rng.shuffle(neighbors)
             for neighbor in neighbors:
                 visited.add(neighbor)
-                stack.append(neighbor)
+                frontier.append(neighbor)
                 order.append(neighbor)
 
         if len(order) >= graph.number_of_nodes():
@@ -357,7 +370,7 @@ def _build_dfs_order(
             break
         restart = rng.choice(unseen)
         visited.add(restart)
-        stack.append(restart)
+        frontier.append(restart)
         order.append(restart)
 
     return order
@@ -533,17 +546,12 @@ def sample_training_subgraphs(
     if num_subgraphs < 0:
         raise ValueError("num_subgraphs must be non-negative")
 
-    normalized_strategy = strategy.upper()
-    if normalized_strategy not in SUPPORTED_SAMPLING_STRATEGIES:
-        supported = ", ".join(sorted(SUPPORTED_SAMPLING_STRATEGIES))
-        raise ValueError(f"Unsupported subgraph sampling strategy: {strategy} ({supported})")
+    normalized_strategy = _normalize_sampling_strategy(strategy)
 
     rng = random.Random(seed)
     sampled_nodes: list[tuple[str, ...]] = []
     for _ in range(num_subgraphs):
-        selected_strategy = normalized_strategy
-        if normalized_strategy == "MIXED":
-            selected_strategy = rng.choice(["BFS", "DFS", "RANDOM_WALK"])
+        selected_strategy = _choose_sampling_strategy(strategy=normalized_strategy, rng=rng)
         target_size = _sample_target_size(
             graph=graph,
             min_nodes=min_nodes,
@@ -609,10 +617,7 @@ def sample_edge_cover_subgraphs(
     if overlap_penalty < 0.0:
         raise ValueError("overlap_penalty must be non-negative")
 
-    normalized_strategy = strategy.upper()
-    if normalized_strategy not in SUPPORTED_SAMPLING_STRATEGIES:
-        supported = ", ".join(sorted(SUPPORTED_SAMPLING_STRATEGIES))
-        raise ValueError(f"Unsupported subgraph sampling strategy: {strategy} ({supported})")
+    normalized_strategy = _normalize_sampling_strategy(strategy)
 
     positive_edges = sorted(_graph_positive_edges(graph))
     if not positive_edges:
@@ -639,9 +644,7 @@ def sample_edge_cover_subgraphs(
             max_nodes=max_nodes,
             rng=rng,
         )
-        selected_strategy = normalized_strategy
-        if normalized_strategy == "MIXED":
-            selected_strategy = rng.choice(["BFS", "DFS", "RANDOM_WALK"])
+        selected_strategy = _choose_sampling_strategy(strategy=normalized_strategy, rng=rng)
 
         seed_edge = _select_seed_edge(
             positive_edges=positive_edges,

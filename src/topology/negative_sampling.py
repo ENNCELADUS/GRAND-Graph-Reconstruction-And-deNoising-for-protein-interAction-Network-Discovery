@@ -1,4 +1,4 @@
-"""PRING-style explicit negative supervision generation utilities."""
+"""Offline PRING explicit-negative supervision generation utilities."""
 
 from __future__ import annotations
 
@@ -16,6 +16,37 @@ class RatioSupervisionManifest:
     train_output_path: Path
     valid_output_path: Path
     test_output_path: Path
+
+
+def _build_ratio_manifest(
+    *,
+    split_dir: Path,
+    negative_ratio: int,
+    train_output_path: Path | None = None,
+    valid_output_path: Path | None = None,
+    test_output_path: Path | None = None,
+) -> RatioSupervisionManifest:
+    """Resolve the on-disk output paths for one ratio-supervision bundle."""
+    return RatioSupervisionManifest(
+        train_output_path=train_output_path
+        or _default_ratio_output_path(
+            split_dir=split_dir,
+            split_name="train",
+            negative_ratio=negative_ratio,
+        ),
+        valid_output_path=valid_output_path
+        or _default_ratio_output_path(
+            split_dir=split_dir,
+            split_name="val",
+            negative_ratio=negative_ratio,
+        ),
+        test_output_path=test_output_path
+        or _default_ratio_output_path(
+            split_dir=split_dir,
+            split_name="test",
+            negative_ratio=negative_ratio,
+        ),
+    )
 
 
 def _default_ratio_output_path(*, split_dir: Path, split_name: str, negative_ratio: int) -> Path:
@@ -204,25 +235,12 @@ def write_exclusive_ratio_supervision_files(
         candidate_nodes=candidate_nodes,
     )
 
-    manifest = RatioSupervisionManifest(
-        train_output_path=train_output_path
-        or _default_ratio_output_path(
-            split_dir=split_dir,
-            split_name="train",
-            negative_ratio=negative_ratio,
-        ),
-        valid_output_path=valid_output_path
-        or _default_ratio_output_path(
-            split_dir=split_dir,
-            split_name="val",
-            negative_ratio=negative_ratio,
-        ),
-        test_output_path=test_output_path
-        or _default_ratio_output_path(
-            split_dir=split_dir,
-            split_name="test",
-            negative_ratio=negative_ratio,
-        ),
+    manifest = _build_ratio_manifest(
+        split_dir=split_dir,
+        negative_ratio=negative_ratio,
+        train_output_path=train_output_path,
+        valid_output_path=valid_output_path,
+        test_output_path=test_output_path,
     )
     _write_labeled_pairs(
         path=manifest.train_output_path,
@@ -256,25 +274,12 @@ def ensure_ratio_supervision_files(
     test_output_path: Path | None = None,
 ) -> RatioSupervisionManifest:
     """Create ratio supervision files on demand and return their manifest."""
-    manifest = RatioSupervisionManifest(
-        train_output_path=train_output_path
-        or _default_ratio_output_path(
-            split_dir=split_dir,
-            split_name="train",
-            negative_ratio=negative_ratio,
-        ),
-        valid_output_path=valid_output_path
-        or _default_ratio_output_path(
-            split_dir=split_dir,
-            split_name="val",
-            negative_ratio=negative_ratio,
-        ),
-        test_output_path=test_output_path
-        or _default_ratio_output_path(
-            split_dir=split_dir,
-            split_name="test",
-            negative_ratio=negative_ratio,
-        ),
+    manifest = _build_ratio_manifest(
+        split_dir=split_dir,
+        negative_ratio=negative_ratio,
+        train_output_path=train_output_path,
+        valid_output_path=valid_output_path,
+        test_output_path=test_output_path,
     )
     if (
         manifest.train_output_path.exists()

@@ -481,7 +481,7 @@ def test_execute_pipeline_topology_finetune_scratch_does_not_require_checkpoint(
     ]
 
 
-def test_execute_pipeline_prepares_topology_supervision_before_stage_launch(
+def test_execute_pipeline_topology_finetune_launches_without_runtime_supervision_preparation(
     base_config: ConfigDict,
     patched_pipeline: PipelineCalls,
     monkeypatch: pytest.MonkeyPatch,
@@ -494,10 +494,6 @@ def test_execute_pipeline_prepares_topology_supervision_before_stage_launch(
 
     base_config["topology_finetune"] = {"init_mode": "scratch"}
     call_order: list[str] = []
-
-    def _fake_prepare_topology_supervision_from_config(config: ConfigDict) -> None:
-        del config
-        call_order.append("prepare")
 
     def _fake_run_topology_finetuning_stage(
         config: ConfigDict,
@@ -513,11 +509,6 @@ def test_execute_pipeline_prepares_topology_supervision_before_stage_launch(
         return Path("artifacts/topology_finetune_best_model.pth")
 
     monkeypatch.setattr(
-        pipeline_orchestrator,
-        "prepare_topology_supervision_from_config",
-        _fake_prepare_topology_supervision_from_config,
-    )
-    monkeypatch.setattr(
         run_module,
         "run_topology_finetuning_stage",
         _fake_run_topology_finetuning_stage,
@@ -525,7 +516,7 @@ def test_execute_pipeline_prepares_topology_supervision_before_stage_launch(
 
     run_module.execute_pipeline(base_config)
 
-    assert call_order == ["prepare", "stage"]
+    assert call_order == ["stage"]
 
 
 def test_execute_pipeline_train_then_topology_finetune_scratch_ignores_train_checkpoint(
