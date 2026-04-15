@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-import logging
-import os
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-
-LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -37,61 +33,6 @@ class DistributedContext:
         return self.rank == 0
 
 
-def initialize_distributed(ddp_enabled: bool) -> DistributedContext:
-    """Initialize distributed context and return process metadata.
-
-    Args:
-        ddp_enabled: Whether distributed mode is enabled in config.
-    """
-    if not ddp_enabled:
-        return DistributedContext(ddp_enabled=False, is_distributed=False)
-
-    if dist.is_initialized():
-        rank = int(dist.get_rank())
-        world_size = int(dist.get_world_size())
-        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        return DistributedContext(
-            ddp_enabled=True,
-            is_distributed=world_size > 1,
-            rank=rank,
-            local_rank=local_rank,
-            world_size=world_size,
-            owns_process_group=False,
-        )
-
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if world_size <= 1:
-        LOGGER.warning("DDP enabled but WORLD_SIZE<=1; running single-process mode.")
-        return DistributedContext(ddp_enabled=True, is_distributed=False)
-
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    if backend == "nccl":
-        torch.cuda.set_device(local_rank)
-    dist.init_process_group(
-        backend=backend,
-        init_method="env://",
-        world_size=world_size,
-        rank=rank,
-    )
-    LOGGER.info(
-        "Initialized distributed process group (backend=%s rank=%d local_rank=%d world_size=%d).",
-        backend,
-        rank,
-        local_rank,
-        world_size,
-    )
-    return DistributedContext(
-        ddp_enabled=True,
-        is_distributed=True,
-        rank=rank,
-        local_rank=local_rank,
-        world_size=world_size,
-        owns_process_group=True,
-    )
-
-
 def distributed_barrier(context: DistributedContext) -> None:
     """Synchronize processes when distributed mode is active.
 
@@ -106,21 +47,9 @@ def distributed_barrier(context: DistributedContext) -> None:
         dist.barrier()
 
 
-def cleanup_distributed(context: DistributedContext) -> None:
-    """Tear down distributed process group if initialized.
-
-    Args:
-        context: Distributed process metadata.
-    """
-    if context.is_distributed and context.owns_process_group and dist.is_initialized():
-        dist.destroy_process_group()
-
-
 __all__ = [
     "DistributedContext",
-    "cleanup_distributed",
     "distributed_barrier",
     "dist",
-    "initialize_distributed",
     "torch",
 ]

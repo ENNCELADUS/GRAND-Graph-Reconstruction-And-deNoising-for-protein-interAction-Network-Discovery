@@ -25,7 +25,6 @@ from src.run.stage_train import (
 from src.utils.accelerator import build_accelerator
 from src.utils.config import ConfigDict, load_config
 from src.utils.data_io import build_dataloaders
-from src.utils.device import resolve_device
 
 ROOT_LOGGER = logging.getLogger(__name__)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -48,7 +47,6 @@ def execute_pipeline(config: ConfigDict) -> None:
         run_evaluation_stage_fn=run_evaluation_stage,
         run_topology_evaluation_stage_fn=run_topology_evaluation_stage,
         build_accelerator_fn=build_accelerator,
-        resolve_device_fn=resolve_device,
     )
 
 
@@ -79,7 +77,6 @@ __all__ = [
     "logging",
     "main",
     "parse_args",
-    "resolve_device",
     "run_shot_adaptation_stage",
     "run_evaluation_stage",
     "run_topology_evaluation_stage",

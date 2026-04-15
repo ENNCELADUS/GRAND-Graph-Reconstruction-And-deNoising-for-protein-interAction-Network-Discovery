@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from contextlib import nullcontext
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import cast
 
@@ -125,10 +125,6 @@ def test_execute_pipeline_writes_stage_logs_and_strict_csv_headers(
         del config
         return _TinyModel()
 
-    def fake_resolve_device(device_name: str) -> torch.device:
-        del device_name
-        return torch.device("cpu")
-
     class _FakeAccelerator:
         device = torch.device("cpu")
         is_main_process = True
@@ -143,7 +139,7 @@ def test_execute_pipeline_writes_stage_logs_and_strict_csv_headers(
                 return components[0]
             return components
 
-        def autocast(self):
+        def autocast(self) -> AbstractContextManager[None]:
             return nullcontext()
 
         def backward(self, loss: torch.Tensor) -> None:
@@ -166,7 +162,6 @@ def test_execute_pipeline_writes_stage_logs_and_strict_csv_headers(
     monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
     monkeypatch.setattr(run_module, "build_model", fake_build_model)
     monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
-    monkeypatch.setattr(run_module, "resolve_device", fake_resolve_device)
 
     run_module.execute_pipeline(_base_config(stages=["train", "evaluate"]))
 

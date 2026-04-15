@@ -31,7 +31,6 @@ from src.utils.config import (
     get_section,
 )
 from src.utils.data_io import build_dataloaders
-from src.utils.device import resolve_device
 from src.utils.distributed import DistributedContext
 from src.utils.logging import generate_run_id, log_stage_event
 
@@ -233,7 +232,6 @@ def execute_pipeline(
         dict[str, float],
     ] = run_topology_evaluation_stage,
     build_accelerator_fn: Callable[..., AcceleratorLike] = build_accelerator,
-    resolve_device_fn: Callable[[str], torch.device] = resolve_device,
 ) -> None:
     """Execute pipeline according to configured stages."""
     run_cfg = get_section(config, "run_config")
@@ -296,9 +294,7 @@ def execute_pipeline(
                     rank=distributed_context.rank,
                     world_size=distributed_context.world_size,
                 )
-        device = resolve_device_fn(requested_device)
-        if requested_device != "cpu":
-            device = accelerator.device
+        device = accelerator.device
         if distributed_context.is_main_process:
             _log_event_for_stages(
                 stage_names=selected_stages_with_adaptation,
