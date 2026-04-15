@@ -16,6 +16,7 @@ from src.train.base import OptimizerConfig, SchedulerConfig, Trainer
 from src.train.strategies.ohem import OHEMSampleStrategy
 from src.utils.config import ConfigDict
 from src.utils.losses import LossConfig
+from tests.runtime_helpers import NoOpAccelerator
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -153,34 +154,6 @@ class GradModeProbeModel(nn.Module):
         return {"logits": logits}
 
 
-class FakeAccelerator:
-    """Small accelerator stub used to verify trainer integration."""
-
-    def __init__(self) -> None:
-        self.device = torch.device("cpu")
-        self.use_distributed = True
-        self.autocast_calls = 0
-        self.backward_calls = 0
-        self.prepare_calls = 0
-        self.gather_for_metrics_calls = 0
-
-    def prepare(self, *components: object) -> tuple[object, ...]:
-        self.prepare_calls += 1
-        return components
-
-    def autocast(self) -> object:
-        self.autocast_calls += 1
-        return nullcontext()
-
-    def backward(self, loss: torch.Tensor) -> None:
-        self.backward_calls += 1
-        loss.backward()
-
-    def gather_for_metrics(self, value: torch.Tensor) -> torch.Tensor:
-        self.gather_for_metrics_calls += 1
-        return value
-
-
 def test_trainer_runs_single_epoch() -> None:
     model = TinyModel()
     loader = DataLoader(TinyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
@@ -193,7 +166,7 @@ def test_trainer_runs_single_epoch() -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=len(loader),
-        accelerator=FakeAccelerator(),
+        accelerator=NoOpAccelerator(),
         ohem_strategy=OHEMSampleStrategy(target_batch_size=1, cap_protein=4),
     )
     metrics = trainer.train_one_epoch(loader)
@@ -205,7 +178,7 @@ def test_trainer_runs_single_epoch() -> None:
 def test_trainer_uses_accelerator_runtime_for_backward_and_autocast() -> None:
     model = TinyModel()
     loader = DataLoader(TinyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
-    accelerator = FakeAccelerator()
+    accelerator = NoOpAccelerator()
     trainer = Trainer(
         model=model,
         device=torch.device("cpu"),
@@ -228,7 +201,7 @@ def test_trainer_uses_accelerator_runtime_for_backward_and_autocast() -> None:
 def test_evaluator_uses_accelerator_runtime_for_autocast_and_metric_gather() -> None:
     model = TinyModel()
     loader = DataLoader(TinyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
-    accelerator = FakeAccelerator()
+    accelerator = NoOpAccelerator()
     evaluator = Evaluator(
         metrics=["accuracy", "auprc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
@@ -267,7 +240,7 @@ def test_trainer_handles_non_tensor_batch_fields() -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=len(loader),
-        accelerator=FakeAccelerator(),
+        accelerator=NoOpAccelerator(),
     )
     metrics = trainer.train_one_epoch(loader)
     assert "loss" in metrics
@@ -292,7 +265,7 @@ def test_trainer_heartbeat_logging(caplog: pytest.LogCaptureFixture) -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=len(loader),
-        accelerator=FakeAccelerator(),
+        accelerator=NoOpAccelerator(),
         logger=trainer_logger,
         heartbeat_every_n_steps=2,
     )
@@ -318,7 +291,7 @@ def test_ohem_disables_pos_weight_for_selected_batch_loss() -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=1,
-        accelerator=FakeAccelerator(),
+        accelerator=NoOpAccelerator(),
         ohem_strategy=OHEMSampleStrategy(target_batch_size=2, cap_protein=4, warmup_epochs=0),
     )
     logits = torch.tensor([[0.0], [1.0], [-0.5]], dtype=torch.float32)
@@ -350,7 +323,7 @@ def test_ohem_training_mines_in_chunks_and_reduces_backward_batch() -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=1,
-        accelerator=FakeAccelerator(),
+        accelerator=NoOpAccelerator(),
         ohem_strategy=OHEMSampleStrategy(target_batch_size=2, cap_protein=4, warmup_epochs=0),
     )
 
@@ -432,7 +405,7 @@ def test_evaluator_returns_metric_dictionary() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "f1", "auroc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
-        accelerator=FakeAccelerator(),
+        accelerator=NoOpAccelerator(),
     )
     model.eval()
     with torch.no_grad():
@@ -459,7 +432,7 @@ def test_evaluator_handles_non_tensor_batch_fields() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "f1", "auroc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
-        accelerator=FakeAccelerator(),
+        accelerator=NoOpAccelerator(),
     )
     model.eval()
     with torch.no_grad():
@@ -479,7 +452,7 @@ def test_evaluator_without_prefix_returns_raw_metric_names() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "f1", "auroc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
-        accelerator=FakeAccelerator(),
+        accelerator=NoOpAccelerator(),
     )
     model.eval()
     with torch.no_grad():
@@ -499,7 +472,7 @@ def test_compute_metrics_characterization_single_class_auc_and_unknown_metric() 
     evaluator = Evaluator(
         metrics=["auroc", "auprc", "accuracy", "unknown_metric"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
-        accelerator=FakeAccelerator(),
+        accelerator=NoOpAccelerator(),
     )
     labels = torch.tensor([1, 1, 1, 1], dtype=torch.long)
     probabilities = torch.tensor([0.9, 0.8, 0.4, 0.2], dtype=torch.float32)
@@ -516,7 +489,7 @@ def test_compute_metrics_characterization_binary_metric_values() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "sensitivity", "specificity", "precision", "recall", "f1", "mcc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
-        accelerator=FakeAccelerator(),
+        accelerator=NoOpAccelerator(),
     )
     labels = torch.tensor([0, 0, 1, 1], dtype=torch.long)
     probabilities = torch.tensor([0.1, 0.6, 0.9, 0.2], dtype=torch.float32)
@@ -536,7 +509,7 @@ def test_compute_metrics_respects_custom_decision_threshold() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "precision", "recall", "f1"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
-        accelerator=FakeAccelerator(),
+        accelerator=NoOpAccelerator(),
         decision_threshold=0.3,
     )
     labels = torch.tensor([0, 0, 1, 1], dtype=torch.long)
@@ -565,7 +538,7 @@ def test_select_best_f1_threshold_disables_grad_tracking() -> None:
     evaluator = Evaluator(
         metrics=["f1"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
-        accelerator=FakeAccelerator(),
+        accelerator=NoOpAccelerator(),
     )
 
     threshold = evaluator.select_best_f1_threshold(

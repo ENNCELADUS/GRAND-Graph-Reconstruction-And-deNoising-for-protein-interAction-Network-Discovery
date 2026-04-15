@@ -572,12 +572,12 @@ def test_run_topology_finetuning_stage_uses_edge_cover_sampling_by_default(
         runtime = build_stage_runtime(
             config,
             stage_run_ids={"topology_finetune": "topology_ft_case"},
-            checkpoint_paths={"topology_finetune": checkpoint_path},
         )
         run_topology_finetuning_stage(
             runtime,
             model,
             cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
         )
     finally:
         os.chdir(previous_cwd)
@@ -602,12 +602,12 @@ def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path
         runtime = build_stage_runtime(
             config,
             stage_run_ids={"topology_finetune": "topology_ft_case"},
-            checkpoint_paths={"topology_finetune": checkpoint_path},
         )
         best_checkpoint = run_topology_finetuning_stage(
             runtime,
             model,
             cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
         )
     finally:
         os.chdir(previous_cwd)
@@ -685,13 +685,13 @@ def test_run_topology_finetuning_stage_allows_embedding_generation_on_non_main_r
         runtime = build_stage_runtime(
             config,
             stage_run_ids={"topology_finetune": "topology_ft_case"},
-            checkpoint_paths={"topology_finetune": checkpoint_path},
             distributed=distributed_context,
         )
         run_topology_finetuning_stage(
             runtime,
             model,
             cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
         )
     finally:
         os.chdir(previous_cwd)
@@ -716,13 +716,13 @@ def test_run_topology_finetuning_stage_uses_accelerator_runtime(
         runtime = build_stage_runtime(
             config,
             stage_run_ids={"topology_finetune": "topology_ft_case"},
-            checkpoint_paths={"topology_finetune": checkpoint_path},
             accelerator=accelerator,
         )
         run_topology_finetuning_stage(
             runtime,
             model,
             cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
         )
     finally:
         os.chdir(previous_cwd)
@@ -752,12 +752,12 @@ def test_run_topology_finetuning_stage_supports_scratch_initialization(
         runtime = build_stage_runtime(
             config,
             stage_run_ids={"topology_finetune": "topology_ft_case"},
-            checkpoint_paths={"topology_finetune": tmp_path / "missing_checkpoint.pth"},
         )
         best_checkpoint = run_topology_finetuning_stage(
             runtime,
             model,
             cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=tmp_path / "missing_checkpoint.pth",
         )
     finally:
         os.chdir(previous_cwd)
@@ -789,12 +789,12 @@ def test_run_topology_finetuning_stage_requires_prepared_supervision_files(
             runtime = build_stage_runtime(
                 config,
                 stage_run_ids={"topology_finetune": "topology_ft_case"},
-                checkpoint_paths={"topology_finetune": None},
             )
             run_topology_finetuning_stage(
                 runtime,
                 model,
                 cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+                checkpoint_path=None,
             )
     finally:
         os.chdir(previous_cwd)

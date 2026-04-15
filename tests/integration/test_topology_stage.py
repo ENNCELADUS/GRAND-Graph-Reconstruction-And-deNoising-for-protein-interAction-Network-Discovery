@@ -226,12 +226,12 @@ def test_run_topology_evaluation_stage_writes_expected_artifacts(tmp_path: Path)
         runtime = build_stage_runtime(
             config,
             stage_run_ids={"topology_evaluate": "topology_case"},
-            checkpoint_paths={"topology_evaluate": checkpoint_path},
         )
         run_topology_evaluation_stage(
             runtime,
             model,
             cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
         )
     finally:
         __import__("os").chdir(previous_cwd)
@@ -282,13 +282,13 @@ def test_run_topology_evaluation_stage_non_main_rank_computes_topology_summary(
         runtime = build_stage_runtime(
             config,
             stage_run_ids={"topology_evaluate": "topology_non_main"},
-            checkpoint_paths={"topology_evaluate": checkpoint_path},
             distributed=distributed_context,
         )
         summary = run_topology_evaluation_stage(
             runtime,
             model,
             cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
         )
     finally:
         __import__("os").chdir(previous_cwd)

@@ -113,10 +113,10 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         runtime: PipelineRuntime,
         model: nn.Module,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        *,
+        checkpoint_path: Path,
     ) -> dict[str, float]:
         del model, dataloaders
-        checkpoint_path = runtime.checkpoint_paths["evaluate"]
-        assert checkpoint_path is not None
         calls.evaluation.append((checkpoint_path, runtime.stage_run_id("evaluate")))
         return {"accuracy": 1.0}
 
@@ -124,11 +124,13 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         runtime: PipelineRuntime,
         model: nn.Module,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        *,
+        checkpoint_path: Path | None,
     ) -> Path:
         del model, dataloaders
         calls.topology_finetuning.append(
             (
-                runtime.checkpoint_paths.get("topology_finetune"),
+                checkpoint_path,
                 runtime.stage_run_id("topology_finetune"),
             )
         )
@@ -138,10 +140,10 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         runtime: PipelineRuntime,
         model: nn.Module,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        *,
+        checkpoint_path: Path,
     ) -> Path:
         del model, dataloaders
-        checkpoint_path = runtime.checkpoint_paths["adapt"]
-        assert checkpoint_path is not None
         calls.adaptation.append((checkpoint_path, runtime.stage_run_id("adapt")))
         return Path("artifacts/adapt_best_model.pth")
 
@@ -149,10 +151,10 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         runtime: PipelineRuntime,
         model: nn.Module,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        *,
+        checkpoint_path: Path,
     ) -> dict[str, float]:
         del model, dataloaders
-        checkpoint_path = runtime.checkpoint_paths["topology_evaluate"]
-        assert checkpoint_path is not None
         calls.topology_evaluation.append(
             (checkpoint_path, runtime.stage_run_id("topology_evaluate"))
         )
@@ -344,8 +346,10 @@ def test_execute_pipeline_uses_accelerator_device_without_resolve_device(
         runtime: PipelineRuntime,
         model: nn.Module,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        *,
+        checkpoint_path: Path,
     ) -> dict[str, float]:
-        del model, dataloaders
+        del model, dataloaders, checkpoint_path
         observed_devices.append(runtime.device)
         return {"accuracy": 1.0}
 
@@ -632,8 +636,10 @@ def test_execute_pipeline_topology_finetune_launches_without_runtime_supervision
         runtime: PipelineRuntime,
         model: nn.Module,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        *,
+        checkpoint_path: Path | None,
     ) -> Path:
-        del runtime, model, dataloaders
+        del runtime, model, dataloaders, checkpoint_path
         call_order.append("stage")
         return Path("artifacts/topology_finetune_best_model.pth")
 
@@ -812,16 +818,20 @@ def test_execute_pipeline_shot_adaptation_enables_ddp_find_unused(
         runtime: PipelineRuntime,
         model: nn.Module,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        *,
+        checkpoint_path: Path,
     ) -> Path:
-        del runtime, model, dataloaders
+        del runtime, model, dataloaders, checkpoint_path
         return Path("artifacts/adapt_best_model.pth")
 
     def fake_run_evaluation_stage(
         runtime: PipelineRuntime,
         model: nn.Module,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        *,
+        checkpoint_path: Path,
     ) -> dict[str, float]:
-        del runtime, model, dataloaders
+        del runtime, model, dataloaders, checkpoint_path
         return {"accuracy": 1.0}
 
     monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)

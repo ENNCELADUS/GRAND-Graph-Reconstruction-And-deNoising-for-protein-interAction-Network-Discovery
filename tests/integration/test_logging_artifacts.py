@@ -251,12 +251,12 @@ def test_evaluation_uses_best_f1_threshold_from_validation_and_logs_it(
         runtime = build_stage_runtime(
             config,
             stage_run_ids={"evaluate": "threshold_eval_case"},
-            checkpoint_paths={"evaluate": checkpoint_path},
         )
         metrics = run_module.run_evaluation_stage(
             runtime,
             model,
             cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
         )
     finally:
         os.chdir(previous_cwd)
@@ -332,13 +332,13 @@ def test_evaluation_worker_rank_runs_metrics_but_skips_artifact_writes(
         runtime = build_stage_runtime(
             config,
             stage_run_ids={"evaluate": "worker_eval_case"},
-            checkpoint_paths={"evaluate": checkpoint_path},
             distributed=distributed_context,
         )
         metrics = stage_evaluate_module.run_evaluation_stage(
             runtime,
             model,
             cast(dict[str, DataLoader[dict[str, object]]], _fake_dataloaders()),
+            checkpoint_path=checkpoint_path,
         )
     finally:
         os.chdir(previous_cwd)
@@ -399,7 +399,6 @@ def test_run_evaluation_stage_propagates_mixed_precision_setting(
         runtime = build_stage_runtime(
             config,
             stage_run_ids={"evaluate": "amp_eval_case"},
-            checkpoint_paths={"evaluate": checkpoint_path},
             device=torch.device("cuda"),
         )
         runtime.load_checkpoint = lambda model, checkpoint_path: None  # type: ignore[method-assign]
@@ -408,6 +407,7 @@ def test_run_evaluation_stage_propagates_mixed_precision_setting(
             runtime,
             model,
             cast(dict[str, DataLoader[dict[str, object]]], _fake_dataloaders()),
+            checkpoint_path=checkpoint_path,
         )
     finally:
         os.chdir(previous_cwd)
