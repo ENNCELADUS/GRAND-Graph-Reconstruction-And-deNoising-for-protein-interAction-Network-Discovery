@@ -308,6 +308,86 @@ def test_execute_pipeline_builds_accelerator_runtime_instead_of_manual_ddp(
     assert stage_calls == ["train"]
 
 
+def test_execute_pipeline_uses_accelerator_device_without_resolve_device(
+    base_config: ConfigDict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_devices: list[torch.device] = []
+
+    class _FakeAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = False
+        process_index = 0
+        local_process_index = 0
+        num_processes = 1
+        mixed_precision = "no"
+
+        def wait_for_everyone(self) -> None:
+            return None
+
+    def fake_build_accelerator(**kwargs: object) -> _FakeAccelerator:
+        del kwargs
+        return _FakeAccelerator()
+
+    def fake_resolve_device(device_name: str) -> torch.device:
+        del device_name
+        raise AssertionError("execute_pipeline should rely on accelerator.device")
+
+    def fake_build_dataloaders(
+        config: ConfigDict,
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> dict[str, DataLoader[dict[str, torch.Tensor]]]:
+        del config, distributed, rank, world_size
+        loader = DataLoader(_EmptyDataset(), batch_size=1)
+        return {"train": loader, "valid": loader, "test": loader}
+
+    def fake_build_model(config: ConfigDict) -> nn.Module:
+        del config
+        return _DummyModel()
+
+    def fake_run_training_stage(
+        stage: str,
+        config: ConfigDict,
+        model: nn.Module,
+        device: torch.device,
+        dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        run_id: str,
+        distributed_context: DistributedContext,
+        accelerator: object | None = None,
+    ) -> Path:
+        del stage, config, model, dataloaders, run_id, distributed_context, accelerator
+        observed_devices.append(device)
+        return Path("artifacts/train_best_model.pth")
+
+    def fake_run_evaluation_stage(
+        config: ConfigDict,
+        model: nn.Module,
+        device: torch.device,
+        dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        run_id: str,
+        checkpoint_path: Path,
+        distributed_context: DistributedContext,
+        accelerator: object | None = None,
+    ) -> dict[str, float]:
+        del config, model, dataloaders, run_id, checkpoint_path, distributed_context, accelerator
+        observed_devices.append(device)
+        return {"accuracy": 1.0}
+
+    monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
+    monkeypatch.setattr(run_module, "resolve_device", fake_resolve_device)
+    monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
+    monkeypatch.setattr(run_module, "build_model", fake_build_model)
+    monkeypatch.setattr(run_module, "run_training_stage", fake_run_training_stage)
+    monkeypatch.setattr(run_module, "run_evaluation_stage", fake_run_evaluation_stage)
+
+    run_module.execute_pipeline(base_config)
+
+    assert observed_devices == [torch.device("cpu"), torch.device("cpu")]
+
+
 def test_execute_pipeline_distributed_worker_reuses_main_run_ids(
     base_config: ConfigDict,
     patched_pipeline: PipelineCalls,
