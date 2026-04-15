@@ -711,6 +711,7 @@ def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path
     config = _build_finetune_config(tmp_path)
     topology_cfg = config["topology_finetune"]
     assert isinstance(topology_cfg, dict)
+    topology_cfg["subgraphs_per_epoch"] = 6
     topology_cfg["validation_subgraphs"] = 7
     model = build_model(config)
     checkpoint_path = Path(str(config["run_config"]["load_checkpoint_path"]))  # type: ignore[index]
@@ -755,6 +756,7 @@ def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path
     assert "internal_val_topology_s" in header
     assert "peak_gpu_mem_mb" in header
     log_text = (log_dir / "log.log").read_text(encoding="utf-8")
+    assert "Epoch Progress" in log_text
     assert "Legacy Validation Subgraphs Ignored" in log_text
 
     updated_state = torch.load(best_checkpoint_path, map_location="cpu")

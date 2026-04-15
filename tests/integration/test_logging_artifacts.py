@@ -177,7 +177,8 @@ def test_execute_pipeline_writes_stage_logs_and_strict_csv_headers(
     assert "Epoch Start" in train_text
     assert "Epoch Done" in train_text
     assert "Stage Done" in train_text
-    assert "Epoch 1 | Step 1/2" in train_text
+    assert "Epoch Progress" in train_text
+    assert "Step: 1/2" in train_text
     assert "Evaluation Metrics" in eval_text
     assert "CSV Written" in eval_text
 

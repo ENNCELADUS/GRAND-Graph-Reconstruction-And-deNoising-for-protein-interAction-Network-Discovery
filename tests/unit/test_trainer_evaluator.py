@@ -251,15 +251,27 @@ def test_trainer_handles_non_tensor_batch_fields() -> None:
     assert metrics["loss"] >= 0.0
 
 
-def test_trainer_heartbeat_logging(caplog: pytest.LogCaptureFixture) -> None:
+def test_trainer_heartbeat_logging_uses_low_frequency_epoch_progress(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     logger_name = "tests.trainer.heartbeat"
     trainer_logger = logging.getLogger(logger_name)
     trainer_logger.handlers.clear()
     trainer_logger.propagate = True
     trainer_logger.setLevel(logging.INFO)
 
+    class TenStepDataset(Dataset[dict[str, torch.Tensor]]):
+        def __len__(self) -> int:
+            return 10
+
+        def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+            value = float(index) / 10.0
+            feature = torch.tensor([value, value + 0.1, value + 0.2, value + 0.3])
+            label = torch.tensor(float(index % 2))
+            return {"x": feature, "label": label}
+
     model = TinyModel()
-    loader = DataLoader(TinyDataset(), batch_size=1, shuffle=False, collate_fn=_collate)
+    loader = DataLoader(TenStepDataset(), batch_size=1, shuffle=False, collate_fn=_collate)
     trainer = Trainer(
         model=model,
         device=torch.device("cpu"),
@@ -271,17 +283,21 @@ def test_trainer_heartbeat_logging(caplog: pytest.LogCaptureFixture) -> None:
         steps_per_epoch=len(loader),
         accelerator=NoOpAccelerator(),
         logger=trainer_logger,
-        heartbeat_every_n_steps=2,
+        heartbeat_every_n_steps=1,
     )
 
     with caplog.at_level(logging.INFO, logger=logger_name):
         trainer.train_one_epoch(loader, epoch_index=0)
 
     messages = [record.getMessage() for record in caplog.records if record.name == logger_name]
-    assert any("Epoch 1 | Step 1/4" in message for message in messages)
-    assert any("Epoch 1 | Step 2/4" in message for message in messages)
-    assert any("Epoch 1 | Step 4/4" in message for message in messages)
-    assert not any("Epoch 1 | Step 3/4" in message for message in messages)
+    progress_messages = [message for message in messages if "Epoch Progress" in message]
+    assert len(progress_messages) == 5
+    assert any("Epoch: 1" in message and "Step: 1/10" in message for message in progress_messages)
+    assert any("Epoch: 1" in message and "Step: 3/10" in message for message in progress_messages)
+    assert any("Epoch: 1" in message and "Step: 6/10" in message for message in progress_messages)
+    assert any("Epoch: 1" in message and "Step: 9/10" in message for message in progress_messages)
+    assert any("Epoch: 1" in message and "Step: 10/10" in message for message in progress_messages)
+    assert not any("Step: 2/10" in message for message in progress_messages)
 
 
 def test_ohem_disables_pos_weight_for_selected_batch_loss() -> None:
