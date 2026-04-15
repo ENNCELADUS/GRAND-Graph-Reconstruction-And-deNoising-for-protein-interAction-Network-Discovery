@@ -28,6 +28,7 @@ from src.run.stage_topology_finetune import (
 )
 from src.run.stage_train import build_model
 from src.topology.finetune_data import EdgeCoverEpochPlan, SubgraphPairChunk
+from src.topology.negative_sampling import prepare_topology_supervision_from_config
 from src.utils.config import ConfigDict, load_config
 from src.utils.data_io import build_dataloaders
 from src.utils.distributed import DistributedContext
@@ -685,13 +686,12 @@ def test_run_topology_finetuning_stage_supports_scratch_initialization(
     assert observed_checkpoint_loads == []
 
 
-def test_run_topology_finetuning_stage_generates_missing_ratio_supervision_files(
+def test_prepare_topology_supervision_from_config_generates_missing_ratio_supervision_files(
     tmp_path: Path,
 ) -> None:
     config = _build_finetune_config(tmp_path)
     topology_cfg = config["topology_finetune"]
     assert isinstance(topology_cfg, dict)
-    topology_cfg["epochs"] = 0
     topology_cfg["bce_negative_ratio"] = 5
     topology_cfg["supervision_train_dataset"] = str(
         tmp_path / "benchmark" / "human" / "BFS" / "human_train_ppi_ratio5_exclusive.txt"
@@ -699,30 +699,11 @@ def test_run_topology_finetuning_stage_generates_missing_ratio_supervision_files
     topology_cfg["supervision_valid_dataset"] = str(
         tmp_path / "benchmark" / "human" / "BFS" / "human_val_ppi_ratio5_exclusive.txt"
     )
-
-    model = build_model(config)
-    dataloaders = build_dataloaders(config=config)
-    checkpoint_path = Path(str(config["run_config"]["load_checkpoint_path"]))  # type: ignore[index]
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(model.state_dict(), checkpoint_path)
-
-    previous_cwd = Path.cwd()
-    try:
-        os.chdir(tmp_path)
-        run_topology_finetuning_stage(
-            config=config,
-            model=model,
-            device=torch.device("cpu"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-            run_id="topology_ft_case",
-            checkpoint_path=checkpoint_path,
-            distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
-        )
-    finally:
-        os.chdir(previous_cwd)
+    manifest = prepare_topology_supervision_from_config(config)
 
     train_supervision_path = Path(str(topology_cfg["supervision_train_dataset"]))
     valid_supervision_path = Path(str(topology_cfg["supervision_valid_dataset"]))
+    assert manifest is not None
     assert train_supervision_path.exists()
     assert valid_supervision_path.exists()
 

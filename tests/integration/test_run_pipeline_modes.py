@@ -481,6 +481,47 @@ def test_execute_pipeline_topology_finetune_scratch_does_not_require_checkpoint(
     ]
 
 
+def test_execute_pipeline_prepares_topology_supervision_before_stage_launch(
+    base_config: ConfigDict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_cfg = base_config["run_config"]
+    assert isinstance(run_cfg, dict)
+    run_cfg["stages"] = ["topology_finetune"]
+    run_cfg["load_checkpoint_path"] = None
+
+    base_config["topology_finetune"] = {"init_mode": "scratch"}
+    call_order: list[str] = []
+
+    def _fake_prepare_topology_supervision_from_config(config: ConfigDict) -> None:
+        del config
+        call_order.append("prepare")
+
+    def _fake_run_topology_finetuning_stage(
+        config: ConfigDict,
+        model: nn.Module,
+        device: torch.device,
+        dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        run_id: str,
+        checkpoint_path: Path | None,
+        distributed_context: DistributedContext,
+    ) -> Path:
+        del config, model, device, dataloaders, run_id, checkpoint_path, distributed_context
+        call_order.append("stage")
+        return Path("artifacts/topology_finetune_best_model.pth")
+
+    monkeypatch.setattr(
+        pipeline_orchestrator,
+        "prepare_topology_supervision_from_config",
+        _fake_prepare_topology_supervision_from_config,
+    )
+    monkeypatch.setattr(run_module, "run_topology_finetuning_stage", _fake_run_topology_finetuning_stage)
+
+    run_module.execute_pipeline(base_config)
+
+    assert call_order == ["prepare", "stage"]
+
+
 def test_execute_pipeline_train_then_topology_finetune_scratch_ignores_train_checkpoint(
     base_config: ConfigDict,
     patched_pipeline: PipelineCalls,
