@@ -1,12 +1,12 @@
 # Model Architecture Standards
 
-This document defines the architectural standards for implementing models in the DIPPI system. The goal is to maintain a modular, predictable, and clean codebase where new architectures can be added without modifying the core orchestration logic.
+This document defines the architectural standards for implementing models in the GRAND system. The goal is to maintain a modular, predictable, and clean codebase where new architectures can be added without modifying the core orchestration logic.
 
 ## Design Philosophy
 
 1.  **Isolation**: Each model architecture resides in its own independent file within `src/model/`.
 2.  **Standard Contract**: Models must adhere to the standard PyTorch `nn.Module` interface. No custom base classes or complex inheritance hierarchies are enforced.
-3.  **Config Injection**: Models receive only the configuration parameters relevant to them, filtered by the orchestrator.
+3.  **Config Injection**: Models receive only the configuration parameters relevant to them, filtered by the engine.
 
 ## Implementation Standards
 
@@ -23,12 +23,12 @@ Models must implement:
     *   Accepts configuration parameters as keyword arguments.
     *   Initializes all layers and sub-modules.
 *   **`forward(self, **batch)`**:
-    *   Accepts input data (typically a dictionary or named arguments matching the data loader output).
-    *   Returns a dictionary containing at least the `loss` (during training) and `logits`/`probs` (for evaluation).
+    *   Accepts input data as named arguments matching the data loader output keys (`emb_a`, `emb_b`, `len_a`, `len_b`, `label`).
+    *   Returns a dictionary containing at least `logits`. When `label` is present in the input, also returns `loss`.
 
 ### 3. Configuration Handling
 
-*   **Extraction**: The orchestrator (`run.py`) uses `src/utils/config.py` to extract model-specific parameters from the global config.
+*   **Extraction**: The engine (`src/pipeline/engine.py`) uses `src/utils/config.py` to extract model-specific parameters from the global config via `extract_model_kwargs()`.
 *   **Injection**: These parameters are passed to the model's `__init__`.
 *   **Strictness**: Models should not be aware of the global config structure. They only know about their specific hyperparameters (e.g., `d_model`, `n_layers`, `dropout`).
 
@@ -48,31 +48,35 @@ class V3(nn.Module):
         ])
         self.head = nn.Linear(d_model, 1)
 
-    def forward(self, x, labels=None):
-        x = self.encoder(x)
-        for layer in self.layers:
-            x = layer(x)
-        logits = self.head(x)
-        
+    def forward(self, emb_a, emb_b, len_a, len_b, label=None, **kwargs):
+        # ... encoding and cross-attention logic ...
+        logits = self.head(cls_repr)
+
         output = {"logits": logits}
-        if labels is not None:
-            output["loss"] = nn.BCEWithLogitsLoss()(logits, labels)
-            
+        if label is not None:
+            output["loss"] = nn.functional.binary_cross_entropy_with_logits(logits, label)
+
         return output
 ```
 
 ## Instantiation Logic
 
-The orchestrator (`run.py`) handles model selection using simple branching, avoiding complex registries for the MVP phase:
+The engine (`src/pipeline/engine.py`) handles model selection via `build_model()` in `src/pipeline/stages/train.py`, using a `MODEL_FACTORIES` dispatch dict:
 
 ```python
-# Conceptual Orchestrator Logic
-def build_model(cfg):
-    name = cfg.model_config.model
-    kwargs = extract_model_kwargs(cfg, name)
-    
-    if name == "v3":
-        return V3(**kwargs)
-    else:
-        raise ValueError(f"Unknown model: {name}")
+MODEL_FACTORIES: dict[str, ModelFactory] = {
+    "v3":   _build_v3_model,
+    "v3.1": _build_v3_1_model,
+    "v4":   _build_v4_model,
+    "v5":   _build_v5_model,
+}
+
+def build_model(config: ConfigDict) -> nn.Module:
+    model_name, model_kwargs = extract_model_kwargs(config)
+    factory = MODEL_FACTORIES.get(model_name)
+    if factory is not None:
+        return factory(model_kwargs)
+    raise ValueError(f"Unknown model: {model_name}")
 ```
+
+After instantiation, the engine moves the model to the runtime device (`model.to(runtime.device)`) before passing it to any stage.

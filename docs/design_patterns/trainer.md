@@ -6,25 +6,26 @@ The **Trainer** module is responsible for the core training loop execution. It i
 
 ### The Trainer (`src/train/base.py`)
 
-The `Trainer` class encapsulates the mechanics of updating the model weights.
+The `Trainer` class encapsulates the mechanics of updating the model weights. It requires a real `AcceleratorLike` instance — there is no fallback builder or optional accelerator path.
 
 **Does:**
 *   **Execute `train_one_epoch(...)`**: Runs the standard forward-backward pass for a single epoch.
     *   Sets `model.train()`.
-    *   Computes loss.
-    *   Performs backpropagation (`loss.backward()`).
-    *   Steps the optimizer (`optimizer.step()`) and then the scheduler (`scheduler.step()`).
+    *   Computes loss via `binary_classification_loss()`.
+    *   Performs backpropagation through `accelerator.backward(loss)`.
+    *   Steps the optimizer and scheduler.
 *   **Manage Optimization State**: Builds and rebuilds the `Optimizer` and `Scheduler` on demand. This is critical for strategies that change trainable parameters (e.g., staged unfreezing).
-*   **Handle Precision**: Wraps execution in `torch.autocast` and `torch.amp.GradScaler` when Mixed Precision (AMP) is enabled.
+*   **Handle Precision**: Mixed precision is managed by the Accelerator. The trainer uses `accelerator.autocast()` for forward passes and `accelerator.backward()` for gradient scaling — no manual `GradScaler` management.
+*   **Prepare Components**: Calls `accelerator.prepare()` to wrap model, optimizer, scheduler, and dataloader for distributed execution.
 *   **Expose Hooks**: Provides access to `named_parameters` for strategies to manipulate gradients.
 
 **Does NOT:**
-*   **Validation**: Validation logic belongs to the `Evaluator`, called by the orchestrator.
-*   **Logging**: The trainer emits heartbeat logs to the provided logger, but file creation and stage management are handled by the orchestrator via `src/utils/logging.py`.
-*   **Checkpointing**: File I/O for saving models is managed by the orchestrator.
-*   **Global Config**: The Trainer receives only the specific configuration objects (optimizer cfg, scheduler cfg) it needs, not the entire global config.
+*   **Validation**: Validation logic belongs to the `Evaluator`, called by the stage orchestrator.
+*   **Logging**: The trainer emits heartbeat logs to the provided logger, but file creation and stage management are handled by the stage via `src/utils/logging.py`.
+*   **Checkpointing**: File I/O for saving models is managed by `PipelineRuntime.save_checkpoint()`.
+*   **Global Configuration Parsing**: The Trainer receives only the specific configuration objects (optimizer cfg, scheduler cfg, loss cfg) it needs, not the entire global config.
 
-### Strategies (`src/train/strategies.py`)
+### Strategies (`src/train/strategies/`)
 
 Strategies implement the "How" and "When" of training, particularly for complex finetuning protocols. They follow a callback-style pattern.
 
@@ -42,19 +43,20 @@ Strategies implement the "How" and "When" of training, particularly for complex 
 
 Inside `train_one_epoch`:
 
-1.  **Zero Gradients**: `optimizer.zero_grad(set_to_none=True)` (Best practice for performance).
-2.  **Forward Pass**: Compute model output and loss.
-    *   *With AMP*: Inside `torch.autocast`.
-3.  **Backward Pass**:
-    *   *With AMP*: `scaler.scale(loss).backward()`, then `scaler.step(optimizer)` and `scaler.update()`.
-    *   *Standard*: `loss.backward()`, then `optimizer.step()`.
-4.  **Scheduler Step**: Called **after** the optimizer step.
-5.  **Return**: A lightweight dictionary of statistics (e.g., `{"loss": avg_loss, "lr": current_lr}`).
+1.  **Zero Gradients**: `optimizer.zero_grad(set_to_none=True)`.
+2.  **Forward Pass**: Compute model output and loss inside `accelerator.autocast()`.
+3.  **Backward Pass**: `accelerator.backward(loss)` — the accelerator handles gradient scaling for mixed precision and DDP synchronization.
+4.  **Optimizer Step**: `optimizer.step()`.
+5.  **Scheduler Step**: Called after the optimizer step.
+6.  **Return**: A lightweight dictionary of statistics (e.g., `{"loss": avg_loss, "lr": current_lr}`).
 
 ## Architecture
 
 ```
 src/train/
-├── base.py          # Generic Trainer class
-└── strategies.py    # Pluggable strategies (StagedUnfreeze, etc.)
+├── base.py                # Trainer class (requires AcceleratorLike)
+├── config.py              # OptimizerConfig, SchedulerConfig, LossConfig
+└── strategies/
+    ├── lifecycle.py       # TrainingStrategy, NoOpStrategy, StagedUnfreezeStrategy
+    └── ohem.py            # OHEMSampleStrategy
 ```
