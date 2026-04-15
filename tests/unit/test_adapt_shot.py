@@ -254,6 +254,28 @@ class _TinyShotModel(nn.Module):
         )
 
 
+class _FakeAccelerator:
+    def __init__(self) -> None:
+        self.device = torch.device("cpu")
+        self.autocast_calls = 0
+        self.backward_calls = 0
+        self.reduce_calls = 0
+
+    def autocast(self):
+        from contextlib import nullcontext
+
+        self.autocast_calls += 1
+        return nullcontext()
+
+    def backward(self, loss: torch.Tensor) -> None:
+        self.backward_calls += 1
+        loss.backward()
+
+    def reduce(self, value: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        self.reduce_calls += 1
+        return value
+
+
 def test_prepare_shot_optimizer_params_preserves_frozen_requires_grad_for_ddp() -> None:
     model = _TinyShotModel()
 
@@ -331,3 +353,69 @@ def test_build_target_loaders_uses_distributed_sampler_when_ddp_enabled() -> Non
     assert isinstance(train_loader.sampler, DistributedSampler)
     assert train_loader.drop_last is True
     assert eval_loader.drop_last is False
+
+
+def test_build_target_loaders_keeps_plain_loaders_when_accelerator_handles_ddp() -> None:
+    config: dict[str, object] = {
+        "training_config": {
+            "batch_size": 2,
+            "domain_adaptation": {
+                "enabled": True,
+                "method": "shot",
+                "target_split": "test",
+            },
+        },
+        "data_config": {
+            "dataloader": {
+                "num_workers": 0,
+                "pin_memory": False,
+            }
+        },
+    }
+    adaptation_config = parse_domain_adaptation_config(config)
+    base_loader = DataLoader(_TinyDataset(), batch_size=2, shuffle=False)
+    dataloaders: dict[str, DataLoader[dict[str, object]]] = {"test": base_loader}
+    context = DistributedContext(
+        ddp_enabled=True,
+        is_distributed=True,
+        rank=0,
+        local_rank=0,
+        world_size=2,
+    )
+
+    eval_loader, train_loader = stage_adapt_module._build_target_loaders(
+        config=config,
+        dataloaders=dataloaders,
+        adaptation_config=adaptation_config,
+        distributed_context=context,
+    )
+
+    assert not isinstance(eval_loader.sampler, DistributedSampler)
+    assert not isinstance(train_loader.sampler, DistributedSampler)
+    assert train_loader.drop_last is True
+    assert eval_loader.drop_last is False
+
+
+def test_train_one_shot_epoch_uses_accelerator_backward_and_reduce() -> None:
+    model = _DummyHeadModel(feature_dim=2)
+    loader = DataLoader(_TargetFeatureDataset(), batch_size=1, shuffle=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+    accelerator = _FakeAccelerator()
+
+    epoch_stats = stage_adapt_module._train_one_shot_epoch(
+        model=model,
+        loader=loader,
+        pseudo_labels=torch.tensor([0, 1], dtype=torch.long),
+        optimizer=optimizer,
+        scheduler=None,
+        accelerator=accelerator,
+        device=torch.device("cpu"),
+        use_amp=False,
+        adaptation_config=parse_domain_adaptation_config(_base_config()),
+        distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+    )
+
+    assert "total_loss" in epoch_stats
+    assert accelerator.autocast_calls == len(loader)
+    assert accelerator.backward_calls == len(loader)
+    assert accelerator.reduce_calls >= 1

@@ -159,6 +159,7 @@ class FakeAccelerator:
         self.autocast_calls = 0
         self.backward_calls = 0
         self.prepare_calls = 0
+        self.gather_for_metrics_calls = 0
 
     def prepare(self, *components: object) -> tuple[object, ...]:
         self.prepare_calls += 1
@@ -171,6 +172,10 @@ class FakeAccelerator:
     def backward(self, loss: torch.Tensor) -> None:
         self.backward_calls += 1
         loss.backward()
+
+    def gather_for_metrics(self, value: torch.Tensor) -> torch.Tensor:
+        self.gather_for_metrics_calls += 1
+        return value
 
 
 def test_trainer_runs_single_epoch() -> None:
@@ -214,6 +219,30 @@ def test_trainer_uses_accelerator_runtime_for_backward_and_autocast() -> None:
     assert accelerator.prepare_calls >= 1
     assert accelerator.autocast_calls == len(loader)
     assert accelerator.backward_calls == len(loader)
+
+
+def test_evaluator_uses_accelerator_runtime_for_autocast_and_metric_gather() -> None:
+    model = TinyModel()
+    loader = DataLoader(TinyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
+    accelerator = FakeAccelerator()
+    evaluator = Evaluator(
+        metrics=["accuracy", "auprc"],
+        loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        decision_threshold=0.5,
+        use_amp=False,
+        accelerator=accelerator,
+    )
+
+    metrics = evaluator.evaluate(
+        model=model.eval(),
+        data_loader=loader,
+        device=torch.device("cpu"),
+        prefix=None,
+    )
+
+    assert "accuracy" in metrics
+    assert accelerator.autocast_calls == len(loader)
+    assert accelerator.gather_for_metrics_calls >= len(loader) * 2
 
 
 def test_trainer_handles_non_tensor_batch_fields() -> None:

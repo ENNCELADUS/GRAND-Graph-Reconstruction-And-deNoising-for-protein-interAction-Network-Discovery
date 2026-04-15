@@ -243,6 +243,50 @@ def _build_finetune_config(tmp_path: Path) -> ConfigDict:
     }
 
 
+class _RecordingAccelerator:
+    def __init__(self) -> None:
+        self.device = torch.device("cpu")
+        self.is_main_process = True
+        self.use_distributed = False
+        self.process_index = 0
+        self.local_process_index = 0
+        self.num_processes = 1
+        self.mixed_precision = "no"
+        self.prepare_calls = 0
+        self.autocast_calls = 0
+        self.backward_calls = 0
+        self.reduce_calls = 0
+
+    def prepare(self, *components: object) -> tuple[object, ...]:
+        self.prepare_calls += 1
+        return components
+
+    def autocast(self):
+        from contextlib import nullcontext
+
+        self.autocast_calls += 1
+        return nullcontext()
+
+    def backward(self, loss: torch.Tensor) -> None:
+        self.backward_calls += 1
+        loss.backward()
+
+    def reduce(self, value: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        del reduction
+        self.reduce_calls += 1
+        return value
+
+    def wait_for_everyone(self) -> None:
+        return None
+
+    def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
+        return model
+
+    def save(self, obj: object, f: object, safe_serialization: bool = False) -> None:
+        del safe_serialization
+        torch.save(obj, f)
+
+
 def test_load_supervision_graphs_excludes_val_edges_and_keeps_all_train_nodes(
     tmp_path: Path,
 ) -> None:
@@ -650,6 +694,39 @@ def test_run_topology_finetuning_stage_allows_embedding_generation_on_non_main_r
         os.chdir(previous_cwd)
 
     assert observed_allow_generation == [True]
+
+
+def test_run_topology_finetuning_stage_uses_accelerator_runtime(
+    tmp_path: Path,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    model = build_model(config)
+    checkpoint_path = Path(str(config["run_config"]["load_checkpoint_path"]))  # type: ignore[index]
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), checkpoint_path)
+    dataloaders = build_dataloaders(config=config)
+    accelerator = _RecordingAccelerator()
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        run_topology_finetuning_stage(
+            config=config,
+            model=model,
+            device=torch.device("cpu"),
+            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            run_id="topology_ft_case",
+            checkpoint_path=checkpoint_path,
+            distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+            accelerator=accelerator,
+        )
+    finally:
+        os.chdir(previous_cwd)
+
+    assert accelerator.prepare_calls >= 1
+    assert accelerator.autocast_calls >= 1
+    assert accelerator.backward_calls >= 1
+    assert accelerator.reduce_calls >= 1
 
 
 def test_run_topology_finetuning_stage_supports_scratch_initialization(
