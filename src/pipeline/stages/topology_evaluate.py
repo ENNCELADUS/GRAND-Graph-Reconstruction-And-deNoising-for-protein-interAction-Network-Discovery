@@ -388,6 +388,8 @@ def run_topology_evaluation_stage(
     runtime: PipelineRuntime,
     model: torch.nn.Module,
     dataloaders: dict[str, DataLoader[dict[str, object]]],
+    *,
+    checkpoint_path: Path,
 ) -> dict[str, float]:
     """Run PRING-style Human topology evaluation and persist artifacts."""
     config = runtime.config.raw
@@ -400,9 +402,6 @@ def run_topology_evaluation_stage(
         device_cfg.get("use_mixed_precision", False),
         "device_config.use_mixed_precision",
     )
-    checkpoint_path = runtime.checkpoint_paths.get("topology_evaluate")
-    if checkpoint_path is None:
-        raise ValueError("runtime.checkpoint_paths['topology_evaluate'] is required")
     checkpoint_path_resolved = Path(checkpoint_path)
     model_name, _ = extract_model_kwargs(config)
     run_id = runtime.stage_run_id("topology_evaluate")

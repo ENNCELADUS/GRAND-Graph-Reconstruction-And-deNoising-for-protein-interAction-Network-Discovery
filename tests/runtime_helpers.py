@@ -31,6 +31,7 @@ class NoOpAccelerator:
         self.prepare_calls = 0
         self.autocast_calls = 0
         self.backward_calls = 0
+        self.gather_for_metrics_calls = 0
         self.reduce_calls = 0
 
     def prepare(self, *components: object) -> object:
@@ -52,6 +53,7 @@ class NoOpAccelerator:
 
     def gather_for_metrics(self, value: torch.Tensor) -> torch.Tensor:
         """Return metric tensors unchanged."""
+        self.gather_for_metrics_calls += 1
         return value
 
     def gather(self, value: torch.Tensor) -> torch.Tensor:
@@ -98,7 +100,6 @@ def build_stage_runtime(
     config: ConfigDict,
     *,
     stage_run_ids: dict[str, str] | None = None,
-    checkpoint_paths: dict[str, Path | None] | None = None,
     distributed: DistributedContext | None = None,
     accelerator: AcceleratorLike | None = None,
     device: torch.device | None = None,
@@ -121,5 +122,4 @@ def build_stage_runtime(
         device=runtime_accelerator.device,
         distributed=context,
         stage_run_ids=stage_ids,
-        checkpoint_paths=checkpoint_paths or {},
     )

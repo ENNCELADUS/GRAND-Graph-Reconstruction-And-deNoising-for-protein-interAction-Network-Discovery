@@ -100,7 +100,7 @@ def test_stage_cleanup_helpers_are_removed() -> None:
 def test_public_package_exports_include_v3_1() -> None:
     """Lock the top-level GRAND export surface to match ``src.model``."""
     assert "V3_1" in src.__all__
-    assert getattr(src, "V3_1").__name__ == "V3_1"
+    assert src.V3_1.__name__ == "V3_1"
 
 
 def test_utils_package_does_not_reexport_train_strategy_symbols() -> None:

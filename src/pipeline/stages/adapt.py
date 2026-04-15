@@ -51,21 +51,6 @@ def _centroid_accumulation_dtype(probs: torch.Tensor, features: torch.Tensor) ->
     return dtype
 
 
-def _move_batch_to_device(batch: BatchInput, device: torch.device) -> dict[str, BatchValue]:
-    """Move tensor fields to target device while preserving non-tensor fields."""
-    return move_batch_to_device(batch, device)
-
-
-def _forward_batch_without_labels(batch: BatchInput) -> dict[str, BatchValue]:
-    """Return model-input batch with labels removed for unlabeled SHOT adaptation."""
-    return {key: value for key, value in batch.items() if key != "label"}
-
-
-def _forward_model(model: nn.Module, batch: BatchInput) -> dict[str, torch.Tensor]:
-    """Execute model forward and validate output contract."""
-    return forward_model(model, batch)
-
-
 def _infer_batch_size(batch: BatchInput) -> int:
     """Infer sample count from one batch payload."""
     label = batch.get("label")
@@ -221,10 +206,10 @@ def _compute_global_centroids(
     model.eval()
     with torch.no_grad():
         for batch in loader:
-            prepared_batch = _move_batch_to_device(batch=batch, device=device)
-            forward_batch = _forward_batch_without_labels(prepared_batch)
+            prepared_batch = move_batch_to_device(batch=batch, device=device)
+            forward_batch = {key: value for key, value in prepared_batch.items() if key != "label"}
             with accelerator.autocast():
-                output = _forward_model(model=model, batch=forward_batch)
+                output = forward_model(model=model, batch=forward_batch)
             logits = output["logits"]
             probs = logits_to_probabilities(logits=logits, epsilon=adaptation_config.epsilon)
             features = feature_hook.pop()
@@ -275,10 +260,10 @@ def _compute_pseudo_labels(
     model.eval()
     with torch.no_grad():
         for batch in loader:
-            prepared_batch = _move_batch_to_device(batch=batch, device=device)
-            forward_batch = _forward_batch_without_labels(prepared_batch)
+            prepared_batch = move_batch_to_device(batch=batch, device=device)
+            forward_batch = {key: value for key, value in prepared_batch.items() if key != "label"}
             with accelerator.autocast():
-                _forward_model(model=model, batch=forward_batch)
+                forward_model(model=model, batch=forward_batch)
             features = feature_hook.pop()
             labels = assign_pseudo_labels(
                 features=features,
@@ -323,12 +308,12 @@ def _train_one_shot_epoch(
         batch_pseudo = pseudo_labels[pseudo_offset:next_offset].to(device=device)
         pseudo_offset = next_offset
 
-        prepared_batch = _move_batch_to_device(batch=batch, device=device)
-        forward_batch = _forward_batch_without_labels(prepared_batch)
+        prepared_batch = move_batch_to_device(batch=batch, device=device)
+        forward_batch = {key: value for key, value in prepared_batch.items() if key != "label"}
 
         optimizer.zero_grad(set_to_none=True)
         with accelerator.autocast():
-            output = _forward_model(model=model, batch=forward_batch)
+            output = forward_model(model=model, batch=forward_batch)
             logits = output["logits"]
             probs = logits_to_probabilities(logits=logits, epsilon=adaptation_config.epsilon)
 
@@ -383,13 +368,12 @@ def run_shot_adaptation_stage(
     runtime: PipelineRuntime,
     model: nn.Module,
     dataloaders: dict[str, DataLoader[dict[str, object]]],
+    *,
+    checkpoint_path: Path,
 ) -> Path:
     """Run SHOT adaptation from one source checkpoint and return adapted checkpoint path."""
     config = runtime.config.raw
     device = runtime.device
-    checkpoint_path = runtime.checkpoint_paths.get("adapt")
-    if checkpoint_path is None:
-        raise ValueError("runtime.checkpoint_paths['adapt'] is required")
     adaptation_config = parse_domain_adaptation_config(config)
     if not adaptation_config.enabled or adaptation_config.method != "shot":
         raise ValueError("run_shot_adaptation_stage requires enabled SHOT configuration")
@@ -409,10 +393,11 @@ def run_shot_adaptation_stage(
             method=adaptation_config.method,
         )
 
-    runtime.load_checkpoint(model, Path(checkpoint_path))
+    checkpoint_path_resolved = Path(checkpoint_path)
+    runtime.load_checkpoint(model, checkpoint_path_resolved)
 
     if runtime.is_main_process:
-        log_stage_event(logger, "checkpoint_loaded", path=checkpoint_path)
+        log_stage_event(logger, "checkpoint_loaded", path=checkpoint_path_resolved)
 
     optimizer_params, trainable_params = _prepare_shot_optimizer_params(
         model=model,

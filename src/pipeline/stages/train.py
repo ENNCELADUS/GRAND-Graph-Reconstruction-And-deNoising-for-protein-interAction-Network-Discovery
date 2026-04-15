@@ -37,11 +37,6 @@ DEFAULT_TRAINING_VAL_METRICS = ["auprc", "auroc"]
 DEFAULT_HEARTBEAT_EVERY_N_STEPS = 20
 
 
-def _stage_logger_name(model_name: str, stage: str, run_id: str, rank: int) -> str:
-    """Return stable logger name for one stage/run/rank tuple."""
-    return f"grand.{model_name}.{stage}.{run_id}.rank{rank}"
-
-
 def _training_logging_config(training_cfg: ConfigDict) -> ConfigDict:
     """Return ``training_config.logging`` mapping with validation."""
     logging_cfg = training_cfg.get("logging", {})

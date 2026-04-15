@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from os import PathLike
 from pathlib import Path
 from types import ModuleType
@@ -121,7 +121,6 @@ class PipelineRuntime:
     device: torch.device
     distributed: DistributedContext
     stage_run_ids: dict[str, str]
-    checkpoint_paths: dict[str, Path | None] = field(default_factory=dict)
 
     @property
     def is_main_process(self) -> bool:

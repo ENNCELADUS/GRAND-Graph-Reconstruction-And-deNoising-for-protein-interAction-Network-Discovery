@@ -80,6 +80,8 @@ def run_evaluation_stage(
     runtime: PipelineRuntime,
     model: torch.nn.Module,
     dataloaders: dict[str, torch.utils.data.DataLoader[dict[str, object]]],
+    *,
+    checkpoint_path: Path,
 ) -> dict[str, float]:
     """Run test evaluation and persist ``evaluate.csv``."""
     config = runtime.config.raw
@@ -89,9 +91,6 @@ def run_evaluation_stage(
         device_cfg.get("use_mixed_precision", False),
         "device_config.use_mixed_precision",
     )
-    checkpoint_path = runtime.checkpoint_paths.get("evaluate")
-    if checkpoint_path is None:
-        raise ValueError("runtime.checkpoint_paths['evaluate'] is required")
     checkpoint_path_resolved = Path(checkpoint_path)
     run_id = runtime.stage_run_id("evaluate")
     paths = runtime.stage_paths("evaluate")

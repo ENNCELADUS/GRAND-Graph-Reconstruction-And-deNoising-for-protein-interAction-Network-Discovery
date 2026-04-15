@@ -216,7 +216,7 @@ def execute_pipeline_with_runtime(
         )
 
     if "topology_finetune" in selected:
-        runtime.checkpoint_paths["topology_finetune"] = topology_finetune_checkpoint_path(
+        finetune_input_checkpoint = topology_finetune_checkpoint_path(
             config=config,
             train_checkpoint_path=train_checkpoint_path,
             load_checkpoint_path=load_checkpoint_path,
@@ -225,6 +225,7 @@ def execute_pipeline_with_runtime(
             runtime,
             model,
             dataloaders,
+            checkpoint_path=finetune_input_checkpoint,
         )
 
     if "evaluate" in selected:
@@ -233,17 +234,17 @@ def execute_pipeline_with_runtime(
             load_checkpoint_path=load_checkpoint_path,
         )
         if should_run_shot_adaptation(config):
-            runtime.checkpoint_paths["adapt"] = eval_input_checkpoint
             adapted_checkpoint_path = run_adaptation_stage_fn(
                 runtime,
                 model,
                 dataloaders,
+                checkpoint_path=eval_input_checkpoint,
             )
-        runtime.checkpoint_paths["evaluate"] = adapted_checkpoint_path or eval_input_checkpoint
         run_evaluation_stage_fn(
             runtime,
             model,
             dataloaders,
+            checkpoint_path=adapted_checkpoint_path or eval_input_checkpoint,
         )
 
     if "topology_evaluate" in selected:
@@ -255,11 +256,11 @@ def execute_pipeline_with_runtime(
                 load_checkpoint_path=load_checkpoint_path,
             )
         )
-        runtime.checkpoint_paths["topology_evaluate"] = topology_eval_checkpoint
         run_topology_evaluation_stage_fn(
             runtime,
             model,
             dataloaders,
+            checkpoint_path=topology_eval_checkpoint,
         )
 
 

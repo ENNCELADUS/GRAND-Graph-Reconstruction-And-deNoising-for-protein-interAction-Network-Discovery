@@ -1049,6 +1049,8 @@ def run_topology_finetuning_stage(
     runtime: PipelineRuntime,
     model: nn.Module,
     dataloaders: dict[str, DataLoader[dict[str, object]]],
+    *,
+    checkpoint_path: Path | None,
 ) -> Path:
     """Fine-tune a pairwise scorer with PRING graph-topology losses."""
     config = runtime.config.raw
@@ -1061,7 +1063,6 @@ def run_topology_finetuning_stage(
     logger = runtime.stage_logger("topology_finetune", log_dir / "log.log")
     finetune_cfg = _topology_finetune_config(config)
     init_mode = _resolve_init_mode(finetune_cfg)
-    checkpoint_path = runtime.checkpoint_paths.get("topology_finetune")
     checkpoint_path_resolved = Path(checkpoint_path) if checkpoint_path is not None else None
     if runtime.is_main_process:
         log_stage_event(

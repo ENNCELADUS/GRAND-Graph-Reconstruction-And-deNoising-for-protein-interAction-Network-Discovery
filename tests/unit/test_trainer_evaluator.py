@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
 
 import pytest
 import torch
 import torch.nn.functional as functional
 from src.evaluate import Evaluator
+from src.pipeline.runtime import DistributedContext
 from src.pipeline.stages.adapt import ADAPT_CSV_COLUMNS
 from src.pipeline.stages.evaluate import EVAL_CSV_COLUMNS
 from src.pipeline.stages.train import _training_validation_metrics
@@ -178,7 +178,9 @@ def test_trainer_runs_single_epoch() -> None:
 def test_trainer_uses_accelerator_runtime_for_backward_and_autocast() -> None:
     model = TinyModel()
     loader = DataLoader(TinyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
-    accelerator = NoOpAccelerator()
+    accelerator = NoOpAccelerator(
+        distributed=DistributedContext(ddp_enabled=True, is_distributed=True)
+    )
     trainer = Trainer(
         model=model,
         device=torch.device("cpu"),
@@ -201,7 +203,9 @@ def test_trainer_uses_accelerator_runtime_for_backward_and_autocast() -> None:
 def test_evaluator_uses_accelerator_runtime_for_autocast_and_metric_gather() -> None:
     model = TinyModel()
     loader = DataLoader(TinyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
-    accelerator = NoOpAccelerator()
+    accelerator = NoOpAccelerator(
+        distributed=DistributedContext(ddp_enabled=True, is_distributed=True)
+    )
     evaluator = Evaluator(
         metrics=["accuracy", "auprc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
