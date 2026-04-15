@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -55,7 +56,7 @@ from src.utils.config import (
     get_section,
 )
 from src.utils.early_stop import EarlyStopping
-from src.utils.logging import append_csv_row, log_stage_event
+from src.utils.logging import append_csv_row, log_epoch_progress, log_stage_event
 from src.utils.losses import binary_classification_loss
 
 TOPOLOGY_FINETUNE_CSV_COLUMNS = [
@@ -822,6 +823,7 @@ def _fit_epoch(
     accelerator: AcceleratorLike,
     embedding_repository: EmbeddingRepository,
     negative_lookup: ExplicitNegativePairLookup | None,
+    logger: logging.Logger | None = None,
 ) -> dict[str, float]:
     """Run one fine-tuning epoch over sampled train subgraphs."""
     del use_amp
@@ -848,6 +850,7 @@ def _fit_epoch(
     sampled_subgraphs = epoch_plan.subgraphs
     aggregates = _initialize_train_aggregates(len(sampled_subgraphs), epoch_plan)
     train_forward_backward_seconds = 0.0
+    total_subgraphs = max(1, len(sampled_subgraphs))
 
     model.train()
     for subgraph_index, nodes in enumerate(sampled_subgraphs):
@@ -909,6 +912,13 @@ def _fit_epoch(
             bce_loss=bce_loss,
             topology_losses=topology_losses,
             total_loss=total_loss,
+        )
+        log_epoch_progress(
+            logger,
+            epoch=epoch_index + 1,
+            step=subgraph_index + 1,
+            total_steps=total_subgraphs,
+            loss=aggregates["total"] / float(subgraph_index + 1),
         )
 
     averaged = _average_train_aggregates(
@@ -1285,6 +1295,7 @@ def run_topology_finetuning_stage(
             accelerator=runtime.accelerator,
             embedding_repository=context.embedding_repository,
             negative_lookup=context.train_negative_lookup,
+            logger=logger,
         )
         train_stats = reduce_scalar_mapping(
             runtime.accelerator,

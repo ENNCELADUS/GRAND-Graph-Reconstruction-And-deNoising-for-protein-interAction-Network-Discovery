@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import logging
+import math
 from datetime import datetime
 from pathlib import Path
 
@@ -93,6 +94,66 @@ def log_stage_event_to_file(logger: logging.Logger, event: str, **fields: object
     for handler in logger.handlers:
         if isinstance(handler, logging.FileHandler):
             handler.handle(record)
+
+
+def log_epoch_progress(
+    logger: logging.Logger | None,
+    *,
+    epoch: int,
+    step: int,
+    total_steps: int,
+    every_n_steps: int = 0,
+    loss: float | None = None,
+    lr: float | None = None,
+) -> None:
+    """Emit one concise epoch-progress line at low-frequency checkpoints."""
+    if logger is None or not should_log_epoch_progress(
+        step=step,
+        total_steps=total_steps,
+        every_n_steps=every_n_steps,
+    ):
+        return
+    fields: dict[str, object] = {
+        "epoch": epoch,
+        "step": f"{step}/{max(1, total_steps)}",
+        "progress": f"{100.0 * step / max(1, total_steps):.0f}%",
+    }
+    if loss is not None:
+        fields["loss"] = loss
+    if lr is not None:
+        fields["lr"] = lr
+    log_stage_event(logger, "epoch_progress", **fields)
+
+
+def should_log_epoch_progress(
+    *,
+    step: int,
+    total_steps: int,
+    every_n_steps: int = 0,
+) -> bool:
+    """Return whether one epoch-progress checkpoint should be logged."""
+    if step <= 0:
+        return False
+    resolved_total_steps = max(1, total_steps)
+    if step == 1 or step == resolved_total_steps:
+        return True
+    return step % epoch_progress_interval(
+        total_steps=resolved_total_steps,
+        every_n_steps=every_n_steps,
+    ) == 0
+
+
+def epoch_progress_interval(
+    *,
+    total_steps: int,
+    every_n_steps: int = 0,
+) -> int:
+    """Return a low-frequency progress interval for one epoch."""
+    resolved_total_steps = max(1, total_steps)
+    low_frequency_interval = max(2, math.ceil(resolved_total_steps / 4))
+    if every_n_steps > 0:
+        return max(every_n_steps, low_frequency_interval)
+    return low_frequency_interval
 
 
 def format_stage_event(event: str, **fields: object) -> str:

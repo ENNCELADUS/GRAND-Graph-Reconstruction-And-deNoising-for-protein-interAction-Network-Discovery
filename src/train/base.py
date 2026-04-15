@@ -16,6 +16,7 @@ from src.pipeline.loops import forward_model, move_batch_to_device
 from src.pipeline.runtime import AcceleratorLike
 from src.train.config import LossConfig, OptimizerConfig, SchedulerConfig
 from src.train.strategies.ohem import OHEMSampleStrategy
+from src.utils.logging import log_epoch_progress
 from src.utils.losses import binary_classification_loss
 
 BatchValue = object
@@ -404,29 +405,20 @@ class Trainer:
                 self.scheduler.step()
 
             running_loss += float(loss.detach().item())
-            if self._should_log_heartbeat(step=batch_count, total_steps=total_steps):
-                current_lr = float(self.optimizer.param_groups[0]["lr"])
-                if self.logger is not None:
-                    self.logger.info(
-                        "Epoch %d | Step %d/%d | Loss %.4f | LR %.4e",
-                        epoch_index + 1,
-                        batch_count,
-                        total_steps,
-                        running_loss / batch_count,
-                        current_lr,
-                    )
+            current_lr = float(self.optimizer.param_groups[0]["lr"])
+            log_epoch_progress(
+                self.logger,
+                epoch=epoch_index + 1,
+                step=batch_count,
+                total_steps=total_steps,
+                every_n_steps=self.heartbeat_every_n_steps,
+                loss=running_loss / batch_count,
+                lr=current_lr,
+            )
 
         average_loss = running_loss / max(1, batch_count)
         current_lr = float(self.optimizer.param_groups[0]["lr"])
         return {"loss": average_loss, "lr": current_lr}
-
-    def _should_log_heartbeat(self, step: int, total_steps: int) -> bool:
-        """Return whether heartbeat logs should be emitted for this step."""
-        if self.logger is None:
-            return False
-        if step == 1 or step == total_steps:
-            return True
-        return self.heartbeat_every_n_steps > 0 and step % self.heartbeat_every_n_steps == 0
 
 
 __all__ = [
