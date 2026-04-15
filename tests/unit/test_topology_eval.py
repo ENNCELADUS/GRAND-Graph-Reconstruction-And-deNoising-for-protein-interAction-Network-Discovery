@@ -13,7 +13,6 @@ from src.run.stage_topology_evaluate import (
     _ordered_predictions_from_shards,
     write_topology_predictions,
 )
-from src.utils.distributed import DistributedContext
 from src.topology.metrics import (
     compute_graph_similarity,
     compute_relative_density,
@@ -25,6 +24,7 @@ from src.topology.report import (
     load_human_table2_baselines,
     write_human_table2_reports,
 )
+from src.utils.distributed import DistributedContext
 
 
 def test_compute_graph_similarity_matches_official_formula() -> None:
@@ -149,6 +149,7 @@ def test_ordered_predictions_from_shards_rejects_incomplete_results() -> None:
 
 class _FakeAccelerator:
     def __init__(self) -> None:
+        self.device = torch.device("cpu")
         self.pad_calls = 0
         self.gather_calls = 0
 

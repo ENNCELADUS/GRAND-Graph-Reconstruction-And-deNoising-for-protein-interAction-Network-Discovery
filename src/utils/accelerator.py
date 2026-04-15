@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager
-from typing import Any, Protocol, runtime_checkable
+from os import PathLike
+from typing import BinaryIO, Protocol, runtime_checkable
 
 import torch
 from accelerate import Accelerator
@@ -33,13 +34,36 @@ class AcceleratorLike(Protocol):
     def backward(self, loss: torch.Tensor) -> None:
         """Backpropagate one loss tensor."""
 
+    def gather_for_metrics(self, value: torch.Tensor) -> torch.Tensor:
+        """Gather tensors for metric computation."""
+
+    def gather(self, value: torch.Tensor) -> torch.Tensor:
+        """Gather tensors across processes."""
+
+    def pad_across_processes(
+        self,
+        value: torch.Tensor,
+        dim: int = 0,
+        pad_index: int = 0,
+        pad_first: bool = False,
+    ) -> torch.Tensor:
+        """Pad one tensor to a common size across processes."""
+
+    def reduce(self, value: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        """Reduce one tensor across processes."""
+
     def wait_for_everyone(self) -> None:
         """Synchronize all processes."""
 
     def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
         """Return the unwrapped model."""
 
-    def save(self, obj: object, f: Any, safe_serialization: bool = False) -> None:
+    def save(
+        self,
+        obj: object,
+        f: str | PathLike[str] | BinaryIO,
+        safe_serialization: bool = False,
+    ) -> None:
         """Persist one object once per machine."""
 
 
@@ -56,23 +80,58 @@ class LocalAccelerator:
         self.mixed_precision = "no"
 
     def prepare(self, *components: object) -> object:
+        """Return components unchanged in local execution."""
         if len(components) == 1:
             return components[0]
         return components
 
     def autocast(self) -> AbstractContextManager[object]:
+        """Use regular autocast when CUDA is available, otherwise no-op."""
         return torch.autocast(device_type=self.device.type, enabled=self.device.type == "cuda")
 
     def backward(self, loss: torch.Tensor) -> None:
+        """Backpropagate locally without distributed wrappers."""
         loss.backward()
 
+    def gather_for_metrics(self, value: torch.Tensor) -> torch.Tensor:
+        """Return local metrics tensor unchanged."""
+        return value
+
+    def gather(self, value: torch.Tensor) -> torch.Tensor:
+        """Return local gather tensor unchanged."""
+        return value
+
+    def pad_across_processes(
+        self,
+        value: torch.Tensor,
+        dim: int = 0,
+        pad_index: int = 0,
+        pad_first: bool = False,
+    ) -> torch.Tensor:
+        """Return local tensor unchanged because no cross-rank padding is needed."""
+        del dim, pad_index, pad_first
+        return value
+
+    def reduce(self, value: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        """Return local reduction tensor unchanged."""
+        del reduction
+        return value
+
     def wait_for_everyone(self) -> None:
+        """No-op synchronization for single-process execution."""
         return None
 
     def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
+        """Return the original model when nothing was wrapped."""
         return model
 
-    def save(self, obj: object, f: Any, safe_serialization: bool = False) -> None:
+    def save(
+        self,
+        obj: object,
+        f: str | PathLike[str] | BinaryIO,
+        safe_serialization: bool = False,
+    ) -> None:
+        """Persist one object with ``torch.save`` in local execution."""
         del safe_serialization
         torch.save(obj, f)
 

@@ -19,7 +19,6 @@ from src.adapt import (
 from src.utils.distributed import DistributedContext
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
 
 
 def _base_config() -> dict[str, object]:
@@ -178,37 +177,8 @@ def test_pseudo_label_loss_binary_path() -> None:
     assert float(loss.item()) >= 0.0
 
 
-def test_stage_adapt_all_reduce_helper(monkeypatch: pytest.MonkeyPatch) -> None:
-    context = DistributedContext(
-        ddp_enabled=True,
-        is_distributed=True,
-        rank=0,
-        local_rank=0,
-        world_size=2,
-    )
-    tensor = torch.tensor([1.0, 2.0], dtype=torch.float32)
-
-    monkeypatch.setattr(stage_adapt_module.dist, "is_initialized", lambda: True)
-
-    def fake_all_reduce(value: torch.Tensor, op: object) -> None:
-        del op
-        value.mul_(2.0)
-
-    monkeypatch.setattr(stage_adapt_module.dist, "all_reduce", fake_all_reduce)
-
-    reduced = stage_adapt_module._all_reduce_sum(tensor, context)
-    assert torch.allclose(reduced, torch.tensor([2.0, 4.0], dtype=torch.float32))
-
-
 def test_compute_global_centroids_promotes_mixed_precision_inputs() -> None:
     config = parse_domain_adaptation_config(_base_config())
-    context = DistributedContext(
-        ddp_enabled=False,
-        is_distributed=False,
-        rank=0,
-        local_rank=0,
-        world_size=1,
-    )
     model = _HalfLogitHeadModel()
     loader = DataLoader(_TargetFeatureDataset(), batch_size=2, shuffle=False)
     feature_hook = OutputHeadFeatureHook(model=model)
@@ -221,7 +191,7 @@ def test_compute_global_centroids_promotes_mixed_precision_inputs() -> None:
             device=torch.device("cpu"),
             use_amp=False,
             adaptation_config=config,
-            distributed_context=context,
+            accelerator=_FakeAccelerator(),
         )
     finally:
         feature_hook.close()
@@ -261,7 +231,7 @@ class _FakeAccelerator:
         self.backward_calls = 0
         self.reduce_calls = 0
 
-    def autocast(self):
+    def autocast(self) -> object:
         from contextlib import nullcontext
 
         self.autocast_calls += 1
@@ -314,47 +284,6 @@ def test_prepare_shot_optimizer_params_freezes_prefixes_without_ddp() -> None:
     assert all(not parameter.requires_grad for parameter in model.output_head.parameters())
 
 
-def test_build_target_loaders_uses_distributed_sampler_when_ddp_enabled() -> None:
-    config: dict[str, object] = {
-        "training_config": {
-            "batch_size": 2,
-            "domain_adaptation": {
-                "enabled": True,
-                "method": "shot",
-                "target_split": "test",
-            },
-        },
-        "data_config": {
-            "dataloader": {
-                "num_workers": 0,
-                "pin_memory": False,
-            }
-        },
-    }
-    adaptation_config = parse_domain_adaptation_config(config)
-    base_loader = DataLoader(_TinyDataset(), batch_size=2, shuffle=False)
-    dataloaders: dict[str, DataLoader[dict[str, object]]] = {"test": base_loader}
-    context = DistributedContext(
-        ddp_enabled=True,
-        is_distributed=True,
-        rank=0,
-        local_rank=0,
-        world_size=2,
-    )
-
-    eval_loader, train_loader = stage_adapt_module._build_target_loaders(
-        config=config,
-        dataloaders=dataloaders,
-        adaptation_config=adaptation_config,
-        distributed_context=context,
-    )
-
-    assert isinstance(eval_loader.sampler, DistributedSampler)
-    assert isinstance(train_loader.sampler, DistributedSampler)
-    assert train_loader.drop_last is True
-    assert eval_loader.drop_last is False
-
-
 def test_build_target_loaders_keeps_plain_loaders_when_accelerator_handles_ddp() -> None:
     config: dict[str, object] = {
         "training_config": {
@@ -390,8 +319,8 @@ def test_build_target_loaders_keeps_plain_loaders_when_accelerator_handles_ddp()
         distributed_context=context,
     )
 
-    assert not isinstance(eval_loader.sampler, DistributedSampler)
-    assert not isinstance(train_loader.sampler, DistributedSampler)
+    assert not type(eval_loader.sampler).__name__.endswith("DistributedSampler")
+    assert not type(train_loader.sampler).__name__.endswith("DistributedSampler")
     assert train_loader.drop_last is True
     assert eval_loader.drop_last is False
 

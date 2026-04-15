@@ -261,7 +261,7 @@ class _RecordingAccelerator:
         self.prepare_calls += 1
         return components
 
-    def autocast(self):
+    def autocast(self) -> object:
         from contextlib import nullcontext
 
         self.autocast_calls += 1
@@ -670,7 +670,6 @@ def test_run_topology_finetuning_stage_allows_embedding_generation_on_non_main_r
     )
     monkeypatch.setattr(topology_finetune_stage.dist, "is_available", lambda: True)
     monkeypatch.setattr(topology_finetune_stage.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(topology_finetune_stage, "distributed_barrier", lambda _: None)
 
     previous_cwd = Path.cwd()
     try:

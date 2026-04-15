@@ -138,6 +138,7 @@ def run_evaluation_stage(
         metrics=metrics_to_compute,
         loss_config=loss_config,
         use_amp=use_amp,
+        accelerator=stage_accelerator,
     )
     decision_threshold, threshold_mode = _resolve_decision_threshold(
         eval_cfg=eval_cfg,
@@ -151,6 +152,7 @@ def run_evaluation_stage(
         loss_config=loss_config,
         decision_threshold=decision_threshold,
         use_amp=use_amp,
+        accelerator=stage_accelerator,
     )
     if distributed_context.is_main_process:
         log_stage_event(

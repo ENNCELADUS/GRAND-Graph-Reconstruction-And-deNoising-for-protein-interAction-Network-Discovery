@@ -156,6 +156,7 @@ class FakeAccelerator:
 
     def __init__(self) -> None:
         self.device = torch.device("cpu")
+        self.use_distributed = True
         self.autocast_calls = 0
         self.backward_calls = 0
         self.prepare_calls = 0
@@ -231,6 +232,7 @@ def test_evaluator_uses_accelerator_runtime_for_autocast_and_metric_gather() -> 
         decision_threshold=0.5,
         use_amp=False,
         accelerator=accelerator,
+        gather_for_metrics=True,
     )
 
     metrics = evaluator.evaluate(

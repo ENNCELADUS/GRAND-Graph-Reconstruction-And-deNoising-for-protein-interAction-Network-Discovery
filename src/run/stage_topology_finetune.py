@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
 
@@ -26,7 +26,6 @@ from src.run.stage_train import (
     _load_checkpoint,
     _save_checkpoint,
 )
-from src.utils.accelerator import AcceleratorLike, LocalAccelerator
 from src.topology.finetune_data import (
     TOPOLOGY_EVAL_NODE_SIZES,
     TOPOLOGY_EVAL_SAMPLES_PER_SIZE,
@@ -46,6 +45,7 @@ from src.topology.finetune_losses import (
     compute_topology_losses,
 )
 from src.topology.metrics import evaluate_graph_samples
+from src.utils.accelerator import AcceleratorLike, LocalAccelerator
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -55,7 +55,7 @@ from src.utils.config import (
     extract_model_kwargs,
     get_section,
 )
-from src.utils.distributed import DistributedContext, distributed_barrier
+from src.utils.distributed import DistributedContext
 from src.utils.early_stop import EarlyStopping
 from src.utils.logging import append_csv_row, log_stage_event
 from src.utils.losses import binary_classification_loss
@@ -108,7 +108,6 @@ class TopologyFinetuneStageContext:
     epochs: int
     run_seed: int
     use_amp: bool
-    scaler: torch.amp.GradScaler
     optimizer: Optimizer
     evaluator: Evaluator
     threshold_probe: Evaluator
@@ -643,21 +642,6 @@ def _evaluate_internal_validation_subgraphs(
     return cast(dict[str, float], result["summary"])
 
 
-def _all_reduce_mean(
-    *,
-    value: float,
-    distributed_context: DistributedContext,
-    device: torch.device,
-) -> float:
-    """Average one scalar across all distributed ranks."""
-    if not distributed_context.is_distributed or not dist.is_initialized():
-        return value
-    tensor = torch.tensor([value], dtype=torch.float64, device=device)
-    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    tensor /= float(max(1, distributed_context.world_size))
-    return float(tensor.item())
-
-
 def _masked_bce_loss(
     *,
     logits: torch.Tensor,
@@ -743,10 +727,11 @@ def _fit_epoch(
     loss_weights: TopologyLossWeights,
     pair_batch_size: int,
     use_amp: bool,
-    scaler: torch.amp.GradScaler,
+    accelerator: AcceleratorLike,
     negative_lookup: ExplicitNegativePairLookup | None,
 ) -> dict[str, float]:
     """Run one fine-tuning epoch over sampled train subgraphs."""
+    del use_amp
     finetune_cfg = _topology_finetune_config(config)
     min_nodes, max_nodes = _resolve_sampling_node_bounds(finetune_cfg)
     subgraphs_per_epoch = as_int(
@@ -771,7 +756,7 @@ def _fit_epoch(
     model.train()
     for subgraph_index, nodes in enumerate(sampled_subgraphs):
         optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, enabled=use_amp):
+        with accelerator.autocast():
             (
                 logits,
                 labels,
@@ -813,13 +798,8 @@ def _fit_epoch(
             )
             total_loss = bce_loss + topology_losses["total_topology"]
 
-        if use_amp:
-            scaler.scale(total_loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            total_loss.backward()
-            optimizer.step()
+        accelerator.backward(total_loss)
+        optimizer.step()
         _update_train_aggregates(
             aggregates=aggregates,
             bce_loss=bce_loss,
@@ -856,6 +836,7 @@ def _prepare_topology_finetune_stage_context(
     log_dir: Path,
     model_dir: Path,
     distributed_context: DistributedContext,
+    accelerator: AcceleratorLike,
 ) -> TopologyFinetuneStageContext:
     """Build shared runtime state for topology fine-tuning."""
     run_cfg = get_section(config, "run_config")
@@ -913,18 +894,20 @@ def _prepare_topology_finetune_stage_context(
         extra_protein_ids=sorted(train_graph.nodes),
     )
     if distributed_context.is_distributed:
-        distributed_barrier(distributed_context)
+        accelerator.wait_for_everyone()
     _validate_embedding_cache(graph=train_graph, embedding_index=embedding_cache.index)
 
     evaluator = Evaluator(
         metrics=["auprc"],
         loss_config=_build_loss_config(training_cfg),
         use_amp=use_amp,
+        accelerator=accelerator,
     )
     threshold_probe = Evaluator(
         metrics=["f1"],
         loss_config=_build_loss_config(training_cfg),
         use_amp=use_amp,
+        accelerator=accelerator,
     )
     overlap_penalty = _resolve_overlap_penalty(finetune_cfg)
     return TopologyFinetuneStageContext(
@@ -939,7 +922,6 @@ def _prepare_topology_finetune_stage_context(
         epochs=epochs,
         run_seed=run_seed,
         use_amp=use_amp,
-        scaler=torch.amp.GradScaler("cuda", enabled=use_amp),
         optimizer=_build_optimizer(config=config, model=model),
         evaluator=evaluator,
         threshold_probe=threshold_probe,
@@ -1117,7 +1099,13 @@ def run_topology_finetuning_stage(
         log_dir=log_dir,
         model_dir=model_dir,
         distributed_context=distributed_context,
+        accelerator=stage_accelerator,
     )
+    stage_model, prepared_optimizer = cast(
+        tuple[nn.Module, Optimizer],
+        stage_accelerator.prepare(model, context.optimizer),
+    )
+    context = replace(context, optimizer=prepared_optimizer)
     best_metrics: dict[str, float | str] = {}
 
     if distributed_context.is_main_process:
@@ -1138,7 +1126,7 @@ def run_topology_finetuning_stage(
         epoch_start = time.perf_counter()
         train_stats = _fit_epoch(
             config=config,
-            model=model,
+            model=stage_model,
             device=device,
             graph=context.train_graph,
             cache_dir=context.cache_dir,
@@ -1151,21 +1139,22 @@ def run_topology_finetuning_stage(
             loss_weights=context.loss_weights,
             pair_batch_size=context.pair_batch_size,
             use_amp=context.use_amp,
-            scaler=context.scaler,
+            accelerator=stage_accelerator,
             negative_lookup=context.train_negative_lookup,
         )
         train_stats = {
-            name: _all_reduce_mean(
-                value=value,
-                distributed_context=distributed_context,
-                device=device,
+            name: float(
+                stage_accelerator.reduce(
+                    torch.tensor(value, dtype=torch.float64, device=device),
+                    reduction="mean",
+                ).item()
             )
             for name, value in train_stats.items()
         }
 
         validation_result = _evaluate_validation_epoch(
             config=config,
-            model=model,
+            model=stage_model,
             dataloaders=dataloaders,
             device=device,
             context=context,
@@ -1192,7 +1181,7 @@ def run_topology_finetuning_stage(
             improved, should_stop = context.early_stopping.update(monitor_value)
             if improved:
                 _save_checkpoint(
-                    model=model,
+                    model=stage_model,
                     checkpoint_path=context.best_checkpoint_path,
                     accelerator=stage_accelerator,
                 )
@@ -1239,7 +1228,7 @@ def run_topology_finetuning_stage(
 
     if distributed_context.is_main_process and not context.best_checkpoint_path.exists():
         _save_checkpoint(
-            model=model,
+            model=stage_model,
             checkpoint_path=context.best_checkpoint_path,
             accelerator=stage_accelerator,
         )
@@ -1253,5 +1242,5 @@ def run_topology_finetuning_stage(
             )
     if distributed_context.is_main_process:
         log_stage_event(logger, "stage_done", run_id=run_id)
-    distributed_barrier(distributed_context)
+    stage_accelerator.wait_for_everyone()
     return context.best_checkpoint_path

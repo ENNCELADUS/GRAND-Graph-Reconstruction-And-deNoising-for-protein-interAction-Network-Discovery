@@ -6,7 +6,6 @@ import json
 import logging
 import pickle
 from collections.abc import Mapping, Sequence
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, cast
 
@@ -18,13 +17,13 @@ from src.embed import ensure_embeddings_ready
 from src.evaluate import Evaluator
 from src.run.stage_evaluate import _resolve_decision_threshold
 from src.run.stage_train import _build_loss_config, _build_stage_runtime, _load_checkpoint
-from src.utils.accelerator import AcceleratorLike, LocalAccelerator
 from src.topology import (
     evaluate_predicted_graph,
     load_human_table2_baselines,
     reconstruct_graph,
     write_human_table2_reports,
 )
+from src.utils.accelerator import AcceleratorLike, LocalAccelerator
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -34,7 +33,7 @@ from src.utils.config import (
     get_section,
 )
 from src.utils.data_io import PRINGPairDataset, _collate_batch
-from src.utils.distributed import DistributedContext, distributed_barrier
+from src.utils.distributed import DistributedContext
 from src.utils.logging import append_csv_row, log_stage_event
 
 TOPOLOGY_METRIC_NAMES = [
@@ -216,18 +215,16 @@ def _predict_topology_labels(
     device: torch.device,
     decision_threshold: float,
     use_amp: bool,
+    accelerator: AcceleratorLike,
 ) -> list[int]:
     """Predict probabilities and thresholded labels for all topology pairs."""
     predictions: list[int] = []
-    autocast_context = (
-        torch.autocast(device_type=device.type, enabled=True)
-        if use_amp and device.type in {"cpu", "cuda"}
-        else nullcontext()
-    )
-    with torch.inference_mode(), autocast_context:
+    del use_amp
+    with torch.inference_mode():
         for batch in data_loader:
             prepared_batch = _move_batch_to_device(batch=batch, device=device)
-            output = _forward_model(model=model, batch=prepared_batch)
+            with accelerator.autocast():
+                output = _forward_model(model=model, batch=prepared_batch)
             logits = output["logits"]
             reduced_logits = (
                 logits.squeeze(-1) if logits.dim() > 1 and logits.size(-1) == 1 else logits
@@ -271,23 +268,52 @@ def _gather_ordered_predictions(
     local_predictions: Sequence[int],
     total_records: int,
     distributed_context: DistributedContext,
+    accelerator: AcceleratorLike,
 ) -> list[int]:
     """Gather local predictions from all ranks and restore original order on every rank."""
     if not distributed_context.is_distributed:
         return [int(prediction) for prediction in local_predictions]
-    if not dist.is_initialized():
-        raise RuntimeError("Distributed topology evaluation requires an initialized process group")
 
-    gathered_payloads: list[dict[str, list[int]]] = [
-        {"indices": [], "predictions": []} for _ in range(distributed_context.world_size)
-    ]
-    dist.all_gather_object(
-        object_list=gathered_payloads,
-        obj={
-            "indices": [int(index) for index in local_indices],
-            "predictions": [int(prediction) for prediction in local_predictions],
-        },
+    local_index_tensor = torch.tensor(local_indices, dtype=torch.long, device=accelerator.device)
+    local_prediction_tensor = torch.tensor(
+        local_predictions,
+        dtype=torch.long,
+        device=accelerator.device,
     )
+    padded_indices = accelerator.pad_across_processes(
+        local_index_tensor,
+        dim=0,
+        pad_index=-1,
+    )
+    padded_predictions = accelerator.pad_across_processes(
+        local_prediction_tensor,
+        dim=0,
+        pad_index=-1,
+    )
+    gathered_indices = accelerator.gather(padded_indices).detach().cpu()
+    gathered_predictions = accelerator.gather(padded_predictions).detach().cpu()
+    per_rank_length = int(padded_indices.size(0))
+    gathered_payloads = []
+    for rank_index in range(distributed_context.world_size):
+        start = rank_index * per_rank_length
+        end = start + per_rank_length
+        rank_indices = [
+            int(index)
+            for index in gathered_indices[start:end].tolist()
+            if int(index) >= 0
+        ]
+        rank_predictions = [
+            int(prediction)
+            for prediction, index in zip(
+                gathered_predictions[start:end].tolist(),
+                gathered_indices[start:end].tolist(),
+                strict=True,
+            )
+            if int(index) >= 0
+        ]
+        gathered_payloads.append(
+            {"indices": rank_indices, "predictions": rank_predictions}
+        )
     return _ordered_predictions_from_shards(
         total_records=total_records,
         shard_payloads=gathered_payloads,
@@ -443,6 +469,7 @@ def run_topology_evaluation_stage(
             metrics=["f1"],
             loss_config=_build_loss_config(training_cfg),
             use_amp=use_amp,
+            accelerator=stage_accelerator,
         )
         decision_threshold, threshold_mode = _resolve_decision_threshold(
             eval_cfg=threshold_cfg,
@@ -484,12 +511,14 @@ def run_topology_evaluation_stage(
         device=device,
         decision_threshold=decision_threshold,
         use_amp=use_amp,
+        accelerator=stage_accelerator,
     )
     predictions = _gather_ordered_predictions(
         local_indices=local_indices,
         local_predictions=local_predictions,
         total_records=len(records),
         distributed_context=distributed_context,
+        accelerator=stage_accelerator,
     )
 
     prediction_path = log_dir / "all_test_ppi_pred.txt"
@@ -555,5 +584,5 @@ def run_topology_evaluation_stage(
         log_stage_event(logger, "topology_metrics_written", path=log_dir / "topology_metrics.json")
         _maybe_write_comparison_report(config=config, model_name=model_name, logger=logger)
         log_stage_event(logger, "stage_done", run_id=run_id)
-    distributed_barrier(distributed_context)
+    stage_accelerator.wait_for_everyone()
     return cast(dict[str, float], topology_result["summary"])

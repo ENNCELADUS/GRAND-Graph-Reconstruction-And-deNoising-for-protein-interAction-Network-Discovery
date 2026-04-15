@@ -274,7 +274,6 @@ def test_run_topology_evaluation_stage_non_main_rank_computes_topology_summary(
         "_gather_ordered_predictions",
         lambda **_: [1, 0, 1],
     )
-    monkeypatch.setattr(topology_stage, "distributed_barrier", lambda context: None)
 
     previous_cwd = Path.cwd()
     try:

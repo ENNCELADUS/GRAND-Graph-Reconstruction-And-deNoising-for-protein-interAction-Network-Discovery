@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext
 
 import torch
 from sklearn.metrics import (
@@ -22,6 +21,7 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from src.train.config import LossConfig
+from src.utils.accelerator import AcceleratorLike, LocalAccelerator
 from src.utils.losses import binary_classification_loss
 
 BatchValue = object
@@ -58,11 +58,15 @@ class Evaluator:
         *,
         decision_threshold: float = 0.5,
         use_amp: bool = False,
+        accelerator: AcceleratorLike | None = None,
+        gather_for_metrics: bool = False,
     ) -> None:
         self.metrics = [metric.lower() for metric in metrics]
         self.loss_config = loss_config
         self.decision_threshold = self._validate_decision_threshold(decision_threshold)
         self.use_amp = use_amp
+        self.accelerator = accelerator
+        self.gather_metrics = gather_for_metrics
 
     @staticmethod
     def _validate_decision_threshold(decision_threshold: float) -> float:
@@ -226,38 +230,40 @@ class Evaluator:
         """Collect probabilities, labels, and average loss for one loader."""
         all_probs: list[torch.Tensor] = []
         all_labels: list[torch.Tensor] = []
-        total_loss = 0.0
-        batch_count = 0
-        autocast_context = (
-            torch.autocast(device_type=device.type, enabled=True)
-            if self.use_amp and device.type in {"cpu", "cuda"}
-            else nullcontext()
-        )
+        all_losses: list[torch.Tensor] = []
+        accelerator = self.accelerator or LocalAccelerator(device)
 
-        with torch.inference_mode(), autocast_context:
+        with torch.inference_mode():
             for batch in data_loader:
-                batch_count += 1
                 prepared_batch = self._move_batch_to_device(batch=batch, device=device)
-                output = self._forward_model(model=model, batch=prepared_batch)
+                with accelerator.autocast():
+                    output = self._forward_model(model=model, batch=prepared_batch)
                 logits = output["logits"]
                 labels = self._batch_tensor(prepared_batch, "label").float()
-                loss = binary_classification_loss(
+                per_sample_loss = binary_classification_loss(
                     logits=logits,
                     labels=labels,
                     loss_config=self.loss_config,
-                    reduction="mean",
+                    reduction="none",
                 )
-                total_loss += float(loss.detach().item())
                 reduced_logits = (
                     logits.squeeze(-1) if logits.dim() > 1 and logits.size(-1) == 1 else logits
                 )
-                all_probs.append(torch.sigmoid(reduced_logits).detach().cpu())
-                all_labels.append(labels.detach().cpu())
+                probs = torch.sigmoid(reduced_logits).detach()
+                gathered_labels = labels.detach()
+                gathered_losses = per_sample_loss.detach()
+                if self.gather_metrics and accelerator.use_distributed:
+                    probs = accelerator.gather_for_metrics(probs)
+                    gathered_labels = accelerator.gather_for_metrics(gathered_labels)
+                    gathered_losses = accelerator.gather_for_metrics(gathered_losses)
+                all_probs.append(probs.cpu())
+                all_labels.append(gathered_labels.cpu())
+                all_losses.append(gathered_losses.cpu())
 
         return (
             torch.cat(all_labels, dim=0).long(),
             torch.cat(all_probs, dim=0),
-            total_loss / max(1, batch_count),
+            float(torch.cat(all_losses, dim=0).mean().item()),
         )
 
     @staticmethod
