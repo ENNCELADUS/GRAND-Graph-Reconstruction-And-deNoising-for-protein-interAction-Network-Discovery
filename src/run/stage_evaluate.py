@@ -8,8 +8,9 @@ from pathlib import Path
 import torch
 
 from src.evaluate import Evaluator
+from src.pipeline.loops import ensure_accelerator
 from src.run.stage_train import _build_loss_config, _build_stage_runtime, _load_checkpoint
-from src.utils.accelerator import AcceleratorLike, LocalAccelerator
+from src.utils.accelerator import AcceleratorLike
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -19,8 +20,11 @@ from src.utils.config import (
     extract_model_kwargs,
     get_section,
 )
-from src.utils.distributed import DistributedContext, distributed_barrier
+from src.utils.distributed import DistributedContext
+from src.utils.distributed import distributed_barrier as _distributed_barrier
 from src.utils.logging import append_csv_row, log_stage_event
+
+distributed_barrier = _distributed_barrier
 
 EVAL_CSV_COLUMNS = [
     "split",
@@ -89,7 +93,16 @@ def run_evaluation_stage(
     accelerator: AcceleratorLike | None = None,
 ) -> dict[str, float]:
     """Run test evaluation and persist ``evaluate.csv``."""
-    stage_accelerator = accelerator or LocalAccelerator(device)
+    device_cfg = get_section(config, "device_config")
+    use_amp = device.type == "cuda" and as_bool(
+        device_cfg.get("use_mixed_precision", False),
+        "device_config.use_mixed_precision",
+    )
+    stage_accelerator = ensure_accelerator(
+        accelerator,
+        device=device,
+        use_mixed_precision=use_amp,
+    )
     checkpoint_path_resolved = Path(checkpoint_path)
     model_name, _ = extract_model_kwargs(config)
     log_dir, _, logger = _build_stage_runtime(
@@ -105,40 +118,33 @@ def run_evaluation_stage(
             run_id=run_id,
             checkpoint=checkpoint_path_resolved,
         )
-    if accelerator is None:
-        _load_checkpoint(
-            model=model,
-            checkpoint_path=checkpoint_path_resolved,
-            device=device,
-        )
-    else:
+    try:
         _load_checkpoint(
             model=model,
             checkpoint_path=checkpoint_path_resolved,
             device=device,
             accelerator=stage_accelerator,
         )
+    except TypeError:
+        _load_checkpoint(
+            model=model,
+            checkpoint_path=checkpoint_path_resolved,
+            device=device,
+        )
     if distributed_context.is_main_process:
         log_stage_event(logger, "checkpoint_loaded", path=checkpoint_path_resolved)
     model.eval()
-    if distributed_context.is_distributed and not distributed_context.is_main_process:
-        distributed_barrier(distributed_context)
-        return {}
     eval_cfg = get_section(config, "evaluate")
     training_cfg = get_section(config, "training_config")
-    device_cfg = get_section(config, "device_config")
     configured_metrics = _metrics_from_config(eval_cfg)
     metrics_to_compute = sorted(set(configured_metrics + EVAL_CSV_COLUMNS[1:]))
     loss_config = _build_loss_config(training_cfg)
-    use_amp = device.type == "cuda" and as_bool(
-        device_cfg.get("use_mixed_precision", False),
-        "device_config.use_mixed_precision",
-    )
     threshold_probe = Evaluator(
         metrics=metrics_to_compute,
         loss_config=loss_config,
         use_amp=use_amp,
         accelerator=stage_accelerator,
+        gather_for_metrics=stage_accelerator.use_distributed,
     )
     decision_threshold, threshold_mode = _resolve_decision_threshold(
         eval_cfg=eval_cfg,
@@ -153,6 +159,7 @@ def run_evaluation_stage(
         decision_threshold=decision_threshold,
         use_amp=use_amp,
         accelerator=stage_accelerator,
+        gather_for_metrics=stage_accelerator.use_distributed,
     )
     if distributed_context.is_main_process:
         log_stage_event(
@@ -184,5 +191,5 @@ def run_evaluation_stage(
             "stage_done",
             run_id=run_id,
         )
-    distributed_barrier(distributed_context)
+    stage_accelerator.wait_for_everyone()
     return metrics

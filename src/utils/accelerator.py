@@ -8,7 +8,7 @@ from typing import BinaryIO, Protocol, runtime_checkable
 
 import torch
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.utils import DataLoaderConfiguration, DistributedDataParallelKwargs
 
 from src.utils.distributed import DistributedContext
 
@@ -66,76 +66,6 @@ class AcceleratorLike(Protocol):
     ) -> None:
         """Persist one object once per machine."""
 
-
-class LocalAccelerator:
-    """Small local fallback used when no shared accelerator is injected."""
-
-    def __init__(self, device: torch.device) -> None:
-        self.device = device
-        self.is_main_process = True
-        self.use_distributed = False
-        self.process_index = 0
-        self.local_process_index = 0
-        self.num_processes = 1
-        self.mixed_precision = "no"
-
-    def prepare(self, *components: object) -> object:
-        """Return components unchanged in local execution."""
-        if len(components) == 1:
-            return components[0]
-        return components
-
-    def autocast(self) -> AbstractContextManager[object]:
-        """Use regular autocast when CUDA is available, otherwise no-op."""
-        return torch.autocast(device_type=self.device.type, enabled=self.device.type == "cuda")
-
-    def backward(self, loss: torch.Tensor) -> None:
-        """Backpropagate locally without distributed wrappers."""
-        loss.backward()
-
-    def gather_for_metrics(self, value: torch.Tensor) -> torch.Tensor:
-        """Return local metrics tensor unchanged."""
-        return value
-
-    def gather(self, value: torch.Tensor) -> torch.Tensor:
-        """Return local gather tensor unchanged."""
-        return value
-
-    def pad_across_processes(
-        self,
-        value: torch.Tensor,
-        dim: int = 0,
-        pad_index: int = 0,
-        pad_first: bool = False,
-    ) -> torch.Tensor:
-        """Return local tensor unchanged because no cross-rank padding is needed."""
-        del dim, pad_index, pad_first
-        return value
-
-    def reduce(self, value: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
-        """Return local reduction tensor unchanged."""
-        del reduction
-        return value
-
-    def wait_for_everyone(self) -> None:
-        """No-op synchronization for single-process execution."""
-        return None
-
-    def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
-        """Return the original model when nothing was wrapped."""
-        return model
-
-    def save(
-        self,
-        obj: object,
-        f: str | PathLike[str] | BinaryIO,
-        safe_serialization: bool = False,
-    ) -> None:
-        """Persist one object with ``torch.save`` in local execution."""
-        del safe_serialization
-        torch.save(obj, f)
-
-
 def build_accelerator(
     *,
     requested_device: str,
@@ -149,9 +79,11 @@ def build_accelerator(
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=find_unused_parameters,
     )
+    dataloader_config = DataLoaderConfiguration(non_blocking=True)
     return Accelerator(
         cpu=requested_device.lower() == "cpu",
         mixed_precision=mixed_precision,
+        dataloader_config=dataloader_config,
         kwargs_handlers=[ddp_kwargs],
     )
 
@@ -174,7 +106,6 @@ def distributed_context_from_accelerator(
 
 __all__ = [
     "AcceleratorLike",
-    "LocalAccelerator",
     "build_accelerator",
     "distributed_context_from_accelerator",
 ]

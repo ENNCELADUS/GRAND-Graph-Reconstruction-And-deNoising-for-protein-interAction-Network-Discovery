@@ -256,24 +256,16 @@ def test_run_topology_evaluation_stage_non_main_rank_computes_topology_summary(
     torch.save(model.state_dict(), checkpoint_path)
     dataloaders = build_dataloaders(config=config)
 
-    monkeypatch.setattr(topology_stage.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(topology_stage.dist, "broadcast", lambda tensor, src: None)
     monkeypatch.setattr(
         topology_stage,
         "_build_topology_loader",
         lambda **_: (
             cast(DataLoader[dict[str, object]], dataloaders["test"]),
             [("P1", "P2"), ("P1", "P3"), ("P2", "P3")],
-            [1],
             3,
         ),
     )
-    monkeypatch.setattr(topology_stage, "_predict_topology_labels", lambda **_: [0])
-    monkeypatch.setattr(
-        topology_stage,
-        "_gather_ordered_predictions",
-        lambda **_: [1, 0, 1],
-    )
+    monkeypatch.setattr(topology_stage, "_predict_topology_labels", lambda **_: [1, 0, 1])
 
     previous_cwd = Path.cwd()
     try:

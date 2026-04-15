@@ -12,9 +12,10 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler, OneCycleLR
 from torch.utils.data import DataLoader
 
+from src.pipeline.loops import ensure_accelerator, forward_model, move_batch_to_device
 from src.train.config import LossConfig, OptimizerConfig, SchedulerConfig
 from src.train.strategies.ohem import OHEMSampleStrategy
-from src.utils.accelerator import AcceleratorLike, LocalAccelerator
+from src.utils.accelerator import AcceleratorLike
 from src.utils.losses import binary_classification_loss
 
 BatchValue = object
@@ -47,7 +48,11 @@ class Trainer:
     ) -> None:
         self.model = model
         self.device = device
-        self.accelerator = accelerator or LocalAccelerator(device)
+        self.accelerator = ensure_accelerator(
+            accelerator,
+            device=device,
+            use_mixed_precision=use_amp,
+        )
         self.optimizer_config = optimizer_config
         self.scheduler_config = scheduler_config
         self.loss_config = loss_config
@@ -167,22 +172,10 @@ class Trainer:
 
     def _move_batch_to_device(self, batch: BatchInput) -> BatchDict:
         """Move tensor fields to target device while preserving non-tensor fields."""
-        moved_batch: BatchDict = {}
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor):
-                moved_batch[key] = value.to(self.device)
-            else:
-                moved_batch[key] = value
-        return moved_batch
+        return move_batch_to_device(batch, self.device)
 
     def _forward_model(self, batch: BatchInput) -> dict[str, torch.Tensor]:
-        try:
-            output = self.model(**batch)
-        except TypeError:
-            output = self.model(batch=batch)
-        if not isinstance(output, dict):
-            raise ValueError("Model forward output must be a dictionary")
-        return output
+        return forward_model(self.model, batch)
 
     def _select_loss(
         self,

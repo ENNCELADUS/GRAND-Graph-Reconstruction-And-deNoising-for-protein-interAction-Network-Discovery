@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader
 
 from src.embed import ensure_embeddings_ready
 from src.evaluate import Evaluator
+from src.pipeline.loops import ensure_accelerator, reduce_scalar_mapping
 from src.run.stage_evaluate import _resolve_decision_threshold
 from src.run.stage_train import (
     _build_loss_config,
@@ -45,7 +46,7 @@ from src.topology.finetune_losses import (
     compute_topology_losses,
 )
 from src.topology.metrics import evaluate_graph_samples
-from src.utils.accelerator import AcceleratorLike, LocalAccelerator
+from src.utils.accelerator import AcceleratorLike
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -1061,7 +1062,14 @@ def run_topology_finetuning_stage(
     accelerator: AcceleratorLike | None = None,
 ) -> Path:
     """Fine-tune a pairwise scorer with PRING graph-topology losses."""
-    stage_accelerator = accelerator or LocalAccelerator(device)
+    stage_accelerator = ensure_accelerator(
+        accelerator,
+        device=device,
+        use_mixed_precision=as_bool(
+            get_section(config, "device_config").get("use_mixed_precision", False),
+            "device_config.use_mixed_precision",
+        ),
+    )
     model_name, _ = extract_model_kwargs(config)
     log_dir, model_dir, logger = _build_stage_runtime(
         model_name=model_name,
@@ -1142,15 +1150,12 @@ def run_topology_finetuning_stage(
             accelerator=stage_accelerator,
             negative_lookup=context.train_negative_lookup,
         )
-        train_stats = {
-            name: float(
-                stage_accelerator.reduce(
-                    torch.tensor(value, dtype=torch.float64, device=device),
-                    reduction="mean",
-                ).item()
-            )
-            for name, value in train_stats.items()
-        }
+        train_stats = reduce_scalar_mapping(
+            stage_accelerator,
+            train_stats,
+            device=device,
+            reduction="mean",
+        )
 
         validation_result = _evaluate_validation_epoch(
             config=config,

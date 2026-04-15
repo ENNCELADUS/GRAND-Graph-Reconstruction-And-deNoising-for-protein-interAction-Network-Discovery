@@ -9,17 +9,16 @@ from pathlib import Path
 from typing import Literal, cast
 
 import torch
-import torch.distributed as dist
 from torch import nn
-from torch.nn.parallel import DistributedDataParallel
 
 from src.evaluate import Evaluator
 from src.model import V3, V3_1, V4, V5
+from src.pipeline.loops import ensure_accelerator
 from src.train.base import Trainer
 from src.train.config import LossConfig, OptimizerConfig, SchedulerConfig
 from src.train.strategies.lifecycle import NoOpStrategy, StagedUnfreezeStrategy, TrainingStrategy
 from src.train.strategies.ohem import OHEMSampleStrategy
-from src.utils.accelerator import AcceleratorLike, LocalAccelerator
+from src.utils.accelerator import AcceleratorLike
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -30,7 +29,7 @@ from src.utils.config import (
     extract_model_kwargs,
     get_section,
 )
-from src.utils.distributed import DistributedContext, distributed_barrier
+from src.utils.distributed import DistributedContext
 from src.utils.early_stop import EarlyStopping
 from src.utils.logging import (
     append_csv_row,
@@ -166,9 +165,9 @@ def _unwrap_model(
 ) -> nn.Module:
     """Return underlying model when wrapped by DDP."""
     if accelerator is not None:
-        return accelerator.unwrap_model(model)
-    if isinstance(model, DistributedDataParallel):
-        return cast(nn.Module, model.module)
+        unwrap_model = getattr(accelerator, "unwrap_model", None)
+        if callable(unwrap_model):
+            return unwrap_model(model)
     return model
 
 
@@ -210,8 +209,8 @@ def build_trainer(
     config: ConfigDict,
     model: nn.Module,
     device: torch.device,
-    accelerator: AcceleratorLike | None,
-    steps_per_epoch: int,
+    accelerator: AcceleratorLike | None = None,
+    steps_per_epoch: int = 1,
     logger: logging.Logger | None = None,
 ) -> tuple[Trainer, LossConfig]:
     """Instantiate trainer with optimizer/scheduler configs."""
@@ -329,7 +328,10 @@ def _save_checkpoint(
         torch.save(state_dict, checkpoint_path)
         return
     accelerator.wait_for_everyone()
-    accelerator.save(state_dict, checkpoint_path, safe_serialization=False)
+    try:
+        accelerator.save(state_dict, checkpoint_path, safe_serialization=False)
+    except TypeError:
+        accelerator.save(state_dict, checkpoint_path)
     accelerator.wait_for_everyone()
 
 
@@ -355,7 +357,14 @@ def run_training_stage(
     accelerator: AcceleratorLike | None = None,
 ) -> Path:
     """Run stage training loop."""
-    stage_accelerator = accelerator or LocalAccelerator(device)
+    stage_accelerator = ensure_accelerator(
+        accelerator,
+        device=device,
+        use_mixed_precision=as_bool(
+            get_section(config, "device_config").get("use_mixed_precision", False),
+            "device_config.use_mixed_precision",
+        ),
+    )
     model_name, _ = extract_model_kwargs(config)
     log_dir, model_dir, stage_logger = _build_stage_runtime(
         model_name=model_name,
@@ -393,7 +402,13 @@ def run_training_stage(
         device_cfg.get("use_mixed_precision", False),
         "device_config.use_mixed_precision",
     )
-    evaluator = Evaluator(metrics=evaluator_metrics, loss_config=loss_config, use_amp=use_amp)
+    evaluator = Evaluator(
+        metrics=evaluator_metrics,
+        loss_config=loss_config,
+        use_amp=use_amp,
+        accelerator=stage_accelerator,
+        gather_for_metrics=stage_accelerator.use_distributed,
+    )
     monitor_key = f"val_{monitor_metric}"
     patience = as_int(
         training_cfg.get("early_stopping_patience", 5),
@@ -508,9 +523,13 @@ def run_training_stage(
                 **val_metric_fields,
             )
         if distributed_context.is_distributed:
-            stop_flag = torch.tensor([1 if should_stop else 0], device=device, dtype=torch.int64)
-            dist.broadcast(stop_flag, src=0)
-            should_stop = bool(int(stop_flag.item()))
+            stop_flag = torch.tensor(
+                [1 if should_stop and distributed_context.is_main_process else 0],
+                device=device,
+                dtype=torch.int64,
+            )
+            reduced_stop_flag = stage_accelerator.reduce(stop_flag, reduction="sum")
+            should_stop = bool(int(reduced_stop_flag.item()) > 0)
         if should_stop:
             if distributed_context.is_main_process:
                 log_stage_event(stage_logger, "early_stop", epoch=epoch + 1)
@@ -529,5 +548,5 @@ def run_training_stage(
             "stage_done",
             run_id=run_id,
         )
-    distributed_barrier(distributed_context)
+    stage_accelerator.wait_for_everyone()
     return best_checkpoint_path

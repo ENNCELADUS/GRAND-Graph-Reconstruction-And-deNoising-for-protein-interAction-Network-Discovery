@@ -150,25 +150,12 @@ def test_ordered_predictions_from_shards_rejects_incomplete_results() -> None:
 class _FakeAccelerator:
     def __init__(self) -> None:
         self.device = torch.device("cpu")
-        self.pad_calls = 0
-        self.gather_calls = 0
+        self.use_distributed = True
+        self.gather_for_metrics_calls = 0
 
-    def pad_across_processes(
-        self,
-        tensor: torch.Tensor,
-        dim: int = 0,
-        pad_index: int = -1,
-        pad_first: bool = False,
-    ) -> torch.Tensor:
-        del dim, pad_first
-        self.pad_calls += 1
-        padded = torch.full((2,), pad_index, dtype=tensor.dtype)
-        padded[: tensor.size(0)] = tensor
-        return padded
-
-    def gather(self, tensor: torch.Tensor) -> torch.Tensor:
-        self.gather_calls += 1
-        if self.gather_calls == 1:
+    def gather_for_metrics(self, tensor: torch.Tensor) -> torch.Tensor:
+        self.gather_for_metrics_calls += 1
+        if self.gather_for_metrics_calls == 1:
             return torch.tensor([0, 2, 1, 3], dtype=tensor.dtype)
         return torch.tensor([1, 0, 0, 1], dtype=tensor.dtype)
 
@@ -191,8 +178,7 @@ def test_gather_ordered_predictions_uses_accelerator_collectives() -> None:
     )
 
     assert ordered_predictions == [1, 0, 0, 1]
-    assert accelerator.pad_calls == 2
-    assert accelerator.gather_calls == 2
+    assert accelerator.gather_for_metrics_calls == 2
 
 
 def test_build_human_table2_rows_merges_baselines_and_v3() -> None:

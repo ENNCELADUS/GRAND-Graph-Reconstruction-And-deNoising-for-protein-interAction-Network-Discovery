@@ -1,4 +1,4 @@
-"""Public pipeline API for imports via ``import src.run``."""
+"""Compatibility public API for imports via ``import src.run``."""
 
 from __future__ import annotations
 
@@ -41,12 +41,12 @@ def execute_pipeline(config: ConfigDict) -> None:
         config=config,
         build_dataloaders_fn=build_dataloaders,
         build_model_fn=build_model,
+        build_accelerator_fn=build_accelerator,
         run_training_stage_fn=run_training_stage,
         run_topology_finetuning_stage_fn=run_topology_finetuning_stage,
         run_adaptation_stage_fn=run_shot_adaptation_stage,
         run_evaluation_stage_fn=run_evaluation_stage,
         run_topology_evaluation_stage_fn=run_topology_evaluation_stage,
-        build_accelerator_fn=build_accelerator,
     )
 
 

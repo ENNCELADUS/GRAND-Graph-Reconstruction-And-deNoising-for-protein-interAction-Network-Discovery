@@ -24,8 +24,9 @@ from src.adapt import (
     parse_domain_adaptation_config,
     pseudo_label_loss,
 )
+from src.pipeline.loops import ensure_accelerator, forward_model, move_batch_to_device
 from src.run.stage_train import _build_stage_runtime, _load_checkpoint, _save_checkpoint
-from src.utils.accelerator import AcceleratorLike, LocalAccelerator
+from src.utils.accelerator import AcceleratorLike
 from src.utils.config import ConfigDict, as_bool, as_int, extract_model_kwargs, get_section
 from src.utils.distributed import DistributedContext
 from src.utils.logging import append_csv_row, log_stage_event
@@ -54,13 +55,7 @@ def _centroid_accumulation_dtype(probs: torch.Tensor, features: torch.Tensor) ->
 
 def _move_batch_to_device(batch: BatchInput, device: torch.device) -> dict[str, BatchValue]:
     """Move tensor fields to target device while preserving non-tensor fields."""
-    moved_batch: dict[str, BatchValue] = {}
-    for key, value in batch.items():
-        if isinstance(value, torch.Tensor):
-            moved_batch[key] = value.to(device)
-        else:
-            moved_batch[key] = value
-    return moved_batch
+    return move_batch_to_device(batch, device)
 
 
 def _forward_batch_without_labels(batch: BatchInput) -> dict[str, BatchValue]:
@@ -70,13 +65,7 @@ def _forward_batch_without_labels(batch: BatchInput) -> dict[str, BatchValue]:
 
 def _forward_model(model: nn.Module, batch: BatchInput) -> dict[str, torch.Tensor]:
     """Execute model forward and validate output contract."""
-    try:
-        output = model(**batch)
-    except TypeError:
-        output = model(batch=batch)
-    if not isinstance(output, dict):
-        raise ValueError("Model forward output must be a dictionary")
-    return output
+    return forward_model(model, batch)
 
 
 def _infer_batch_size(batch: BatchInput) -> int:
@@ -302,6 +291,7 @@ def _compute_pseudo_labels(
         raise ValueError("SHOT target loader produced no batches while computing pseudo labels")
     return torch.cat(pseudo_labels, dim=0)
 
+
 def _train_one_shot_epoch(
     model: nn.Module,
     loader: DataLoader[dict[str, object]],
@@ -400,7 +390,14 @@ def run_shot_adaptation_stage(
     accelerator: AcceleratorLike | None = None,
 ) -> Path:
     """Run SHOT adaptation from one source checkpoint and return adapted checkpoint path."""
-    stage_accelerator = accelerator or LocalAccelerator(device)
+    stage_accelerator = ensure_accelerator(
+        accelerator,
+        device=device,
+        use_mixed_precision=as_bool(
+            get_section(config, "device_config").get("use_mixed_precision", False),
+            "device_config.use_mixed_precision",
+        ),
+    )
     adaptation_config = parse_domain_adaptation_config(config)
     if not adaptation_config.enabled or adaptation_config.method != "shot":
         raise ValueError("run_shot_adaptation_stage requires enabled SHOT configuration")

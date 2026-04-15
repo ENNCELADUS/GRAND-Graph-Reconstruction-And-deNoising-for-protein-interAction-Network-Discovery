@@ -20,8 +20,9 @@ from sklearn.metrics import (
 from torch import nn
 from torch.utils.data import DataLoader
 
+from src.pipeline.loops import ensure_accelerator, forward_model, move_batch_to_device
 from src.train.config import LossConfig
-from src.utils.accelerator import AcceleratorLike, LocalAccelerator
+from src.utils.accelerator import AcceleratorLike
 from src.utils.losses import binary_classification_loss
 
 BatchValue = object
@@ -87,13 +88,7 @@ class Evaluator:
     @staticmethod
     def _move_batch_to_device(batch: BatchInput, device: torch.device) -> BatchDict:
         """Move tensor fields to target device while preserving non-tensor fields."""
-        prepared_batch: BatchDict = {}
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor):
-                prepared_batch[key] = value.to(device)
-            else:
-                prepared_batch[key] = value
-        return prepared_batch
+        return move_batch_to_device(batch, device)
 
     @staticmethod
     def _forward_model(model: nn.Module, batch: BatchInput) -> dict[str, torch.Tensor]:
@@ -109,13 +104,7 @@ class Evaluator:
         Raises:
             ValueError: If model output is not a dictionary.
         """
-        try:
-            output = model(**batch)
-        except TypeError:
-            output = model(batch=batch)
-        if not isinstance(output, dict):
-            raise ValueError("Model forward output must be a dictionary")
-        return output
+        return forward_model(model, batch)
 
     @staticmethod
     def _binary_stats(labels: torch.Tensor, predictions: torch.Tensor) -> tuple[float, float]:
@@ -231,7 +220,11 @@ class Evaluator:
         all_probs: list[torch.Tensor] = []
         all_labels: list[torch.Tensor] = []
         all_losses: list[torch.Tensor] = []
-        accelerator = self.accelerator or LocalAccelerator(device)
+        accelerator = ensure_accelerator(
+            self.accelerator,
+            device=device,
+            use_mixed_precision=self.use_amp,
+        )
 
         with torch.inference_mode():
             for batch in data_loader:

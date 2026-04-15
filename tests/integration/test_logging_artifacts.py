@@ -273,23 +273,37 @@ def test_evaluation_uses_best_f1_threshold_from_validation_and_logs_it(
     assert metrics["recall"] >= 0.5
 
 
-def test_evaluation_worker_rank_skips_threshold_search_and_test_inference(
+def test_evaluation_worker_rank_runs_metrics_but_skips_artifact_writes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    class _GuardEvaluator:
+    observed_calls: list[str] = []
+
+    class _WorkerEvaluator:
         def __init__(self, *args: object, **kwargs: object) -> None:
             del args, kwargs
 
         def select_best_f1_threshold(self, **kwargs: object) -> float:
             del kwargs
-            raise AssertionError("worker ranks must skip validation threshold search")
+            observed_calls.append("threshold")
+            return 0.5
 
         def evaluate(self, **kwargs: object) -> dict[str, float]:
             del kwargs
-            raise AssertionError("worker ranks must skip test-set inference")
+            observed_calls.append("evaluate")
+            return {
+                "auroc": 1.0,
+                "auprc": 1.0,
+                "accuracy": 1.0,
+                "sensitivity": 1.0,
+                "specificity": 1.0,
+                "precision": 1.0,
+                "recall": 1.0,
+                "f1": 1.0,
+                "mcc": 1.0,
+                "loss": 0.0,
+            }
 
-    barrier_calls: list[int] = []
     previous_cwd = Path.cwd()
     try:
         os.chdir(tmp_path)
@@ -303,12 +317,7 @@ def test_evaluation_worker_rank_skips_threshold_search_and_test_inference(
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), checkpoint_path)
 
-        monkeypatch.setattr(stage_evaluate_module, "Evaluator", _GuardEvaluator)
-        monkeypatch.setattr(
-            stage_evaluate_module,
-            "distributed_barrier",
-            lambda context: barrier_calls.append(context.rank),
-        )
+        monkeypatch.setattr(stage_evaluate_module, "Evaluator", _WorkerEvaluator)
 
         metrics = stage_evaluate_module.run_evaluation_stage(
             config=config,
@@ -330,8 +339,8 @@ def test_evaluation_worker_rank_skips_threshold_search_and_test_inference(
         os.chdir(previous_cwd)
 
     eval_dir = tmp_path / "logs" / "v3" / "evaluate" / "worker_eval_case"
-    assert metrics == {}
-    assert barrier_calls == [1]
+    assert metrics["accuracy"] == 1.0
+    assert observed_calls == ["threshold", "evaluate"]
     assert eval_dir.exists()
     assert not (eval_dir / "evaluate.csv").exists()
     assert not (eval_dir / "log.log").exists()
