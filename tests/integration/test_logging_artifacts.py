@@ -228,6 +228,93 @@ def test_non_main_process_does_not_write_stage_artifacts(tmp_path: Path) -> None
     assert not best_checkpoint.exists()
 
 
+def test_pipeline_runtime_logs_once_to_console_for_multi_stage_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    config = _base_config(stages=["train", "evaluate", "topology_evaluate"])
+
+    class _FakeDistributedAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = True
+        process_index = 0
+        local_process_index = 0
+        num_processes = 4
+        mixed_precision = "fp16"
+
+        def prepare(self, *components: object) -> object:
+            if len(components) == 1:
+                return components[0]
+            return components
+
+        def autocast(self) -> AbstractContextManager[None]:
+            return nullcontext()
+
+        def backward(self, loss: torch.Tensor) -> None:
+            loss.backward()
+
+        def wait_for_everyone(self) -> None:
+            return None
+
+        def unwrap_model(self, model: nn.Module) -> nn.Module:
+            return model
+
+        def save(self, obj: object, f: object, safe_serialization: bool = False) -> None:
+            del safe_serialization
+            torch.save(obj, f)
+
+    def fake_build_accelerator(**kwargs: object) -> _FakeDistributedAccelerator:
+        del kwargs
+        return _FakeDistributedAccelerator()
+
+    def fake_run_training_stage(
+        runtime: run_module.PipelineRuntime,
+        model: nn.Module,
+        dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+    ) -> Path:
+        del runtime, model, dataloaders
+        return Path("artifacts/train_best_model.pth")
+
+    def fake_run_evaluation_stage(
+        runtime: run_module.PipelineRuntime,
+        model: nn.Module,
+        dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        *,
+        checkpoint_path: Path,
+    ) -> dict[str, float]:
+        del runtime, model, dataloaders, checkpoint_path
+        return {"accuracy": 1.0}
+
+    def fake_run_topology_evaluation_stage(
+        runtime: run_module.PipelineRuntime,
+        model: nn.Module,
+        dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        *,
+        checkpoint_path: Path,
+    ) -> dict[str, float]:
+        del runtime, model, dataloaders, checkpoint_path
+        return {"graph_sim": 1.0}
+
+    monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
+
+    run_module.execute_pipeline(
+        config,
+        build_dataloaders_fn=lambda **_: _fake_dataloaders(),
+        build_model_fn=lambda _: _TinyModel(),
+        run_training_stage_fn=fake_run_training_stage,
+        run_evaluation_stage_fn=fake_run_evaluation_stage,
+        run_topology_evaluation_stage_fn=fake_run_topology_evaluation_stage,
+    )
+
+    captured = capsys.readouterr()
+
+    assert captured.err.count("Pipeline Runtime") == 1
+
+
 def test_evaluation_uses_best_f1_threshold_from_validation_and_logs_it(
     tmp_path: Path,
 ) -> None:
