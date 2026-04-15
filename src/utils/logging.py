@@ -69,14 +69,49 @@ def log_stage_event(logger: logging.Logger, event: str, **fields: object) -> Non
         event: Event name.
         **fields: Optional key-value fields to append.
     """
+    logger.info(format_stage_event(event, **fields))
+
+
+def log_stage_event_to_file(logger: logging.Logger, event: str, **fields: object) -> None:
+    """Emit one structured stage event only to file handlers.
+
+    Args:
+        logger: Destination logger.
+        event: Event name.
+        **fields: Optional key-value fields to append.
+    """
+    message = format_stage_event(event, **fields)
+    record = logger.makeRecord(
+        logger.name,
+        logging.INFO,
+        fn="",
+        lno=0,
+        msg=message,
+        args=(),
+        exc_info=None,
+    )
+    for handler in logger.handlers:
+        if isinstance(handler, logging.FileHandler):
+            handler.handle(record)
+
+
+def format_stage_event(event: str, **fields: object) -> str:
+    """Return the rendered message body for one structured stage event.
+
+    Args:
+        event: Event name.
+        **fields: Optional key-value fields to append.
+
+    Returns:
+        Formatted log message body.
+    """
     event_label = _format_label(event)
     if not fields:
-        logger.info(event_label)
-        return
+        return event_label
     formatted_fields = " | ".join(
         f"{_format_label(key)}: {_format_field_value(fields[key])}" for key in sorted(fields)
     )
-    logger.info("%s | %s", event_label, formatted_fields)
+    return f"{event_label} | {formatted_fields}"
 
 
 def _format_field_value(value: object) -> str:

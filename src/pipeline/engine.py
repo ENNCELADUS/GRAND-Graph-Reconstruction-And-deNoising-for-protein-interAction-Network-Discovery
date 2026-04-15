@@ -19,7 +19,7 @@ from src.pipeline.stages.topology_finetune import run_topology_finetuning_stage
 from src.pipeline.stages.train import build_model, run_training_stage
 from src.utils.config import ConfigDict, as_str, get_section
 from src.utils.data_io import build_dataloaders
-from src.utils.logging import log_stage_event
+from src.utils.logging import log_stage_event, log_stage_event_to_file
 
 DataLoaderMap = dict[str, torch.utils.data.DataLoader[dict[str, object]]]
 
@@ -279,9 +279,13 @@ def _log_event_for_stages(
     event: str,
     **details: object,
 ) -> None:
-    """Emit one stage event for each selected stage logger."""
-    for stage in stage_names:
-        log_stage_event(stage_loggers[stage], event, **details)
+    """Emit one stage event to all stage logs while avoiding repeated console output."""
+    if not stage_names:
+        return
+    first_stage, *remaining_stages = stage_names
+    log_stage_event(stage_loggers[first_stage], event, **details)
+    for stage in remaining_stages:
+        log_stage_event_to_file(stage_loggers[stage], event, **details)
 
 
 __all__ = [
