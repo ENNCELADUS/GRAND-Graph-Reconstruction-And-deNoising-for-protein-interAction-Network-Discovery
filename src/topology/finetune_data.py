@@ -16,6 +16,8 @@ from torch.nn.utils.rnn import pad_sequence
 from src.embed import load_cached_embedding
 
 SUPPORTED_SAMPLING_STRATEGIES = {"BFS", "DFS", "RANDOM_WALK", "MIXED"}
+TOPOLOGY_EVAL_NODE_SIZES: tuple[int, ...] = (20, 40, 60, 80, 100, 120, 140, 160, 180, 200)
+TOPOLOGY_EVAL_SAMPLES_PER_SIZE = 50
 
 
 @dataclass(frozen=True)
@@ -30,6 +32,37 @@ class SubgraphPairChunk:
     label: torch.Tensor
     pair_index_a: torch.Tensor
     pair_index_b: torch.Tensor
+    bce_label: torch.Tensor | None = None
+    bce_mask: torch.Tensor | None = None
+
+
+@dataclass(frozen=True)
+class ExplicitNegativePairLookup:
+    """Explicitly supervised negative pairs available for BCE learning."""
+
+    negative_pairs: frozenset[tuple[str, str]]
+    partners_by_node: Mapping[str, frozenset[str]]
+
+
+@dataclass(frozen=True)
+class EdgeCoverEpochPlan:
+    """Training-epoch plan and summary for edge-cover sampling."""
+
+    subgraphs: tuple[tuple[str, ...], ...]
+    total_positive_edges: int
+    covered_positive_edges: int
+    positive_edge_coverage_ratio: float
+    mean_positive_edge_reuse: float
+
+
+def _canonical_edge(node_a: str, node_b: str) -> tuple[str, str]:
+    """Return a stable undirected edge representation."""
+    return (node_a, node_b) if node_a <= node_b else (node_b, node_a)
+
+
+def _graph_positive_edges(graph: nx.Graph) -> set[tuple[str, str]]:
+    """Return the canonical positive-edge set for a supervision graph."""
+    return {_canonical_edge(node_a, node_b) for node_a, node_b in graph.edges()}
 
 
 def filter_graph_to_embedding_index(
@@ -85,6 +118,43 @@ def build_pair_supervision_graph(
                 continue
             graph.add_edge(parts[0], parts[1])
     return graph
+
+
+def build_explicit_negative_lookup(
+    *,
+    pair_path: Path,
+    node_ids: set[str],
+) -> ExplicitNegativePairLookup:
+    """Load in-split explicit negatives from a labeled PRING pair file."""
+    if not pair_path.exists():
+        raise FileNotFoundError(f"Pair dataset not found: {pair_path}")
+
+    negative_pairs: set[tuple[str, str]] = set()
+    partners_by_node: dict[str, set[str]] = {}
+    with pair_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            parts = [part.strip() for part in line.strip().split("\t")]
+            if len(parts) < 3 or not parts[0] or not parts[1] or not parts[2]:
+                continue
+            try:
+                label = int(float(parts[2]))
+            except ValueError:
+                continue
+            if label >= 0 and label != 0:
+                continue
+            if parts[0] not in node_ids or parts[1] not in node_ids:
+                continue
+            pair = _canonical_edge(parts[0], parts[1])
+            negative_pairs.add(pair)
+            partners_by_node.setdefault(pair[0], set()).add(pair[1])
+            partners_by_node.setdefault(pair[1], set()).add(pair[0])
+
+    return ExplicitNegativePairLookup(
+        negative_pairs=frozenset(negative_pairs),
+        partners_by_node={
+            node: frozenset(sorted(partners)) for node, partners in partners_by_node.items()
+        },
+    )
 
 
 def _sample_target_size(
@@ -223,6 +293,233 @@ def _sample_random_walk_nodes(
     )
 
 
+def _build_bfs_order(
+    *,
+    graph: nx.Graph,
+    seed_nodes: Sequence[str],
+    rng: random.Random,
+) -> list[str]:
+    """Return a randomized BFS traversal order from the seed nodes."""
+    queue: deque[str] = deque(seed_nodes)
+    visited = set(seed_nodes)
+    order: list[str] = list(seed_nodes)
+    graph_nodes = list(graph.nodes)
+
+    while len(order) < graph.number_of_nodes():
+        while queue and len(order) < graph.number_of_nodes():
+            node = queue.popleft()
+            neighbors = [neighbor for neighbor in graph.neighbors(node) if neighbor not in visited]
+            rng.shuffle(neighbors)
+            for neighbor in neighbors:
+                visited.add(neighbor)
+                queue.append(neighbor)
+                order.append(neighbor)
+
+        if len(order) >= graph.number_of_nodes():
+            break
+        unseen = [candidate for candidate in graph_nodes if candidate not in visited]
+        if not unseen:
+            break
+        restart = rng.choice(unseen)
+        visited.add(restart)
+        queue.append(restart)
+        order.append(restart)
+
+    return order
+
+
+def _build_dfs_order(
+    *,
+    graph: nx.Graph,
+    seed_nodes: Sequence[str],
+    rng: random.Random,
+) -> list[str]:
+    """Return a randomized DFS traversal order from the seed nodes."""
+    stack = list(reversed(seed_nodes))
+    visited = set(seed_nodes)
+    order: list[str] = list(seed_nodes)
+    graph_nodes = list(graph.nodes)
+
+    while len(order) < graph.number_of_nodes():
+        while stack and len(order) < graph.number_of_nodes():
+            node = stack.pop()
+            neighbors = [neighbor for neighbor in graph.neighbors(node) if neighbor not in visited]
+            rng.shuffle(neighbors)
+            for neighbor in neighbors:
+                visited.add(neighbor)
+                stack.append(neighbor)
+                order.append(neighbor)
+
+        if len(order) >= graph.number_of_nodes():
+            break
+        unseen = [candidate for candidate in graph_nodes if candidate not in visited]
+        if not unseen:
+            break
+        restart = rng.choice(unseen)
+        visited.add(restart)
+        stack.append(restart)
+        order.append(restart)
+
+    return order
+
+
+def _build_random_walk_order(
+    *,
+    graph: nx.Graph,
+    seed_nodes: Sequence[str],
+    rng: random.Random,
+) -> list[str]:
+    """Return a randomized walk order from the seed nodes with restart fallback."""
+    graph_nodes = list(graph.nodes)
+    order: list[str] = []
+    visited: set[str] = set()
+    for node in seed_nodes:
+        if node not in visited:
+            order.append(node)
+            visited.add(node)
+
+    current = seed_nodes[-1]
+    max_steps = max(graph.number_of_nodes() * 20, 100)
+    for _ in range(max_steps):
+        if len(order) >= graph.number_of_nodes():
+            break
+        neighbors = list(graph.neighbors(current))
+        if neighbors:
+            current = rng.choice(neighbors)
+        else:
+            unseen = [candidate for candidate in graph_nodes if candidate not in visited]
+            if not unseen:
+                break
+            current = rng.choice(unseen)
+        if current not in visited:
+            order.append(current)
+            visited.add(current)
+
+    if len(order) < graph.number_of_nodes():
+        unseen = [candidate for candidate in graph_nodes if candidate not in visited]
+        rng.shuffle(unseen)
+        order.extend(unseen)
+    return order
+
+
+def _traversal_rank(
+    *,
+    graph: nx.Graph,
+    seed_nodes: Sequence[str],
+    strategy: str,
+    rng: random.Random,
+) -> dict[str, int]:
+    """Return a node-to-rank mapping for traversal tie-breaking."""
+    if strategy == "BFS":
+        order = _build_bfs_order(graph=graph, seed_nodes=seed_nodes, rng=rng)
+    elif strategy == "DFS":
+        order = _build_dfs_order(graph=graph, seed_nodes=seed_nodes, rng=rng)
+    else:
+        order = _build_random_walk_order(graph=graph, seed_nodes=seed_nodes, rng=rng)
+    return {node: index for index, node in enumerate(order)}
+
+
+def _selected_positive_edges(
+    *,
+    graph: nx.Graph,
+    nodes: Sequence[str],
+) -> set[tuple[str, str]]:
+    """Return positive train-graph edges fully contained in a node set."""
+    node_list = tuple(nodes)
+    selected_edges: set[tuple[str, str]] = set()
+    for index, node_a in enumerate(node_list):
+        for node_b in node_list[index + 1 :]:
+            if graph.has_edge(node_a, node_b):
+                selected_edges.add(_canonical_edge(node_a, node_b))
+    return selected_edges
+
+
+def summarize_edge_cover_epoch(
+    *,
+    graph: nx.Graph,
+    subgraphs: Sequence[Sequence[str]],
+) -> EdgeCoverEpochPlan:
+    """Summarize positive-edge coverage and reuse for a sampled epoch."""
+    total_positive_edges = _graph_positive_edges(graph)
+    edge_cover_counts: dict[tuple[str, str], int] = dict.fromkeys(total_positive_edges, 0)
+    for nodes in subgraphs:
+        for edge in _selected_positive_edges(graph=graph, nodes=nodes):
+            edge_cover_counts[edge] += 1
+
+    covered_positive_edges = sum(1 for count in edge_cover_counts.values() if count > 0)
+    total_positive_edge_count = len(total_positive_edges)
+    if total_positive_edge_count == 0:
+        coverage_ratio = 1.0
+        mean_reuse = 0.0
+    else:
+        coverage_ratio = covered_positive_edges / float(total_positive_edge_count)
+        mean_reuse = (
+            sum(count for count in edge_cover_counts.values() if count > 0)
+            / float(max(1, covered_positive_edges))
+        )
+
+    return EdgeCoverEpochPlan(
+        subgraphs=tuple(tuple(nodes) for nodes in subgraphs),
+        total_positive_edges=total_positive_edge_count,
+        covered_positive_edges=covered_positive_edges,
+        positive_edge_coverage_ratio=coverage_ratio,
+        mean_positive_edge_reuse=mean_reuse,
+    )
+
+
+def _select_seed_edge(
+    *,
+    positive_edges: Sequence[tuple[str, str]],
+    uncovered_edges: set[tuple[str, str]],
+    edge_cover_counts: Mapping[tuple[str, str], int],
+    rng: random.Random,
+) -> tuple[str, str]:
+    """Select the next seed edge, preferring uncovered edges first."""
+    candidate_edges = list(uncovered_edges) if uncovered_edges else list(positive_edges)
+    rng.shuffle(candidate_edges)
+    return min(candidate_edges, key=lambda edge: (edge_cover_counts.get(edge, 0), edge))
+
+
+def _pick_next_node(
+    *,
+    graph: nx.Graph,
+    selected_nodes: Sequence[str],
+    candidate_nodes: Sequence[str],
+    uncovered_edges: set[tuple[str, str]],
+    edge_cover_counts: Mapping[tuple[str, str], int],
+    traversal_rank: Mapping[str, int],
+    overlap_penalty: float,
+    rng: random.Random,
+) -> str:
+    """Pick the next node using uncovered-edge gain, overlap, and traversal rank."""
+    shuffled_candidates = list(candidate_nodes)
+    rng.shuffle(shuffled_candidates)
+    max_rank = len(traversal_rank) + len(shuffled_candidates) + 1
+    selected_set = set(selected_nodes)
+
+    def _score(candidate: str) -> tuple[float, float, int]:
+        connecting_edges = [
+            _canonical_edge(candidate, node)
+            for node in selected_set
+            if graph.has_edge(candidate, node)
+        ]
+        uncovered_gain = float(sum(1 for edge in connecting_edges if edge in uncovered_edges))
+        overlap_cost = float(
+            sum(
+                edge_cover_counts.get(edge, 0)
+                for edge in connecting_edges
+                if edge not in uncovered_edges
+            )
+        )
+        return (
+            uncovered_gain,
+            -(overlap_penalty * overlap_cost),
+            -traversal_rank.get(candidate, max_rank),
+        )
+
+    return max(shuffled_candidates, key=_score)
+
+
 def sample_training_subgraphs(
     *,
     graph: nx.Graph,
@@ -233,8 +530,8 @@ def sample_training_subgraphs(
     seed: int,
 ) -> list[tuple[str, ...]]:
     """Sample node-induced training subgraphs from a PRING train graph."""
-    if num_subgraphs <= 0:
-        raise ValueError("num_subgraphs must be positive")
+    if num_subgraphs < 0:
+        raise ValueError("num_subgraphs must be non-negative")
 
     normalized_strategy = strategy.upper()
     if normalized_strategy not in SUPPORTED_SAMPLING_STRATEGIES:
@@ -262,21 +559,205 @@ def sample_training_subgraphs(
     return sampled_nodes
 
 
+def sample_topology_evaluation_subgraphs(
+    *,
+    graph: nx.Graph,
+    seed: int,
+    strategy: str = "mixed",
+    node_sizes: Sequence[int] = TOPOLOGY_EVAL_NODE_SIZES,
+    samples_per_size: int = TOPOLOGY_EVAL_SAMPLES_PER_SIZE,
+) -> dict[int, list[tuple[str, ...]]]:
+    """Sample topology-evaluation-style node buckets for internal validation."""
+    if graph.number_of_nodes() < 2:
+        raise ValueError("Topology evaluation sampling requires at least two graph nodes")
+    if samples_per_size <= 0:
+        raise ValueError("samples_per_size must be positive")
+
+    eligible_sizes = [size for size in node_sizes if size <= graph.number_of_nodes()]
+    if not eligible_sizes:
+        eligible_sizes = [graph.number_of_nodes()]
+
+    sampled_by_size: dict[int, list[tuple[str, ...]]] = {}
+    for offset, node_size in enumerate(eligible_sizes):
+        sampled_by_size[int(node_size)] = [
+            tuple(sorted(nodes))
+            for nodes in sample_training_subgraphs(
+                graph=graph,
+                num_subgraphs=samples_per_size,
+                min_nodes=int(node_size),
+                max_nodes=int(node_size),
+                strategy=strategy,
+                seed=seed + offset,
+            )
+        ]
+    return sampled_by_size
+
+
+def sample_edge_cover_subgraphs(
+    *,
+    graph: nx.Graph,
+    num_subgraphs: int,
+    min_nodes: int,
+    max_nodes: int,
+    strategy: str,
+    seed: int,
+    overlap_penalty: float = 0.5,
+) -> EdgeCoverEpochPlan:
+    """Plan one epoch of training subgraphs with positive-edge coverage guarantees."""
+    if num_subgraphs < 0:
+        raise ValueError("num_subgraphs must be non-negative")
+    if overlap_penalty < 0.0:
+        raise ValueError("overlap_penalty must be non-negative")
+
+    normalized_strategy = strategy.upper()
+    if normalized_strategy not in SUPPORTED_SAMPLING_STRATEGIES:
+        supported = ", ".join(sorted(SUPPORTED_SAMPLING_STRATEGIES))
+        raise ValueError(f"Unsupported subgraph sampling strategy: {strategy} ({supported})")
+
+    positive_edges = sorted(_graph_positive_edges(graph))
+    if not positive_edges:
+        fallback_subgraphs = sample_training_subgraphs(
+            graph=graph,
+            num_subgraphs=num_subgraphs,
+            min_nodes=min_nodes,
+            max_nodes=max_nodes,
+            strategy=strategy,
+            seed=seed,
+        )
+        return summarize_edge_cover_epoch(graph=graph, subgraphs=fallback_subgraphs)
+
+    rng = random.Random(seed)
+    uncovered_edges = set(positive_edges)
+    edge_cover_counts = dict.fromkeys(positive_edges, 0)
+    graph_nodes = list(graph.nodes)
+    sampled_subgraphs: list[tuple[str, ...]] = []
+
+    while len(sampled_subgraphs) < num_subgraphs or uncovered_edges:
+        target_size = _sample_target_size(
+            graph=graph,
+            min_nodes=min_nodes,
+            max_nodes=max_nodes,
+            rng=rng,
+        )
+        selected_strategy = normalized_strategy
+        if normalized_strategy == "MIXED":
+            selected_strategy = rng.choice(["BFS", "DFS", "RANDOM_WALK"])
+
+        seed_edge = _select_seed_edge(
+            positive_edges=positive_edges,
+            uncovered_edges=uncovered_edges,
+            edge_cover_counts=edge_cover_counts,
+            rng=rng,
+        )
+        selected_nodes = [seed_edge[0], seed_edge[1]]
+        selected_set = set(selected_nodes)
+        traversal_rank = _traversal_rank(
+            graph=graph,
+            seed_nodes=selected_nodes,
+            strategy=selected_strategy,
+            rng=rng,
+        )
+
+        while len(selected_nodes) < target_size:
+            frontier = [
+                candidate
+                for candidate in graph_nodes
+                if candidate not in selected_set
+                and any(graph.has_edge(candidate, node) for node in selected_nodes)
+            ]
+            candidate_nodes = frontier or [
+                candidate for candidate in graph_nodes if candidate not in selected_set
+            ]
+            if not candidate_nodes:
+                break
+            next_node = _pick_next_node(
+                graph=graph,
+                selected_nodes=selected_nodes,
+                candidate_nodes=candidate_nodes,
+                uncovered_edges=uncovered_edges,
+                edge_cover_counts=edge_cover_counts,
+                traversal_rank=traversal_rank,
+                overlap_penalty=overlap_penalty,
+                rng=rng,
+            )
+            selected_nodes.append(next_node)
+            selected_set.add(next_node)
+
+        selected_tuple = tuple(selected_nodes)
+        sampled_subgraphs.append(selected_tuple)
+        for edge in _selected_positive_edges(graph=graph, nodes=selected_tuple):
+            edge_cover_counts[edge] += 1
+            uncovered_edges.discard(edge)
+
+    return summarize_edge_cover_epoch(graph=graph, subgraphs=sampled_subgraphs)
+
+
 def _subgraph_pair_tuples(
     *,
     graph: nx.Graph,
     nodes: tuple[str, ...],
-) -> list[tuple[int, int, str, str, float]]:
-    """Return all upper-triangle node pairs with graph labels."""
-    pair_rows: list[tuple[int, int, str, str, float]] = []
+    negative_lookup: ExplicitNegativePairLookup | None = None,
+    negative_ratio: int = 1,
+    rng: random.Random | None = None,
+) -> list[tuple[int, int, str, str, float, float, float]]:
+    """Return all upper-triangle node pairs with topology labels and BCE masks."""
+    if negative_ratio < 0:
+        raise ValueError("negative_ratio must be non-negative")
+
+    pair_rows: list[tuple[int, int, str, str, float, float, float]] = []
+    positive_pairs: set[tuple[str, str]] = set()
+    negative_candidates: list[tuple[str, str]] = []
     for index_a, protein_a in enumerate(nodes):
         for index_b in range(index_a + 1, len(nodes)):
             protein_b = nodes[index_b]
-            label = 1.0 if graph.has_edge(protein_a, protein_b) else 0.0
-            pair_rows.append((index_a, index_b, protein_a, protein_b, label))
+            pair = _canonical_edge(protein_a, protein_b)
+            topology_label = 1.0 if graph.has_edge(protein_a, protein_b) else 0.0
+            if topology_label > 0.0:
+                positive_pairs.add(pair)
+            elif (
+                negative_lookup is not None
+                and protein_b in negative_lookup.partners_by_node.get(protein_a, frozenset())
+            ):
+                negative_candidates.append(pair)
+            pair_rows.append((index_a, index_b, protein_a, protein_b, topology_label, 0.0, 0.0))
     if not pair_rows:
         raise ValueError("A sampled subgraph must contain at least one node pair")
-    return pair_rows
+
+    if negative_lookup is None:
+        return [
+            (index_a, index_b, protein_a, protein_b, topology_label, topology_label, 1.0)
+            for index_a, index_b, protein_a, protein_b, topology_label, _, _ in pair_rows
+        ]
+
+    sampled_negative_pairs: set[tuple[str, str]] = set()
+    desired_negative_count = min(len(negative_candidates), len(positive_pairs) * negative_ratio)
+    if desired_negative_count > 0:
+        candidate_pool = sorted(negative_candidates)
+        sampler = rng or random.Random(0)
+        sampled_negative_pairs = set(sampler.sample(candidate_pool, desired_negative_count))
+
+    return [
+        (
+            index_a,
+            index_b,
+            protein_a,
+            protein_b,
+            topology_label,
+            topology_label,
+            1.0,
+        )
+        if topology_label > 0.0
+        else (
+            index_a,
+            index_b,
+            protein_a,
+            protein_b,
+            topology_label,
+            0.0,
+            1.0 if _canonical_edge(protein_a, protein_b) in sampled_negative_pairs else 0.0,
+        )
+        for index_a, index_b, protein_a, protein_b, topology_label, _, _ in pair_rows
+    ]
 
 
 def iter_subgraph_pair_chunks(
@@ -288,10 +769,15 @@ def iter_subgraph_pair_chunks(
     input_dim: int,
     max_sequence_length: int,
     pair_batch_size: int,
+    negative_lookup: ExplicitNegativePairLookup | None = None,
+    negative_ratio: int = 1,
+    seed: int | None = None,
 ) -> Iterator[SubgraphPairChunk]:
     """Yield all within-subgraph pairs as padded mini-batches."""
     if pair_batch_size <= 0:
         raise ValueError("pair_batch_size must be positive")
+    if negative_ratio < 0:
+        raise ValueError("negative_ratio must be non-negative")
 
     node_tuple = tuple(nodes)
     if len(node_tuple) < 2:
@@ -307,16 +793,22 @@ def iter_subgraph_pair_chunks(
         )
         for protein_id in node_tuple
     }
-    pair_rows = _subgraph_pair_tuples(graph=graph, nodes=node_tuple)
+    pair_rows = _subgraph_pair_tuples(
+        graph=graph,
+        nodes=node_tuple,
+        negative_lookup=negative_lookup,
+        negative_ratio=negative_ratio,
+        rng=random.Random(seed) if seed is not None else None,
+    )
 
     for chunk_start in range(0, len(pair_rows), pair_batch_size):
         rows = pair_rows[chunk_start : chunk_start + pair_batch_size]
         emb_a = pad_sequence(
-            [embeddings[protein_a] for _, _, protein_a, _, _ in rows],
+            [embeddings[protein_a] for _, _, protein_a, _, _, _, _ in rows],
             batch_first=True,
         )
         emb_b = pad_sequence(
-            [embeddings[protein_b] for _, _, _, protein_b, _ in rows],
+            [embeddings[protein_b] for _, _, _, protein_b, _, _, _ in rows],
             batch_first=True,
         )
         yield SubgraphPairChunk(
@@ -324,14 +816,31 @@ def iter_subgraph_pair_chunks(
             emb_a=emb_a,
             emb_b=emb_b,
             len_a=torch.tensor(
-                [embeddings[protein_a].size(0) for _, _, protein_a, _, _ in rows],
+                [embeddings[protein_a].size(0) for _, _, protein_a, _, _, _, _ in rows],
                 dtype=torch.long,
             ),
             len_b=torch.tensor(
-                [embeddings[protein_b].size(0) for _, _, _, protein_b, _ in rows],
+                [embeddings[protein_b].size(0) for _, _, _, protein_b, _, _, _ in rows],
                 dtype=torch.long,
             ),
-            label=torch.tensor([label for _, _, _, _, label in rows], dtype=torch.float32),
-            pair_index_a=torch.tensor([index_a for index_a, _, _, _, _ in rows], dtype=torch.long),
-            pair_index_b=torch.tensor([index_b for _, index_b, _, _, _ in rows], dtype=torch.long),
+            label=torch.tensor(
+                [topology_label for _, _, _, _, topology_label, _, _ in rows],
+                dtype=torch.float32,
+            ),
+            pair_index_a=torch.tensor(
+                [index_a for index_a, _, _, _, _, _, _ in rows],
+                dtype=torch.long,
+            ),
+            pair_index_b=torch.tensor(
+                [index_b for _, index_b, _, _, _, _, _ in rows],
+                dtype=torch.long,
+            ),
+            bce_label=torch.tensor(
+                [bce_label for _, _, _, _, _, bce_label, _ in rows],
+                dtype=torch.float32,
+            ),
+            bce_mask=torch.tensor(
+                [bce_mask for _, _, _, _, _, _, bce_mask in rows],
+                dtype=torch.float32,
+            ),
         )

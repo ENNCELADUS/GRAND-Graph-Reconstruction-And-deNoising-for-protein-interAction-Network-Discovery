@@ -203,16 +203,14 @@ def _summary_metric_value(
     return float(np.mean(numeric_values)) if numeric_values else 0.0
 
 
-def evaluate_predicted_graph(
+def evaluate_graph_samples(
     *,
-    pred_graph: nx.Graph,
-    gt_graph: nx.Graph,
-    test_graph_nodes: Mapping[int, list[list[str]]],
+    pred_graphs_by_size: Mapping[int, list[nx.Graph]],
+    gt_graphs_by_size: Mapping[int, list[nx.Graph]],
 ) -> dict[str, Any]:
-    """Evaluate a reconstructed graph against PRING topology metrics."""
-    if len(gt_graph.nodes()) > len(pred_graph.nodes()):
-        missing_nodes = set(gt_graph.nodes()) - set(pred_graph.nodes())
-        pred_graph.add_nodes_from(missing_nodes)
+    """Evaluate predicted and ground-truth graph samples grouped by node size."""
+    if set(pred_graphs_by_size) != set(gt_graphs_by_size):
+        raise ValueError("pred_graphs_by_size and gt_graphs_by_size must share node-size keys")
 
     graph_level_results: MetricDict = {
         "graph_sim": {},
@@ -223,31 +221,39 @@ def evaluate_predicted_graph(
     }
     per_node_size: dict[int, dict[str, float | int]] = {}
 
-    for node_size, node_lists in test_graph_nodes.items():
-        gt_deg_dist: list[np.ndarray] = []
-        pred_deg_dist: list[np.ndarray] = []
-        gt_graphs: list[nx.Graph] = []
-        pred_graphs: list[nx.Graph] = []
+    for node_size, gt_graphs in gt_graphs_by_size.items():
+        pred_graphs = pred_graphs_by_size[node_size]
+        if len(pred_graphs) != len(gt_graphs):
+            raise ValueError("Predicted and ground-truth graph samples must have matching counts")
+
         graph_sim_values: list[float] = []
         density_values: list[float] = []
+        pred_deg_dist: list[np.ndarray] = []
+        gt_deg_dist: list[np.ndarray] = []
 
-        for nodes in node_lists:
-            gt_subgraph = gt_graph.subgraph(nodes)
-            pred_subgraph = pred_graph.subgraph(nodes)
-
-            graph_sim = compute_graph_similarity(pred_graph=pred_subgraph, gt_graph=gt_subgraph)
+        for pred_graph, gt_graph in zip(pred_graphs, gt_graphs, strict=True):
+            normalized_pred_graph = pred_graph.copy()
+            if len(gt_graph.nodes()) > len(normalized_pred_graph.nodes()):
+                missing_nodes = set(gt_graph.nodes()) - set(normalized_pred_graph.nodes())
+                normalized_pred_graph.add_nodes_from(missing_nodes)
+            graph_sim = compute_graph_similarity(
+                pred_graph=normalized_pred_graph,
+                gt_graph=gt_graph,
+            )
             relative_density = compute_relative_density(
-                pred_graph=pred_subgraph,
-                gt_graph=gt_subgraph,
+                pred_graph=normalized_pred_graph,
+                gt_graph=gt_graph,
             )
             graph_sim_values.append(graph_sim)
             density_values.append(relative_density)
 
-            deg_pred, deg_gt = degree_distribution(pred_graph=pred_subgraph, gt_graph=gt_subgraph)
+            deg_pred, deg_gt = degree_distribution(
+                pred_graph=normalized_pred_graph,
+                gt_graph=gt_graph,
+            )
             pred_deg_dist.append(deg_pred)
             gt_deg_dist.append(deg_gt)
-            gt_graphs.append(gt_subgraph)
-            pred_graphs.append(pred_subgraph)
+            pred_graph = normalized_pred_graph
 
         deg_dist_mmd = compute_mmd(pred_deg_dist, gt_deg_dist)
         cc_mmd = clustering_stats(gt_graphs, pred_graphs)
@@ -259,7 +265,7 @@ def evaluate_predicted_graph(
         graph_level_results["cc_mmd"][node_size] = cc_mmd
         graph_level_results["laplacian_eigen_mmd"][node_size] = laplacian_eigen_mmd
         per_node_size[node_size] = {
-            "graph_count": len(node_lists),
+            "graph_count": len(gt_graphs),
             "graph_sim": float(np.mean(graph_sim_values)) if graph_sim_values else 0.0,
             "relative_density": float(np.mean(density_values)) if density_values else 0.0,
             "deg_dist_mmd": deg_dist_mmd,
@@ -276,3 +282,33 @@ def evaluate_predicted_graph(
         "summary": summary,
         "per_node_size": per_node_size,
     }
+
+
+def evaluate_predicted_graph(
+    *,
+    pred_graph: nx.Graph,
+    gt_graph: nx.Graph,
+    test_graph_nodes: Mapping[int, list[list[str]]],
+) -> dict[str, Any]:
+    """Evaluate a reconstructed graph against PRING topology metrics."""
+    if len(gt_graph.nodes()) > len(pred_graph.nodes()):
+        missing_nodes = set(gt_graph.nodes()) - set(pred_graph.nodes())
+        pred_graph.add_nodes_from(missing_nodes)
+
+    pred_graphs_by_size: dict[int, list[nx.Graph]] = {}
+    gt_graphs_by_size: dict[int, list[nx.Graph]] = {}
+    for node_size, node_lists in test_graph_nodes.items():
+        gt_graphs: list[nx.Graph] = []
+        pred_graphs: list[nx.Graph] = []
+        for nodes in node_lists:
+            gt_subgraph = gt_graph.subgraph(nodes)
+            pred_subgraph = pred_graph.subgraph(nodes)
+            gt_graphs.append(gt_subgraph)
+            pred_graphs.append(pred_subgraph)
+        gt_graphs_by_size[node_size] = gt_graphs
+        pred_graphs_by_size[node_size] = pred_graphs
+
+    return evaluate_graph_samples(
+        pred_graphs_by_size=pred_graphs_by_size,
+        gt_graphs_by_size=gt_graphs_by_size,
+    )

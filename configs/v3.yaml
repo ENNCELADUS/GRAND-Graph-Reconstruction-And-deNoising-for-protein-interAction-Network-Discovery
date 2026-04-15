@@ -94,7 +94,6 @@ topology_finetune:
   supervision_train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi_ratio5_exclusive.txt"
   supervision_valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi_ratio5_exclusive.txt"
   bce_negative_ratio: 5
-  validation_mode: "sampled"
   min_nodes: 20
   max_nodes: 20
   strategy: "mixed"

@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import cast
 
 import networkx as nx
-import numpy as np
 import torch
 import torch.distributed as dist
 from torch import nn
@@ -27,6 +26,8 @@ from src.run.stage_train import (
     _save_checkpoint,
 )
 from src.topology.finetune_data import (
+    TOPOLOGY_EVAL_NODE_SIZES,
+    TOPOLOGY_EVAL_SAMPLES_PER_SIZE,
     ExplicitNegativePairLookup,
     SubgraphPairChunk,
     build_explicit_negative_lookup,
@@ -34,20 +35,14 @@ from src.topology.finetune_data import (
     iter_subgraph_pair_chunks,
     load_split_node_ids,
     sample_edge_cover_subgraphs,
-    sample_training_subgraphs,
+    sample_topology_evaluation_subgraphs,
 )
 from src.topology.finetune_losses import (
     TopologyLossWeights,
     build_symmetric_adjacency,
     compute_topology_losses,
 )
-from src.topology.metrics import (
-    clustering_stats,
-    compute_graph_similarity,
-    compute_mmd,
-    compute_relative_density,
-    degree_distribution,
-)
+from src.topology.metrics import evaluate_graph_samples
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -259,30 +254,16 @@ def _build_internal_validation_node_sets(
     finetune_cfg: ConfigDict,
     graph: nx.Graph,
     seed: int,
-) -> list[tuple[str, ...]]:
-    """Build node sets used for internal topology validation."""
-    validation_mode = as_str(
-        finetune_cfg.get("validation_mode", "sampled"),
-        "topology_finetune.validation_mode",
-    ).lower()
-    if validation_mode == "whole_graph":
-        return [tuple(sorted(graph.nodes))]
-    if validation_mode != "sampled":
-        raise ValueError("topology_finetune.validation_mode must be 'whole_graph' or 'sampled'")
-
-    min_nodes, max_nodes = _resolve_sampling_node_bounds(finetune_cfg)
-    sampled_subgraphs = sample_training_subgraphs(
+) -> dict[int, list[tuple[str, ...]]]:
+    """Build topology-evaluate-style node buckets for internal validation."""
+    del finetune_cfg
+    return sample_topology_evaluation_subgraphs(
         graph=graph,
-        num_subgraphs=as_int(
-            finetune_cfg.get("validation_subgraphs", 8),
-            "topology_finetune.validation_subgraphs",
-        ),
-        min_nodes=min_nodes,
-        max_nodes=max_nodes,
-        strategy=as_str(finetune_cfg.get("strategy", "mixed"), "topology_finetune.strategy"),
         seed=seed,
+        strategy="mixed",
+        node_sizes=TOPOLOGY_EVAL_NODE_SIZES,
+        samples_per_size=TOPOLOGY_EVAL_SAMPLES_PER_SIZE,
     )
-    return [tuple(nodes) for nodes in sampled_subgraphs]
 
 
 def _resolve_internal_validation_threshold(
@@ -506,7 +487,7 @@ def _evaluate_internal_validation_subgraphs(
     *,
     model: nn.Module,
     graph: nx.Graph,
-    sampled_subgraphs: Sequence[tuple[str, ...]],
+    sampled_subgraphs: Mapping[int, Sequence[tuple[str, ...]]],
     cache_dir: Path,
     embedding_index: Mapping[str, str],
     input_dim: int,
@@ -516,55 +497,35 @@ def _evaluate_internal_validation_subgraphs(
     device: torch.device,
 ) -> dict[str, float]:
     """Compute internal subgraph topology metrics on fixed validation samples."""
-    graph_sim_values: list[float] = []
-    density_values: list[float] = []
-    pred_degree_histograms: list[np.ndarray] = []
-    target_degree_histograms: list[np.ndarray] = []
-    pred_graphs: list[nx.Graph] = []
-    target_graphs: list[nx.Graph] = []
+    pred_graphs_by_size: dict[int, list[nx.Graph]] = {}
+    target_graphs_by_size: dict[int, list[nx.Graph]] = {}
 
     with torch.no_grad():
-        for nodes in sampled_subgraphs:
-            pred_subgraph = _predict_hard_subgraph(
-                model=model,
-                graph=graph,
-                nodes=nodes,
-                cache_dir=cache_dir,
-                embedding_index=embedding_index,
-                input_dim=input_dim,
-                max_sequence_length=max_sequence_length,
-                pair_batch_size=pair_batch_size,
-                threshold=threshold,
-                device=device,
-            )
-            target_subgraph = graph.subgraph(nodes).copy()
-            graph_sim_values.append(
-                compute_graph_similarity(
-                    pred_graph=pred_subgraph,
-                    gt_graph=target_subgraph,
+        for node_size, node_sets in sampled_subgraphs.items():
+            pred_graphs_by_size[node_size] = []
+            target_graphs_by_size[node_size] = []
+            for nodes in node_sets:
+                pred_subgraph = _predict_hard_subgraph(
+                    model=model,
+                    graph=graph,
+                    nodes=nodes,
+                    cache_dir=cache_dir,
+                    embedding_index=embedding_index,
+                    input_dim=input_dim,
+                    max_sequence_length=max_sequence_length,
+                    pair_batch_size=pair_batch_size,
+                    threshold=threshold,
+                    device=device,
                 )
-            )
-            density_values.append(
-                compute_relative_density(
-                    pred_graph=pred_subgraph,
-                    gt_graph=target_subgraph,
-                )
-            )
-            pred_deg_hist, target_deg_hist = degree_distribution(
-                pred_graph=pred_subgraph,
-                gt_graph=target_subgraph,
-            )
-            pred_degree_histograms.append(pred_deg_hist)
-            target_degree_histograms.append(target_deg_hist)
-            pred_graphs.append(pred_subgraph)
-            target_graphs.append(target_subgraph)
+                target_subgraph = graph.subgraph(nodes).copy()
+                pred_graphs_by_size[node_size].append(pred_subgraph)
+                target_graphs_by_size[node_size].append(target_subgraph)
 
-    return {
-        "graph_sim": float(np.mean(graph_sim_values)) if graph_sim_values else 0.0,
-        "relative_density": float(np.mean(density_values)) if density_values else 0.0,
-        "deg_dist_mmd": compute_mmd(pred_degree_histograms, target_degree_histograms),
-        "cc_mmd": clustering_stats(target_graphs, pred_graphs),
-    }
+    result = evaluate_graph_samples(
+        pred_graphs_by_size=pred_graphs_by_size,
+        gt_graphs_by_size=target_graphs_by_size,
+    )
+    return cast(dict[str, float], result["summary"])
 
 
 def _all_reduce_mean(
@@ -846,7 +807,10 @@ def run_topology_finetuning_stage(
             "finetune_config",
             epochs=epochs,
             monitor=monitor_metric,
-            internal_validation_subgraphs=len(internal_validation_node_sets),
+            internal_validation_subgraphs=sum(
+                len(node_sets) for node_sets in internal_validation_node_sets.values()
+            ),
+            internal_validation_node_sizes=sorted(internal_validation_node_sets),
             pair_batch_size=pair_batch_size,
             overlap_penalty=overlap_penalty,
         )

@@ -224,7 +224,6 @@ def _build_finetune_config(tmp_path: Path) -> ConfigDict:
         },
         "topology_finetune": {
             "epochs": 1,
-            "validation_mode": "whole_graph",
             "min_nodes": 3,
             "max_nodes": 4,
             "strategy": "mixed",
@@ -296,7 +295,10 @@ def test_build_internal_validation_node_sets_matches_topology_eval_bucketing() -
     )
 
     assert sorted(node_sets) == list(TOPOLOGY_EVAL_NODE_SIZES)
-    assert all(len(node_sets[node_size]) == TOPOLOGY_EVAL_SAMPLES_PER_SIZE for node_size in node_sets)
+    assert all(
+        len(node_sets[node_size]) == TOPOLOGY_EVAL_SAMPLES_PER_SIZE
+        for node_size in node_sets
+    )
     assert all(
         all(len(nodes) == node_size for nodes in node_sets[node_size])
         for node_size in node_sets
@@ -717,7 +719,7 @@ def test_prepare_topology_supervision_from_config_generates_missing_ratio_superv
     assert valid_supervision_path.exists()
 
 
-def test_v3_configs_use_sampled_internal_validation_mode() -> None:
+def test_v3_configs_omit_validation_mode() -> None:
     for config_path in (Path("configs/v3.yaml"), Path("configs/v3.1.yaml")):
         config = load_config(config_path)
         topology_cfg = config["topology_finetune"]
