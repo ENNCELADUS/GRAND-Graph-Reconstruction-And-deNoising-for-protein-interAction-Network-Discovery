@@ -1,0 +1,13 @@
+2026-04-15 01:02:41 INFO Startup | Rank: 0 | Run Id: 20260415_010241 | Seed: 47 | Stages: ['evaluate', 'topology_evaluate'] | World Size: 4
+2026-04-15 01:02:41 INFO Device | Resolved Device: cuda:0
+2026-04-15 01:03:20 INFO Data Ready | Test: 54126 | Train: 97555 | Valid: 24389
+2026-04-15 01:03:22 INFO DDP Ready | Wrapped: True
+2026-04-15 01:10:21 INFO Begin Topology Evaluation
+2026-04-15 01:10:21 INFO Stage Start | Checkpoint: models/v3.1/train/20260414_202131/best_model.pth | Run Id: 20260415_010241
+2026-04-15 01:12:35 INFO Decision Threshold | Mode: best_f1_on_valid | Value: 0.1274
+2026-04-15 01:13:15 INFO Topology Inference Ready | Cached Embedding Count: 2017 | Distributed: True | Local Pair Count: 508789 | Pair Count: 2035153 | World Size: 4
+2026-04-15 02:26:10 INFO Pair Predictions Written | Path: logs/v3.1/topology_evaluate/20260415_010241/all_test_ppi_pred.txt
+2026-04-15 02:52:40 INFO Topology Metrics Written | Path: logs/v3.1/topology_evaluate/20260415_010241/topology_metrics.json
+2026-04-15 02:52:40 INFO Comparison Report Skipped | Reason: missing_baselines:src/topology/baselines/pring_human_table2.json
+2026-04-15 02:52:40 INFO Stage Done | Run Id: 20260415_010241
+2026-04-15 02:52:40 INFO End Topology Evaluation
