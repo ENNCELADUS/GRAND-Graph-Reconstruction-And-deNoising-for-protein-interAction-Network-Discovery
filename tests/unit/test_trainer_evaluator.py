@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 
 import pytest
 import src.run as run_module
@@ -150,6 +151,28 @@ class GradModeProbeModel(nn.Module):
         return {"logits": logits}
 
 
+class FakeAccelerator:
+    """Small accelerator stub used to verify trainer integration."""
+
+    def __init__(self) -> None:
+        self.device = torch.device("cpu")
+        self.autocast_calls = 0
+        self.backward_calls = 0
+        self.prepare_calls = 0
+
+    def prepare(self, *components: object) -> tuple[object, ...]:
+        self.prepare_calls += 1
+        return components
+
+    def autocast(self) -> object:
+        self.autocast_calls += 1
+        return nullcontext()
+
+    def backward(self, loss: torch.Tensor) -> None:
+        self.backward_calls += 1
+        loss.backward()
+
+
 def test_trainer_runs_single_epoch() -> None:
     model = TinyModel()
     loader = DataLoader(TinyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
@@ -168,6 +191,29 @@ def test_trainer_runs_single_epoch() -> None:
     assert "loss" in metrics
     assert "lr" in metrics
     assert metrics["loss"] >= 0.0
+
+
+def test_trainer_uses_accelerator_runtime_for_backward_and_autocast() -> None:
+    model = TinyModel()
+    loader = DataLoader(TinyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
+    accelerator = FakeAccelerator()
+    trainer = Trainer(
+        model=model,
+        device=torch.device("cpu"),
+        accelerator=accelerator,
+        optimizer_config=OptimizerConfig(optimizer_type="adamw", lr=1e-2),
+        scheduler_config=SchedulerConfig(scheduler_type="none"),
+        loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        use_amp=False,
+        total_epochs=1,
+        steps_per_epoch=len(loader),
+    )
+
+    trainer.train_one_epoch(loader)
+
+    assert accelerator.prepare_calls >= 1
+    assert accelerator.autocast_calls == len(loader)
+    assert accelerator.backward_calls == len(loader)
 
 
 def test_trainer_handles_non_tensor_batch_fields() -> None:
