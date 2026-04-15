@@ -19,17 +19,20 @@ from torch.utils.data import DataLoader
 
 from src.embed import ensure_embeddings_ready
 from src.evaluate import Evaluator
-from src.pipeline.loops import reduce_scalar_mapping
+from src.pipeline.loops import move_batch_to_device, reduce_scalar_mapping
 from src.pipeline.runtime import AcceleratorLike, DistributedContext, PipelineRuntime
-from src.pipeline.stages.evaluate import _resolve_decision_threshold
 from src.pipeline.stages.train import _build_loss_config
 from src.topology.finetune_data import (
     TOPOLOGY_EVAL_NODE_SIZES,
     TOPOLOGY_EVAL_SAMPLES_PER_SIZE,
     EdgeCoverEpochPlan,
+    EmbeddingRepository,
     ExplicitNegativePairLookup,
+    InternalValidationPairRecord,
+    InternalValidationPlan,
     SubgraphPairChunk,
     build_explicit_negative_lookup,
+    build_internal_validation_plan,
     build_pair_supervision_graph,
     iter_subgraph_pair_chunks,
     load_split_node_ids,
@@ -75,6 +78,12 @@ TOPOLOGY_FINETUNE_CSV_COLUMNS = [
     "Total Positive Edges",
     "Positive Edge Coverage Ratio",
     "Mean Positive Edge Reuse",
+    "edge_cover_sampling_s",
+    "train_forward_backward_s",
+    "val_pair_pass_s",
+    "val_threshold_s",
+    "internal_val_topology_s",
+    "peak_gpu_mem_mb",
     "Learning Rate",
 ]
 
@@ -97,15 +106,16 @@ class TopologyFinetuneStageContext:
     train_negative_lookup: ExplicitNegativePairLookup
     cache_dir: Path
     embedding_index: Mapping[str, str]
+    embedding_repository: EmbeddingRepository
     input_dim: int
     max_sequence_length: int
     pair_batch_size: int
+    internal_validation_inference_batch_size: int
     epochs: int
     run_seed: int
     use_amp: bool
     optimizer: Optimizer
     evaluator: Evaluator
-    threshold_probe: Evaluator
     loss_weights: TopologyLossWeights
     overlap_penalty: float
     monitor_metric: str
@@ -114,6 +124,7 @@ class TopologyFinetuneStageContext:
     metrics_path: Path
     csv_path: Path
     internal_validation_node_sets: Mapping[int, Sequence[tuple[str, ...]]]
+    internal_validation_plan: InternalValidationPlan
 
 
 @dataclass(frozen=True)
@@ -123,6 +134,9 @@ class ValidationEpochResult:
     decision_threshold: float
     val_pair_stats: Mapping[str, float]
     internal_val_topology_stats: Mapping[str, float]
+    val_pair_pass_seconds: float
+    threshold_resolution_seconds: float
+    internal_validation_seconds: float
 
 
 def _topology_finetune_config(config: ConfigDict) -> ConfigDict:
@@ -342,13 +356,33 @@ def _build_internal_validation_node_sets(
     )
 
 
+def _resolve_internal_validation_inference_batch_size(finetune_cfg: ConfigDict) -> int:
+    """Return the batch size used for internal validation inference only."""
+    batch_size = as_int(
+        finetune_cfg.get("internal_validation_inference_batch_size", 128),
+        "topology_finetune.internal_validation_inference_batch_size",
+    )
+    if batch_size <= 0:
+        raise ValueError("topology_finetune.internal_validation_inference_batch_size must be > 0")
+    return batch_size
+
+
+def _resolve_embedding_cache_max_bytes(finetune_cfg: ConfigDict) -> int:
+    """Return the byte ceiling for the stage-local embedding cache."""
+    max_bytes = as_int(
+        finetune_cfg.get("embedding_cache_max_bytes", 1_073_741_824),
+        "topology_finetune.embedding_cache_max_bytes",
+    )
+    if max_bytes <= 0:
+        raise ValueError("topology_finetune.embedding_cache_max_bytes must be > 0")
+    return max_bytes
+
+
 def _resolve_internal_validation_threshold(
     *,
     config: ConfigDict,
-    evaluator: Evaluator,
-    model: nn.Module,
-    dataloaders: dict[str, DataLoader[dict[str, object]]],
-    device: torch.device,
+    labels: torch.Tensor,
+    probabilities: torch.Tensor,
 ) -> tuple[float, str]:
     """Resolve the hard threshold used for internal topology validation."""
     finetune_cfg = _topology_finetune_config(config)
@@ -356,19 +390,26 @@ def _resolve_internal_validation_threshold(
     if not isinstance(evaluate_cfg, dict):
         raise ValueError("evaluate must be a mapping")
 
-    threshold_cfg: ConfigDict = {
-        "decision_threshold": finetune_cfg.get(
-            "decision_threshold",
-            cast(ConfigDict, evaluate_cfg).get("decision_threshold", 0.5),
-        )
-    }
-    return _resolve_decision_threshold(
-        eval_cfg=threshold_cfg,
-        evaluator=evaluator,
-        model=model,
-        dataloaders=dataloaders,
-        device=device,
+    raw_threshold = finetune_cfg.get(
+        "decision_threshold",
+        cast(ConfigDict, evaluate_cfg).get("decision_threshold", 0.5),
     )
+    if isinstance(raw_threshold, dict):
+        mode = as_str(
+            raw_threshold.get("mode", "fixed"),
+            "topology_finetune.decision_threshold.mode",
+        ).lower()
+        if mode == "fixed":
+            return (
+                as_float(raw_threshold.get("value", 0.5), "topology_finetune.decision_threshold"),
+                "fixed",
+            )
+        if mode == "best_f1_on_valid":
+            return (Evaluator.best_f1_threshold(labels=labels, probabilities=probabilities), mode)
+        raise ValueError(
+            "topology_finetune.decision_threshold.mode must be 'fixed' or 'best_f1_on_valid'"
+        )
+    return (as_float(raw_threshold, "topology_finetune.decision_threshold"), "fixed")
 
 
 def _move_chunk_to_device(
@@ -439,6 +480,7 @@ def _iter_subgraph_forward_passes(
     max_sequence_length: int,
     pair_batch_size: int,
     device: torch.device,
+    embedding_repository: EmbeddingRepository | None = None,
     negative_lookup: ExplicitNegativePairLookup | None = None,
     negative_ratio: int = 1,
     seed: int | None = None,
@@ -452,6 +494,7 @@ def _iter_subgraph_forward_passes(
         input_dim=input_dim,
         max_sequence_length=max_sequence_length,
         pair_batch_size=pair_batch_size,
+        embedding_repository=embedding_repository,
         negative_lookup=negative_lookup,
         negative_ratio=negative_ratio,
         seed=seed,
@@ -472,6 +515,7 @@ def _concat_logits_and_pairs(
     max_sequence_length: int,
     pair_batch_size: int,
     device: torch.device,
+    embedding_repository: EmbeddingRepository | None = None,
     negative_lookup: ExplicitNegativePairLookup | None = None,
     negative_ratio: int = 1,
     seed: int | None = None,
@@ -494,6 +538,7 @@ def _concat_logits_and_pairs(
         max_sequence_length=max_sequence_length,
         pair_batch_size=pair_batch_size,
         device=device,
+        embedding_repository=embedding_repository,
         negative_lookup=negative_lookup,
         negative_ratio=negative_ratio,
         seed=seed,
@@ -567,6 +612,7 @@ def _predict_hard_subgraph(
     pair_batch_size: int,
     threshold: float,
     device: torch.device,
+    embedding_repository: EmbeddingRepository | None = None,
 ) -> nx.Graph:
     """Predict one hard-thresholded node-induced subgraph."""
     node_tuple = tuple(nodes)
@@ -582,6 +628,7 @@ def _predict_hard_subgraph(
         max_sequence_length=max_sequence_length,
         pair_batch_size=pair_batch_size,
         device=device,
+        embedding_repository=embedding_repository,
     ):
         probabilities = torch.sigmoid(logits).detach().cpu().tolist()
         rows = chunk.pair_index_a.tolist()
@@ -592,43 +639,93 @@ def _predict_hard_subgraph(
     return pred_subgraph
 
 
+def _chunked_pair_records(
+    *,
+    pair_records: Sequence[InternalValidationPairRecord],
+    batch_size: int,
+) -> Iterator[Sequence[InternalValidationPairRecord]]:
+    """Yield contiguous slices of pair records."""
+    for start in range(0, len(pair_records), batch_size):
+        yield pair_records[start : start + batch_size]
+
+
+def _validation_pair_batch(
+    *,
+    pair_records: Sequence[InternalValidationPairRecord],
+    embedding_repository: EmbeddingRepository,
+) -> dict[str, torch.Tensor]:
+    """Materialize one internal-validation pair batch on CPU."""
+    unique_proteins = sorted(
+        {record.protein_a for record in pair_records}
+        | {record.protein_b for record in pair_records}
+    )
+    embeddings = embedding_repository.get_many(unique_proteins)
+    emb_a = torch.nn.utils.rnn.pad_sequence(
+        [embeddings[record.protein_a] for record in pair_records],
+        batch_first=True,
+    )
+    emb_b = torch.nn.utils.rnn.pad_sequence(
+        [embeddings[record.protein_b] for record in pair_records],
+        batch_first=True,
+    )
+    return {
+        "emb_a": emb_a,
+        "emb_b": emb_b,
+        "len_a": torch.tensor(
+            [embeddings[record.protein_a].size(0) for record in pair_records],
+            dtype=torch.long,
+        ),
+        "len_b": torch.tensor(
+            [embeddings[record.protein_b].size(0) for record in pair_records],
+            dtype=torch.long,
+        ),
+    }
+
+
 def _evaluate_internal_validation_subgraphs(
     *,
     model: nn.Module,
-    graph: nx.Graph,
-    sampled_subgraphs: Mapping[int, Sequence[tuple[str, ...]]],
-    cache_dir: Path,
-    embedding_index: Mapping[str, str],
-    input_dim: int,
-    max_sequence_length: int,
-    pair_batch_size: int,
+    validation_plan: InternalValidationPlan,
+    embedding_repository: EmbeddingRepository,
+    inference_batch_size: int,
     threshold: float,
     device: torch.device,
+    accelerator: AcceleratorLike,
 ) -> dict[str, float]:
     """Compute internal subgraph topology metrics on fixed validation samples."""
     pred_graphs_by_size: dict[int, list[nx.Graph]] = {}
     target_graphs_by_size: dict[int, list[nx.Graph]] = {}
 
     with torch.no_grad():
-        for node_size, node_sets in sampled_subgraphs.items():
-            pred_graphs_by_size[node_size] = []
-            target_graphs_by_size[node_size] = []
-            for nodes in node_sets:
-                pred_subgraph = _predict_hard_subgraph(
-                    model=model,
-                    graph=graph,
-                    nodes=nodes,
-                    cache_dir=cache_dir,
-                    embedding_index=embedding_index,
-                    input_dim=input_dim,
-                    max_sequence_length=max_sequence_length,
-                    pair_batch_size=pair_batch_size,
-                    threshold=threshold,
+        for bucket in validation_plan.buckets:
+            pred_subgraphs = [nx.Graph() for _ in bucket.sampled_subgraphs]
+            for subgraph, nodes in zip(pred_subgraphs, bucket.sampled_subgraphs, strict=True):
+                subgraph.add_nodes_from(nodes)
+            for pair_batch in _chunked_pair_records(
+                pair_records=bucket.pair_records,
+                batch_size=inference_batch_size,
+            ):
+                prepared_batch = move_batch_to_device(
+                    batch=_validation_pair_batch(
+                        pair_records=pair_batch,
+                        embedding_repository=embedding_repository,
+                    ),
                     device=device,
                 )
-                target_subgraph = graph.subgraph(nodes).copy()
-                pred_graphs_by_size[node_size].append(pred_subgraph)
-                target_graphs_by_size[node_size].append(target_subgraph)
+                with accelerator.autocast():
+                    logits = _squeeze_binary_logits(
+                        _forward_model(model=model, batch=prepared_batch)["logits"]
+                    )
+                probabilities = torch.sigmoid(logits).detach().cpu().tolist()
+                for record, probability in zip(pair_batch, probabilities, strict=True):
+                    if float(probability) < threshold:
+                        continue
+                    pred_subgraphs[record.subgraph_index].add_edge(
+                        bucket.sampled_subgraphs[record.subgraph_index][record.pair_index_a],
+                        bucket.sampled_subgraphs[record.subgraph_index][record.pair_index_b],
+                    )
+            pred_graphs_by_size[bucket.node_size] = pred_subgraphs
+            target_graphs_by_size[bucket.node_size] = list(bucket.target_subgraphs)
 
     result = evaluate_graph_samples(
         pred_graphs_by_size=pred_graphs_by_size,
@@ -723,6 +820,7 @@ def _fit_epoch(
     pair_batch_size: int,
     use_amp: bool,
     accelerator: AcceleratorLike,
+    embedding_repository: EmbeddingRepository,
     negative_lookup: ExplicitNegativePairLookup | None,
 ) -> dict[str, float]:
     """Run one fine-tuning epoch over sampled train subgraphs."""
@@ -736,6 +834,7 @@ def _fit_epoch(
     strategy = as_str(finetune_cfg.get("strategy", "mixed"), "topology_finetune.strategy")
     overlap_penalty = _resolve_overlap_penalty(finetune_cfg)
     negative_ratio = _resolve_bce_negative_ratio(finetune_cfg)
+    sampling_start = time.perf_counter()
     epoch_plan = sample_edge_cover_subgraphs(
         graph=graph,
         num_subgraphs=subgraphs_per_epoch,
@@ -745,11 +844,14 @@ def _fit_epoch(
         seed=rank_seed + epoch_index,
         overlap_penalty=overlap_penalty,
     )
+    edge_cover_sampling_seconds = time.perf_counter() - sampling_start
     sampled_subgraphs = epoch_plan.subgraphs
     aggregates = _initialize_train_aggregates(len(sampled_subgraphs), epoch_plan)
+    train_forward_backward_seconds = 0.0
 
     model.train()
     for subgraph_index, nodes in enumerate(sampled_subgraphs):
+        step_start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         with accelerator.autocast():
             (
@@ -769,6 +871,7 @@ def _fit_epoch(
                 max_sequence_length=max_sequence_length,
                 pair_batch_size=pair_batch_size,
                 device=device,
+                embedding_repository=embedding_repository,
                 negative_lookup=negative_lookup,
                 negative_ratio=negative_ratio,
                 seed=(rank_seed + epoch_index) * 1000 + subgraph_index,
@@ -787,14 +890,20 @@ def _fit_epoch(
                 pair_index_b=pair_index_b,
             )
             topology_losses = compute_topology_losses(
+                weights=loss_weights,
                 pred_adjacency=pred_adjacency,
                 target_adjacency=target_adjacency,
-                weights=loss_weights,
+                num_nodes=len(nodes),
+                pair_index_a=pair_index_a,
+                pair_index_b=pair_index_b,
+                pred_pair_probabilities=torch.sigmoid(logits),
+                target_pair_probabilities=labels,
             )
             total_loss = bce_loss + topology_losses["total_topology"]
 
         accelerator.backward(total_loss)
         optimizer.step()
+        train_forward_backward_seconds += time.perf_counter() - step_start
         _update_train_aggregates(
             aggregates=aggregates,
             bce_loss=bce_loss,
@@ -802,7 +911,13 @@ def _fit_epoch(
             total_loss=total_loss,
         )
 
-    return _average_train_aggregates(aggregates=aggregates, num_subgraphs=len(sampled_subgraphs))
+    averaged = _average_train_aggregates(
+        aggregates=aggregates,
+        num_subgraphs=len(sampled_subgraphs),
+    )
+    averaged["edge_cover_sampling_s"] = edge_cover_sampling_seconds
+    averaged["train_forward_backward_s"] = train_forward_backward_seconds
+    return averaged
 
 
 def _validate_embedding_cache(
@@ -850,6 +965,9 @@ def _prepare_topology_finetune_stage_context(
         finetune_cfg.get("pair_batch_size", training_cfg.get("batch_size", 8)),
         "topology_finetune.pair_batch_size",
     )
+    internal_validation_inference_batch_size = _resolve_internal_validation_inference_batch_size(
+        finetune_cfg
+    )
     epochs = as_int(
         finetune_cfg.get("epochs", training_cfg.get("epochs", 1)),
         "topology_finetune.epochs",
@@ -891,15 +1009,27 @@ def _prepare_topology_finetune_stage_context(
     if distributed_context.is_distributed:
         accelerator.wait_for_everyone()
     _validate_embedding_cache(graph=train_graph, embedding_index=embedding_cache.index)
+    internal_validation_node_sets = _build_internal_validation_node_sets(
+        finetune_cfg=finetune_cfg,
+        graph=internal_val_graph,
+        seed=run_seed + 100_000,
+    )
+    internal_validation_plan = build_internal_validation_plan(
+        graph=internal_val_graph,
+        sampled_subgraphs=internal_validation_node_sets,
+    )
+    embedding_repository = EmbeddingRepository(
+        cache_dir=embedding_cache.cache_dir,
+        embedding_index=embedding_cache.index,
+        input_dim=input_dim,
+        max_sequence_length=max_sequence_length,
+        max_cache_bytes=_resolve_embedding_cache_max_bytes(finetune_cfg),
+    )
+    if internal_validation_plan.protein_ids:
+        embedding_repository.preload(sorted(internal_validation_plan.protein_ids))
 
     evaluator = Evaluator(
         metrics=["auprc"],
-        loss_config=_build_loss_config(training_cfg),
-        use_amp=use_amp,
-        accelerator=accelerator,
-    )
-    threshold_probe = Evaluator(
-        metrics=["f1"],
         loss_config=_build_loss_config(training_cfg),
         use_amp=use_amp,
         accelerator=accelerator,
@@ -911,15 +1041,16 @@ def _prepare_topology_finetune_stage_context(
         train_negative_lookup=train_negative_lookup,
         cache_dir=embedding_cache.cache_dir,
         embedding_index=embedding_cache.index,
+        embedding_repository=embedding_repository,
         input_dim=input_dim,
         max_sequence_length=max_sequence_length,
         pair_batch_size=pair_batch_size,
+        internal_validation_inference_batch_size=internal_validation_inference_batch_size,
         epochs=epochs,
         run_seed=run_seed,
         use_amp=use_amp,
         optimizer=_build_optimizer(config=config, model=model),
         evaluator=evaluator,
-        threshold_probe=threshold_probe,
         loss_weights=_parse_loss_weights(config),
         overlap_penalty=overlap_penalty,
         monitor_metric=monitor_metric,
@@ -930,11 +1061,8 @@ def _prepare_topology_finetune_stage_context(
         best_checkpoint_path=model_dir / "best_model.pth",
         metrics_path=log_dir / "topology_finetune_metrics.json",
         csv_path=log_dir / "topology_finetune_step.csv",
-        internal_validation_node_sets=_build_internal_validation_node_sets(
-            finetune_cfg=finetune_cfg,
-            graph=internal_val_graph,
-            seed=run_seed + 100_000,
-        ),
+        internal_validation_node_sets=internal_validation_node_sets,
+        internal_validation_plan=internal_validation_plan,
     )
 
 
@@ -949,35 +1077,44 @@ def _evaluate_validation_epoch(
     """Run pairwise validation and sampled topology validation for one epoch."""
     model.eval()
     with torch.no_grad():
-        val_pair_stats = context.evaluator.evaluate(
+        val_pair_start = time.perf_counter()
+        labels, probabilities, average_loss = context.evaluator.collect_probabilities_and_labels(
             model=model,
             data_loader=dataloaders["valid"],
             device=device,
+        )
+        val_pair_stats = context.evaluator.metrics_from_outputs(
+            labels=labels,
+            probabilities=probabilities,
+            average_loss=average_loss,
             prefix="val",
         )
+        val_pair_pass_seconds = time.perf_counter() - val_pair_start
+    threshold_start = time.perf_counter()
     decision_threshold, _ = _resolve_internal_validation_threshold(
         config=config,
-        evaluator=context.threshold_probe,
-        model=model,
-        dataloaders=dataloaders,
-        device=device,
+        labels=labels,
+        probabilities=probabilities,
     )
+    threshold_resolution_seconds = time.perf_counter() - threshold_start
+    internal_validation_start = time.perf_counter()
     internal_val_topology_stats = _evaluate_internal_validation_subgraphs(
         model=model,
-        graph=context.internal_val_graph,
-        sampled_subgraphs=context.internal_validation_node_sets,
-        cache_dir=context.cache_dir,
-        embedding_index=context.embedding_index,
-        input_dim=context.input_dim,
-        max_sequence_length=context.max_sequence_length,
-        pair_batch_size=context.pair_batch_size,
+        validation_plan=context.internal_validation_plan,
+        embedding_repository=context.embedding_repository,
+        inference_batch_size=context.internal_validation_inference_batch_size,
         threshold=decision_threshold,
         device=device,
+        accelerator=context.evaluator.accelerator,
     )
+    internal_validation_seconds = time.perf_counter() - internal_validation_start
     return ValidationEpochResult(
         decision_threshold=decision_threshold,
         val_pair_stats=val_pair_stats,
         internal_val_topology_stats=internal_val_topology_stats,
+        val_pair_pass_seconds=val_pair_pass_seconds,
+        threshold_resolution_seconds=threshold_resolution_seconds,
+        internal_validation_seconds=internal_validation_seconds,
     )
 
 
@@ -988,6 +1125,7 @@ def _build_epoch_csv_row(
     train_stats: Mapping[str, float],
     validation_result: ValidationEpochResult,
     optimizer: Optimizer,
+    peak_gpu_mem_mb: float,
 ) -> dict[str, float | int | str]:
     """Build the persisted CSV row for one fine-tuning epoch."""
     internal_val_topology_stats = validation_result.internal_val_topology_stats
@@ -1012,6 +1150,12 @@ def _build_epoch_csv_row(
         "Total Positive Edges": int(train_stats["total_positive_edges"]),
         "Positive Edge Coverage Ratio": train_stats["positive_edge_coverage_ratio"],
         "Mean Positive Edge Reuse": train_stats["mean_positive_edge_reuse"],
+        "edge_cover_sampling_s": train_stats["edge_cover_sampling_s"],
+        "train_forward_backward_s": train_stats["train_forward_backward_s"],
+        "val_pair_pass_s": validation_result.val_pair_pass_seconds,
+        "val_threshold_s": validation_result.threshold_resolution_seconds,
+        "internal_val_topology_s": validation_result.internal_validation_seconds,
+        "peak_gpu_mem_mb": peak_gpu_mem_mb,
         "Learning Rate": float(optimizer.param_groups[0]["lr"]),
     }
 
@@ -1101,16 +1245,28 @@ def run_topology_finetuning_stage(
             "finetune_config",
             epochs=context.epochs,
             monitor=context.monitor_metric,
-            internal_validation_subgraphs=sum(
-                len(node_sets) for node_sets in context.internal_validation_node_sets.values()
-            ),
+            internal_validation_subgraphs=context.internal_validation_plan.total_subgraphs,
             internal_validation_node_sizes=sorted(context.internal_validation_node_sets),
+            internal_validation_pairs=context.internal_validation_plan.total_pairs,
             pair_batch_size=context.pair_batch_size,
+            internal_validation_inference_batch_size=(
+                context.internal_validation_inference_batch_size
+            ),
             overlap_penalty=context.overlap_penalty,
         )
+        if "validation_subgraphs" in finetune_cfg:
+            log_stage_event(
+                logger,
+                "legacy_validation_subgraphs_ignored",
+                configured=finetune_cfg.get("validation_subgraphs"),
+                effective_internal_validation_subgraphs=context.internal_validation_plan.total_subgraphs,
+                reason="fixed_topology_eval_buckets",
+            )
 
     for epoch in range(context.epochs):
         epoch_start = time.perf_counter()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         train_stats = _fit_epoch(
             config=config,
             model=stage_model,
@@ -1127,6 +1283,7 @@ def run_topology_finetuning_stage(
             pair_batch_size=context.pair_batch_size,
             use_amp=context.use_amp,
             accelerator=runtime.accelerator,
+            embedding_repository=context.embedding_repository,
             negative_lookup=context.train_negative_lookup,
         )
         train_stats = reduce_scalar_mapping(
@@ -1143,6 +1300,11 @@ def run_topology_finetuning_stage(
             device=device,
             context=context,
         )
+        peak_gpu_mem_mb = (
+            float(torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0))
+            if device.type == "cuda"
+            else 0.0
+        )
 
         monitor_value = _resolve_monitor_value(
             monitor_metric=context.monitor_metric,
@@ -1158,6 +1320,7 @@ def run_topology_finetuning_stage(
                 train_stats=train_stats,
                 validation_result=validation_result,
                 optimizer=context.optimizer,
+                peak_gpu_mem_mb=peak_gpu_mem_mb,
             )
             append_csv_row(
                 csv_path=context.csv_path,
@@ -1201,6 +1364,12 @@ def run_topology_finetuning_stage(
                 total_positive_edges=int(train_stats["total_positive_edges"]),
                 positive_edge_coverage_ratio=train_stats["positive_edge_coverage_ratio"],
                 mean_positive_edge_reuse=train_stats["mean_positive_edge_reuse"],
+                edge_cover_sampling_s=train_stats["edge_cover_sampling_s"],
+                train_forward_backward_s=train_stats["train_forward_backward_s"],
+                val_pair_pass_s=validation_result.val_pair_pass_seconds,
+                val_threshold_s=validation_result.threshold_resolution_seconds,
+                internal_val_topology_s=validation_result.internal_validation_seconds,
+                peak_gpu_mem_mb=peak_gpu_mem_mb,
             )
 
         if runtime.is_distributed:

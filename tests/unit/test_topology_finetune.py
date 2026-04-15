@@ -10,8 +10,10 @@ import pytest
 import torch
 from src.topology.finetune_data import (
     EdgeCoverEpochPlan,
+    EmbeddingRepository,
     ExplicitNegativePairLookup,
     build_explicit_negative_lookup,
+    build_internal_validation_plan,
     build_pair_supervision_graph,
     filter_graph_to_embedding_index,
     iter_subgraph_pair_chunks,
@@ -305,6 +307,47 @@ def test_iter_subgraph_pair_chunks_materializes_all_labels(tmp_path: Path) -> No
     assert chunks[0].emb_b.shape == torch.Size([2, 2, 4])
 
 
+def test_embedding_repository_matches_cached_loader_and_evicts_by_byte_budget(
+    tmp_path: Path,
+) -> None:
+    cache_dir = tmp_path / "cache"
+    embedding_index = _write_embedding_cache(cache_dir)
+    repository = EmbeddingRepository(
+        cache_dir=cache_dir,
+        embedding_index=embedding_index,
+        input_dim=4,
+        max_sequence_length=8,
+        max_cache_bytes=64,
+    )
+
+    first = repository.get("P1")
+    second = repository.get("P2")
+    reloaded = repository.get("P1")
+
+    assert torch.allclose(first, torch.full((2, 4), 1.0, dtype=torch.float32))
+    assert torch.allclose(second, torch.full((2, 4), 2.0, dtype=torch.float32))
+    assert torch.allclose(reloaded, first)
+    assert repository.preload(["P3", "P4"]) >= 1
+
+
+def test_build_internal_validation_plan_flattens_pairs_and_targets() -> None:
+    graph = nx.path_graph(["P1", "P2", "P3", "P4"])
+
+    plan = build_internal_validation_plan(
+        graph=graph,
+        sampled_subgraphs={
+            3: [("P1", "P2", "P3"), ("P2", "P3", "P4")],
+        },
+    )
+
+    assert plan.total_subgraphs == 2
+    assert plan.total_pairs == 6
+    assert plan.protein_ids == frozenset({"P1", "P2", "P3", "P4"})
+    assert len(plan.buckets) == 1
+    assert len(plan.buckets[0].pair_records) == 6
+    assert sorted(plan.buckets[0].target_subgraphs[0].edges()) == [("P1", "P2"), ("P2", "P3")]
+
+
 def test_iter_subgraph_pair_chunks_uses_explicit_negative_masks_for_bce(tmp_path: Path) -> None:
     graph = nx.Graph()
     graph.add_edges_from([("P1", "P2"), ("P2", "P3")])
@@ -493,3 +536,46 @@ def test_compute_topology_losses_returns_weighted_total() -> None:
         + 0.2 * losses["clustering_mmd"]
     )
     assert losses["total_topology"].item() == pytest.approx(expected_total.item())
+
+
+def test_compute_topology_losses_pairwise_path_matches_dense_path() -> None:
+    pair_index_a = torch.tensor([0, 0, 1], dtype=torch.long)
+    pair_index_b = torch.tensor([1, 2, 2], dtype=torch.long)
+    pred_pair_probabilities = torch.tensor([0.9, 0.1, 0.8], dtype=torch.float32)
+    target_pair_probabilities = torch.tensor([1.0, 0.0, 1.0], dtype=torch.float32)
+    adjacency = build_symmetric_adjacency(
+        num_nodes=3,
+        pair_index_a=pair_index_a,
+        pair_index_b=pair_index_b,
+        pair_probabilities=pred_pair_probabilities,
+    )
+    target = build_symmetric_adjacency(
+        num_nodes=3,
+        pair_index_a=pair_index_a,
+        pair_index_b=pair_index_b,
+        pair_probabilities=target_pair_probabilities,
+    )
+    weights = TopologyLossWeights(alpha=0.5, beta=1.0, gamma=0.3, delta=0.2)
+
+    dense_losses = compute_topology_losses(
+        pred_adjacency=adjacency,
+        target_adjacency=target,
+        weights=weights,
+    )
+    pairwise_losses = compute_topology_losses(
+        weights=weights,
+        num_nodes=3,
+        pair_index_a=pair_index_a,
+        pair_index_b=pair_index_b,
+        pred_pair_probabilities=pred_pair_probabilities,
+        target_pair_probabilities=target_pair_probabilities,
+    )
+
+    for key in (
+        "graph_similarity",
+        "relative_density",
+        "degree_mmd",
+        "clustering_mmd",
+        "total_topology",
+    ):
+        assert pairwise_losses[key].item() == pytest.approx(dense_losses[key].item(), abs=1e-6)

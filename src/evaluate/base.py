@@ -303,6 +303,34 @@ class Evaluator:
         )
         return self.best_f1_threshold(labels=labels, probabilities=probabilities)
 
+    def collect_probabilities_and_labels(
+        self,
+        model: nn.Module,
+        data_loader: DataLoader[Mapping[str, object]],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        """Collect labels, probabilities, and average loss from one loader pass."""
+        return self._collect_probabilities_and_labels(
+            model=model,
+            data_loader=data_loader,
+            device=device,
+        )
+
+    def metrics_from_outputs(
+        self,
+        *,
+        labels: torch.Tensor,
+        probabilities: torch.Tensor,
+        average_loss: float,
+        prefix: str | None = "val",
+    ) -> dict[str, float]:
+        """Compute metrics from precomputed labels/probabilities without another model pass."""
+        metric_values = self._compute_metrics(labels=labels, probabilities=probabilities)
+        metric_values["loss"] = average_loss
+        if prefix is None:
+            return metric_values
+        return {f"{prefix}_{key}": value for key, value in metric_values.items()}
+
     def evaluate(
         self,
         model: nn.Module,
@@ -323,13 +351,14 @@ class Evaluator:
         Returns:
             Metric dictionary with prefixed names.
         """
-        labels_tensor, probs_tensor, average_loss = self._collect_probabilities_and_labels(
+        labels_tensor, probs_tensor, average_loss = self.collect_probabilities_and_labels(
             model=model,
             data_loader=data_loader,
             device=device,
         )
-        metric_values = self._compute_metrics(labels=labels_tensor, probabilities=probs_tensor)
-        metric_values["loss"] = average_loss
-        if prefix is None:
-            return metric_values
-        return {f"{prefix}_{key}": value for key, value in metric_values.items()}
+        return self.metrics_from_outputs(
+            labels=labels_tensor,
+            probabilities=probs_tensor,
+            average_loss=average_loss,
+            prefix=prefix,
+        )

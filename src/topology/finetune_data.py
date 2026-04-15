@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pickle
 import random
-from collections import deque
-from collections.abc import Iterator, Mapping, Sequence
+from collections import OrderedDict, deque
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,6 +54,101 @@ class EdgeCoverEpochPlan:
     covered_positive_edges: int
     positive_edge_coverage_ratio: float
     mean_positive_edge_reuse: float
+
+
+@dataclass(frozen=True)
+class InternalValidationPairRecord:
+    """Flattened pair metadata for batched internal topology validation."""
+
+    subgraph_index: int
+    pair_index_a: int
+    pair_index_b: int
+    protein_a: str
+    protein_b: str
+
+
+@dataclass(frozen=True)
+class InternalValidationNodeBucketPlan:
+    """Precomputed node bucket used for batched internal validation inference."""
+
+    node_size: int
+    sampled_subgraphs: tuple[tuple[str, ...], ...]
+    target_subgraphs: tuple[nx.Graph, ...]
+    pair_records: tuple[InternalValidationPairRecord, ...]
+
+
+@dataclass(frozen=True)
+class InternalValidationPlan:
+    """Fully materialized internal-validation surface reused across epochs."""
+
+    buckets: tuple[InternalValidationNodeBucketPlan, ...]
+    protein_ids: frozenset[str]
+    total_subgraphs: int
+    total_pairs: int
+
+
+class EmbeddingRepository:
+    """Byte-bounded CPU LRU cache for embedding tensors."""
+
+    def __init__(
+        self,
+        *,
+        cache_dir: Path,
+        embedding_index: Mapping[str, str],
+        input_dim: int,
+        max_sequence_length: int,
+        max_cache_bytes: int = 1_073_741_824,
+    ) -> None:
+        if max_cache_bytes <= 0:
+            raise ValueError("max_cache_bytes must be positive")
+        self._cache_dir = cache_dir
+        self._embedding_index = embedding_index
+        self._input_dim = input_dim
+        self._max_sequence_length = max_sequence_length
+        self._max_cache_bytes = max_cache_bytes
+        self._cache: OrderedDict[str, torch.Tensor] = OrderedDict()
+        self._cache_bytes = 0
+
+    @staticmethod
+    def _tensor_bytes(tensor: torch.Tensor) -> int:
+        return int(tensor.element_size() * tensor.numel())
+
+    def _evict_as_needed(self, incoming_bytes: int) -> None:
+        while self._cache and self._cache_bytes + incoming_bytes > self._max_cache_bytes:
+            _, tensor = self._cache.popitem(last=False)
+            self._cache_bytes -= self._tensor_bytes(tensor)
+
+    def get(self, protein_id: str) -> torch.Tensor:
+        """Return one embedding tensor and update its LRU position."""
+        cached = self._cache.get(protein_id)
+        if cached is not None:
+            self._cache.move_to_end(protein_id)
+            return cached
+
+        embedding = load_cached_embedding(
+            cache_dir=self._cache_dir,
+            index=self._embedding_index,
+            protein_id=protein_id,
+            expected_input_dim=self._input_dim,
+            max_sequence_length=self._max_sequence_length,
+        )
+        tensor_bytes = self._tensor_bytes(embedding)
+        if tensor_bytes <= self._max_cache_bytes:
+            self._evict_as_needed(tensor_bytes)
+            self._cache[protein_id] = embedding
+            self._cache.move_to_end(protein_id)
+            self._cache_bytes += tensor_bytes
+        return embedding
+
+    def get_many(self, protein_ids: Sequence[str]) -> dict[str, torch.Tensor]:
+        """Return a dictionary of embeddings for the requested proteins."""
+        return {protein_id: self.get(protein_id) for protein_id in protein_ids}
+
+    def preload(self, protein_ids: Iterable[str]) -> int:
+        """Best-effort preload of the requested protein IDs into the LRU."""
+        for protein_id in protein_ids:
+            self.get(protein_id)
+        return len(self._cache)
 
 
 def _canonical_edge(node_a: str, node_b: str) -> tuple[str, str]:
@@ -598,6 +693,53 @@ def sample_topology_evaluation_subgraphs(
     return sampled_by_size
 
 
+def build_internal_validation_plan(
+    *,
+    graph: nx.Graph,
+    sampled_subgraphs: Mapping[int, Sequence[tuple[str, ...]]],
+) -> InternalValidationPlan:
+    """Build batched internal-validation metadata for all node-size buckets."""
+    buckets: list[InternalValidationNodeBucketPlan] = []
+    protein_ids: set[str] = set()
+    total_subgraphs = 0
+    total_pairs = 0
+
+    for node_size in sorted(sampled_subgraphs):
+        node_sets = tuple(tuple(nodes) for nodes in sampled_subgraphs[node_size])
+        target_subgraphs = tuple(graph.subgraph(nodes).copy() for nodes in node_sets)
+        pair_records: list[InternalValidationPairRecord] = []
+        for subgraph_index, nodes in enumerate(node_sets):
+            protein_ids.update(nodes)
+            for index_a, protein_a in enumerate(nodes):
+                for index_b in range(index_a + 1, len(nodes)):
+                    pair_records.append(
+                        InternalValidationPairRecord(
+                            subgraph_index=subgraph_index,
+                            pair_index_a=index_a,
+                            pair_index_b=index_b,
+                            protein_a=protein_a,
+                            protein_b=nodes[index_b],
+                        )
+                    )
+        buckets.append(
+            InternalValidationNodeBucketPlan(
+                node_size=int(node_size),
+                sampled_subgraphs=node_sets,
+                target_subgraphs=target_subgraphs,
+                pair_records=tuple(pair_records),
+            )
+        )
+        total_subgraphs += len(node_sets)
+        total_pairs += len(pair_records)
+
+    return InternalValidationPlan(
+        buckets=tuple(buckets),
+        protein_ids=frozenset(protein_ids),
+        total_subgraphs=total_subgraphs,
+        total_pairs=total_pairs,
+    )
+
+
 def sample_edge_cover_subgraphs(
     *,
     graph: nx.Graph,
@@ -768,6 +910,7 @@ def iter_subgraph_pair_chunks(
     input_dim: int,
     max_sequence_length: int,
     pair_batch_size: int,
+    embedding_repository: EmbeddingRepository | None = None,
     negative_lookup: ExplicitNegativePairLookup | None = None,
     negative_ratio: int = 1,
     seed: int | None = None,
@@ -782,16 +925,19 @@ def iter_subgraph_pair_chunks(
     if len(node_tuple) < 2:
         raise ValueError("A sampled subgraph must contain at least two nodes")
 
-    embeddings = {
-        protein_id: load_cached_embedding(
-            cache_dir=cache_dir,
-            index=embedding_index,
-            protein_id=protein_id,
-            expected_input_dim=input_dim,
-            max_sequence_length=max_sequence_length,
-        )
-        for protein_id in node_tuple
-    }
+    if embedding_repository is not None:
+        embeddings = embedding_repository.get_many(node_tuple)
+    else:
+        embeddings = {
+            protein_id: load_cached_embedding(
+                cache_dir=cache_dir,
+                index=embedding_index,
+                protein_id=protein_id,
+                expected_input_dim=input_dim,
+                max_sequence_length=max_sequence_length,
+            )
+            for protein_id in node_tuple
+        }
     pair_rows = _subgraph_pair_tuples(
         graph=graph,
         nodes=node_tuple,

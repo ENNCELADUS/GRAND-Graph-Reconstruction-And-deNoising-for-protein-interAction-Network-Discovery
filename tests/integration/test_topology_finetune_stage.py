@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from csv import DictReader
 from pathlib import Path
 from typing import cast
@@ -19,6 +19,7 @@ from src.evaluate import Evaluator
 from src.pipeline.runtime import DistributedContext
 from src.pipeline.stages.topology_finetune import (
     _build_internal_validation_node_sets,
+    _evaluate_internal_validation_subgraphs,
     _forward_model,
     _load_supervision_graphs,
     _resolve_internal_validation_threshold,
@@ -32,8 +33,11 @@ from src.topology.finetune_data import (
     TOPOLOGY_EVAL_NODE_SIZES,
     TOPOLOGY_EVAL_SAMPLES_PER_SIZE,
     EdgeCoverEpochPlan,
+    EmbeddingRepository,
     SubgraphPairChunk,
+    build_internal_validation_plan,
 )
+from src.topology.metrics import evaluate_graph_samples
 from src.topology.negative_sampling import prepare_topology_supervision_from_config
 from src.utils.config import ConfigDict, load_config
 from src.utils.data_io import build_dataloaders
@@ -364,40 +368,20 @@ def test_build_internal_validation_node_sets_uses_graph_size_fallback_when_under
 
 
 def test_resolve_internal_validation_threshold_uses_validation_selected_mode(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     config = _build_finetune_config(tmp_path)
     topology_cfg = config["topology_finetune"]
     assert isinstance(topology_cfg, dict)
     topology_cfg["decision_threshold"] = {"mode": "best_f1_on_valid"}
-
-    observed_calls: list[str] = []
-
-    class _ThresholdProbe:
-        def select_best_f1_threshold(
-            self,
-            *,
-            model: torch.nn.Module,
-            data_loader: DataLoader[dict[str, object]],
-            device: torch.device,
-        ) -> float:
-            del model, data_loader, device
-            observed_calls.append("called")
-            return 0.125
-
-    dataloaders = build_dataloaders(config=config)
     threshold, mode = _resolve_internal_validation_threshold(
         config=config,
-        evaluator=cast(Evaluator, _ThresholdProbe()),
-        model=build_model(config).eval(),
-        dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-        device=torch.device("cpu"),
+        labels=torch.tensor([0, 1, 1, 0], dtype=torch.long),
+        probabilities=torch.tensor([0.1, 0.9, 0.8, 0.2], dtype=torch.float32),
     )
 
-    assert threshold == pytest.approx(0.125)
+    assert threshold == pytest.approx(0.8)
     assert mode == "best_f1_on_valid"
-    assert observed_calls == ["called"]
 
 
 def test_resolve_monitor_mode_uses_min_for_val_loss() -> None:
@@ -538,6 +522,142 @@ def test_predict_hard_subgraph_streams_pair_chunks_for_inference(
     assert sorted(pred_subgraph.edges()) == [("P1", "P2"), ("P2", "P3")]
 
 
+def test_evaluate_internal_validation_subgraphs_matches_per_subgraph_baseline(
+    tmp_path: Path,
+) -> None:
+    graph = nx.Graph()
+    graph.add_edges_from([("P1", "P2"), ("P2", "P3"), ("P2", "P4")])
+    cache_dir = tmp_path / "cache"
+    _write_embedding_cache(
+        cache_dir=cache_dir,
+        embeddings={
+            "P1": torch.full((2, 4), 1.0, dtype=torch.float32),
+            "P2": torch.full((2, 4), 2.0, dtype=torch.float32),
+            "P3": torch.full((2, 4), 3.0, dtype=torch.float32),
+            "P4": torch.full((2, 4), 4.0, dtype=torch.float32),
+        },
+        input_dim=4,
+        max_sequence_length=8,
+    )
+    embedding_index = {
+        protein_id: f"embeddings/{protein_id}.pt" for protein_id in ("P1", "P2", "P3", "P4")
+    }
+    validation_plan = build_internal_validation_plan(
+        graph=graph,
+        sampled_subgraphs={3: [("P1", "P2", "P3"), ("P2", "P3", "P4")]},
+    )
+    embedding_repository = EmbeddingRepository(
+        cache_dir=cache_dir,
+        embedding_index=embedding_index,
+        input_dim=4,
+        max_sequence_length=8,
+        max_cache_bytes=1_024,
+    )
+
+    class _ToyModel(torch.nn.Module):
+        def forward(
+            self,
+            emb_a: torch.Tensor,
+            emb_b: torch.Tensor,
+            len_a: torch.Tensor,
+            len_b: torch.Tensor,
+            **_: object,
+        ) -> dict[str, torch.Tensor]:
+            del len_a, len_b
+            scores = emb_a[:, 0, 0] + emb_b[:, 0, 0]
+            return {"logits": (scores - 5.0) * 10.0}
+
+    model = _ToyModel().eval()
+    batched_summary = _evaluate_internal_validation_subgraphs(
+        model=model,
+        validation_plan=validation_plan,
+        embedding_repository=embedding_repository,
+        inference_batch_size=4,
+        threshold=0.5,
+        device=torch.device("cpu"),
+        accelerator=_RecordingAccelerator(),
+    )
+
+    expected_pred_graphs = {
+        3: [
+            topology_finetune_stage._predict_hard_subgraph(
+                model=model,
+                graph=graph,
+                nodes=nodes,
+                cache_dir=cache_dir,
+                embedding_index=embedding_index,
+                input_dim=4,
+                max_sequence_length=8,
+                pair_batch_size=2,
+                threshold=0.5,
+                device=torch.device("cpu"),
+                embedding_repository=embedding_repository,
+            )
+            for nodes in (("P1", "P2", "P3"), ("P2", "P3", "P4"))
+        ]
+    }
+    expected_target_graphs = {
+        3: [graph.subgraph(nodes).copy() for nodes in (("P1", "P2", "P3"), ("P2", "P3", "P4"))]
+    }
+    expected_summary = evaluate_graph_samples(
+        pred_graphs_by_size=expected_pred_graphs,
+        gt_graphs_by_size=expected_target_graphs,
+    )["summary"]
+
+    assert batched_summary == pytest.approx(expected_summary)
+
+
+def test_run_topology_finetuning_stage_reuses_single_validation_pass_for_threshold(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["decision_threshold"] = {"mode": "best_f1_on_valid"}
+    topology_cfg["epochs"] = 1
+    model = build_model(config)
+    checkpoint_path = Path(str(config["run_config"]["load_checkpoint_path"]))  # type: ignore[index]
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), checkpoint_path)
+    dataloaders = build_dataloaders(config=config)
+    observed_collect_calls: list[int] = []
+    original_collect = Evaluator.collect_probabilities_and_labels
+
+    def _record_collect(
+        self: Evaluator,
+        model: torch.nn.Module,
+        data_loader: DataLoader[Mapping[str, object]],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        observed_collect_calls.append(1)
+        return original_collect(self, model, data_loader, device)
+
+    def _unexpected_threshold_call(*args: object, **kwargs: object) -> float:
+        raise AssertionError("threshold selection should reuse collected validation outputs")
+
+    monkeypatch.setattr(Evaluator, "collect_probabilities_and_labels", _record_collect)
+    monkeypatch.setattr(Evaluator, "select_best_f1_threshold", _unexpected_threshold_call)
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_finetune": "topology_ft_case"},
+        )
+        run_topology_finetuning_stage(
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
+        )
+    finally:
+        os.chdir(previous_cwd)
+
+    assert observed_collect_calls == [1]
+
+
 def test_run_topology_finetuning_stage_uses_edge_cover_sampling_by_default(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -589,6 +709,9 @@ def test_run_topology_finetuning_stage_uses_edge_cover_sampling_by_default(
 
 def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path: Path) -> None:
     config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["validation_subgraphs"] = 7
     model = build_model(config)
     checkpoint_path = Path(str(config["run_config"]["load_checkpoint_path"]))  # type: ignore[index]
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -625,6 +748,14 @@ def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path
     assert "Planned Subgraphs" in header
     assert "Positive Edge Coverage Ratio" in header
     assert "Mean Positive Edge Reuse" in header
+    assert "edge_cover_sampling_s" in header
+    assert "train_forward_backward_s" in header
+    assert "val_pair_pass_s" in header
+    assert "val_threshold_s" in header
+    assert "internal_val_topology_s" in header
+    assert "peak_gpu_mem_mb" in header
+    log_text = (log_dir / "log.log").read_text(encoding="utf-8")
+    assert "Legacy Validation Subgraphs Ignored" in log_text
 
     updated_state = torch.load(best_checkpoint_path, map_location="cpu")
     assert any(
