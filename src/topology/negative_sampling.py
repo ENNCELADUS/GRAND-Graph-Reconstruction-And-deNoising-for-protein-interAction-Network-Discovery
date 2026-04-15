@@ -6,6 +6,8 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.utils.config import ConfigDict, as_int, as_str, get_section
+
 
 @dataclass(frozen=True)
 class RatioSupervisionManifest:
@@ -293,3 +295,52 @@ def ensure_ratio_supervision_files(
         valid_output_path=manifest.valid_output_path,
         test_output_path=manifest.test_output_path,
     )
+
+
+def prepare_topology_supervision_from_config(
+    config: ConfigDict,
+) -> RatioSupervisionManifest | None:
+    """Materialize configured topology supervision files before pipeline launch."""
+    finetune_cfg = config.get("topology_finetune", {})
+    if finetune_cfg is None:
+        finetune_cfg = {}
+    if not isinstance(finetune_cfg, dict):
+        raise ValueError("topology_finetune must be a mapping")
+
+    train_output_raw = finetune_cfg.get("supervision_train_dataset")
+    valid_output_raw = finetune_cfg.get("supervision_valid_dataset")
+    if train_output_raw is None or valid_output_raw is None:
+        return None
+
+    negative_ratio = as_int(
+        finetune_cfg.get("bce_negative_ratio", 5),
+        "topology_finetune.bce_negative_ratio",
+    )
+    if negative_ratio <= 0:
+        return None
+
+    data_cfg = get_section(config, "data_config")
+    benchmark_cfg = get_section(data_cfg, "benchmark")
+    dataloader_cfg = get_section(data_cfg, "dataloader")
+    run_cfg = get_section(config, "run_config")
+
+    species = as_str(benchmark_cfg.get("species", "human"), "data_config.benchmark.species")
+    processed_dir = Path(str(benchmark_cfg.get("processed_dir", "")))
+    split_dir = Path(str(train_output_raw)).parent
+    manifest = ensure_ratio_supervision_files(
+        split_dir=split_dir,
+        global_positive_path=processed_dir.parent / f"{species}_ppi.txt",
+        train_input_path=Path(str(dataloader_cfg.get("train_dataset", ""))),
+        valid_input_path=Path(str(dataloader_cfg.get("valid_dataset", ""))),
+        test_input_path=Path(str(dataloader_cfg.get("test_dataset", ""))),
+        negative_ratio=negative_ratio,
+        seed=as_int(run_cfg.get("seed", 0), "run_config.seed"),
+        train_output_path=Path(str(train_output_raw)),
+        valid_output_path=Path(str(valid_output_raw)),
+        test_output_path=Path(
+            str(split_dir / f"{species}_test_ppi_ratio{negative_ratio}_exclusive.txt")
+        ),
+    )
+    finetune_cfg["supervision_train_dataset"] = str(manifest.train_output_path)
+    finetune_cfg["supervision_valid_dataset"] = str(manifest.valid_output_path)
+    return manifest

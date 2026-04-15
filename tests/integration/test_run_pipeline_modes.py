@@ -483,8 +483,10 @@ def test_execute_pipeline_topology_finetune_scratch_does_not_require_checkpoint(
 
 def test_execute_pipeline_prepares_topology_supervision_before_stage_launch(
     base_config: ConfigDict,
+    patched_pipeline: PipelineCalls,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    del patched_pipeline
     run_cfg = base_config["run_config"]
     assert isinstance(run_cfg, dict)
     run_cfg["stages"] = ["topology_finetune"]
@@ -515,7 +517,11 @@ def test_execute_pipeline_prepares_topology_supervision_before_stage_launch(
         "prepare_topology_supervision_from_config",
         _fake_prepare_topology_supervision_from_config,
     )
-    monkeypatch.setattr(run_module, "run_topology_finetuning_stage", _fake_run_topology_finetuning_stage)
+    monkeypatch.setattr(
+        run_module,
+        "run_topology_finetuning_stage",
+        _fake_run_topology_finetuning_stage,
+    )
 
     run_module.execute_pipeline(base_config)
 

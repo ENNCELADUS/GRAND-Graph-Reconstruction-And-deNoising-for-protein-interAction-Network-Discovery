@@ -48,7 +48,6 @@ from src.topology.metrics import (
     compute_relative_density,
     degree_distribution,
 )
-from src.topology.negative_sampling import ensure_ratio_supervision_files
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -284,44 +283,6 @@ def _build_internal_validation_node_sets(
         seed=seed,
     )
     return [tuple(nodes) for nodes in sampled_subgraphs]
-
-
-def _prepare_topology_supervision_datasets(*, config: ConfigDict) -> None:
-    """Materialize configured ratio-supervision datasets before stage startup."""
-    finetune_cfg = _topology_finetune_config(config)
-    train_output_raw = finetune_cfg.get("supervision_train_dataset")
-    valid_output_raw = finetune_cfg.get("supervision_valid_dataset")
-    if train_output_raw is None or valid_output_raw is None:
-        return
-
-    negative_ratio = _resolve_bce_negative_ratio(finetune_cfg)
-    if negative_ratio <= 0:
-        return
-
-    data_cfg = get_section(config, "data_config")
-    benchmark_cfg = get_section(data_cfg, "benchmark")
-    dataloader_cfg = get_section(data_cfg, "dataloader")
-    run_cfg = get_section(config, "run_config")
-
-    species = as_str(benchmark_cfg.get("species", "human"), "data_config.benchmark.species")
-    processed_dir = Path(str(benchmark_cfg.get("processed_dir", "")))
-    split_dir = Path(str(train_output_raw)).parent
-    manifest = ensure_ratio_supervision_files(
-        split_dir=split_dir,
-        global_positive_path=processed_dir.parent / f"{species}_ppi.txt",
-        train_input_path=Path(str(dataloader_cfg.get("train_dataset", ""))),
-        valid_input_path=Path(str(dataloader_cfg.get("valid_dataset", ""))),
-        test_input_path=Path(str(dataloader_cfg.get("test_dataset", ""))),
-        negative_ratio=negative_ratio,
-        seed=as_int(run_cfg.get("seed", 0), "run_config.seed"),
-        train_output_path=Path(str(train_output_raw)),
-        valid_output_path=Path(str(valid_output_raw)),
-        test_output_path=Path(
-            str(split_dir / f"{species}_test_ppi_ratio{negative_ratio}_exclusive.txt")
-        ),
-    )
-    finetune_cfg["supervision_train_dataset"] = str(manifest.train_output_path)
-    finetune_cfg["supervision_valid_dataset"] = str(manifest.valid_output_path)
 
 
 def _resolve_internal_validation_threshold(
@@ -823,7 +784,6 @@ def run_topology_finetuning_stage(
         "device_config.use_mixed_precision",
     )
 
-    _prepare_topology_supervision_datasets(config=config)
     train_path = Path(str(dataloader_cfg.get("train_dataset", "")))
     valid_path = Path(str(dataloader_cfg.get("valid_dataset", "")))
     train_graph, internal_val_graph = _load_supervision_graphs(config=config)

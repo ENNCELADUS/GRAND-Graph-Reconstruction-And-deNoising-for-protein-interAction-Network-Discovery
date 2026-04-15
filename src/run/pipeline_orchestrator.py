@@ -17,6 +17,7 @@ from src.run.stage_evaluate import run_evaluation_stage
 from src.run.stage_topology_evaluate import run_topology_evaluation_stage
 from src.run.stage_topology_finetune import run_topology_finetuning_stage
 from src.run.stage_train import _build_stage_runtime, build_model, run_training_stage
+from src.topology.negative_sampling import prepare_topology_supervision_from_config
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -298,6 +299,16 @@ def execute_pipeline(
                 event="device",
                 resolved_device=device,
             )
+        if "topology_finetune" in selected_stages:
+            topology_manifest = prepare_topology_supervision_from_config(config)
+            if distributed_context.is_main_process and topology_manifest is not None:
+                log_stage_event(
+                    stage_loggers["topology_finetune"],
+                    "topology_supervision_ready",
+                    train_dataset=topology_manifest.train_output_path,
+                    valid_dataset=topology_manifest.valid_output_path,
+                    test_dataset=topology_manifest.test_output_path,
+                )
 
         dataloaders = build_dataloaders_fn(
             config=config,
