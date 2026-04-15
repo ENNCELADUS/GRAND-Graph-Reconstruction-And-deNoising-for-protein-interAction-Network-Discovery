@@ -6,26 +6,10 @@ import importlib
 import inspect
 from pathlib import Path
 
-import src.run as run_module
 from src.embed import EmbeddingCacheManifest, ensure_embeddings_ready, load_cached_embedding
 from src.train.config import LossConfig as SharedLossConfig
 from src.train.strategies.ohem import OHEMSampleStrategy, select_ohem_indices
 from src.utils.losses import LossConfig, binary_classification_loss
-
-
-def test_run_module_entrypoint_contract() -> None:
-    """Lock top-level run-module callable exports used by tests and scripts."""
-    assert callable(run_module.main)
-    assert callable(run_module.execute_pipeline)
-    assert callable(run_module.run_training_stage)
-    assert callable(run_module.run_evaluation_stage)
-    assert isinstance(run_module.EVAL_CSV_COLUMNS, list)
-
-
-def test_run_module_all_exports_are_importable() -> None:
-    """Lock every declared legacy ``src.run`` export during module moves."""
-    for export_name in run_module.__all__:
-        assert hasattr(run_module, export_name), export_name
 
 
 def test_pipeline_stage_modules_are_canonical_runtime_entrypoints() -> None:

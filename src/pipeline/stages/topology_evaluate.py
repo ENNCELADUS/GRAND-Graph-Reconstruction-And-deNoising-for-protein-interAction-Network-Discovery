@@ -16,20 +16,19 @@ from torch.utils.data import DataLoader, Dataset
 from src.embed import ensure_embeddings_ready
 from src.evaluate import Evaluator
 from src.pipeline.loops import (
-    ensure_accelerator,
     forward_model,
     gather_indexed_predictions,
     move_batch_to_device,
 )
-from src.run.stage_evaluate import _resolve_decision_threshold
-from src.run.stage_train import _build_loss_config, _build_stage_runtime, _load_checkpoint
+from src.pipeline.runtime import AcceleratorLike, DistributedContext, PipelineRuntime
+from src.pipeline.stages.evaluate import _resolve_decision_threshold
+from src.pipeline.stages.train import _build_loss_config
 from src.topology import (
     evaluate_predicted_graph,
     load_human_table2_baselines,
     reconstruct_graph,
     write_human_table2_reports,
 )
-from src.utils.accelerator import AcceleratorLike
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -39,7 +38,6 @@ from src.utils.config import (
     get_section,
 )
 from src.utils.data_io import PRINGPairDataset, _collate_batch
-from src.utils.distributed import DistributedContext
 from src.utils.logging import append_csv_row, log_stage_event
 
 dist = _dist
@@ -117,7 +115,7 @@ class _IndexedTopologyDataset(Dataset[dict[str, torch.Tensor]]):
 
 def _collate_topology_batch(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     """Collate topology batches while preserving original sample indices."""
-    collated = cast(dict[str, torch.Tensor], _collate_batch(batch))
+    collated = _collate_batch(batch)
     collated["pair_index"] = torch.stack([sample["pair_index"] for sample in batch], dim=0)
     return collated
 
@@ -387,16 +385,13 @@ def _maybe_write_comparison_report(
 
 
 def run_topology_evaluation_stage(
-    config: ConfigDict,
+    runtime: PipelineRuntime,
     model: torch.nn.Module,
-    device: torch.device,
     dataloaders: dict[str, DataLoader[dict[str, object]]],
-    run_id: str,
-    checkpoint_path: Path,
-    distributed_context: DistributedContext,
-    accelerator: AcceleratorLike | None = None,
 ) -> dict[str, float]:
     """Run PRING-style Human topology evaluation and persist artifacts."""
+    config = runtime.config.raw
+    device = runtime.device
     topology_cfg = _topology_config(config)
     evaluate_cfg = get_section(config, "evaluate")
     training_cfg = get_section(config, "training_config")
@@ -405,27 +400,18 @@ def run_topology_evaluation_stage(
         device_cfg.get("use_mixed_precision", False),
         "device_config.use_mixed_precision",
     )
-    stage_accelerator = ensure_accelerator(
-        accelerator,
-        device=device,
-        use_mixed_precision=use_amp,
-    )
+    checkpoint_path = runtime.checkpoint_paths.get("topology_evaluate")
+    if checkpoint_path is None:
+        raise ValueError("runtime.checkpoint_paths['topology_evaluate'] is required")
     checkpoint_path_resolved = Path(checkpoint_path)
     model_name, _ = extract_model_kwargs(config)
-    log_dir, _, logger = _build_stage_runtime(
-        model_name=model_name,
-        stage="topology_evaluate",
-        run_id=run_id,
-        distributed_context=distributed_context,
-    )
-    if distributed_context.is_main_process:
+    run_id = runtime.stage_run_id("topology_evaluate")
+    paths = runtime.stage_paths("topology_evaluate")
+    log_dir = paths.log_dir
+    logger = runtime.stage_logger("topology_evaluate", log_dir / "log.log")
+    if runtime.is_main_process:
         log_stage_event(logger, "stage_start", run_id=run_id, checkpoint=checkpoint_path_resolved)
-    _load_checkpoint(
-        model=model,
-        checkpoint_path=checkpoint_path_resolved,
-        device=device,
-        accelerator=stage_accelerator,
-    )
+    runtime.load_checkpoint(model, checkpoint_path_resolved)
     model.eval()
 
     threshold_cfg: ConfigDict = {
@@ -438,8 +424,8 @@ def run_topology_evaluation_stage(
         metrics=["f1"],
         loss_config=_build_loss_config(training_cfg),
         use_amp=use_amp,
-        accelerator=stage_accelerator,
-        gather_for_metrics=stage_accelerator.use_distributed,
+        accelerator=runtime.accelerator,
+        gather_for_metrics=runtime.accelerator.use_distributed,
     )
     decision_threshold, threshold_mode = _resolve_decision_threshold(
         eval_cfg=threshold_cfg,
@@ -448,7 +434,7 @@ def run_topology_evaluation_stage(
         dataloaders=dataloaders,
         device=device,
     )
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         log_stage_event(logger, "decision_threshold", mode=threshold_mode, value=decision_threshold)
 
     all_test_path, gt_graph_path, sampled_nodes_path = _topology_paths(config)
@@ -458,16 +444,16 @@ def run_topology_evaluation_stage(
     )
     topology_loader = cast(
         DataLoader[dict[str, object]],
-        stage_accelerator.prepare(topology_loader),
+        runtime.accelerator.prepare(topology_loader),
     )
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         log_stage_event(
             logger,
             "topology_inference_ready",
             pair_count=len(records),
             cached_embedding_count=cached_embedding_count,
-            distributed=distributed_context.is_distributed,
-            world_size=distributed_context.world_size,
+            distributed=runtime.is_distributed,
+            world_size=runtime.world_size,
         )
     predictions = _predict_topology_labels(
         model=model,
@@ -476,11 +462,11 @@ def run_topology_evaluation_stage(
         total_records=len(records),
         decision_threshold=decision_threshold,
         use_amp=use_amp,
-        accelerator=stage_accelerator,
+        accelerator=runtime.accelerator,
     )
 
     prediction_path = log_dir / "all_test_ppi_pred.txt"
-    if distributed_context.is_main_process and as_bool(
+    if runtime.is_main_process and as_bool(
         topology_cfg.get("save_pair_predictions", True),
         "topology_evaluate.save_pair_predictions",
     ):
@@ -507,7 +493,7 @@ def run_topology_evaluation_stage(
         test_graph_nodes=test_graph_nodes,
     )
 
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         with (log_dir / "graph_eval_results.pkl").open("wb") as handle:
             pickle.dump(topology_result["details"], handle)
         with (log_dir / "topology_metrics.json").open("w", encoding="utf-8") as handle:
@@ -542,5 +528,5 @@ def run_topology_evaluation_stage(
         log_stage_event(logger, "topology_metrics_written", path=log_dir / "topology_metrics.json")
         _maybe_write_comparison_report(config=config, model_name=model_name, logger=logger)
         log_stage_event(logger, "stage_done", run_id=run_id)
-    stage_accelerator.wait_for_everyone()
+    runtime.barrier()
     return cast(dict[str, float], topology_result["summary"])

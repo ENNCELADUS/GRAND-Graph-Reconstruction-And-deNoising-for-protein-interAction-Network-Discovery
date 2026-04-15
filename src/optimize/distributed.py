@@ -14,8 +14,8 @@ from src.optimize.trial_runner import (
     execute_trial,
     run_best_full_pipeline,
 )
+from src.pipeline.runtime import DistributedContext, dist, distributed_barrier
 from src.utils.config import ConfigDict
-from src.utils.distributed import DistributedContext, dist, distributed_barrier
 
 ExecuteTrialFn = Callable[..., TrialExecutionResult | None]
 RunBestPipelineFn = Callable[..., str]

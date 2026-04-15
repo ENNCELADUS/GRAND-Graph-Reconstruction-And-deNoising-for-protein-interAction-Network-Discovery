@@ -8,7 +8,8 @@ from pathlib import Path
 import networkx as nx
 import pytest
 import torch
-from src.run.stage_topology_evaluate import (
+from src.pipeline.runtime import DistributedContext
+from src.pipeline.stages.topology_evaluate import (
     _gather_ordered_predictions,
     _ordered_predictions_from_shards,
     write_topology_predictions,
@@ -24,7 +25,6 @@ from src.topology.report import (
     load_human_table2_baselines,
     write_human_table2_reports,
 )
-from src.utils.distributed import DistributedContext
 
 
 def test_compute_graph_similarity_matches_official_formula() -> None:

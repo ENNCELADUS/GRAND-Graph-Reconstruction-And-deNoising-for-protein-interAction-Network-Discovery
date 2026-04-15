@@ -19,14 +19,10 @@ from torch.utils.data import DataLoader
 
 from src.embed import ensure_embeddings_ready
 from src.evaluate import Evaluator
-from src.pipeline.loops import ensure_accelerator, reduce_scalar_mapping
-from src.run.stage_evaluate import _resolve_decision_threshold
-from src.run.stage_train import (
-    _build_loss_config,
-    _build_stage_runtime,
-    _load_checkpoint,
-    _save_checkpoint,
-)
+from src.pipeline.loops import reduce_scalar_mapping
+from src.pipeline.runtime import AcceleratorLike, DistributedContext, PipelineRuntime
+from src.pipeline.stages.evaluate import _resolve_decision_threshold
+from src.pipeline.stages.train import _build_loss_config
 from src.topology.finetune_data import (
     TOPOLOGY_EVAL_NODE_SIZES,
     TOPOLOGY_EVAL_SAMPLES_PER_SIZE,
@@ -46,7 +42,6 @@ from src.topology.finetune_losses import (
     compute_topology_losses,
 )
 from src.topology.metrics import evaluate_graph_samples
-from src.utils.accelerator import AcceleratorLike
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -56,7 +51,6 @@ from src.utils.config import (
     extract_model_kwargs,
     get_section,
 )
-from src.utils.distributed import DistributedContext
 from src.utils.early_stop import EarlyStopping
 from src.utils.logging import append_csv_row, log_stage_event
 from src.utils.losses import binary_classification_loss
@@ -994,7 +988,7 @@ def _build_epoch_csv_row(
     train_stats: Mapping[str, float],
     validation_result: ValidationEpochResult,
     optimizer: Optimizer,
-) -> dict[str, float | int]:
+) -> dict[str, float | int | str]:
     """Build the persisted CSV row for one fine-tuning epoch."""
     internal_val_topology_stats = validation_result.internal_val_topology_stats
     val_pair_stats = validation_result.val_pair_stats
@@ -1052,35 +1046,24 @@ def _build_best_metrics_payload(
 
 
 def run_topology_finetuning_stage(
-    config: ConfigDict,
+    runtime: PipelineRuntime,
     model: nn.Module,
-    device: torch.device,
     dataloaders: dict[str, DataLoader[dict[str, object]]],
-    run_id: str,
-    checkpoint_path: Path | None,
-    distributed_context: DistributedContext,
-    accelerator: AcceleratorLike | None = None,
 ) -> Path:
     """Fine-tune a pairwise scorer with PRING graph-topology losses."""
-    stage_accelerator = ensure_accelerator(
-        accelerator,
-        device=device,
-        use_mixed_precision=as_bool(
-            get_section(config, "device_config").get("use_mixed_precision", False),
-            "device_config.use_mixed_precision",
-        ),
-    )
+    config = runtime.config.raw
+    device = runtime.device
     model_name, _ = extract_model_kwargs(config)
-    log_dir, model_dir, logger = _build_stage_runtime(
-        model_name=model_name,
-        stage="topology_finetune",
-        run_id=run_id,
-        distributed_context=distributed_context,
-    )
+    run_id = runtime.stage_run_id("topology_finetune")
+    paths = runtime.stage_paths("topology_finetune")
+    log_dir = paths.log_dir
+    model_dir = paths.model_dir
+    logger = runtime.stage_logger("topology_finetune", log_dir / "log.log")
     finetune_cfg = _topology_finetune_config(config)
     init_mode = _resolve_init_mode(finetune_cfg)
+    checkpoint_path = runtime.checkpoint_paths.get("topology_finetune")
     checkpoint_path_resolved = Path(checkpoint_path) if checkpoint_path is not None else None
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         log_stage_event(
             logger,
             "stage_start",
@@ -1093,12 +1076,7 @@ def run_topology_finetuning_stage(
             raise ValueError(
                 "checkpoint_path is required when topology_finetune.init_mode='warm_start'"
             )
-        _load_checkpoint(
-            model=model,
-            checkpoint_path=checkpoint_path_resolved,
-            device=device,
-            accelerator=stage_accelerator,
-        )
+        runtime.load_checkpoint(model, checkpoint_path_resolved)
 
     context = _prepare_topology_finetune_stage_context(
         config=config,
@@ -1106,17 +1084,17 @@ def run_topology_finetuning_stage(
         device=device,
         log_dir=log_dir,
         model_dir=model_dir,
-        distributed_context=distributed_context,
-        accelerator=stage_accelerator,
+        distributed_context=runtime.distributed,
+        accelerator=runtime.accelerator,
     )
     stage_model, prepared_optimizer = cast(
         tuple[nn.Module, Optimizer],
-        stage_accelerator.prepare(model, context.optimizer),
+        runtime.accelerator.prepare(model, context.optimizer),
     )
     context = replace(context, optimizer=prepared_optimizer)
     best_metrics: dict[str, float | str] = {}
 
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         log_stage_event(
             logger,
             "finetune_config",
@@ -1141,17 +1119,17 @@ def run_topology_finetuning_stage(
             embedding_index=context.embedding_index,
             optimizer=context.optimizer,
             epoch_index=epoch,
-            rank_seed=context.run_seed + 1000 * distributed_context.rank,
+            rank_seed=context.run_seed + 1000 * runtime.rank,
             input_dim=context.input_dim,
             max_sequence_length=context.max_sequence_length,
             loss_weights=context.loss_weights,
             pair_batch_size=context.pair_batch_size,
             use_amp=context.use_amp,
-            accelerator=stage_accelerator,
+            accelerator=runtime.accelerator,
             negative_lookup=context.train_negative_lookup,
         )
         train_stats = reduce_scalar_mapping(
-            stage_accelerator,
+            runtime.accelerator,
             train_stats,
             device=device,
             reduction="mean",
@@ -1171,25 +1149,26 @@ def run_topology_finetuning_stage(
             internal_val_topology_stats=validation_result.internal_val_topology_stats,
         )
         should_stop = False
-        if distributed_context.is_main_process:
+        save_best_checkpoint = False
+        if runtime.is_main_process:
+            csv_row: dict[str, float | int | str] = _build_epoch_csv_row(
+                epoch=epoch + 1,
+                epoch_seconds=time.perf_counter() - epoch_start,
+                train_stats=train_stats,
+                validation_result=validation_result,
+                optimizer=context.optimizer,
+            )
             append_csv_row(
                 csv_path=context.csv_path,
-                row=_build_epoch_csv_row(
-                    epoch=epoch + 1,
-                    epoch_seconds=time.perf_counter() - epoch_start,
-                    train_stats=train_stats,
-                    validation_result=validation_result,
-                    optimizer=context.optimizer,
-                ),
+                row=csv_row,
                 fieldnames=TOPOLOGY_FINETUNE_CSV_COLUMNS,
             )
             improved, should_stop = context.early_stopping.update(monitor_value)
-            if improved:
-                _save_checkpoint(
-                    model=stage_model,
-                    checkpoint_path=context.best_checkpoint_path,
-                    accelerator=stage_accelerator,
-                )
+            save_best_checkpoint = improved
+        save_best_checkpoint = _sync_flag(runtime, save_best_checkpoint)
+        if save_best_checkpoint:
+            runtime.save_checkpoint(stage_model, context.best_checkpoint_path)
+            if runtime.is_main_process:
                 best_metrics = _build_best_metrics_payload(
                     epoch=epoch + 1,
                     monitor_metric=context.monitor_metric,
@@ -1208,6 +1187,7 @@ def run_topology_finetuning_stage(
                     monitor=context.monitor_metric,
                     value=monitor_value,
                 )
+        if runtime.is_main_process:
             log_stage_event(
                 logger,
                 "epoch_done",
@@ -1222,30 +1202,36 @@ def run_topology_finetuning_stage(
                 mean_positive_edge_reuse=train_stats["mean_positive_edge_reuse"],
             )
 
-        if distributed_context.is_distributed:
+        if runtime.is_distributed:
             stop_flag = torch.tensor([1 if should_stop else 0], device=device, dtype=torch.int64)
             dist.broadcast(stop_flag, src=0)
             should_stop = bool(int(stop_flag.item()))
         if should_stop:
-            if distributed_context.is_main_process:
+            if runtime.is_main_process:
                 log_stage_event(logger, "early_stop", epoch=epoch + 1)
             break
 
-    if distributed_context.is_main_process and not context.best_checkpoint_path.exists():
-        _save_checkpoint(
-            model=stage_model,
-            checkpoint_path=context.best_checkpoint_path,
-            accelerator=stage_accelerator,
+    fallback_save = runtime.is_main_process and not context.best_checkpoint_path.exists()
+    if _sync_flag(runtime, fallback_save):
+        runtime.save_checkpoint(stage_model, context.best_checkpoint_path)
+    if runtime.is_main_process and fallback_save and not best_metrics:
+        context.metrics_path.write_text(
+            json.dumps(
+                {"monitor_metric": context.monitor_metric, "monitor_value": 0.0},
+                indent=2,
+            ),
+            encoding="utf-8",
         )
-        if not best_metrics:
-            context.metrics_path.write_text(
-                json.dumps(
-                    {"monitor_metric": context.monitor_metric, "monitor_value": 0.0},
-                    indent=2,
-                ),
-                encoding="utf-8",
-            )
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         log_stage_event(logger, "stage_done", run_id=run_id)
-    stage_accelerator.wait_for_everyone()
+    runtime.barrier()
     return context.best_checkpoint_path
+
+
+def _sync_flag(runtime: PipelineRuntime, flag: bool) -> bool:
+    """Return a flag that is true on all ranks when any rank reports true."""
+    if not runtime.is_distributed:
+        return flag
+    flag_tensor = torch.tensor([1 if flag else 0], device=runtime.device, dtype=torch.int64)
+    reduced = runtime.accelerator.reduce(flag_tensor, reduction="sum")
+    return bool(int(reduced.item()) > 0)

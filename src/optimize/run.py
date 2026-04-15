@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import importlib
 import json
 import logging
 import os
@@ -25,6 +24,8 @@ from src.optimize.distributed import (
 )
 from src.optimize.search_space import extend_with_nas_lite, parse_search_space
 from src.optimize.trial_runner import run_best_full_pipeline
+from src.pipeline.engine import execute_pipeline
+from src.pipeline.runtime import DistributedContext
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -34,31 +35,11 @@ from src.utils.config import (
     get_section,
     load_config,
 )
-from src.utils.distributed import DistributedContext
 from src.utils.logging import generate_run_id
 
 LOGGER = logging.getLogger(__name__)
 PipelineExecuteFn = Callable[[ConfigDict], None]
-PIPELINE_EXECUTE_FN: PipelineExecuteFn
-
-
-def _resolve_pipeline_execute_fn() -> PipelineExecuteFn:
-    """Resolve pipeline execute function from runtime module layout."""
-    run_module = importlib.import_module("src.run")
-    execute_fn = getattr(run_module, "execute_pipeline", None)
-    if callable(execute_fn):
-        return cast(PipelineExecuteFn, execute_fn)
-    return _fallback_pipeline_execute
-
-
-def _fallback_pipeline_execute(config: ConfigDict) -> None:
-    """Fallback to package orchestrator when ``src.run`` script module is unavailable."""
-    from src.run.pipeline_orchestrator import execute_pipeline
-
-    cast(PipelineExecuteFn, execute_pipeline)(config)
-
-
-PIPELINE_EXECUTE_FN = _resolve_pipeline_execute_fn()
+PIPELINE_EXECUTE_FN: PipelineExecuteFn = cast(PipelineExecuteFn, execute_pipeline)
 
 
 def parse_args() -> argparse.Namespace:

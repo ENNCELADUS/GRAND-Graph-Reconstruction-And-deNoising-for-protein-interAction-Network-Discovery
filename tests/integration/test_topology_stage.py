@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-import src.run.stage_topology_evaluate as topology_stage
+import src.pipeline.stages.topology_evaluate as topology_stage
 import torch
-from src.run.stage_topology_evaluate import run_topology_evaluation_stage
-from src.run.stage_train import build_model
+from src.pipeline.runtime import DistributedContext
+from src.pipeline.stages.topology_evaluate import run_topology_evaluation_stage
+from src.pipeline.stages.train import build_model
 from src.utils.config import ConfigDict
 from src.utils.data_io import build_dataloaders
-from src.utils.distributed import DistributedContext
+from tests.runtime_helpers import build_stage_runtime
 from torch.utils.data import DataLoader
 
 
@@ -220,16 +221,17 @@ def test_run_topology_evaluation_stage_writes_expected_artifacts(tmp_path: Path)
         model = build_model(config)
         torch.save(model.state_dict(), Path(str(config["run_config"]["load_checkpoint_path"])))  # type: ignore[index]
         dataloaders = build_dataloaders(config=config)
-        distributed_context = DistributedContext(ddp_enabled=False, is_distributed=False)
+        checkpoint_path = Path(str(config["run_config"]["load_checkpoint_path"]))  # type: ignore[index]
         __import__("os").chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_evaluate": "topology_case"},
+            checkpoint_paths={"topology_evaluate": checkpoint_path},
+        )
         run_topology_evaluation_stage(
-            config=config,
-            model=model,
-            device=torch.device("cpu"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-            run_id="topology_case",
-            checkpoint_path=Path(str(config["run_config"]["load_checkpoint_path"])),  # type: ignore[index]
-            distributed_context=distributed_context,
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
         )
     finally:
         __import__("os").chdir(previous_cwd)
@@ -270,20 +272,23 @@ def test_run_topology_evaluation_stage_non_main_rank_computes_topology_summary(
     previous_cwd = Path.cwd()
     try:
         __import__("os").chdir(tmp_path)
+        distributed_context = DistributedContext(
+            ddp_enabled=True,
+            is_distributed=True,
+            rank=1,
+            local_rank=1,
+            world_size=2,
+        )
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_evaluate": "topology_non_main"},
+            checkpoint_paths={"topology_evaluate": checkpoint_path},
+            distributed=distributed_context,
+        )
         summary = run_topology_evaluation_stage(
-            config=config,
-            model=model,
-            device=torch.device("cpu"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-            run_id="topology_non_main",
-            checkpoint_path=checkpoint_path,
-            distributed_context=DistributedContext(
-                ddp_enabled=True,
-                is_distributed=True,
-                rank=1,
-                local_rank=1,
-                world_size=2,
-            ),
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
         )
     finally:
         __import__("os").chdir(previous_cwd)

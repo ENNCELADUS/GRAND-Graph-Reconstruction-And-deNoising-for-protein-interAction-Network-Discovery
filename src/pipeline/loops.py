@@ -8,31 +8,11 @@ from typing import cast
 import torch
 from torch import nn
 
-from src.utils.accelerator import AcceleratorLike, build_accelerator
+from src.pipeline.runtime import AcceleratorLike
 
 BatchValue = object
 BatchInput = Mapping[str, BatchValue]
 BatchDict = dict[str, BatchValue]
-
-
-def ensure_accelerator(
-    accelerator: AcceleratorLike | None,
-    *,
-    device: torch.device,
-    use_mixed_precision: bool = False,
-) -> AcceleratorLike:
-    """Return the provided accelerator or build a single-process runtime."""
-    if accelerator is not None:
-        return accelerator
-    return cast(
-        AcceleratorLike,
-        build_accelerator(
-            requested_device=device.type,
-            ddp_enabled=False,
-            use_mixed_precision=use_mixed_precision,
-            find_unused_parameters=False,
-        ),
-    )
 
 
 def move_batch_to_device(
@@ -128,7 +108,6 @@ __all__ = [
     "BatchDict",
     "BatchInput",
     "BatchValue",
-    "ensure_accelerator",
     "forward_model",
     "gather_indexed_predictions",
     "move_batch_to_device",

@@ -12,10 +12,10 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler, OneCycleLR
 from torch.utils.data import DataLoader
 
-from src.pipeline.loops import ensure_accelerator, forward_model, move_batch_to_device
+from src.pipeline.loops import forward_model, move_batch_to_device
+from src.pipeline.runtime import AcceleratorLike
 from src.train.config import LossConfig, OptimizerConfig, SchedulerConfig
 from src.train.strategies.ohem import OHEMSampleStrategy
-from src.utils.accelerator import AcceleratorLike
 from src.utils.losses import binary_classification_loss
 
 BatchValue = object
@@ -41,18 +41,14 @@ class Trainer:
         use_amp: bool,
         total_epochs: int,
         steps_per_epoch: int,
+        accelerator: AcceleratorLike,
         ohem_strategy: OHEMSampleStrategy | None = None,
         logger: logging.Logger | None = None,
         heartbeat_every_n_steps: int = 0,
-        accelerator: AcceleratorLike | None = None,
     ) -> None:
         self.model = model
         self.device = device
-        self.accelerator = ensure_accelerator(
-            accelerator,
-            device=device,
-            use_mixed_precision=use_amp,
-        )
+        self.accelerator = accelerator
         self.optimizer_config = optimizer_config
         self.scheduler_config = scheduler_config
         self.loss_config = loss_config

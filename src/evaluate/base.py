@@ -20,9 +20,9 @@ from sklearn.metrics import (
 from torch import nn
 from torch.utils.data import DataLoader
 
-from src.pipeline.loops import ensure_accelerator, forward_model, move_batch_to_device
+from src.pipeline.loops import forward_model, move_batch_to_device
+from src.pipeline.runtime import AcceleratorLike
 from src.train.config import LossConfig
-from src.utils.accelerator import AcceleratorLike
 from src.utils.losses import binary_classification_loss
 
 BatchValue = object
@@ -57,9 +57,9 @@ class Evaluator:
         metrics: list[str],
         loss_config: LossConfig,
         *,
+        accelerator: AcceleratorLike,
         decision_threshold: float = 0.5,
         use_amp: bool = False,
-        accelerator: AcceleratorLike | None = None,
         gather_for_metrics: bool = False,
     ) -> None:
         self.metrics = [metric.lower() for metric in metrics]
@@ -220,16 +220,10 @@ class Evaluator:
         all_probs: list[torch.Tensor] = []
         all_labels: list[torch.Tensor] = []
         all_losses: list[torch.Tensor] = []
-        accelerator = ensure_accelerator(
-            self.accelerator,
-            device=device,
-            use_mixed_precision=self.use_amp,
-        )
-
         with torch.inference_mode():
             for batch in data_loader:
                 prepared_batch = self._move_batch_to_device(batch=batch, device=device)
-                with accelerator.autocast():
+                with self.accelerator.autocast():
                     output = self._forward_model(model=model, batch=prepared_batch)
                 logits = output["logits"]
                 labels = self._batch_tensor(prepared_batch, "label").float()
@@ -245,10 +239,10 @@ class Evaluator:
                 probs = torch.sigmoid(reduced_logits).detach()
                 gathered_labels = labels.detach()
                 gathered_losses = per_sample_loss.detach()
-                if self.gather_metrics and accelerator.use_distributed:
-                    probs = accelerator.gather_for_metrics(probs)
-                    gathered_labels = accelerator.gather_for_metrics(gathered_labels)
-                    gathered_losses = accelerator.gather_for_metrics(gathered_losses)
+                if self.gather_metrics and self.accelerator.use_distributed:
+                    probs = self.accelerator.gather_for_metrics(probs)
+                    gathered_labels = self.accelerator.gather_for_metrics(gathered_labels)
+                    gathered_losses = self.accelerator.gather_for_metrics(gathered_losses)
                 all_probs.append(probs.cpu())
                 all_labels.append(gathered_labels.cpu())
                 all_losses.append(gathered_losses.cpu())

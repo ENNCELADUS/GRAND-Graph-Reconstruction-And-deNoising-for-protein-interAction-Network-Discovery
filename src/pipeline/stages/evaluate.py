@@ -8,23 +8,17 @@ from pathlib import Path
 import torch
 
 from src.evaluate import Evaluator
-from src.pipeline.loops import ensure_accelerator
-from src.run.stage_train import _build_loss_config, _build_stage_runtime, _load_checkpoint
-from src.utils.accelerator import AcceleratorLike
+from src.pipeline.runtime import PipelineRuntime
+from src.pipeline.stages.train import _build_loss_config
 from src.utils.config import (
     ConfigDict,
     as_bool,
     as_float,
     as_str,
     as_str_list,
-    extract_model_kwargs,
     get_section,
 )
-from src.utils.distributed import DistributedContext
-from src.utils.distributed import distributed_barrier as _distributed_barrier
 from src.utils.logging import append_csv_row, log_stage_event
-
-distributed_barrier = _distributed_barrier
 
 EVAL_CSV_COLUMNS = [
     "split",
@@ -83,55 +77,35 @@ def _resolve_decision_threshold(
 
 
 def run_evaluation_stage(
-    config: ConfigDict,
+    runtime: PipelineRuntime,
     model: torch.nn.Module,
-    device: torch.device,
     dataloaders: dict[str, torch.utils.data.DataLoader[dict[str, object]]],
-    run_id: str,
-    checkpoint_path: Path,
-    distributed_context: DistributedContext,
-    accelerator: AcceleratorLike | None = None,
 ) -> dict[str, float]:
     """Run test evaluation and persist ``evaluate.csv``."""
+    config = runtime.config.raw
+    device = runtime.device
     device_cfg = get_section(config, "device_config")
     use_amp = device.type == "cuda" and as_bool(
         device_cfg.get("use_mixed_precision", False),
         "device_config.use_mixed_precision",
     )
-    stage_accelerator = ensure_accelerator(
-        accelerator,
-        device=device,
-        use_mixed_precision=use_amp,
-    )
+    checkpoint_path = runtime.checkpoint_paths.get("evaluate")
+    if checkpoint_path is None:
+        raise ValueError("runtime.checkpoint_paths['evaluate'] is required")
     checkpoint_path_resolved = Path(checkpoint_path)
-    model_name, _ = extract_model_kwargs(config)
-    log_dir, _, logger = _build_stage_runtime(
-        model_name=model_name,
-        stage="evaluate",
-        run_id=run_id,
-        distributed_context=distributed_context,
-    )
-    if distributed_context.is_main_process:
+    run_id = runtime.stage_run_id("evaluate")
+    paths = runtime.stage_paths("evaluate")
+    log_dir = paths.log_dir
+    logger = runtime.stage_logger("evaluate", log_dir / "log.log")
+    if runtime.is_main_process:
         log_stage_event(
             logger,
             "stage_start",
             run_id=run_id,
             checkpoint=checkpoint_path_resolved,
         )
-    try:
-        _load_checkpoint(
-            model=model,
-            checkpoint_path=checkpoint_path_resolved,
-            device=device,
-            accelerator=stage_accelerator,
-        )
-    except TypeError:
-        _load_checkpoint(
-            model=model,
-            checkpoint_path=checkpoint_path_resolved,
-            device=device,
-        )
-    if distributed_context.is_main_process:
+    runtime.load_checkpoint(model, checkpoint_path_resolved)
+    if runtime.is_main_process:
         log_stage_event(logger, "checkpoint_loaded", path=checkpoint_path_resolved)
     model.eval()
     eval_cfg = get_section(config, "evaluate")
@@ -143,8 +117,8 @@ def run_evaluation_stage(
         metrics=metrics_to_compute,
         loss_config=loss_config,
         use_amp=use_amp,
-        accelerator=stage_accelerator,
-        gather_for_metrics=stage_accelerator.use_distributed,
+        accelerator=runtime.accelerator,
+        gather_for_metrics=runtime.accelerator.use_distributed,
     )
     decision_threshold, threshold_mode = _resolve_decision_threshold(
         eval_cfg=eval_cfg,
@@ -158,10 +132,10 @@ def run_evaluation_stage(
         loss_config=loss_config,
         decision_threshold=decision_threshold,
         use_amp=use_amp,
-        accelerator=stage_accelerator,
-        gather_for_metrics=stage_accelerator.use_distributed,
+        accelerator=runtime.accelerator,
+        gather_for_metrics=runtime.accelerator.use_distributed,
     )
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         log_stage_event(
             logger,
             "decision_threshold",
@@ -175,7 +149,7 @@ def run_evaluation_stage(
             device=device,
             prefix=None,
         )
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         csv_row: dict[str, float | int | str] = {"split": "test"}
         for metric_name in EVAL_CSV_COLUMNS[1:]:
             csv_row[metric_name] = float(metrics.get(metric_name, 0.0))
@@ -191,5 +165,5 @@ def run_evaluation_stage(
             "stage_done",
             run_id=run_id,
         )
-    stage_accelerator.wait_for_everyone()
+    runtime.barrier()
     return metrics

@@ -6,11 +6,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-import src.run as run_module
-import src.run.pipeline_orchestrator as pipeline_orchestrator
+import src.pipeline.engine as run_module
+import src.pipeline.runtime as pipeline_runtime
 import torch
+from src.pipeline.runtime import PipelineRuntime
 from src.utils.config import ConfigDict
-from src.utils.distributed import DistributedContext
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -100,73 +100,62 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         return _DummyModel()
 
     def fake_run_training_stage(
-        stage: str,
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
-        distributed_context: DistributedContext,
-        accelerator: object | None = None,
     ) -> Path:
-        del config, model, device, dataloaders, distributed_context, accelerator
-        calls.training.append((stage, run_id))
+        del model, dataloaders
+        stage = "train"
+        calls.training.append((stage, runtime.stage_run_id(stage)))
         return Path(f"artifacts/{stage}_best_model.pth")
 
     def fake_run_evaluation_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
-        checkpoint_path: Path,
-        distributed_context: DistributedContext,
-        accelerator: object | None = None,
     ) -> dict[str, float]:
-        del config, model, device, dataloaders, distributed_context, accelerator
-        calls.evaluation.append((checkpoint_path, run_id))
+        del model, dataloaders
+        checkpoint_path = runtime.checkpoint_paths["evaluate"]
+        assert checkpoint_path is not None
+        calls.evaluation.append((checkpoint_path, runtime.stage_run_id("evaluate")))
         return {"accuracy": 1.0}
 
     def fake_run_topology_finetuning_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
-        checkpoint_path: Path | None,
-        distributed_context: DistributedContext,
-        accelerator: object | None = None,
     ) -> Path:
-        del config, model, device, dataloaders, distributed_context, accelerator
-        calls.topology_finetuning.append((checkpoint_path, run_id))
+        del model, dataloaders
+        calls.topology_finetuning.append(
+            (
+                runtime.checkpoint_paths.get("topology_finetune"),
+                runtime.stage_run_id("topology_finetune"),
+            )
+        )
         return Path("artifacts/topology_finetune_best_model.pth")
 
     def fake_run_adaptation_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
-        checkpoint_path: Path,
-        distributed_context: DistributedContext,
-        accelerator: object | None = None,
     ) -> Path:
-        del config, model, device, dataloaders, distributed_context, accelerator
-        calls.adaptation.append((checkpoint_path, run_id))
+        del model, dataloaders
+        checkpoint_path = runtime.checkpoint_paths["adapt"]
+        assert checkpoint_path is not None
+        calls.adaptation.append((checkpoint_path, runtime.stage_run_id("adapt")))
         return Path("artifacts/adapt_best_model.pth")
 
     def fake_run_topology_evaluation_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
-        checkpoint_path: Path,
-        distributed_context: DistributedContext,
-        accelerator: object | None = None,
     ) -> dict[str, float]:
-        del config, model, device, dataloaders, distributed_context, accelerator
-        calls.topology_evaluation.append((checkpoint_path, run_id))
+        del model, dataloaders
+        checkpoint_path = runtime.checkpoint_paths["topology_evaluate"]
+        assert checkpoint_path is not None
+        calls.topology_evaluation.append(
+            (checkpoint_path, runtime.stage_run_id("topology_evaluate"))
+        )
         return {"graph_sim": 1.0}
 
     class _FakeAccelerator:
@@ -343,31 +332,21 @@ def test_execute_pipeline_uses_accelerator_device_without_resolve_device(
         return _DummyModel()
 
     def fake_run_training_stage(
-        stage: str,
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
-        distributed_context: DistributedContext,
-        accelerator: object | None = None,
     ) -> Path:
-        del stage, config, model, dataloaders, run_id, distributed_context, accelerator
-        observed_devices.append(device)
+        del model, dataloaders
+        observed_devices.append(runtime.device)
         return Path("artifacts/train_best_model.pth")
 
     def fake_run_evaluation_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
-        checkpoint_path: Path,
-        distributed_context: DistributedContext,
-        accelerator: object | None = None,
     ) -> dict[str, float]:
-        del config, model, dataloaders, run_id, checkpoint_path, distributed_context, accelerator
-        observed_devices.append(device)
+        del model, dataloaders
+        observed_devices.append(runtime.device)
         return {"accuracy": 1.0}
 
     monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
@@ -406,7 +385,7 @@ def test_execute_pipeline_distributed_worker_reuses_main_run_ids(
         lambda **kwargs: _WorkerAccelerator(),
         raising=False,
     )
-    monkeypatch.setattr(pipeline_orchestrator.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(pipeline_runtime.torch.distributed, "is_initialized", lambda: True)
 
     def fake_broadcast_object_list(payload: list[object], src: int) -> None:
         del src
@@ -419,7 +398,7 @@ def test_execute_pipeline_distributed_worker_reuses_main_run_ids(
         }
 
     monkeypatch.setattr(
-        pipeline_orchestrator.torch.distributed,
+        pipeline_runtime.torch.distributed,
         "broadcast_object_list",
         fake_broadcast_object_list,
     )
@@ -433,8 +412,8 @@ def test_execute_pipeline_distributed_worker_reuses_main_run_ids(
         ]
     )
     monkeypatch.setattr(
-        pipeline_orchestrator,
-        "generate_run_id",
+        pipeline_runtime,
+        "_default_generate_run_id",
         lambda existing_value: next(generated_run_ids),
     )
 
@@ -650,25 +629,11 @@ def test_execute_pipeline_topology_finetune_launches_without_runtime_supervision
     call_order: list[str] = []
 
     def _fake_run_topology_finetuning_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
-        checkpoint_path: Path | None,
-        distributed_context: DistributedContext,
-        accelerator: object | None = None,
     ) -> Path:
-        del (
-            config,
-            model,
-            device,
-            dataloaders,
-            run_id,
-            checkpoint_path,
-            distributed_context,
-            accelerator,
-        )
+        del runtime, model, dataloaders
         call_order.append("stage")
         return Path("artifacts/topology_finetune_best_model.pth")
 
@@ -775,16 +740,11 @@ def test_execute_pipeline_staged_unfreeze_enables_ddp_find_unused(
         return _FakeAccelerator()
 
     def fake_run_training_stage(
-        stage: str,
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
-        distributed_context: DistributedContext,
-        accelerator: object | None = None,
     ) -> Path:
-        del stage, config, model, device, dataloaders, run_id, distributed_context, accelerator
+        del runtime, model, dataloaders
         return Path("artifacts/train_best_model.pth")
 
     monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
@@ -849,47 +809,19 @@ def test_execute_pipeline_shot_adaptation_enables_ddp_find_unused(
         return _FakeAccelerator()
 
     def fake_run_adaptation_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
-        checkpoint_path: Path,
-        distributed_context: DistributedContext,
-        accelerator: object | None = None,
     ) -> Path:
-        del (
-            config,
-            model,
-            device,
-            dataloaders,
-            run_id,
-            checkpoint_path,
-            distributed_context,
-            accelerator,
-        )
+        del runtime, model, dataloaders
         return Path("artifacts/adapt_best_model.pth")
 
     def fake_run_evaluation_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
-        checkpoint_path: Path,
-        distributed_context: DistributedContext,
-        accelerator: object | None = None,
     ) -> dict[str, float]:
-        del (
-            config,
-            model,
-            device,
-            dataloaders,
-            run_id,
-            checkpoint_path,
-            distributed_context,
-            accelerator,
-        )
+        del runtime, model, dataloaders
         return {"accuracy": 1.0}
 
     monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)

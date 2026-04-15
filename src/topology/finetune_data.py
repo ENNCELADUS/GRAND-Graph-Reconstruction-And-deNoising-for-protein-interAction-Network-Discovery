@@ -226,8 +226,7 @@ def _sample_frontier_nodes(
 ) -> tuple[str, ...]:
     """Sample nodes by randomized frontier expansion with restart fallback."""
     graph_nodes = list(graph.nodes)
-    frontier: deque[str] | list[str]
-    frontier = [rng.choice(graph_nodes)] if depth_first else deque([rng.choice(graph_nodes)])
+    frontier = deque([rng.choice(graph_nodes)])
     visited: set[str] = set()
     nodes_in_order: list[str] = []
 
@@ -347,8 +346,7 @@ def _build_frontier_order(
     depth_first: bool,
 ) -> list[str]:
     """Return a randomized BFS/DFS traversal order with restart fallback."""
-    frontier: deque[str] | list[str]
-    frontier = list(reversed(seed_nodes)) if depth_first else deque(seed_nodes)
+    frontier = deque(reversed(seed_nodes) if depth_first else seed_nodes)
     visited = set(seed_nodes)
     order: list[str] = list(seed_nodes)
     graph_nodes = list(graph.nodes)
@@ -466,9 +464,8 @@ def summarize_edge_cover_epoch(
         mean_reuse = 0.0
     else:
         coverage_ratio = covered_positive_edges / float(total_positive_edge_count)
-        mean_reuse = (
-            sum(count for count in edge_cover_counts.values() if count > 0)
-            / float(max(1, covered_positive_edges))
+        mean_reuse = sum(count for count in edge_cover_counts.values() if count > 0) / float(
+            max(1, covered_positive_edges)
         )
 
     return EdgeCoverEpochPlan(
@@ -717,9 +714,8 @@ def _subgraph_pair_tuples(
             topology_label = 1.0 if graph.has_edge(protein_a, protein_b) else 0.0
             if topology_label > 0.0:
                 positive_pairs.add(pair)
-            elif (
-                negative_lookup is not None
-                and protein_b in negative_lookup.partners_by_node.get(protein_a, frozenset())
+            elif negative_lookup is not None and protein_b in negative_lookup.partners_by_node.get(
+                protein_a, frozenset()
             ):
                 negative_candidates.append(pair)
             pair_rows.append((index_a, index_b, protein_a, protein_b, topology_label, 0.0, 0.0))

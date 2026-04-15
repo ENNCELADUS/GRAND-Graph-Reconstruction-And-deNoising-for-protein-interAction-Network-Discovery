@@ -8,8 +8,8 @@ from csv import DictReader
 from pathlib import Path
 
 import pytest
-import src.run as run_module
 import torch
+from src.pipeline.stages.evaluate import EVAL_CSV_COLUMNS
 from src.utils.config import load_config
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -55,7 +55,7 @@ def test_hpc_config_artifact_is_valid() -> None:
 
     eval_metrics = evaluate_cfg["metrics"]
     assert isinstance(eval_metrics, list)
-    assert run_module.EVAL_CSV_COLUMNS == [
+    assert EVAL_CSV_COLUMNS == [
         "split",
         "auroc",
         "auprc",
@@ -67,7 +67,7 @@ def test_hpc_config_artifact_is_valid() -> None:
         "f1",
         "mcc",
     ]
-    assert set(run_module.EVAL_CSV_COLUMNS[1:]).issubset(set(eval_metrics))
+    assert set(EVAL_CSV_COLUMNS[1:]).issubset(set(eval_metrics))
 
 
 @pytest.mark.e2e
@@ -86,7 +86,7 @@ def test_hpc_ddp_train_evaluate_smoke() -> None:
         "--standalone",
         f"--nproc_per_node={world_size}",
         "-m",
-        "src.run",
+        "src.pipeline",
         "--config",
         str(CONFIG_PATH),
     ]
@@ -124,4 +124,4 @@ def test_hpc_ddp_train_evaluate_smoke() -> None:
         eval_header = DictReader(handle).fieldnames
 
     assert train_header == expected_train_header
-    assert eval_header == run_module.EVAL_CSV_COLUMNS
+    assert eval_header == EVAL_CSV_COLUMNS

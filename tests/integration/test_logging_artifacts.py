@@ -8,11 +8,12 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-import src.run as run_module
-import src.run.stage_evaluate as stage_evaluate_module
+import src.pipeline.engine as run_module
+import src.pipeline.stages.evaluate as stage_evaluate_module
 import torch
+from src.pipeline.runtime import DistributedContext
 from src.utils.config import ConfigDict
-from src.utils.distributed import DistributedContext
+from tests.runtime_helpers import build_stage_runtime
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -207,14 +208,15 @@ def test_non_main_process_does_not_write_stage_artifacts(tmp_path: Path) -> None
             local_rank=1,
             world_size=2,
         )
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"train": "rank1_case"},
+            distributed=distributed_context,
+        )
         best_checkpoint = run_module.run_training_stage(
-            stage="train",
-            config=config,
-            model=model,
-            device=torch.device("cpu"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-            run_id="rank1_case",
-            distributed_context=distributed_context,
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
         )
     finally:
         os.chdir(previous_cwd)
@@ -246,15 +248,15 @@ def test_evaluation_uses_best_f1_threshold_from_validation_and_logs_it(
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(model.state_dict(), checkpoint_path)
 
-        distributed_context = DistributedContext(ddp_enabled=False, is_distributed=False)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"evaluate": "threshold_eval_case"},
+            checkpoint_paths={"evaluate": checkpoint_path},
+        )
         metrics = run_module.run_evaluation_stage(
-            config=config,
-            model=model,
-            device=torch.device("cpu"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-            run_id="threshold_eval_case",
-            checkpoint_path=checkpoint_path,
-            distributed_context=distributed_context,
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
         )
     finally:
         os.chdir(previous_cwd)
@@ -319,21 +321,24 @@ def test_evaluation_worker_rank_runs_metrics_but_skips_artifact_writes(
 
         monkeypatch.setattr(stage_evaluate_module, "Evaluator", _WorkerEvaluator)
 
+        distributed_context = DistributedContext(
+            ddp_enabled=True,
+            is_distributed=True,
+            rank=1,
+            local_rank=1,
+            world_size=4,
+            owns_process_group=False,
+        )
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"evaluate": "worker_eval_case"},
+            checkpoint_paths={"evaluate": checkpoint_path},
+            distributed=distributed_context,
+        )
         metrics = stage_evaluate_module.run_evaluation_stage(
-            config=config,
-            model=model,
-            device=torch.device("cpu"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], _fake_dataloaders()),
-            run_id="worker_eval_case",
-            checkpoint_path=checkpoint_path,
-            distributed_context=DistributedContext(
-                ddp_enabled=True,
-                is_distributed=True,
-                rank=1,
-                local_rank=1,
-                world_size=4,
-                owns_process_group=False,
-            ),
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], _fake_dataloaders()),
         )
     finally:
         os.chdir(previous_cwd)
@@ -391,20 +396,18 @@ def test_run_evaluation_stage_propagates_mixed_precision_setting(
         torch.save(model.state_dict(), checkpoint_path)
 
         monkeypatch.setattr(stage_evaluate_module, "Evaluator", _RecordingEvaluator)
-        monkeypatch.setattr(
-            stage_evaluate_module,
-            "_load_checkpoint",
-            lambda model, checkpoint_path, device: None,
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"evaluate": "amp_eval_case"},
+            checkpoint_paths={"evaluate": checkpoint_path},
+            device=torch.device("cuda"),
         )
+        runtime.load_checkpoint = lambda model, checkpoint_path: None  # type: ignore[method-assign]
 
         stage_evaluate_module.run_evaluation_stage(
-            config=config,
-            model=model,
-            device=torch.device("cuda"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], _fake_dataloaders()),
-            run_id="amp_eval_case",
-            checkpoint_path=checkpoint_path,
-            distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], _fake_dataloaders()),
         )
     finally:
         os.chdir(previous_cwd)

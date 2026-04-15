@@ -9,8 +9,9 @@ from csv import DictReader
 from pathlib import Path
 
 import pytest
-import src.run as run_module
+import src.pipeline.engine as pipeline_engine
 import torch
+from src.pipeline.stages.evaluate import EVAL_CSV_COLUMNS
 from src.utils.config import ConfigDict, load_config
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -238,7 +239,7 @@ def test_local_cpu_config_artifact_is_valid() -> None:
         "Val auroc",
         "Learning Rate",
     ]
-    assert run_module.EVAL_CSV_COLUMNS == [
+    assert EVAL_CSV_COLUMNS == [
         "split",
         "auroc",
         "auprc",
@@ -261,7 +262,7 @@ def test_local_cpu_train_evaluate_smoke(tmp_path: Path, monkeypatch: pytest.Monk
 
     monkeypatch.chdir(tmp_path)
     config = _resolve_data_paths(load_config(CONFIG_PATH))
-    run_module.execute_pipeline(config=config)
+    pipeline_engine.execute_pipeline(config=config)
 
     train_log_dir = tmp_path / "logs" / "v3" / "train" / "local_cpu_e2e_train"
     eval_log_dir = tmp_path / "logs" / "v3" / "evaluate" / "local_cpu_e2e_eval"
@@ -288,7 +289,7 @@ def test_local_cpu_train_evaluate_smoke(tmp_path: Path, monkeypatch: pytest.Monk
         "Val auroc",
         "Learning Rate",
     ]
-    assert eval_header == run_module.EVAL_CSV_COLUMNS
+    assert eval_header == EVAL_CSV_COLUMNS
 
 
 @pytest.mark.e2e
@@ -298,7 +299,7 @@ def test_local_cpu_train_evaluate_topology_tiny_smoke(
 ) -> None:
     """Run a tiny end-to-end topology pipeline without the full Human all-test surface."""
     monkeypatch.chdir(tmp_path)
-    run_module.execute_pipeline(config=_tiny_topology_config(tmp_path))
+    pipeline_engine.execute_pipeline(config=_tiny_topology_config(tmp_path))
 
     train_log_dir = tmp_path / "logs" / "v3" / "train" / "tiny_e2e_train"
     eval_log_dir = tmp_path / "logs" / "v3" / "evaluate" / "tiny_e2e_eval"

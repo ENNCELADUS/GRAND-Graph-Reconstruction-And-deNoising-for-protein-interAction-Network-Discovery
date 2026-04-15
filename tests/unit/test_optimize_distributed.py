@@ -91,7 +91,7 @@ def test_torch_distributed_channel_send_receive_and_barrier(
         OptimizationCommand,
         TorchDistributedOptimizationChannel,
     )
-    from src.utils.distributed import DistributedContext
+    from src.pipeline.runtime import DistributedContext
 
     context = DistributedContext(
         ddp_enabled=True,
@@ -134,7 +134,7 @@ def test_torch_distributed_channel_send_receive_and_barrier(
 
 def test_build_optimization_channel_returns_none_for_single_process() -> None:
     from src.optimize.distributed import build_optimization_channel
-    from src.utils.distributed import DistributedContext
+    from src.pipeline.runtime import DistributedContext
 
     context = DistributedContext(ddp_enabled=False, is_distributed=False)
 

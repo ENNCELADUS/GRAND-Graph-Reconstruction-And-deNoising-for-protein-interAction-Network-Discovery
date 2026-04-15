@@ -11,12 +11,12 @@ from torch import nn
 
 from src.adapt import should_run_shot_adaptation
 from src.pipeline.config import PipelineConfig
-from src.pipeline.runtime import PipelineRuntime, build_runtime
-from src.pipeline.topology import run_topology_evaluation_stage, run_topology_finetuning_stage
-from src.run.stage_adapt import run_shot_adaptation_stage
-from src.run.stage_evaluate import run_evaluation_stage
-from src.run.stage_train import _build_stage_runtime, build_model, run_training_stage
-from src.utils.accelerator import build_accelerator
+from src.pipeline.runtime import AcceleratorLike, PipelineRuntime, build_accelerator, build_runtime
+from src.pipeline.stages.adapt import run_shot_adaptation_stage
+from src.pipeline.stages.evaluate import run_evaluation_stage
+from src.pipeline.stages.topology_evaluate import run_topology_evaluation_stage
+from src.pipeline.stages.topology_finetune import run_topology_finetuning_stage
+from src.pipeline.stages.train import build_model, run_training_stage
 from src.utils.config import ConfigDict, as_str, get_section
 from src.utils.data_io import build_dataloaders
 from src.utils.logging import log_stage_event
@@ -121,30 +121,36 @@ def topology_finetune_checkpoint_path(
 def execute_pipeline(
     config: ConfigDict,
     *,
-    build_dataloaders_fn: Callable[..., DataLoaderMap] = build_dataloaders,
-    build_model_fn: Callable[[ConfigDict], nn.Module] = build_model,
-    build_accelerator_fn: object = build_accelerator,
-    run_training_stage_fn: Callable[..., Path] = run_training_stage,
-    run_topology_finetuning_stage_fn: Callable[..., Path] = run_topology_finetuning_stage,
-    run_adaptation_stage_fn: Callable[..., Path] = run_shot_adaptation_stage,
-    run_evaluation_stage_fn: Callable[..., dict[str, float]] = run_evaluation_stage,
+    build_dataloaders_fn: Callable[..., DataLoaderMap] | None = None,
+    build_model_fn: Callable[[ConfigDict], nn.Module] | None = None,
+    build_accelerator_fn: Callable[..., AcceleratorLike] | None = None,
+    run_training_stage_fn: Callable[..., Path] | None = None,
+    run_topology_finetuning_stage_fn: Callable[..., Path] | None = None,
+    run_adaptation_stage_fn: Callable[..., Path] | None = None,
+    run_evaluation_stage_fn: Callable[..., dict[str, float]] | None = None,
     run_topology_evaluation_stage_fn: Callable[
         ...,
         dict[str, float],
-    ] = run_topology_evaluation_stage,
+    ]
+    | None = None,
 ) -> None:
     """Execute pipeline according to configured stages."""
+    resolved_build_accelerator = build_accelerator_fn or build_accelerator
     typed_config = PipelineConfig.from_dict(config)
-    runtime = build_runtime(typed_config, build_accelerator_fn=build_accelerator_fn)
+    runtime = build_runtime(typed_config, build_accelerator_fn=resolved_build_accelerator)
     execute_pipeline_with_runtime(
         runtime,
-        build_dataloaders_fn=build_dataloaders_fn,
-        build_model_fn=build_model_fn,
-        run_training_stage_fn=run_training_stage_fn,
-        run_topology_finetuning_stage_fn=run_topology_finetuning_stage_fn,
-        run_adaptation_stage_fn=run_adaptation_stage_fn,
-        run_evaluation_stage_fn=run_evaluation_stage_fn,
-        run_topology_evaluation_stage_fn=run_topology_evaluation_stage_fn,
+        build_dataloaders_fn=build_dataloaders_fn or build_dataloaders,
+        build_model_fn=build_model_fn or build_model,
+        run_training_stage_fn=run_training_stage_fn or run_training_stage,
+        run_topology_finetuning_stage_fn=(
+            run_topology_finetuning_stage_fn or run_topology_finetuning_stage
+        ),
+        run_adaptation_stage_fn=run_adaptation_stage_fn or run_shot_adaptation_stage,
+        run_evaluation_stage_fn=run_evaluation_stage_fn or run_evaluation_stage,
+        run_topology_evaluation_stage_fn=(
+            run_topology_evaluation_stage_fn or run_topology_evaluation_stage
+        ),
     )
 
 
@@ -168,12 +174,6 @@ def execute_pipeline_with_runtime(
         if runtime.config.run.load_checkpoint_path is not None
         else None
     )
-    stage_run_map = runtime.stage_run_ids
-    train_run_id = stage_run_map["train"]
-    topology_finetune_run_id = stage_run_map["topology_finetune"]
-    adapt_run_id = stage_run_map["adapt"]
-    eval_run_id = stage_run_map["evaluate"]
-    topology_eval_run_id = stage_run_map["topology_evaluate"]
     stage_names = selected_stages_with_adaptation(
         selected,
         shot_enabled=should_run_shot_adaptation(config),
@@ -181,12 +181,8 @@ def execute_pipeline_with_runtime(
 
     stage_loggers: dict[str, logging.Logger] = {}
     for stage in stage_names:
-        _, _, logger = _build_stage_runtime(
-            runtime.config.model_name,
-            stage,
-            stage_run_map[stage],
-            runtime.distributed,
-        )
+        paths = runtime.stage_paths(stage)
+        logger = runtime.stage_logger(stage, paths.log_dir / "log.log")
         stage_loggers[stage] = logger
 
     dataloaders = build_dataloaders_fn(
@@ -214,30 +210,21 @@ def execute_pipeline_with_runtime(
 
     if "train" in selected:
         train_checkpoint_path = run_training_stage_fn(
-            "train",
-            config,
+            runtime,
             model,
-            runtime.device,
             dataloaders,
-            train_run_id,
-            runtime.distributed,
-            runtime.accelerator,
         )
 
     if "topology_finetune" in selected:
+        runtime.checkpoint_paths["topology_finetune"] = topology_finetune_checkpoint_path(
+            config=config,
+            train_checkpoint_path=train_checkpoint_path,
+            load_checkpoint_path=load_checkpoint_path,
+        )
         finetuned_checkpoint_path = run_topology_finetuning_stage_fn(
-            config,
+            runtime,
             model,
-            runtime.device,
             dataloaders,
-            topology_finetune_run_id,
-            topology_finetune_checkpoint_path(
-                config=config,
-                train_checkpoint_path=train_checkpoint_path,
-                load_checkpoint_path=load_checkpoint_path,
-            ),
-            runtime.distributed,
-            runtime.accelerator,
         )
 
     if "evaluate" in selected:
@@ -246,25 +233,17 @@ def execute_pipeline_with_runtime(
             load_checkpoint_path=load_checkpoint_path,
         )
         if should_run_shot_adaptation(config):
+            runtime.checkpoint_paths["adapt"] = eval_input_checkpoint
             adapted_checkpoint_path = run_adaptation_stage_fn(
-                config,
+                runtime,
                 model,
-                runtime.device,
                 dataloaders,
-                adapt_run_id,
-                eval_input_checkpoint,
-                runtime.distributed,
-                runtime.accelerator,
             )
+        runtime.checkpoint_paths["evaluate"] = adapted_checkpoint_path or eval_input_checkpoint
         run_evaluation_stage_fn(
-            config,
+            runtime,
             model,
-            runtime.device,
             dataloaders,
-            eval_run_id,
-            adapted_checkpoint_path or eval_input_checkpoint,
-            runtime.distributed,
-            runtime.accelerator,
         )
 
     if "topology_evaluate" in selected:
@@ -276,15 +255,11 @@ def execute_pipeline_with_runtime(
                 load_checkpoint_path=load_checkpoint_path,
             )
         )
+        runtime.checkpoint_paths["topology_evaluate"] = topology_eval_checkpoint
         run_topology_evaluation_stage_fn(
-            config,
+            runtime,
             model,
-            runtime.device,
             dataloaders,
-            topology_eval_run_id,
-            topology_eval_checkpoint,
-            runtime.distributed,
-            runtime.accelerator,
         )
 
 

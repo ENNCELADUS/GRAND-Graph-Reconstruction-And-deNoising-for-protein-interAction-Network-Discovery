@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-import src.run.stage_adapt as stage_adapt_module
+import src.pipeline.stages.adapt as stage_adapt_module
 import torch
 from src.adapt import (
     OutputHeadFeatureHook,
@@ -16,7 +16,7 @@ from src.adapt import (
     pseudo_label_loss,
     should_run_shot_adaptation,
 )
-from src.utils.distributed import DistributedContext
+from src.pipeline.runtime import DistributedContext
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 

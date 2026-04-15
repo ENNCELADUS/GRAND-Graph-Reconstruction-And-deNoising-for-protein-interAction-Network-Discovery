@@ -4,25 +4,23 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
-from dataclasses import dataclass
+from contextlib import AbstractContextManager, contextmanager
+from dataclasses import dataclass, field
+from os import PathLike
 from pathlib import Path
 from types import ModuleType
-from typing import cast
+from typing import BinaryIO, Protocol, cast, runtime_checkable
 
 import torch
+import torch.distributed as dist
+from accelerate import Accelerator
+from accelerate.utils import DataLoaderConfiguration, DistributedDataParallelKwargs
 
 from src.adapt import should_run_shot_adaptation
 from src.pipeline.bootstrap import configure_root_logging as _configure_root_logging_impl
 from src.pipeline.bootstrap import set_global_seed
 from src.pipeline.config import PipelineConfig
-from src.utils.accelerator import (
-    AcceleratorLike,
-    build_accelerator,
-    distributed_context_from_accelerator,
-)
 from src.utils.config import as_bool, as_str, get_section
-from src.utils.distributed import DistributedContext
 from src.utils.logging import generate_run_id as _default_generate_run_id
 from src.utils.logging import prepare_stage_directories, setup_stage_logger
 
@@ -33,6 +31,77 @@ _STAGE_RUN_ID_KEYS: tuple[tuple[str, str], ...] = (
     ("evaluate", "eval_run_id"),
     ("topology_evaluate", "topology_eval_run_id"),
 )
+
+
+@runtime_checkable
+class AcceleratorLike(Protocol):
+    """Minimal accelerator protocol used across the training pipeline."""
+
+    device: torch.device
+    is_main_process: bool
+    use_distributed: bool
+    process_index: int
+    local_process_index: int
+    num_processes: int
+    mixed_precision: str
+
+    def prepare(self, *components: object) -> object:
+        """Prepare models, optimizers, schedulers, or loaders."""
+
+    def autocast(self) -> AbstractContextManager[object]:
+        """Return autocast context manager."""
+
+    def backward(self, loss: torch.Tensor) -> None:
+        """Backpropagate one loss tensor."""
+
+    def gather_for_metrics(self, value: torch.Tensor) -> torch.Tensor:
+        """Gather tensors for metric computation."""
+
+    def gather(self, value: torch.Tensor) -> torch.Tensor:
+        """Gather tensors across processes."""
+
+    def pad_across_processes(
+        self,
+        value: torch.Tensor,
+        dim: int = 0,
+        pad_index: int = 0,
+        pad_first: bool = False,
+    ) -> torch.Tensor:
+        """Pad one tensor to a common size across processes."""
+
+    def reduce(self, value: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        """Reduce one tensor across processes."""
+
+    def wait_for_everyone(self) -> None:
+        """Synchronize all processes."""
+
+    def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
+        """Return the unwrapped model."""
+
+    def save(
+        self,
+        obj: object,
+        f: str | PathLike[str] | BinaryIO,
+        safe_serialization: bool = False,
+    ) -> None:
+        """Persist one object once per machine."""
+
+
+@dataclass(frozen=True)
+class DistributedContext:
+    """Process metadata for distributed execution."""
+
+    ddp_enabled: bool
+    is_distributed: bool
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+    owns_process_group: bool = False
+
+    @property
+    def is_main_process(self) -> bool:
+        """Return whether this process is the main rank."""
+        return self.rank == 0
 
 
 @dataclass(frozen=True)
@@ -52,6 +121,7 @@ class PipelineRuntime:
     device: torch.device
     distributed: DistributedContext
     stage_run_ids: dict[str, str]
+    checkpoint_paths: dict[str, Path | None] = field(default_factory=dict)
 
     @property
     def is_main_process(self) -> bool:
@@ -73,6 +143,78 @@ class PipelineRuntime:
         """Return world size."""
         return self.distributed.world_size
 
+    def stage_run_id(self, stage: str) -> str:
+        """Return the resolved run ID for one stage."""
+        return self.stage_run_ids[stage]
+
+    def stage_paths(self, stage: str) -> StagePaths:
+        """Resolve output directories for one stage."""
+        return stage_paths(self, stage, self.stage_run_id(stage))
+
+    def stage_logger(self, stage: str, log_file: Path) -> logging.Logger:
+        """Build one stage logger scoped to the runtime rank."""
+        return stage_logger(self, stage, self.stage_run_id(stage), log_file)
+
+    def save_checkpoint(self, model: torch.nn.Module, checkpoint_path: Path) -> None:
+        """Persist model weights to disk once on the main process."""
+        save_checkpoint(self, model, checkpoint_path)
+
+    def load_checkpoint(self, model: torch.nn.Module, checkpoint_path: Path) -> None:
+        """Load model weights from disk into the unwrapped model."""
+        load_checkpoint(self, model, checkpoint_path)
+
+    def barrier(self) -> None:
+        """Synchronize all ranks."""
+        barrier(self)
+
+
+def build_accelerator(
+    *,
+    requested_device: str,
+    ddp_enabled: bool,
+    use_mixed_precision: bool,
+    find_unused_parameters: bool,
+) -> Accelerator:
+    """Create the shared Accelerator runtime for the pipeline."""
+    del ddp_enabled
+    mixed_precision = "fp16" if use_mixed_precision and torch.cuda.is_available() else "no"
+    ddp_kwargs = DistributedDataParallelKwargs(
+        find_unused_parameters=find_unused_parameters,
+    )
+    dataloader_config = DataLoaderConfiguration(non_blocking=True)
+    return Accelerator(
+        cpu=requested_device.lower() == "cpu",
+        mixed_precision=mixed_precision,
+        dataloader_config=dataloader_config,
+        kwargs_handlers=[ddp_kwargs],
+    )
+
+
+def distributed_context_from_accelerator(
+    *,
+    accelerator: AcceleratorLike,
+    ddp_enabled: bool,
+) -> DistributedContext:
+    """Project accelerator process metadata onto the repository context type."""
+    return DistributedContext(
+        ddp_enabled=ddp_enabled,
+        is_distributed=accelerator.use_distributed,
+        rank=accelerator.process_index,
+        local_rank=accelerator.local_process_index,
+        world_size=accelerator.num_processes,
+        owns_process_group=False,
+    )
+
+
+def distributed_barrier(context: DistributedContext) -> None:
+    """Synchronize processes when distributed mode is active."""
+    if context.is_distributed and dist.is_initialized():
+        backend = dist.get_backend()
+        if backend == "nccl" and torch.cuda.is_available():
+            dist.barrier(device_ids=[context.local_rank])
+            return
+        dist.barrier()
+
 
 def configure_root_logging(logging_module: ModuleType, rank: int) -> None:
     """Configure process-level logging."""
@@ -81,7 +223,7 @@ def configure_root_logging(logging_module: ModuleType, rank: int) -> None:
 
 def ddp_find_unused_parameters(raw_config: dict[str, object]) -> bool:
     """Return DDP ``find_unused_parameters`` setting from config."""
-    config = cast(dict[str, object], raw_config)
+    config = raw_config
     device_cfg = get_section(config, "device_config")
     explicit_find_unused = device_cfg.get("find_unused_parameters")
     if explicit_find_unused is not None:
@@ -149,14 +291,14 @@ def resolve_stage_run_ids(
         raise ValueError("run_config must be a mapping")
     if not distributed.is_distributed or not torch.distributed.is_initialized():
         return {
-            stage: _generate_run_id(run_cfg.get(config_key))
+            stage: _default_generate_run_id(run_cfg.get(config_key))
             for stage, config_key in _STAGE_RUN_ID_KEYS
         }
 
     payload: list[object] = [{}]
     if distributed.is_main_process:
         payload[0] = {
-            stage: _generate_run_id(run_cfg.get(config_key))
+            stage: _default_generate_run_id(run_cfg.get(config_key))
             for stage, config_key in _STAGE_RUN_ID_KEYS
         }
     torch.distributed.broadcast_object_list(payload, src=0)
@@ -280,23 +422,19 @@ def _unwrap_model(
     return model
 
 
-def _generate_run_id(existing_value: object) -> str:
-    """Resolve run-id generator via the compatibility wrapper when available."""
-    try:
-        from src.run import pipeline_orchestrator as compatibility_orchestrator
-
-        return compatibility_orchestrator.generate_run_id(existing_value)
-    except Exception:
-        return _default_generate_run_id(existing_value)
-
-
 __all__ = [
+    "AcceleratorLike",
+    "DistributedContext",
     "PipelineRuntime",
     "StagePaths",
     "barrier",
+    "build_accelerator",
     "build_runtime",
     "configure_root_logging",
     "ddp_find_unused_parameters",
+    "dist",
+    "distributed_barrier",
+    "distributed_context_from_accelerator",
     "load_checkpoint",
     "main_process_first",
     "save_checkpoint",

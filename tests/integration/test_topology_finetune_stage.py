@@ -12,11 +12,12 @@ from typing import cast
 
 import networkx as nx
 import pytest
-import src.run.stage_topology_finetune as topology_finetune_stage
+import src.pipeline.stages.topology_finetune as topology_finetune_stage
 import torch
 from src.embed import EmbeddingCacheManifest
 from src.evaluate import Evaluator
-from src.run.stage_topology_finetune import (
+from src.pipeline.runtime import DistributedContext
+from src.pipeline.stages.topology_finetune import (
     _build_internal_validation_node_sets,
     _forward_model,
     _load_supervision_graphs,
@@ -26,7 +27,7 @@ from src.run.stage_topology_finetune import (
     _resolve_sampling_node_bounds,
     run_topology_finetuning_stage,
 )
-from src.run.stage_train import build_model
+from src.pipeline.stages.train import build_model
 from src.topology.finetune_data import (
     TOPOLOGY_EVAL_NODE_SIZES,
     TOPOLOGY_EVAL_SAMPLES_PER_SIZE,
@@ -36,7 +37,7 @@ from src.topology.finetune_data import (
 from src.topology.negative_sampling import prepare_topology_supervision_from_config
 from src.utils.config import ConfigDict, load_config
 from src.utils.data_io import build_dataloaders
-from src.utils.distributed import DistributedContext
+from tests.runtime_helpers import build_stage_runtime
 from torch.utils.data import DataLoader
 
 
@@ -340,12 +341,10 @@ def test_build_internal_validation_node_sets_matches_topology_eval_bucketing() -
 
     assert sorted(node_sets) == list(TOPOLOGY_EVAL_NODE_SIZES)
     assert all(
-        len(node_sets[node_size]) == TOPOLOGY_EVAL_SAMPLES_PER_SIZE
-        for node_size in node_sets
+        len(node_sets[node_size]) == TOPOLOGY_EVAL_SAMPLES_PER_SIZE for node_size in node_sets
     )
     assert all(
-        all(len(nodes) == node_size for nodes in node_sets[node_size])
-        for node_size in node_sets
+        all(len(nodes) == node_size for nodes in node_sets[node_size]) for node_size in node_sets
     )
 
 
@@ -570,14 +569,15 @@ def test_run_topology_finetuning_stage_uses_edge_cover_sampling_by_default(
     previous_cwd = Path.cwd()
     try:
         os.chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_finetune": "topology_ft_case"},
+            checkpoint_paths={"topology_finetune": checkpoint_path},
+        )
         run_topology_finetuning_stage(
-            config=config,
-            model=model,
-            device=torch.device("cpu"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-            run_id="topology_ft_case",
-            checkpoint_path=checkpoint_path,
-            distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
         )
     finally:
         os.chdir(previous_cwd)
@@ -599,14 +599,15 @@ def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path
     previous_cwd = Path.cwd()
     try:
         os.chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_finetune": "topology_ft_case"},
+            checkpoint_paths={"topology_finetune": checkpoint_path},
+        )
         best_checkpoint = run_topology_finetuning_stage(
-            config=config,
-            model=model,
-            device=torch.device("cpu"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-            run_id="topology_ft_case",
-            checkpoint_path=checkpoint_path,
-            distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
         )
     finally:
         os.chdir(previous_cwd)
@@ -674,20 +675,23 @@ def test_run_topology_finetuning_stage_allows_embedding_generation_on_non_main_r
     previous_cwd = Path.cwd()
     try:
         os.chdir(tmp_path)
+        distributed_context = DistributedContext(
+            ddp_enabled=True,
+            is_distributed=True,
+            rank=1,
+            local_rank=1,
+            world_size=4,
+        )
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_finetune": "topology_ft_case"},
+            checkpoint_paths={"topology_finetune": checkpoint_path},
+            distributed=distributed_context,
+        )
         run_topology_finetuning_stage(
-            config=config,
-            model=model,
-            device=torch.device("cpu"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-            run_id="topology_ft_case",
-            checkpoint_path=checkpoint_path,
-            distributed_context=DistributedContext(
-                ddp_enabled=True,
-                is_distributed=True,
-                rank=1,
-                local_rank=1,
-                world_size=4,
-            ),
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
         )
     finally:
         os.chdir(previous_cwd)
@@ -709,15 +713,16 @@ def test_run_topology_finetuning_stage_uses_accelerator_runtime(
     previous_cwd = Path.cwd()
     try:
         os.chdir(tmp_path)
-        run_topology_finetuning_stage(
-            config=config,
-            model=model,
-            device=torch.device("cpu"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-            run_id="topology_ft_case",
-            checkpoint_path=checkpoint_path,
-            distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_finetune": "topology_ft_case"},
+            checkpoint_paths={"topology_finetune": checkpoint_path},
             accelerator=accelerator,
+        )
+        run_topology_finetuning_stage(
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
         )
     finally:
         os.chdir(previous_cwd)
@@ -741,36 +746,23 @@ def test_run_topology_finetuning_stage_supports_scratch_initialization(
 
     model = build_model(config)
     dataloaders = build_dataloaders(config=config)
-    observed_checkpoint_loads: list[Path] = []
-
-    def _fake_load_checkpoint(
-        *,
-        model: torch.nn.Module,
-        checkpoint_path: Path,
-        device: torch.device,
-    ) -> None:
-        del model, device
-        observed_checkpoint_loads.append(checkpoint_path)
-
-    monkeypatch.setattr(topology_finetune_stage, "_load_checkpoint", _fake_load_checkpoint)
-
     previous_cwd = Path.cwd()
     try:
         os.chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_finetune": "topology_ft_case"},
+            checkpoint_paths={"topology_finetune": tmp_path / "missing_checkpoint.pth"},
+        )
         best_checkpoint = run_topology_finetuning_stage(
-            config=config,
-            model=model,
-            device=torch.device("cpu"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-            run_id="topology_ft_case",
-            checkpoint_path=tmp_path / "missing_checkpoint.pth",
-            distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
         )
     finally:
         os.chdir(previous_cwd)
 
     assert best_checkpoint == Path("models/v3/topology_finetune/topology_ft_case/best_model.pth")
-    assert observed_checkpoint_loads == []
 
 
 def test_run_topology_finetuning_stage_requires_prepared_supervision_files(
@@ -794,14 +786,15 @@ def test_run_topology_finetuning_stage_requires_prepared_supervision_files(
     try:
         os.chdir(tmp_path)
         with pytest.raises(FileNotFoundError, match="prepare them offline"):
+            runtime = build_stage_runtime(
+                config,
+                stage_run_ids={"topology_finetune": "topology_ft_case"},
+                checkpoint_paths={"topology_finetune": None},
+            )
             run_topology_finetuning_stage(
-                config=config,
-                model=model,
-                device=torch.device("cpu"),
-                dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-                run_id="topology_ft_case",
-                checkpoint_path=None,
-                distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+                runtime,
+                model,
+                cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
             )
     finally:
         os.chdir(previous_cwd)

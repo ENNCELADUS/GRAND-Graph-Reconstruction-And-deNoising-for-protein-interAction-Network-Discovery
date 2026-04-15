@@ -162,7 +162,7 @@ def spectral_worker(graph: nx.Graph, n_eigvals: int = -1) -> np.ndarray:
         eigenvalues = eigenvalues[1 : n_eigvals + 1]
     spectral_pmf, _ = np.histogram(eigenvalues, bins=200, range=(-1e-5, 2), density=False)
     spectral_pmf = spectral_pmf / max(1.0, spectral_pmf.sum())
-    return spectral_pmf
+    return np.asarray(spectral_pmf)
 
 
 def spectral_stats(

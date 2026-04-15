@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-import src.utils.distributed as distributed_module
+import src.pipeline.runtime as distributed_module
 
 
 def test_distributed_barrier_nccl_uses_local_device(

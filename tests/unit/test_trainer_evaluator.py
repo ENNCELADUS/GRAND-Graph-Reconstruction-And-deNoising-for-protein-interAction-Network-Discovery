@@ -6,14 +6,16 @@ import logging
 from contextlib import nullcontext
 
 import pytest
-import src.run as run_module
 import torch
 import torch.nn.functional as functional
 from src.evaluate import Evaluator
+from src.pipeline.stages.adapt import ADAPT_CSV_COLUMNS
+from src.pipeline.stages.evaluate import EVAL_CSV_COLUMNS
+from src.pipeline.stages.train import _training_validation_metrics
 from src.train.base import OptimizerConfig, SchedulerConfig, Trainer
+from src.train.strategies.ohem import OHEMSampleStrategy
 from src.utils.config import ConfigDict
 from src.utils.losses import LossConfig
-from src.utils.ohem_sample_strategy import OHEMSampleStrategy
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -191,6 +193,7 @@ def test_trainer_runs_single_epoch() -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=len(loader),
+        accelerator=FakeAccelerator(),
         ohem_strategy=OHEMSampleStrategy(target_batch_size=1, cap_protein=4),
     )
     metrics = trainer.train_one_epoch(loader)
@@ -264,6 +267,7 @@ def test_trainer_handles_non_tensor_batch_fields() -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=len(loader),
+        accelerator=FakeAccelerator(),
     )
     metrics = trainer.train_one_epoch(loader)
     assert "loss" in metrics
@@ -288,6 +292,7 @@ def test_trainer_heartbeat_logging(caplog: pytest.LogCaptureFixture) -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=len(loader),
+        accelerator=FakeAccelerator(),
         logger=trainer_logger,
         heartbeat_every_n_steps=2,
     )
@@ -313,6 +318,7 @@ def test_ohem_disables_pos_weight_for_selected_batch_loss() -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=1,
+        accelerator=FakeAccelerator(),
         ohem_strategy=OHEMSampleStrategy(target_batch_size=2, cap_protein=4, warmup_epochs=0),
     )
     logits = torch.tensor([[0.0], [1.0], [-0.5]], dtype=torch.float32)
@@ -344,6 +350,7 @@ def test_ohem_training_mines_in_chunks_and_reduces_backward_batch() -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=1,
+        accelerator=FakeAccelerator(),
         ohem_strategy=OHEMSampleStrategy(target_batch_size=2, cap_protein=4, warmup_epochs=0),
     )
 
@@ -358,7 +365,7 @@ def test_training_csv_schema_header_order_regression() -> None:
             "validation_metrics": ["auprc", "auroc"],
         }
     }
-    validation_metrics = run_module._training_validation_metrics(training_cfg)
+    validation_metrics = _training_validation_metrics(training_cfg)
     header = [
         "Epoch",
         "Epoch Time",
@@ -379,7 +386,7 @@ def test_training_csv_schema_header_order_regression() -> None:
 
 
 def test_evaluate_csv_schema_header_order_and_required_columns() -> None:
-    assert run_module.EVAL_CSV_COLUMNS == [
+    assert EVAL_CSV_COLUMNS == [
         "split",
         "auroc",
         "auprc",
@@ -403,12 +410,12 @@ def test_evaluate_csv_schema_header_order_and_required_columns() -> None:
         "f1",
         "mcc",
     }
-    assert required_columns.issubset(set(run_module.EVAL_CSV_COLUMNS))
-    assert len(run_module.EVAL_CSV_COLUMNS) == len(required_columns)
+    assert required_columns.issubset(set(EVAL_CSV_COLUMNS))
+    assert len(EVAL_CSV_COLUMNS) == len(required_columns)
 
 
 def test_adapt_csv_schema_header_order_and_required_columns() -> None:
-    assert run_module.ADAPT_CSV_COLUMNS == [
+    assert ADAPT_CSV_COLUMNS == [
         "Epoch",
         "Epoch Time",
         "Entropy Loss",
@@ -425,6 +432,7 @@ def test_evaluator_returns_metric_dictionary() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "f1", "auroc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=FakeAccelerator(),
     )
     model.eval()
     with torch.no_grad():
@@ -451,6 +459,7 @@ def test_evaluator_handles_non_tensor_batch_fields() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "f1", "auroc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=FakeAccelerator(),
     )
     model.eval()
     with torch.no_grad():
@@ -470,6 +479,7 @@ def test_evaluator_without_prefix_returns_raw_metric_names() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "f1", "auroc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=FakeAccelerator(),
     )
     model.eval()
     with torch.no_grad():
@@ -489,6 +499,7 @@ def test_compute_metrics_characterization_single_class_auc_and_unknown_metric() 
     evaluator = Evaluator(
         metrics=["auroc", "auprc", "accuracy", "unknown_metric"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=FakeAccelerator(),
     )
     labels = torch.tensor([1, 1, 1, 1], dtype=torch.long)
     probabilities = torch.tensor([0.9, 0.8, 0.4, 0.2], dtype=torch.float32)
@@ -505,6 +516,7 @@ def test_compute_metrics_characterization_binary_metric_values() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "sensitivity", "specificity", "precision", "recall", "f1", "mcc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=FakeAccelerator(),
     )
     labels = torch.tensor([0, 0, 1, 1], dtype=torch.long)
     probabilities = torch.tensor([0.1, 0.6, 0.9, 0.2], dtype=torch.float32)
@@ -524,6 +536,7 @@ def test_compute_metrics_respects_custom_decision_threshold() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "precision", "recall", "f1"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=FakeAccelerator(),
         decision_threshold=0.3,
     )
     labels = torch.tensor([0, 0, 1, 1], dtype=torch.long)
@@ -552,6 +565,7 @@ def test_select_best_f1_threshold_disables_grad_tracking() -> None:
     evaluator = Evaluator(
         metrics=["f1"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=FakeAccelerator(),
     )
 
     threshold = evaluator.select_best_f1_threshold(

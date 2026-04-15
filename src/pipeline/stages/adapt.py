@@ -24,11 +24,9 @@ from src.adapt import (
     parse_domain_adaptation_config,
     pseudo_label_loss,
 )
-from src.pipeline.loops import ensure_accelerator, forward_model, move_batch_to_device
-from src.run.stage_train import _build_stage_runtime, _load_checkpoint, _save_checkpoint
-from src.utils.accelerator import AcceleratorLike
-from src.utils.config import ConfigDict, as_bool, as_int, extract_model_kwargs, get_section
-from src.utils.distributed import DistributedContext
+from src.pipeline.loops import forward_model, move_batch_to_device
+from src.pipeline.runtime import AcceleratorLike, DistributedContext, PipelineRuntime
+from src.utils.config import ConfigDict, as_bool, as_int, get_section
 from src.utils.logging import append_csv_row, log_stage_event
 
 BatchValue = object
@@ -201,7 +199,7 @@ def _build_scheduler(
 
     def _lambda(step: int) -> float:
         progress = float(step) / float(max(1, total_steps))
-        return (1.0 + gamma * progress) ** (-power)
+        return float((1.0 + gamma * progress) ** (-power))
 
     return LambdaLR(optimizer=optimizer, lr_lambda=_lambda)
 
@@ -243,6 +241,8 @@ def _compute_global_centroids(
                 feature_sums = batch_feature_sums
                 class_masses = batch_class_masses
             else:
+                if class_masses is None:
+                    raise RuntimeError("SHOT class masses were not initialized")
                 feature_sums = feature_sums + batch_feature_sums
                 class_masses = class_masses + batch_class_masses
 
@@ -380,37 +380,27 @@ def _train_one_shot_epoch(
 
 
 def run_shot_adaptation_stage(
-    config: ConfigDict,
+    runtime: PipelineRuntime,
     model: nn.Module,
-    device: torch.device,
     dataloaders: dict[str, DataLoader[dict[str, object]]],
-    run_id: str,
-    checkpoint_path: Path,
-    distributed_context: DistributedContext,
-    accelerator: AcceleratorLike | None = None,
 ) -> Path:
     """Run SHOT adaptation from one source checkpoint and return adapted checkpoint path."""
-    stage_accelerator = ensure_accelerator(
-        accelerator,
-        device=device,
-        use_mixed_precision=as_bool(
-            get_section(config, "device_config").get("use_mixed_precision", False),
-            "device_config.use_mixed_precision",
-        ),
-    )
+    config = runtime.config.raw
+    device = runtime.device
+    checkpoint_path = runtime.checkpoint_paths.get("adapt")
+    if checkpoint_path is None:
+        raise ValueError("runtime.checkpoint_paths['adapt'] is required")
     adaptation_config = parse_domain_adaptation_config(config)
     if not adaptation_config.enabled or adaptation_config.method != "shot":
         raise ValueError("run_shot_adaptation_stage requires enabled SHOT configuration")
 
-    model_name, _ = extract_model_kwargs(config)
-    log_dir, model_dir, logger = _build_stage_runtime(
-        model_name=model_name,
-        stage="adapt",
-        run_id=run_id,
-        distributed_context=distributed_context,
-    )
+    run_id = runtime.stage_run_id("adapt")
+    paths = runtime.stage_paths("adapt")
+    log_dir = paths.log_dir
+    model_dir = paths.model_dir
+    logger = runtime.stage_logger("adapt", log_dir / "log.log")
 
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         log_stage_event(
             logger,
             "stage_start",
@@ -419,27 +409,22 @@ def run_shot_adaptation_stage(
             method=adaptation_config.method,
         )
 
-    _load_checkpoint(
-        model=model,
-        checkpoint_path=checkpoint_path,
-        device=device,
-        accelerator=stage_accelerator,
-    )
+    runtime.load_checkpoint(model, Path(checkpoint_path))
 
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         log_stage_event(logger, "checkpoint_loaded", path=checkpoint_path)
 
     optimizer_params, trainable_params = _prepare_shot_optimizer_params(
         model=model,
         prefixes=adaptation_config.freeze_prefixes,
-        preserve_frozen_requires_grad=distributed_context.is_distributed,
+        preserve_frozen_requires_grad=runtime.is_distributed,
     )
 
     eval_loader, train_loader = _build_target_loaders(
         config=config,
         dataloaders=dataloaders,
         adaptation_config=adaptation_config,
-        distributed_context=distributed_context,
+        distributed_context=runtime.distributed,
     )
     steps_per_epoch = len(train_loader)
     if steps_per_epoch <= 0:
@@ -466,7 +451,7 @@ def run_shot_adaptation_stage(
                 DataLoader[dict[str, object]],
                 DataLoader[dict[str, object]],
             ],
-            stage_accelerator.prepare(model, optimizer, eval_loader, train_loader),
+            runtime.accelerator.prepare(model, optimizer, eval_loader, train_loader),
         )
     else:
         (
@@ -483,11 +468,11 @@ def run_shot_adaptation_stage(
                 DataLoader[dict[str, object]],
                 LRScheduler,
             ],
-            stage_accelerator.prepare(model, optimizer, eval_loader, train_loader, scheduler),
+            runtime.accelerator.prepare(model, optimizer, eval_loader, train_loader, scheduler),
         )
 
     csv_path = log_dir / "adapt_step.csv"
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         log_stage_event(
             logger,
             "adapt_config",
@@ -516,7 +501,7 @@ def run_shot_adaptation_stage(
                 device=device,
                 use_amp=use_amp,
                 adaptation_config=adaptation_config,
-                accelerator=stage_accelerator,
+                accelerator=runtime.accelerator,
             )
             pseudo_labels = _compute_pseudo_labels(
                 model=stage_model,
@@ -526,7 +511,7 @@ def run_shot_adaptation_stage(
                 device=device,
                 use_amp=use_amp,
                 adaptation_config=adaptation_config,
-                accelerator=stage_accelerator,
+                accelerator=runtime.accelerator,
             )
             epoch_stats = _train_one_shot_epoch(
                 model=stage_model,
@@ -534,16 +519,16 @@ def run_shot_adaptation_stage(
                 pseudo_labels=pseudo_labels,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                accelerator=stage_accelerator,
+                accelerator=runtime.accelerator,
                 device=device,
                 use_amp=use_amp,
                 adaptation_config=adaptation_config,
-                distributed_context=distributed_context,
+                distributed_context=runtime.distributed,
             )
             epoch_seconds = time.perf_counter() - epoch_start
 
-            if distributed_context.is_main_process:
-                row: dict[str, float | int] = {
+            if runtime.is_main_process:
+                row: dict[str, float | int | str] = {
                     "Epoch": epoch + 1,
                     "Epoch Time": epoch_seconds,
                     "Entropy Loss": epoch_stats["entropy_loss"],
@@ -564,18 +549,14 @@ def run_shot_adaptation_stage(
                     total_loss=epoch_stats["total_loss"],
                     lr=epoch_stats["lr"],
                 )
-            stage_accelerator.wait_for_everyone()
+            runtime.barrier()
     finally:
         feature_hook.close()
 
     adapted_checkpoint_path = model_dir / "best_model.pth"
-    if distributed_context.is_main_process:
-        _save_checkpoint(
-            model=stage_model,
-            checkpoint_path=adapted_checkpoint_path,
-            accelerator=stage_accelerator,
-        )
+    runtime.save_checkpoint(stage_model, adapted_checkpoint_path)
+    if runtime.is_main_process:
         log_stage_event(logger, "checkpoint_saved", path=adapted_checkpoint_path)
         log_stage_event(logger, "stage_done", run_id=run_id)
-    stage_accelerator.wait_for_everyone()
+    runtime.barrier()
     return adapted_checkpoint_path
