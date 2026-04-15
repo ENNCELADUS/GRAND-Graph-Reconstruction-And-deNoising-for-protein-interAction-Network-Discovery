@@ -27,7 +27,12 @@ from src.run.stage_topology_finetune import (
     run_topology_finetuning_stage,
 )
 from src.run.stage_train import build_model
-from src.topology.finetune_data import EdgeCoverEpochPlan, SubgraphPairChunk
+from src.topology.finetune_data import (
+    TOPOLOGY_EVAL_NODE_SIZES,
+    TOPOLOGY_EVAL_SAMPLES_PER_SIZE,
+    EdgeCoverEpochPlan,
+    SubgraphPairChunk,
+)
 from src.topology.negative_sampling import prepare_topology_supervision_from_config
 from src.utils.config import ConfigDict, load_config
 from src.utils.data_io import build_dataloaders
@@ -281,32 +286,36 @@ def test_resolve_sampling_node_bounds_caps_subgraphs_to_20_nodes() -> None:
     assert max_nodes == 50
 
 
-def test_build_internal_validation_node_sets_uses_whole_graph_by_default() -> None:
-    graph = nx.Graph()
-    graph.add_nodes_from(["P3", "P1", "P2"])
+def test_build_internal_validation_node_sets_matches_topology_eval_bucketing() -> None:
+    graph = nx.path_graph([f"P{i}" for i in range(1, 221)])
 
     node_sets = _build_internal_validation_node_sets(
-        finetune_cfg={"validation_subgraphs": 64, "min_nodes": 2, "max_nodes": 3},
+        finetune_cfg={"strategy": "mixed"},
         graph=graph,
         seed=11,
     )
 
-    assert len(node_sets) == 64
-    assert all(2 <= len(nodes) <= 3 for nodes in node_sets)
-    assert all(set(nodes).issubset({"P1", "P2", "P3"}) for nodes in node_sets)
+    assert sorted(node_sets) == list(TOPOLOGY_EVAL_NODE_SIZES)
+    assert all(len(node_sets[node_size]) == TOPOLOGY_EVAL_SAMPLES_PER_SIZE for node_size in node_sets)
+    assert all(
+        all(len(nodes) == node_size for nodes in node_sets[node_size])
+        for node_size in node_sets
+    )
 
 
-def test_build_internal_validation_node_sets_supports_explicit_whole_graph_mode() -> None:
+def test_build_internal_validation_node_sets_uses_graph_size_fallback_when_under_20() -> None:
     graph = nx.Graph()
     graph.add_nodes_from(["P3", "P1", "P2"])
 
     node_sets = _build_internal_validation_node_sets(
-        finetune_cfg={"validation_mode": "whole_graph"},
+        finetune_cfg={"strategy": "mixed"},
         graph=graph,
         seed=11,
     )
 
-    assert node_sets == [("P1", "P2", "P3")]
+    assert sorted(node_sets) == [3]
+    assert len(node_sets[3]) == TOPOLOGY_EVAL_SAMPLES_PER_SIZE
+    assert all(nodes == ("P1", "P2", "P3") for nodes in node_sets[3])
 
 
 def test_resolve_internal_validation_threshold_uses_validation_selected_mode(
@@ -713,4 +722,4 @@ def test_v3_configs_use_sampled_internal_validation_mode() -> None:
         config = load_config(config_path)
         topology_cfg = config["topology_finetune"]
         assert isinstance(topology_cfg, dict)
-        assert topology_cfg["validation_mode"] == "sampled"
+        assert "validation_mode" not in topology_cfg

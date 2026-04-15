@@ -14,6 +14,7 @@ from src.run.stage_topology_evaluate import (
 from src.topology.metrics import (
     compute_graph_similarity,
     compute_relative_density,
+    evaluate_graph_samples,
     evaluate_predicted_graph,
 )
 from src.topology.report import (
@@ -77,6 +78,32 @@ def test_evaluate_predicted_graph_returns_official_summary_shape() -> None:
         "cc_mmd",
         "laplacian_eigen_mmd",
     }
+    assert result["per_node_size"][3]["graph_count"] == 2
+    assert result["per_node_size"][4]["graph_count"] == 1
+
+
+def test_evaluate_graph_samples_returns_official_summary_shape() -> None:
+    gt_graphs = {
+        3: [
+            nx.path_graph(["A", "B", "C"]),
+            nx.path_graph(["B", "C", "D"]),
+        ],
+        4: [nx.path_graph(["A", "B", "C", "D"])],
+    }
+    pred_graphs = {
+        3: [
+            nx.Graph([("A", "B"), ("B", "C")]),
+            nx.Graph([("B", "C")]),
+        ],
+        4: [nx.Graph([("A", "B"), ("B", "C")])],
+    }
+
+    result = evaluate_graph_samples(
+        pred_graphs_by_size=pred_graphs,
+        gt_graphs_by_size=gt_graphs,
+    )
+
+    assert set(result.keys()) == {"details", "summary", "per_node_size"}
     assert result["per_node_size"][3]["graph_count"] == 2
     assert result["per_node_size"][4]["graph_count"] == 1
 
