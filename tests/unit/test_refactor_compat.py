@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
+import inspect
+
 import src.run as run_module
 from src.embed import EmbeddingCacheManifest, ensure_embeddings_ready, load_cached_embedding
 from src.train.config import LossConfig as SharedLossConfig
@@ -17,6 +20,28 @@ def test_run_module_entrypoint_contract() -> None:
     assert callable(run_module.run_training_stage)
     assert callable(run_module.run_evaluation_stage)
     assert isinstance(run_module.EVAL_CSV_COLUMNS, list)
+
+
+def test_run_module_all_exports_are_importable() -> None:
+    """Lock every declared legacy ``src.run`` export during module moves."""
+    for export_name in run_module.__all__:
+        assert hasattr(run_module, export_name), export_name
+
+
+def test_pipeline_stage_modules_are_canonical_runtime_entrypoints() -> None:
+    """Lock the new canonical stage package and runtime-first stage signatures."""
+    expected_entrypoints = {
+        "src.pipeline.stages.train": "run_training_stage",
+        "src.pipeline.stages.evaluate": "run_evaluation_stage",
+        "src.pipeline.stages.adapt": "run_shot_adaptation_stage",
+        "src.pipeline.stages.topology_finetune": "run_topology_finetuning_stage",
+        "src.pipeline.stages.topology_evaluate": "run_topology_evaluation_stage",
+    }
+
+    for module_name, function_name in expected_entrypoints.items():
+        module = importlib.import_module(module_name)
+        signature = inspect.signature(getattr(module, function_name))
+        assert list(signature.parameters)[:3] == ["runtime", "model", "dataloaders"]
 
 
 def test_embed_public_exports_contract() -> None:
