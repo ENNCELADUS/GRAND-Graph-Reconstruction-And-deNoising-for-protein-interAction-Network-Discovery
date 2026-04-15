@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 from src.train.config import LossConfig, OptimizerConfig, SchedulerConfig
 from src.train.strategies.ohem import OHEMSampleStrategy
+from src.utils.accelerator import AcceleratorLike, LocalAccelerator
 from src.utils.losses import binary_classification_loss
 
 BatchValue = object
@@ -42,9 +43,11 @@ class Trainer:
         ohem_strategy: OHEMSampleStrategy | None = None,
         logger: logging.Logger | None = None,
         heartbeat_every_n_steps: int = 0,
+        accelerator: AcceleratorLike | None = None,
     ) -> None:
         self.model = model
         self.device = device
+        self.accelerator = accelerator or LocalAccelerator(device)
         self.optimizer_config = optimizer_config
         self.scheduler_config = scheduler_config
         self.loss_config = loss_config
@@ -54,12 +57,9 @@ class Trainer:
         self.ohem_strategy = ohem_strategy
         self.logger = logger
         self.heartbeat_every_n_steps = max(0, int(heartbeat_every_n_steps))
-        self.scaler = torch.amp.GradScaler(  # type: ignore[attr-defined]
-            "cuda",
-            enabled=self.use_amp,
-        )
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
+        self._train_components_prepared = False
 
     def _trainable_parameters(self) -> list[nn.Parameter]:
         return [param for param in self.model.parameters() if param.requires_grad]
@@ -104,6 +104,48 @@ class Trainer:
         """Rebuild optimizer and scheduler after trainable params change."""
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
+        self._train_components_prepared = False
+
+    def prepare_training_components(
+        self,
+        train_loader: DataLoader[Mapping[str, object]],
+    ) -> DataLoader[Mapping[str, object]]:
+        """Wrap train-time model state with the accelerator runtime."""
+        if self._train_components_prepared:
+            return train_loader
+        if self.scheduler is None:
+            prepared = self.accelerator.prepare(
+                self.model,
+                self.optimizer,
+                train_loader,
+            )
+            self.model, self.optimizer, prepared_loader = cast(
+                tuple[nn.Module, Optimizer, DataLoader[Mapping[str, object]]],
+                prepared,
+            )
+        else:
+            prepared = self.accelerator.prepare(
+                self.model,
+                self.optimizer,
+                train_loader,
+                self.scheduler,
+            )
+            (
+                self.model,
+                self.optimizer,
+                prepared_loader,
+                self.scheduler,
+            ) = cast(
+                tuple[
+                    nn.Module,
+                    Optimizer,
+                    DataLoader[Mapping[str, object]],
+                    LRScheduler,
+                ],
+                prepared,
+            )
+        self._train_components_prepared = True
+        return prepared_loader
 
     @staticmethod
     def _required_batch_tensor(
@@ -333,6 +375,7 @@ class Trainer:
         Returns:
             Aggregate epoch metrics, including average loss and learning rate.
         """
+        train_loader = self.prepare_training_components(train_loader)
         self.model.train()
         running_loss = 0.0
         batch_count = 0
@@ -353,11 +396,11 @@ class Trainer:
                 )
                 del prepared_batch
                 del selected_indices
-                with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                with self.accelerator.autocast():
                     output = self._forward_model(selected_batch)
                     loss = self._ohem_selected_batch_loss(output=output, batch=selected_batch)
             else:
-                with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                with self.accelerator.autocast():
                     output = self._forward_model(prepared_batch)
                     loss = self._select_loss(
                         output=output,
@@ -365,14 +408,8 @@ class Trainer:
                         epoch_index=epoch_index,
                     )
 
-            if self.use_amp:
-                scaled_loss = self.scaler.scale(loss)
-                torch.autograd.backward(scaled_loss)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                torch.autograd.backward(loss)
-                self.optimizer.step()
+            self.accelerator.backward(loss)
+            self.optimizer.step()
 
             if self.scheduler is not None:
                 self.scheduler.step()

@@ -5,8 +5,6 @@ from __future__ import annotations
 import logging
 import os
 
-from torch.nn.parallel import DistributedDataParallel
-
 from src.run.bootstrap import _rank_from_env, configure_root_logging, parse_args, set_global_seed
 from src.run.pipeline_orchestrator import _ddp_find_unused_parameters
 from src.run.pipeline_orchestrator import execute_pipeline as _execute_pipeline_impl
@@ -24,10 +22,10 @@ from src.run.stage_train import (
     build_trainer,
     run_training_stage,
 )
+from src.utils.accelerator import build_accelerator
 from src.utils.config import ConfigDict, load_config
 from src.utils.data_io import build_dataloaders
 from src.utils.device import resolve_device
-from src.utils.distributed import cleanup_distributed, initialize_distributed
 
 ROOT_LOGGER = logging.getLogger(__name__)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -49,10 +47,8 @@ def execute_pipeline(config: ConfigDict) -> None:
         run_adaptation_stage_fn=run_shot_adaptation_stage,
         run_evaluation_stage_fn=run_evaluation_stage,
         run_topology_evaluation_stage_fn=run_topology_evaluation_stage,
-        initialize_distributed_fn=initialize_distributed,
-        cleanup_distributed_fn=cleanup_distributed,
+        build_accelerator_fn=build_accelerator,
         resolve_device_fn=resolve_device,
-        distributed_data_parallel_cls=DistributedDataParallel,
     )
 
 
@@ -74,13 +70,12 @@ __all__ = [
     "_ddp_find_unused_parameters",
     "_metrics_from_config",
     "_training_validation_metrics",
+    "build_accelerator",
     "build_dataloaders",
     "build_model",
     "build_strategy",
     "build_trainer",
-    "cleanup_distributed",
     "execute_pipeline",
-    "initialize_distributed",
     "logging",
     "main",
     "parse_args",

@@ -19,6 +19,7 @@ from src.train.base import Trainer
 from src.train.config import LossConfig, OptimizerConfig, SchedulerConfig
 from src.train.strategies.lifecycle import NoOpStrategy, StagedUnfreezeStrategy, TrainingStrategy
 from src.train.strategies.ohem import OHEMSampleStrategy
+from src.utils.accelerator import AcceleratorLike, LocalAccelerator
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -159,8 +160,13 @@ def _build_stage_logger(name: str, log_file: Path, enabled: bool) -> logging.Log
     return logger
 
 
-def _unwrap_model(model: nn.Module) -> nn.Module:
+def _unwrap_model(
+    model: nn.Module,
+    accelerator: AcceleratorLike | None = None,
+) -> nn.Module:
     """Return underlying model when wrapped by DDP."""
+    if accelerator is not None:
+        return accelerator.unwrap_model(model)
     if isinstance(model, DistributedDataParallel):
         return cast(nn.Module, model.module)
     return model
@@ -204,6 +210,7 @@ def build_trainer(
     config: ConfigDict,
     model: nn.Module,
     device: torch.device,
+    accelerator: AcceleratorLike | None,
     steps_per_epoch: int,
     logger: logging.Logger | None = None,
 ) -> tuple[Trainer, LossConfig]:
@@ -273,6 +280,7 @@ def build_trainer(
     trainer = Trainer(
         model=model,
         device=device,
+        accelerator=accelerator,
         optimizer_config=optimizer_config,
         scheduler_config=scheduler_config,
         loss_config=loss_config,
@@ -309,16 +317,31 @@ def build_strategy(config: ConfigDict) -> TrainingStrategy:
     return NoOpStrategy()
 
 
-def _save_checkpoint(model: nn.Module, checkpoint_path: Path) -> None:
+def _save_checkpoint(
+    model: nn.Module,
+    checkpoint_path: Path,
+    accelerator: AcceleratorLike | None = None,
+) -> None:
     """Persist model weights to disk."""
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(_unwrap_model(model).state_dict(), checkpoint_path)
+    state_dict = _unwrap_model(model, accelerator=accelerator).state_dict()
+    if accelerator is None:
+        torch.save(state_dict, checkpoint_path)
+        return
+    accelerator.wait_for_everyone()
+    accelerator.save(state_dict, checkpoint_path, safe_serialization=False)
+    accelerator.wait_for_everyone()
 
 
-def _load_checkpoint(model: nn.Module, checkpoint_path: Path, device: torch.device) -> None:
+def _load_checkpoint(
+    model: nn.Module,
+    checkpoint_path: Path,
+    device: torch.device,
+    accelerator: AcceleratorLike | None = None,
+) -> None:
     """Load model weights from disk."""
     state_dict = torch.load(checkpoint_path, map_location=device)
-    _unwrap_model(model).load_state_dict(state_dict)
+    _unwrap_model(model, accelerator=accelerator).load_state_dict(state_dict)
 
 
 def run_training_stage(
@@ -329,8 +352,10 @@ def run_training_stage(
     dataloaders: dict[str, torch.utils.data.DataLoader[dict[str, object]]],
     run_id: str,
     distributed_context: DistributedContext,
+    accelerator: AcceleratorLike | None = None,
 ) -> Path:
     """Run stage training loop."""
+    stage_accelerator = accelerator or LocalAccelerator(device)
     model_name, _ = extract_model_kwargs(config)
     log_dir, model_dir, stage_logger = _build_stage_runtime(
         model_name=model_name,
@@ -351,9 +376,12 @@ def run_training_stage(
         config=config,
         model=model,
         device=device,
+        accelerator=stage_accelerator,
         steps_per_epoch=len(dataloaders["train"]),
         logger=stage_logger,
     )
+    train_loader = trainer.prepare_training_components(dataloaders["train"])
+    stage_model = trainer.model
     strategy = build_strategy(config)
 
     monitor_metric = as_str(
@@ -402,24 +430,24 @@ def run_training_stage(
         epoch_start = time.perf_counter()
         if distributed_context.is_main_process:
             log_stage_event(stage_logger, "epoch_start", epoch=epoch + 1)
-        train_sampler = dataloaders["train"].sampler
-        train_batch_sampler = getattr(dataloaders["train"], "batch_sampler", None)
+        train_sampler = train_loader.sampler
+        train_batch_sampler = getattr(train_loader, "batch_sampler", None)
         set_epoch_fn = getattr(train_batch_sampler, "set_epoch", None)
         if callable(set_epoch_fn):
             set_epoch_fn(epoch)
         elif distributed_context.is_distributed and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
         strategy.on_epoch_begin(trainer, epoch)
-        train_stats = trainer.train_one_epoch(dataloaders["train"], epoch_index=epoch)
-        model.eval()
+        train_stats = trainer.train_one_epoch(train_loader, epoch_index=epoch)
+        stage_model.eval()
         with torch.no_grad():
             val_stats = evaluator.evaluate(
-                model=model,
+                model=stage_model,
                 data_loader=dataloaders["valid"],
                 device=device,
                 prefix="val",
             )
-        model.train()
+        stage_model.train()
         strategy.on_epoch_end(trainer, epoch)
         epoch_seconds = time.perf_counter() - epoch_start
 
@@ -441,7 +469,11 @@ def run_training_stage(
         if distributed_context.is_main_process:
             improved, should_stop = early_stopping.update(monitor_value)
             if improved:
-                _save_checkpoint(model=model, checkpoint_path=best_checkpoint_path)
+                _save_checkpoint(
+                    model=stage_model,
+                    checkpoint_path=best_checkpoint_path,
+                    accelerator=stage_accelerator,
+                )
                 log_stage_event(
                     stage_logger,
                     "best_saved",
@@ -452,8 +484,9 @@ def run_training_stage(
             if not save_best_only:
                 epoch_checkpoint_path = model_dir / f"checkpoint_epoch_{epoch + 1:03d}.pth"
                 _save_checkpoint(
-                    model=model,
+                    model=stage_model,
                     checkpoint_path=epoch_checkpoint_path,
+                    accelerator=stage_accelerator,
                 )
                 log_stage_event(
                     stage_logger,
@@ -484,7 +517,11 @@ def run_training_stage(
             break
 
     if distributed_context.is_main_process and not best_checkpoint_path.exists():
-        _save_checkpoint(model=model, checkpoint_path=best_checkpoint_path)
+        _save_checkpoint(
+            model=stage_model,
+            checkpoint_path=best_checkpoint_path,
+            accelerator=stage_accelerator,
+        )
         log_stage_event(stage_logger, "fallback_saved")
     if distributed_context.is_main_process:
         log_stage_event(

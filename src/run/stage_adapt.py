@@ -26,6 +26,7 @@ from src.adapt import (
     pseudo_label_loss,
 )
 from src.run.stage_train import _build_stage_runtime, _load_checkpoint, _save_checkpoint
+from src.utils.accelerator import AcceleratorLike, LocalAccelerator
 from src.utils.config import ConfigDict, as_bool, as_int, extract_model_kwargs, get_section
 from src.utils.distributed import DistributedContext, distributed_barrier
 from src.utils.logging import append_csv_row, log_stage_event
@@ -450,8 +451,10 @@ def run_shot_adaptation_stage(
     run_id: str,
     checkpoint_path: Path,
     distributed_context: DistributedContext,
+    accelerator: AcceleratorLike | None = None,
 ) -> Path:
     """Run SHOT adaptation from one source checkpoint and return adapted checkpoint path."""
+    stage_accelerator = accelerator or LocalAccelerator(device)
     adaptation_config = parse_domain_adaptation_config(config)
     if not adaptation_config.enabled or adaptation_config.method != "shot":
         raise ValueError("run_shot_adaptation_stage requires enabled SHOT configuration")
@@ -473,7 +476,12 @@ def run_shot_adaptation_stage(
             method=adaptation_config.method,
         )
 
-    _load_checkpoint(model=model, checkpoint_path=checkpoint_path, device=device)
+    _load_checkpoint(
+        model=model,
+        checkpoint_path=checkpoint_path,
+        device=device,
+        accelerator=stage_accelerator,
+    )
 
     if distributed_context.is_main_process:
         log_stage_event(logger, "checkpoint_loaded", path=checkpoint_path)
@@ -591,7 +599,11 @@ def run_shot_adaptation_stage(
 
     adapted_checkpoint_path = model_dir / "best_model.pth"
     if distributed_context.is_main_process:
-        _save_checkpoint(model=model, checkpoint_path=adapted_checkpoint_path)
+        _save_checkpoint(
+            model=model,
+            checkpoint_path=adapted_checkpoint_path,
+            accelerator=stage_accelerator,
+        )
         log_stage_event(logger, "checkpoint_saved", path=adapted_checkpoint_path)
         log_stage_event(logger, "stage_done", run_id=run_id)
     distributed_barrier(distributed_context)

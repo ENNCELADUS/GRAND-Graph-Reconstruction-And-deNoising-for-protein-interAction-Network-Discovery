@@ -8,7 +8,6 @@ from pathlib import Path
 
 import torch
 from torch import nn
-from torch.nn.parallel import DistributedDataParallel
 
 from src.adapt import should_run_shot_adaptation
 from src.run.bootstrap import set_global_seed
@@ -17,6 +16,11 @@ from src.run.stage_evaluate import run_evaluation_stage
 from src.run.stage_topology_evaluate import run_topology_evaluation_stage
 from src.run.stage_topology_finetune import run_topology_finetuning_stage
 from src.run.stage_train import _build_stage_runtime, build_model, run_training_stage
+from src.utils.accelerator import (
+    AcceleratorLike,
+    build_accelerator,
+    distributed_context_from_accelerator,
+)
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -28,11 +32,7 @@ from src.utils.config import (
 )
 from src.utils.data_io import build_dataloaders
 from src.utils.device import resolve_device
-from src.utils.distributed import (
-    DistributedContext,
-    cleanup_distributed,
-    initialize_distributed,
-)
+from src.utils.distributed import DistributedContext
 from src.utils.logging import generate_run_id, log_stage_event
 
 DataLoaderMap = dict[str, torch.utils.data.DataLoader[dict[str, object]]]
@@ -232,20 +232,29 @@ def execute_pipeline(
         ...,
         dict[str, float],
     ] = run_topology_evaluation_stage,
-    initialize_distributed_fn: Callable[[bool], DistributedContext] = initialize_distributed,
-    cleanup_distributed_fn: Callable[[DistributedContext], None] = cleanup_distributed,
+    build_accelerator_fn: Callable[..., AcceleratorLike] = build_accelerator,
     resolve_device_fn: Callable[[str], torch.device] = resolve_device,
-    distributed_data_parallel_cls: type[DistributedDataParallel] = DistributedDataParallel,
 ) -> None:
     """Execute pipeline according to configured stages."""
     run_cfg = get_section(config, "run_config")
     device_cfg = get_section(config, "device_config")
     seed = as_int(run_cfg.get("seed", 0), "run_config.seed")
     set_global_seed(seed=seed)
-    distributed_context = initialize_distributed_fn(
-        as_bool(device_cfg.get("ddp_enabled", False), "device_config.ddp_enabled")
+    ddp_enabled = as_bool(device_cfg.get("ddp_enabled", False), "device_config.ddp_enabled")
+    requested_device = as_str(device_cfg.get("device", "cpu"), "device_config.device")
+    accelerator = build_accelerator_fn(
+        requested_device=requested_device,
+        ddp_enabled=ddp_enabled,
+        use_mixed_precision=as_bool(
+            device_cfg.get("use_mixed_precision", False),
+            "device_config.use_mixed_precision",
+        ),
+        find_unused_parameters=_ddp_find_unused_parameters(config),
     )
-    ddp_find_unused_parameters = _ddp_find_unused_parameters(config)
+    distributed_context = distributed_context_from_accelerator(
+        accelerator=accelerator,
+        ddp_enabled=ddp_enabled,
+    )
     try:
         selected_stages = _selected_stages(run_cfg)
         stage_run_map = _resolve_stage_run_map(
@@ -287,10 +296,9 @@ def execute_pipeline(
                     rank=distributed_context.rank,
                     world_size=distributed_context.world_size,
                 )
-        requested_device = as_str(device_cfg.get("device", "cpu"), "device_config.device")
         device = resolve_device_fn(requested_device)
-        if distributed_context.is_distributed and device.type == "cuda":
-            device = torch.device("cuda", distributed_context.local_rank)
+        if requested_device != "cpu":
+            device = accelerator.device
         if distributed_context.is_main_process:
             _log_event_for_stages(
                 stage_names=selected_stages_with_adaptation,
@@ -314,7 +322,7 @@ def execute_pipeline(
                 valid=_len_or_unknown(dataloaders["valid"].dataset),
                 test=_len_or_unknown(dataloaders["test"].dataset),
             )
-        model = build_model_fn(config).to(device)
+        model = build_model_fn(config)
         if distributed_context.is_main_process:
             log_stage_event(
                 stage_loggers[selected_stages_with_adaptation[0]],
@@ -322,18 +330,12 @@ def execute_pipeline(
                 model=model_name,
                 params=sum(parameter.numel() for parameter in model.parameters()),
             )
-        if distributed_context.is_distributed:
-            model = distributed_data_parallel_cls(
-                model,
-                device_ids=[distributed_context.local_rank] if device.type == "cuda" else None,
-                find_unused_parameters=ddp_find_unused_parameters,
-            )
         if distributed_context.is_main_process:
             _log_event_for_stages(
                 stage_names=selected_stages_with_adaptation,
                 stage_loggers=stage_loggers,
                 event="ddp_ready",
-                wrapped=distributed_context.is_distributed,
+                wrapped=accelerator.use_distributed,
             )
 
         train_checkpoint_path: Path | None = None
@@ -350,6 +352,7 @@ def execute_pipeline(
                 dataloaders=dataloaders,
                 run_id=train_run_id,
                 distributed_context=distributed_context,
+                accelerator=accelerator,
             )
             if distributed_context.is_main_process:
                 log_stage_event(stage_loggers["train"], "end_training")
@@ -370,6 +373,7 @@ def execute_pipeline(
                 run_id=topology_finetune_run_id,
                 checkpoint_path=topology_finetune_checkpoint_input,
                 distributed_context=distributed_context,
+                accelerator=accelerator,
             )
             if distributed_context.is_main_process:
                 log_stage_event(stage_loggers["topology_finetune"], "end_topology_finetuning")
@@ -393,6 +397,7 @@ def execute_pipeline(
                 run_id=adapt_run_id,
                 checkpoint_path=base_checkpoint,
                 distributed_context=distributed_context,
+                accelerator=accelerator,
             )
             if distributed_context.is_main_process:
                 log_stage_event(stage_loggers["adapt"], "end_adaptation")
@@ -418,6 +423,7 @@ def execute_pipeline(
                 run_id=eval_run_id,
                 checkpoint_path=checkpoint_path,
                 distributed_context=distributed_context,
+                accelerator=accelerator,
             )
             if distributed_context.is_main_process:
                 log_stage_event(stage_loggers["evaluate"], "end_evaluation")
@@ -443,8 +449,9 @@ def execute_pipeline(
                 run_id=topology_eval_run_id,
                 checkpoint_path=topology_checkpoint_path,
                 distributed_context=distributed_context,
+                accelerator=accelerator,
             )
             if distributed_context.is_main_process:
                 log_stage_event(stage_loggers["topology_evaluate"], "end_topology_evaluation")
     finally:
-        cleanup_distributed_fn(distributed_context)
+        pass

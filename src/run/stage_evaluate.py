@@ -9,6 +9,7 @@ import torch
 
 from src.evaluate import Evaluator
 from src.run.stage_train import _build_loss_config, _build_stage_runtime, _load_checkpoint
+from src.utils.accelerator import AcceleratorLike, LocalAccelerator
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -85,8 +86,10 @@ def run_evaluation_stage(
     run_id: str,
     checkpoint_path: Path,
     distributed_context: DistributedContext,
+    accelerator: AcceleratorLike | None = None,
 ) -> dict[str, float]:
     """Run test evaluation and persist ``evaluate.csv``."""
+    stage_accelerator = accelerator or LocalAccelerator(device)
     checkpoint_path_resolved = Path(checkpoint_path)
     model_name, _ = extract_model_kwargs(config)
     log_dir, _, logger = _build_stage_runtime(
@@ -102,7 +105,19 @@ def run_evaluation_stage(
             run_id=run_id,
             checkpoint=checkpoint_path_resolved,
         )
-    _load_checkpoint(model=model, checkpoint_path=checkpoint_path_resolved, device=device)
+    if accelerator is None:
+        _load_checkpoint(
+            model=model,
+            checkpoint_path=checkpoint_path_resolved,
+            device=device,
+        )
+    else:
+        _load_checkpoint(
+            model=model,
+            checkpoint_path=checkpoint_path_resolved,
+            device=device,
+            accelerator=stage_accelerator,
+        )
     if distributed_context.is_main_process:
         log_stage_event(logger, "checkpoint_loaded", path=checkpoint_path_resolved)
     model.eval()

@@ -26,6 +26,7 @@ from src.run.stage_train import (
     _load_checkpoint,
     _save_checkpoint,
 )
+from src.utils.accelerator import AcceleratorLike, LocalAccelerator
 from src.topology.finetune_data import (
     TOPOLOGY_EVAL_NODE_SIZES,
     TOPOLOGY_EVAL_SAMPLES_PER_SIZE,
@@ -1075,8 +1076,10 @@ def run_topology_finetuning_stage(
     run_id: str,
     checkpoint_path: Path | None,
     distributed_context: DistributedContext,
+    accelerator: AcceleratorLike | None = None,
 ) -> Path:
     """Fine-tune a pairwise scorer with PRING graph-topology losses."""
+    stage_accelerator = accelerator or LocalAccelerator(device)
     model_name, _ = extract_model_kwargs(config)
     log_dir, model_dir, logger = _build_stage_runtime(
         model_name=model_name,
@@ -1100,7 +1103,12 @@ def run_topology_finetuning_stage(
             raise ValueError(
                 "checkpoint_path is required when topology_finetune.init_mode='warm_start'"
             )
-        _load_checkpoint(model=model, checkpoint_path=checkpoint_path_resolved, device=device)
+        _load_checkpoint(
+            model=model,
+            checkpoint_path=checkpoint_path_resolved,
+            device=device,
+            accelerator=stage_accelerator,
+        )
 
     context = _prepare_topology_finetune_stage_context(
         config=config,
@@ -1183,7 +1191,11 @@ def run_topology_finetuning_stage(
             )
             improved, should_stop = context.early_stopping.update(monitor_value)
             if improved:
-                _save_checkpoint(model=model, checkpoint_path=context.best_checkpoint_path)
+                _save_checkpoint(
+                    model=model,
+                    checkpoint_path=context.best_checkpoint_path,
+                    accelerator=stage_accelerator,
+                )
                 best_metrics = _build_best_metrics_payload(
                     epoch=epoch + 1,
                     monitor_metric=context.monitor_metric,
@@ -1226,7 +1238,11 @@ def run_topology_finetuning_stage(
             break
 
     if distributed_context.is_main_process and not context.best_checkpoint_path.exists():
-        _save_checkpoint(model=model, checkpoint_path=context.best_checkpoint_path)
+        _save_checkpoint(
+            model=model,
+            checkpoint_path=context.best_checkpoint_path,
+            accelerator=stage_accelerator,
+        )
         if not best_metrics:
             context.metrics_path.write_text(
                 json.dumps(

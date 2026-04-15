@@ -107,8 +107,9 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
         run_id: str,
         distributed_context: DistributedContext,
+        accelerator: object | None = None,
     ) -> Path:
-        del config, model, device, dataloaders, distributed_context
+        del config, model, device, dataloaders, distributed_context, accelerator
         calls.training.append((stage, run_id))
         return Path(f"artifacts/{stage}_best_model.pth")
 
@@ -120,8 +121,9 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         run_id: str,
         checkpoint_path: Path,
         distributed_context: DistributedContext,
+        accelerator: object | None = None,
     ) -> dict[str, float]:
-        del config, model, device, dataloaders, distributed_context
+        del config, model, device, dataloaders, distributed_context, accelerator
         calls.evaluation.append((checkpoint_path, run_id))
         return {"accuracy": 1.0}
 
@@ -133,8 +135,9 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         run_id: str,
         checkpoint_path: Path | None,
         distributed_context: DistributedContext,
+        accelerator: object | None = None,
     ) -> Path:
-        del config, model, device, dataloaders, distributed_context
+        del config, model, device, dataloaders, distributed_context, accelerator
         calls.topology_finetuning.append((checkpoint_path, run_id))
         return Path("artifacts/topology_finetune_best_model.pth")
 
@@ -146,8 +149,9 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         run_id: str,
         checkpoint_path: Path,
         distributed_context: DistributedContext,
+        accelerator: object | None = None,
     ) -> Path:
-        del config, model, device, dataloaders, distributed_context
+        del config, model, device, dataloaders, distributed_context, accelerator
         calls.adaptation.append((checkpoint_path, run_id))
         return Path("artifacts/adapt_best_model.pth")
 
@@ -159,21 +163,28 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         run_id: str,
         checkpoint_path: Path,
         distributed_context: DistributedContext,
+        accelerator: object | None = None,
     ) -> dict[str, float]:
-        del config, model, device, dataloaders, distributed_context
+        del config, model, device, dataloaders, distributed_context, accelerator
         calls.topology_evaluation.append((checkpoint_path, run_id))
         return {"graph_sim": 1.0}
-
-    def fake_initialize_distributed(ddp_enabled: bool) -> DistributedContext:
-        del ddp_enabled
-        return DistributedContext(ddp_enabled=False, is_distributed=False)
-
-    def fake_cleanup_distributed(context: DistributedContext) -> None:
-        del context
 
     def fake_resolve_device(device_name: str) -> torch.device:
         del device_name
         return torch.device("cpu")
+
+    class _FakeAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = False
+        process_index = 0
+        local_process_index = 0
+        num_processes = 1
+        mixed_precision = "no"
+
+    def fake_build_accelerator(**kwargs: object) -> _FakeAccelerator:
+        del kwargs
+        return _FakeAccelerator()
 
     monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
     monkeypatch.setattr(run_module, "build_model", fake_build_model)
@@ -190,8 +201,7 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         "run_topology_evaluation_stage",
         fake_run_topology_evaluation_stage,
     )
-    monkeypatch.setattr(run_module, "initialize_distributed", fake_initialize_distributed)
-    monkeypatch.setattr(run_module, "cleanup_distributed", fake_cleanup_distributed)
+    monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
     monkeypatch.setattr(run_module, "resolve_device", fake_resolve_device)
     return calls
 
@@ -247,12 +257,14 @@ def test_execute_pipeline_builds_accelerator_runtime_instead_of_manual_ddp(
 
     def fake_build_accelerator(
         *,
+        requested_device: str,
         ddp_enabled: bool,
         use_mixed_precision: bool,
         find_unused_parameters: bool,
     ) -> _FakeAccelerator:
         accelerator_calls.append(
             {
+                "requested_device": requested_device,
                 "ddp_enabled": ddp_enabled,
                 "use_mixed_precision": use_mixed_precision,
                 "find_unused_parameters": find_unused_parameters,
@@ -275,20 +287,6 @@ def test_execute_pipeline_builds_accelerator_runtime_instead_of_manual_ddp(
         return Path("artifacts/train_best_model.pth")
 
     monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
-    monkeypatch.setattr(
-        run_module,
-        "initialize_distributed",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("manual distributed initialization should not run")
-        ),
-    )
-    monkeypatch.setattr(
-        run_module,
-        "cleanup_distributed",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("manual distributed cleanup should not run")
-        ),
-    )
     monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
     monkeypatch.setattr(run_module, "build_model", fake_build_model)
     monkeypatch.setattr(run_module, "run_training_stage", fake_run_training_stage)
@@ -301,6 +299,7 @@ def test_execute_pipeline_builds_accelerator_runtime_instead_of_manual_ddp(
 
     assert accelerator_calls == [
         {
+            "requested_device": "cpu",
             "ddp_enabled": False,
             "use_mixed_precision": False,
             "find_unused_parameters": False,
@@ -319,21 +318,20 @@ def test_execute_pipeline_distributed_worker_reuses_main_run_ids(
     run_cfg["stages"] = ["train"]
     run_cfg["train_run_id"] = None
 
+    class _WorkerAccelerator:
+        device = torch.device("cpu")
+        is_main_process = False
+        use_distributed = True
+        process_index = 1
+        local_process_index = 1
+        num_processes = 2
+        mixed_precision = "no"
+
     monkeypatch.setattr(
         run_module,
-        "initialize_distributed",
-        lambda ddp_enabled: DistributedContext(
-            ddp_enabled=ddp_enabled,
-            is_distributed=True,
-            rank=1,
-            local_rank=1,
-            world_size=2,
-        ),
-    )
-    monkeypatch.setattr(
-        run_module,
-        "DistributedDataParallel",
-        lambda model, **kwargs: model,
+        "build_accelerator",
+        lambda **kwargs: _WorkerAccelerator(),
+        raising=False,
     )
     monkeypatch.setattr(pipeline_orchestrator.torch.distributed, "is_initialized", lambda: True)
 
@@ -586,8 +584,9 @@ def test_execute_pipeline_topology_finetune_launches_without_runtime_supervision
         run_id: str,
         checkpoint_path: Path | None,
         distributed_context: DistributedContext,
+        accelerator: object | None = None,
     ) -> Path:
-        del config, model, device, dataloaders, run_id, checkpoint_path, distributed_context
+        del config, model, device, dataloaders, run_id, checkpoint_path, distributed_context, accelerator
         call_order.append("stage")
         return Path("artifacts/topology_finetune_best_model.pth")
 
@@ -664,22 +663,7 @@ def test_execute_pipeline_staged_unfreeze_enables_ddp_find_unused(
         "initial_trainable_prefixes": ["output_head"],
     }
 
-    ddp_call: dict[str, object] = {}
-
-    class _FakeDDP(nn.Module):
-        def __init__(
-            self,
-            module: nn.Module,
-            device_ids: list[int] | None = None,
-            find_unused_parameters: bool = False,
-        ) -> None:
-            super().__init__()
-            self.module = module
-            ddp_call["device_ids"] = device_ids
-            ddp_call["find_unused_parameters"] = find_unused_parameters
-
-        def forward(self, *args: object, **kwargs: object) -> object:
-            return self.module(*args, **kwargs)
+    accelerator_call: dict[str, object] = {}
 
     def fake_build_dataloaders(
         config: ConfigDict,
@@ -695,22 +679,22 @@ def test_execute_pipeline_staged_unfreeze_enables_ddp_find_unused(
         del config
         return _DummyModel()
 
-    def fake_initialize_distributed(ddp_enabled: bool) -> DistributedContext:
-        del ddp_enabled
-        return DistributedContext(
-            ddp_enabled=True,
-            is_distributed=True,
-            rank=0,
-            local_rank=0,
-            world_size=2,
-        )
-
-    def fake_cleanup_distributed(context: DistributedContext) -> None:
-        del context
-
     def fake_resolve_device(device_name: str) -> torch.device:
         del device_name
         return torch.device("cpu")
+
+    class _FakeAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = True
+        process_index = 0
+        local_process_index = 0
+        num_processes = 2
+        mixed_precision = "no"
+
+    def fake_build_accelerator(**kwargs: object) -> _FakeAccelerator:
+        accelerator_call.update(kwargs)
+        return _FakeAccelerator()
 
     def fake_run_training_stage(
         stage: str,
@@ -720,22 +704,20 @@ def test_execute_pipeline_staged_unfreeze_enables_ddp_find_unused(
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
         run_id: str,
         distributed_context: DistributedContext,
+        accelerator: object | None = None,
     ) -> Path:
-        del stage, config, model, device, dataloaders, run_id, distributed_context
+        del stage, config, model, device, dataloaders, run_id, distributed_context, accelerator
         return Path("artifacts/train_best_model.pth")
 
     monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
     monkeypatch.setattr(run_module, "build_model", fake_build_model)
-    monkeypatch.setattr(run_module, "initialize_distributed", fake_initialize_distributed)
-    monkeypatch.setattr(run_module, "cleanup_distributed", fake_cleanup_distributed)
+    monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
     monkeypatch.setattr(run_module, "resolve_device", fake_resolve_device)
     monkeypatch.setattr(run_module, "run_training_stage", fake_run_training_stage)
-    monkeypatch.setattr(run_module, "DistributedDataParallel", _FakeDDP)
 
     run_module.execute_pipeline(base_config)
 
-    assert ddp_call["device_ids"] is None
-    assert ddp_call["find_unused_parameters"] is True
+    assert accelerator_call["find_unused_parameters"] is True
 
 
 def test_execute_pipeline_shot_adaptation_enables_ddp_find_unused(
@@ -760,22 +742,7 @@ def test_execute_pipeline_shot_adaptation_enables_ddp_find_unused(
         "target_split": "test",
     }
 
-    ddp_call: dict[str, object] = {}
-
-    class _FakeDDP(nn.Module):
-        def __init__(
-            self,
-            module: nn.Module,
-            device_ids: list[int] | None = None,
-            find_unused_parameters: bool = False,
-        ) -> None:
-            super().__init__()
-            self.module = module
-            ddp_call["device_ids"] = device_ids
-            ddp_call["find_unused_parameters"] = find_unused_parameters
-
-        def forward(self, *args: object, **kwargs: object) -> object:
-            return self.module(*args, **kwargs)
+    accelerator_call: dict[str, object] = {}
 
     def fake_build_dataloaders(
         config: ConfigDict,
@@ -791,22 +758,22 @@ def test_execute_pipeline_shot_adaptation_enables_ddp_find_unused(
         del config
         return _DummyModel()
 
-    def fake_initialize_distributed(ddp_enabled: bool) -> DistributedContext:
-        del ddp_enabled
-        return DistributedContext(
-            ddp_enabled=True,
-            is_distributed=True,
-            rank=0,
-            local_rank=0,
-            world_size=2,
-        )
-
-    def fake_cleanup_distributed(context: DistributedContext) -> None:
-        del context
-
     def fake_resolve_device(device_name: str) -> torch.device:
         del device_name
         return torch.device("cpu")
+
+    class _FakeAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = True
+        process_index = 0
+        local_process_index = 0
+        num_processes = 2
+        mixed_precision = "no"
+
+    def fake_build_accelerator(**kwargs: object) -> _FakeAccelerator:
+        accelerator_call.update(kwargs)
+        return _FakeAccelerator()
 
     def fake_run_adaptation_stage(
         config: ConfigDict,
@@ -816,8 +783,9 @@ def test_execute_pipeline_shot_adaptation_enables_ddp_find_unused(
         run_id: str,
         checkpoint_path: Path,
         distributed_context: DistributedContext,
+        accelerator: object | None = None,
     ) -> Path:
-        del config, model, device, dataloaders, run_id, checkpoint_path, distributed_context
+        del config, model, device, dataloaders, run_id, checkpoint_path, distributed_context, accelerator
         return Path("artifacts/adapt_best_model.pth")
 
     def fake_run_evaluation_stage(
@@ -828,20 +796,18 @@ def test_execute_pipeline_shot_adaptation_enables_ddp_find_unused(
         run_id: str,
         checkpoint_path: Path,
         distributed_context: DistributedContext,
+        accelerator: object | None = None,
     ) -> dict[str, float]:
-        del config, model, device, dataloaders, run_id, checkpoint_path, distributed_context
+        del config, model, device, dataloaders, run_id, checkpoint_path, distributed_context, accelerator
         return {"accuracy": 1.0}
 
     monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
     monkeypatch.setattr(run_module, "build_model", fake_build_model)
-    monkeypatch.setattr(run_module, "initialize_distributed", fake_initialize_distributed)
-    monkeypatch.setattr(run_module, "cleanup_distributed", fake_cleanup_distributed)
+    monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
     monkeypatch.setattr(run_module, "resolve_device", fake_resolve_device)
     monkeypatch.setattr(run_module, "run_shot_adaptation_stage", fake_run_adaptation_stage)
     monkeypatch.setattr(run_module, "run_evaluation_stage", fake_run_evaluation_stage)
-    monkeypatch.setattr(run_module, "DistributedDataParallel", _FakeDDP)
 
     run_module.execute_pipeline(base_config)
 
-    assert ddp_call["device_ids"] is None
-    assert ddp_call["find_unused_parameters"] is True
+    assert accelerator_call["find_unused_parameters"] is True

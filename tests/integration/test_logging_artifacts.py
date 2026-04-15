@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from typing import cast
 
@@ -124,21 +125,47 @@ def test_execute_pipeline_writes_stage_logs_and_strict_csv_headers(
         del config
         return _TinyModel()
 
-    def fake_initialize_distributed(ddp_enabled: bool) -> DistributedContext:
-        del ddp_enabled
-        return DistributedContext(ddp_enabled=False, is_distributed=False)
-
-    def fake_cleanup_distributed(context: DistributedContext) -> None:
-        del context
-
     def fake_resolve_device(device_name: str) -> torch.device:
         del device_name
         return torch.device("cpu")
 
+    class _FakeAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = False
+        process_index = 0
+        local_process_index = 0
+        num_processes = 1
+        mixed_precision = "no"
+
+        def prepare(self, *components: object) -> object:
+            if len(components) == 1:
+                return components[0]
+            return components
+
+        def autocast(self):
+            return nullcontext()
+
+        def backward(self, loss: torch.Tensor) -> None:
+            loss.backward()
+
+        def wait_for_everyone(self) -> None:
+            return None
+
+        def unwrap_model(self, model: nn.Module) -> nn.Module:
+            return model
+
+        def save(self, obj: object, f: object, safe_serialization: bool = False) -> None:
+            del safe_serialization
+            torch.save(obj, f)
+
+    def fake_build_accelerator(**kwargs: object) -> _FakeAccelerator:
+        del kwargs
+        return _FakeAccelerator()
+
     monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
     monkeypatch.setattr(run_module, "build_model", fake_build_model)
-    monkeypatch.setattr(run_module, "initialize_distributed", fake_initialize_distributed)
-    monkeypatch.setattr(run_module, "cleanup_distributed", fake_cleanup_distributed)
+    monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
     monkeypatch.setattr(run_module, "resolve_device", fake_resolve_device)
 
     run_module.execute_pipeline(_base_config(stages=["train", "evaluate"]))

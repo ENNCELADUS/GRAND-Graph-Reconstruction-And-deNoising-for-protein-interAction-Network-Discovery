@@ -18,6 +18,7 @@ from src.embed import ensure_embeddings_ready
 from src.evaluate import Evaluator
 from src.run.stage_evaluate import _resolve_decision_threshold
 from src.run.stage_train import _build_loss_config, _build_stage_runtime, _load_checkpoint
+from src.utils.accelerator import AcceleratorLike, LocalAccelerator
 from src.topology import (
     evaluate_predicted_graph,
     load_human_table2_baselines,
@@ -399,8 +400,10 @@ def run_topology_evaluation_stage(
     run_id: str,
     checkpoint_path: Path,
     distributed_context: DistributedContext,
+    accelerator: AcceleratorLike | None = None,
 ) -> dict[str, float]:
     """Run PRING-style Human topology evaluation and persist artifacts."""
+    stage_accelerator = accelerator or LocalAccelerator(device)
     checkpoint_path_resolved = Path(checkpoint_path)
     model_name, _ = extract_model_kwargs(config)
     log_dir, _, logger = _build_stage_runtime(
@@ -411,7 +414,12 @@ def run_topology_evaluation_stage(
     )
     if distributed_context.is_main_process:
         log_stage_event(logger, "stage_start", run_id=run_id, checkpoint=checkpoint_path_resolved)
-    _load_checkpoint(model=model, checkpoint_path=checkpoint_path_resolved, device=device)
+    _load_checkpoint(
+        model=model,
+        checkpoint_path=checkpoint_path_resolved,
+        device=device,
+        accelerator=stage_accelerator,
+    )
     model.eval()
 
     topology_cfg = _topology_config(config)
