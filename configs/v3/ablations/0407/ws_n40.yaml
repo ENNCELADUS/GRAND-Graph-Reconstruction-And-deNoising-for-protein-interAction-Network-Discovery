@@ -90,8 +90,7 @@ topology_finetune:
   init_mode: "warm_start"
   epochs: 15
   subgraphs_per_epoch: 111
-  min_nodes: 40
-  max_nodes: 40
+  subgraph_node_range: [40, 40]
   strategy: "mixed"
   pair_batch_size: 16
   decision_threshold: 0.5

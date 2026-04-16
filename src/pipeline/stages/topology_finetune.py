@@ -152,6 +152,16 @@ class SubgraphForwardResult:
     pair_index_b: torch.Tensor
 
 
+@dataclass(frozen=True)
+class LocalSubgraphTask:
+    """Rank-local train task, including DDP padding participation."""
+
+    nodes: tuple[str, ...]
+    assigned_positive_edges: frozenset[tuple[str, str]]
+    assigned_negative_edges: frozenset[tuple[str, str]]
+    is_padding: bool = False
+
+
 def _empty_validation_epoch_result() -> ValidationEpochResult:
     """Return a zeroed validation payload for non-main distributed ranks."""
     return ValidationEpochResult(
@@ -728,15 +738,9 @@ def _forward_subgraph_group(
                 bce_labels=torch.cat([chunk.bce_label for chunk in chunks], dim=0)
                 .to(device)
                 .float(),
-                bce_mask=torch.cat([chunk.bce_mask for chunk in chunks], dim=0)
-                .to(device)
-                .float(),
-                pair_index_a=torch.cat([chunk.pair_index_a for chunk in chunks], dim=0).to(
-                    device
-                ),
-                pair_index_b=torch.cat([chunk.pair_index_b for chunk in chunks], dim=0).to(
-                    device
-                ),
+                bce_mask=torch.cat([chunk.bce_mask for chunk in chunks], dim=0).to(device).float(),
+                pair_index_a=torch.cat([chunk.pair_index_a for chunk in chunks], dim=0).to(device),
+                pair_index_b=torch.cat([chunk.pair_index_b for chunk in chunks], dim=0).to(device),
             )
         )
         logit_offset = next_offset
@@ -1008,6 +1012,61 @@ def _local_edge_assignments_for_rank(
     return tuple(assigned_edges[distributed_context.rank :: distributed_context.world_size])
 
 
+def _local_subgraph_tasks_for_rank(
+    *,
+    subgraphs: Sequence[tuple[str, ...]],
+    assigned_positive_edges: Sequence[frozenset[tuple[str, str]]],
+    assigned_negative_edges: Sequence[frozenset[tuple[str, str]]],
+    distributed_context: DistributedContext,
+) -> tuple[LocalSubgraphTask, ...]:
+    """Return rank-local train tasks padded to equal DDP backward participation."""
+    local_subgraphs = _local_subgraphs_for_rank(
+        subgraphs=subgraphs,
+        distributed_context=distributed_context,
+    )
+    local_positive_edges = _local_edge_assignments_for_rank(
+        assigned_edges=assigned_positive_edges,
+        distributed_context=distributed_context,
+    )
+    local_negative_edges = _local_edge_assignments_for_rank(
+        assigned_edges=assigned_negative_edges,
+        distributed_context=distributed_context,
+    )
+    tasks = [
+        LocalSubgraphTask(
+            nodes=nodes,
+            assigned_positive_edges=positive_edges,
+            assigned_negative_edges=negative_edges,
+        )
+        for nodes, positive_edges, negative_edges in zip(
+            local_subgraphs,
+            local_positive_edges,
+            local_negative_edges,
+            strict=True,
+        )
+    ]
+    if not distributed_context.is_distributed or not subgraphs:
+        return tuple(tasks)
+
+    local_counts = [
+        len(subgraphs[rank :: distributed_context.world_size])
+        for rank in range(distributed_context.world_size)
+    ]
+    target_count = max(local_counts)
+    padding_count = target_count - len(tasks)
+    if padding_count <= 0:
+        return tuple(tasks)
+
+    padding_task = LocalSubgraphTask(
+        nodes=tuple(subgraphs[0]),
+        assigned_positive_edges=assigned_positive_edges[0],
+        assigned_negative_edges=assigned_negative_edges[0],
+        is_padding=True,
+    )
+    tasks.extend(padding_task for _ in range(padding_count))
+    return tuple(tasks)
+
+
 def _reduce_train_stats(
     *,
     accelerator: AcceleratorLike,
@@ -1103,38 +1162,23 @@ def _fit_epoch(
     assigned_negative_edges = epoch_plan.assigned_negative_edges or tuple(
         frozenset() for _ in sampled_subgraphs
     )
-    local_subgraphs = _local_subgraphs_for_rank(
+    local_tasks = _local_subgraph_tasks_for_rank(
         subgraphs=sampled_subgraphs,
-        distributed_context=distributed_context,
-    )
-    local_assigned_positive_edges = _local_edge_assignments_for_rank(
-        assigned_edges=assigned_positive_edges,
-        distributed_context=distributed_context,
-    )
-    local_assigned_negative_edges = _local_edge_assignments_for_rank(
-        assigned_edges=assigned_negative_edges,
+        assigned_positive_edges=assigned_positive_edges,
+        assigned_negative_edges=assigned_negative_edges,
         distributed_context=distributed_context,
     )
     aggregates = _initialize_train_aggregates(len(sampled_subgraphs), epoch_plan)
     train_forward_backward_seconds = 0.0
-    total_subgraphs = max(1, len(local_subgraphs))
+    real_local_subgraphs = sum(1 for task in local_tasks if not task.is_padding)
+    total_subgraphs = max(1, real_local_subgraphs)
+    completed_real_subgraphs = 0
 
     model.train()
-    if local_subgraphs:
+    if local_tasks:
         optimizer.zero_grad(set_to_none=True)
     if subgraphs_per_forward == 1:
-        for subgraph_index, (
-            nodes,
-            subgraph_assigned_positive_edges,
-            subgraph_assigned_negative_edges,
-        ) in enumerate(
-            zip(
-                local_subgraphs,
-                local_assigned_positive_edges,
-                local_assigned_negative_edges,
-                strict=True,
-            )
-        ):
+        for task_index, task in enumerate(local_tasks):
             step_start = time.perf_counter()
             with accelerator.autocast():
                 (
@@ -1147,9 +1191,9 @@ def _fit_epoch(
                 ) = _concat_logits_and_pairs(
                     model=model,
                     graph=graph,
-                    nodes=nodes,
-                    assigned_positive_edges=subgraph_assigned_positive_edges,
-                    assigned_negative_edges=subgraph_assigned_negative_edges,
+                    nodes=task.nodes,
+                    assigned_positive_edges=task.assigned_positive_edges,
+                    assigned_negative_edges=task.assigned_negative_edges,
                     cache_dir=cache_dir,
                     embedding_index=embedding_index,
                     input_dim=input_dim,
@@ -1165,7 +1209,7 @@ def _fit_epoch(
                     config=config,
                 )
                 pred_adjacency, target_adjacency = _subgraph_adjacencies(
-                    num_nodes=len(nodes),
+                    num_nodes=len(task.nodes),
                     logits=logits,
                     labels=labels,
                     pair_index_a=pair_index_a,
@@ -1175,60 +1219,64 @@ def _fit_epoch(
                     weights=loss_weights,
                     pred_adjacency=pred_adjacency,
                     target_adjacency=target_adjacency,
-                    num_nodes=len(nodes),
+                    num_nodes=len(task.nodes),
                     pair_index_a=pair_index_a,
                     pair_index_b=pair_index_b,
                     pred_pair_probabilities=torch.sigmoid(logits),
                     target_pair_probabilities=labels,
                 )
                 total_loss = bce_loss + topology_losses["total_topology"]
+                backward_loss = total_loss * 0.0 if task.is_padding else total_loss
 
-            current_window_start = (subgraph_index // gradient_accumulation_steps) * (
+            current_window_start = (task_index // gradient_accumulation_steps) * (
                 gradient_accumulation_steps
             )
             current_window_size = min(
                 gradient_accumulation_steps,
-                len(local_subgraphs) - current_window_start,
+                len(local_tasks) - current_window_start,
             )
-            accelerator.backward(total_loss / float(current_window_size))
-            is_accumulation_boundary = (subgraph_index + 1) % gradient_accumulation_steps == 0
-            is_last_subgraph = subgraph_index + 1 == len(local_subgraphs)
+            accelerator.backward(backward_loss / float(current_window_size))
+            is_accumulation_boundary = (task_index + 1) % gradient_accumulation_steps == 0
+            is_last_subgraph = task_index + 1 == len(local_tasks)
             if is_accumulation_boundary or is_last_subgraph:
                 optimizer.step()
                 if not is_last_subgraph:
                     optimizer.zero_grad(set_to_none=True)
             train_forward_backward_seconds += time.perf_counter() - step_start
-            _update_train_aggregates(
-                aggregates=aggregates,
-                bce_loss=bce_loss,
-                topology_losses=topology_losses,
-                total_loss=total_loss,
-            )
-            log_epoch_progress(
-                logger,
-                epoch=epoch_index + 1,
-                step=subgraph_index + 1,
-                total_steps=total_subgraphs,
-                loss=aggregates["total"] / float(subgraph_index + 1),
-            )
+            if not task.is_padding:
+                completed_real_subgraphs += 1
+                _update_train_aggregates(
+                    aggregates=aggregates,
+                    bce_loss=bce_loss,
+                    topology_losses=topology_losses,
+                    total_loss=total_loss,
+                )
+                log_epoch_progress(
+                    logger,
+                    epoch=epoch_index + 1,
+                    step=completed_real_subgraphs,
+                    total_steps=total_subgraphs,
+                    loss=aggregates["total"] / float(completed_real_subgraphs),
+                )
     else:
-        for window_start in range(0, len(local_subgraphs), gradient_accumulation_steps):
-            window_end = min(window_start + gradient_accumulation_steps, len(local_subgraphs))
+        for window_start in range(0, len(local_tasks), gradient_accumulation_steps):
+            window_end = min(window_start + gradient_accumulation_steps, len(local_tasks))
             current_window_size = window_end - window_start
             for group_start in range(window_start, window_end, subgraphs_per_forward):
                 step_start = time.perf_counter()
                 group_end = min(group_start + subgraphs_per_forward, window_end)
+                group_tasks = local_tasks[group_start:group_end]
                 with accelerator.autocast():
                     forward_results = _forward_subgraph_group(
                         model=model,
                         graph=graph,
-                        subgraphs=local_subgraphs[group_start:group_end],
-                        assigned_positive_edges=local_assigned_positive_edges[
-                            group_start:group_end
-                        ],
-                        assigned_negative_edges=local_assigned_negative_edges[
-                            group_start:group_end
-                        ],
+                        subgraphs=tuple(task.nodes for task in group_tasks),
+                        assigned_positive_edges=tuple(
+                            task.assigned_positive_edges for task in group_tasks
+                        ),
+                        assigned_negative_edges=tuple(
+                            task.assigned_negative_edges for task in group_tasks
+                        ),
                         cache_dir=cache_dir,
                         embedding_index=embedding_index,
                         input_dim=input_dim,
@@ -1239,9 +1287,14 @@ def _fit_epoch(
                     )
                     group_loss = torch.zeros((), dtype=torch.float32, device=device)
                     group_updates: list[
-                        tuple[torch.Tensor, Mapping[str, torch.Tensor], torch.Tensor]
+                        tuple[
+                            LocalSubgraphTask,
+                            torch.Tensor,
+                            Mapping[str, torch.Tensor],
+                            torch.Tensor,
+                        ]
                     ] = []
-                    for result in forward_results:
+                    for task, result in zip(group_tasks, forward_results, strict=True):
                         bce_loss = _masked_bce_loss(
                             logits=result.logits,
                             bce_labels=result.bce_labels,
@@ -1266,21 +1319,22 @@ def _fit_epoch(
                             target_pair_probabilities=result.labels,
                         )
                         total_loss = bce_loss + topology_losses["total_topology"]
-                        group_loss = group_loss + total_loss
-                        group_updates.append((bce_loss, topology_losses, total_loss))
+                        task_loss = total_loss * 0.0 if task.is_padding else total_loss
+                        group_loss = group_loss + task_loss
+                        group_updates.append((task, bce_loss, topology_losses, total_loss))
 
                 accelerator.backward(group_loss / float(current_window_size))
-                is_last_window = window_end == len(local_subgraphs)
+                is_last_window = window_end == len(local_tasks)
                 is_last_group_in_window = group_end == window_end
                 if is_last_group_in_window:
                     optimizer.step()
                     if not is_last_window:
                         optimizer.zero_grad(set_to_none=True)
                 train_forward_backward_seconds += time.perf_counter() - step_start
-                for relative_index, (bce_loss, topology_losses, total_loss) in enumerate(
-                    group_updates
-                ):
-                    subgraph_index = group_start + relative_index
+                for task, bce_loss, topology_losses, total_loss in group_updates:
+                    if task.is_padding:
+                        continue
+                    completed_real_subgraphs += 1
                     _update_train_aggregates(
                         aggregates=aggregates,
                         bce_loss=bce_loss,
@@ -1290,9 +1344,9 @@ def _fit_epoch(
                     log_epoch_progress(
                         logger,
                         epoch=epoch_index + 1,
-                        step=subgraph_index + 1,
+                        step=completed_real_subgraphs,
                         total_steps=total_subgraphs,
-                        loss=aggregates["total"] / float(subgraph_index + 1),
+                        loss=aggregates["total"] / float(completed_real_subgraphs),
                     )
 
     aggregates["edge_cover_sampling_s"] = edge_cover_sampling_seconds

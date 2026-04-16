@@ -176,9 +176,7 @@ def test_sample_edge_cover_subgraphs_assigns_each_positive_edge_exactly_once() -
     )
 
     assigned_edges = [
-        edge
-        for assigned_chunk in plan.assigned_positive_edges
-        for edge in assigned_chunk
+        edge for assigned_chunk in plan.assigned_positive_edges for edge in assigned_chunk
     ]
     assert sorted(assigned_edges) == sorted(tuple(sorted(edge)) for edge in graph.edges())
     assert len(assigned_edges) == len(set(assigned_edges))
@@ -213,9 +211,7 @@ def test_sample_edge_cover_subgraphs_preassigns_each_negative_edge_at_most_once(
     )
 
     assigned_edges = [
-        edge
-        for assigned_chunk in plan.assigned_negative_edges
-        for edge in assigned_chunk
+        edge for assigned_chunk in plan.assigned_negative_edges for edge in assigned_chunk
     ]
     assert sorted(assigned_edges) == sorted(negative_lookup.negative_pairs)
     assert len(assigned_edges) == len(set(assigned_edges))
@@ -268,7 +264,7 @@ def test_sample_edge_cover_subgraphs_supports_all_strategies() -> None:
             seed=19,
         )
 
-        assert len(plan.subgraphs) == 2
+        assert len(plan.subgraphs) >= 4
         assert plan.positive_edge_coverage_ratio == pytest.approx(1.0)
         assert all(2 <= len(node_ids) <= graph.number_of_nodes() for node_ids in plan.subgraphs)
         assert all(set(node_ids).issubset(set(graph.nodes)) for node_ids in plan.subgraphs)

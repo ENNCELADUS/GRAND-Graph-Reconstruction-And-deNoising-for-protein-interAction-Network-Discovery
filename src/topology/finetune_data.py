@@ -586,14 +586,45 @@ def _partition_edges(
     *,
     positive_edges: Sequence[tuple[str, str]],
     chunk_size: int,
+    max_nodes: int,
 ) -> tuple[tuple[tuple[str, str], ...], ...]:
-    """Partition shuffled positive edges into fixed-size chunks."""
+    """Partition shuffled positive edges by edge count and endpoint budget."""
     if chunk_size <= 0:
         raise ValueError("edge_chunk_size must be positive")
-    return tuple(
-        tuple(positive_edges[start : start + chunk_size])
-        for start in range(0, len(positive_edges), chunk_size)
-    )
+    if max_nodes <= 1:
+        raise ValueError("max_nodes must be greater than 1")
+
+    chunks: list[tuple[tuple[str, str], ...]] = []
+    current_chunk: list[tuple[str, str]] = []
+    current_nodes: set[str] = set()
+    for edge in positive_edges:
+        edge_nodes = set(edge)
+        would_exceed_edge_budget = len(current_chunk) >= chunk_size
+        would_exceed_node_budget = len(current_nodes | edge_nodes) > max_nodes
+        if current_chunk and (would_exceed_edge_budget or would_exceed_node_budget):
+            chunks.append(tuple(current_chunk))
+            current_chunk = []
+            current_nodes = set()
+        current_chunk.append(edge)
+        current_nodes.update(edge_nodes)
+    if current_chunk:
+        chunks.append(tuple(current_chunk))
+    return tuple(chunks)
+
+
+def _resolve_epoch_edge_chunk_size(
+    *,
+    positive_edge_count: int,
+    requested_chunk_size: int,
+    num_subgraphs: int,
+) -> int:
+    """Return an edge chunk size that preserves the configured epoch floor."""
+    if requested_chunk_size <= 0:
+        raise ValueError("edge_chunk_size must be positive")
+    if num_subgraphs <= 0 or positive_edge_count < num_subgraphs:
+        return requested_chunk_size
+    floor_chunk_size = max(1, positive_edge_count // num_subgraphs)
+    return min(requested_chunk_size, floor_chunk_size)
 
 
 def _negative_edges_within_nodes(
@@ -841,13 +872,17 @@ def sample_edge_cover_subgraphs(
     shuffled_edges = list(positive_edges)
     rng.shuffle(shuffled_edges)
     resolved_edge_chunk_size = (
-        _default_edge_chunk_size(max_nodes)
-        if edge_chunk_size is None
-        else int(edge_chunk_size)
+        _default_edge_chunk_size(max_nodes) if edge_chunk_size is None else int(edge_chunk_size)
+    )
+    resolved_edge_chunk_size = _resolve_epoch_edge_chunk_size(
+        positive_edge_count=len(shuffled_edges),
+        requested_chunk_size=resolved_edge_chunk_size,
+        num_subgraphs=num_subgraphs,
     )
     edge_chunks = _partition_edges(
         positive_edges=shuffled_edges,
         chunk_size=resolved_edge_chunk_size,
+        max_nodes=max_nodes,
     )
     sampled_subgraphs = [
         _expand_chunk_nodes(
