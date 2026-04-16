@@ -1314,6 +1314,193 @@ def test_fit_epoch_batches_multiple_subgraphs_into_one_forward(
     assert observed_forward_batch_sizes == [2, 2]
 
 
+def _run_fit_epoch_for_rank(
+    *,
+    tmp_path: Path,
+    config: ConfigDict,
+    graph: nx.Graph,
+    distributed_context: DistributedContext,
+) -> NoOpAccelerator:
+    accelerator = NoOpAccelerator(distributed=distributed_context)
+    topology_finetune_stage._fit_epoch(
+        config=config,
+        model=torch.nn.Linear(1, 1),
+        device=torch.device("cpu"),
+        graph=graph,
+        cache_dir=tmp_path,
+        embedding_index={},
+        optimizer=cast(torch.optim.Optimizer, _CountingOptimizer()),
+        epoch_index=0,
+        epoch_seed=11,
+        input_dim=4,
+        max_sequence_length=8,
+        loss_weights=topology_finetune_stage.TopologyLossWeights(
+            alpha=0.0,
+            beta=0.0,
+            gamma=0.0,
+            delta=0.0,
+        ),
+        pair_batch_size=8,
+        use_amp=False,
+        accelerator=accelerator,
+        embedding_repository=cast(EmbeddingRepository, object()),
+        negative_lookup=None,
+        distributed_context=distributed_context,
+    )
+    return accelerator
+
+
+def test_fit_epoch_pads_uneven_ddp_subgraph_steps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    graph = nx.path_graph(["P1", "P2", "P3", "P4"])
+
+    def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
+        return EdgeCoverEpochPlan(
+            subgraphs=(("P1", "P2"), ("P2", "P3"), ("P3", "P4")),
+            assigned_positive_edges=(
+                frozenset({("P1", "P2")}),
+                frozenset({("P2", "P3")}),
+                frozenset({("P3", "P4")}),
+            ),
+            total_positive_edges=3,
+            covered_positive_edges=3,
+            positive_edge_coverage_ratio=1.0,
+            mean_positive_edge_reuse=1.0,
+        )
+
+    def _fake_concat_logits_and_pairs(**_: object) -> tuple[torch.Tensor, ...]:
+        return (
+            torch.zeros(1, dtype=torch.float32, requires_grad=True),
+            torch.ones(1, dtype=torch.float32),
+            torch.ones(1, dtype=torch.float32),
+            torch.ones(1, dtype=torch.float32),
+            torch.tensor([0], dtype=torch.long),
+            torch.tensor([1], dtype=torch.long),
+        )
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "sample_edge_cover_subgraphs",
+        _fake_sample_edge_cover_subgraphs,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_concat_logits_and_pairs",
+        _fake_concat_logits_and_pairs,
+    )
+
+    backward_counts = [
+        _run_fit_epoch_for_rank(
+            tmp_path=tmp_path,
+            config=config,
+            graph=graph,
+            distributed_context=DistributedContext(
+                ddp_enabled=True,
+                is_distributed=True,
+                rank=rank,
+                local_rank=rank,
+                world_size=2,
+            ),
+        ).backward_calls
+        for rank in (0, 1)
+    ]
+
+    assert backward_counts == [2, 2]
+
+
+def test_fit_epoch_pads_uneven_ddp_grouped_forward_steps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["subgraphs_per_forward"] = 2
+    topology_cfg["gradient_accumulation_steps"] = 4
+    graph = nx.path_graph(["P1", "P2", "P3", "P4", "P5", "P6"])
+
+    def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
+        return EdgeCoverEpochPlan(
+            subgraphs=(
+                ("P1", "P2"),
+                ("P2", "P3"),
+                ("P3", "P4"),
+                ("P4", "P5"),
+                ("P5", "P6"),
+            ),
+            assigned_positive_edges=(
+                frozenset({("P1", "P2")}),
+                frozenset({("P2", "P3")}),
+                frozenset({("P3", "P4")}),
+                frozenset({("P4", "P5")}),
+                frozenset({("P5", "P6")}),
+            ),
+            total_positive_edges=5,
+            covered_positive_edges=5,
+            positive_edge_coverage_ratio=1.0,
+            mean_positive_edge_reuse=1.0,
+        )
+
+    def _fake_iter_subgraph_pair_chunks(**kwargs: object) -> Sequence[SubgraphPairChunk]:
+        nodes = tuple(cast(Sequence[str], kwargs["nodes"]))
+        return (
+            SubgraphPairChunk(
+                nodes=nodes,
+                emb_a=torch.zeros((1, 1, 4), dtype=torch.float32),
+                emb_b=torch.ones((1, 1, 4), dtype=torch.float32),
+                len_a=torch.ones(1, dtype=torch.long),
+                len_b=torch.ones(1, dtype=torch.long),
+                label=torch.ones(1, dtype=torch.float32),
+                pair_index_a=torch.zeros(1, dtype=torch.long),
+                pair_index_b=torch.ones(1, dtype=torch.long),
+                bce_label=torch.ones(1, dtype=torch.float32),
+                bce_mask=torch.ones(1, dtype=torch.float32),
+            ),
+        )
+
+    def _fake_forward_model(
+        *,
+        model: torch.nn.Module,
+        batch: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        del model
+        batch_size = int(batch["label"].numel())
+        return {"logits": torch.zeros(batch_size, dtype=torch.float32, requires_grad=True)}
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "sample_edge_cover_subgraphs",
+        _fake_sample_edge_cover_subgraphs,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "iter_subgraph_pair_chunks",
+        _fake_iter_subgraph_pair_chunks,
+    )
+    monkeypatch.setattr(topology_finetune_stage, "_forward_model", _fake_forward_model)
+
+    backward_counts = [
+        _run_fit_epoch_for_rank(
+            tmp_path=tmp_path,
+            config=config,
+            graph=graph,
+            distributed_context=DistributedContext(
+                ddp_enabled=True,
+                is_distributed=True,
+                rank=rank,
+                local_rank=rank,
+                world_size=2,
+            ),
+        ).backward_calls
+        for rank in (0, 1)
+    ]
+
+    assert backward_counts == [2, 2]
+
+
 def test_run_topology_finetuning_stage_uses_accelerator_runtime(
     tmp_path: Path,
 ) -> None:

@@ -135,6 +135,25 @@ def test_sample_edge_cover_subgraphs_uses_bounded_shuffle_chunk_plan() -> None:
     assert all(len(set(node_ids)) == len(node_ids) for node_ids in plan.subgraphs)
 
 
+def test_sample_edge_cover_subgraphs_splits_sparse_chunks_by_max_nodes() -> None:
+    graph = nx.Graph()
+    graph.add_edges_from((f"A{i}", f"B{i}") for i in range(100))
+
+    plan = sample_edge_cover_subgraphs(
+        graph=graph,
+        num_subgraphs=0,
+        min_nodes=30,
+        max_nodes=60,
+        strategy="BFS",
+        seed=13,
+    )
+
+    assert plan.covered_positive_edges == plan.total_positive_edges == 100
+    assert plan.positive_edge_coverage_ratio == pytest.approx(1.0)
+    assert all(len(node_ids) <= 60 for node_ids in plan.subgraphs)
+    assert all(len(assigned_edges) <= 885 for assigned_edges in plan.assigned_positive_edges)
+
+
 def test_sample_edge_cover_subgraphs_assigns_each_positive_edge_exactly_once() -> None:
     graph = nx.Graph()
     graph.add_edges_from(
@@ -202,21 +221,21 @@ def test_sample_edge_cover_subgraphs_preassigns_each_negative_edge_at_most_once(
     assert len(assigned_edges) == len(set(assigned_edges))
 
 
-def test_sample_edge_cover_subgraphs_respects_minimum_floor_after_full_coverage() -> None:
-    graph = nx.path_graph(["P1", "P2", "P3", "P4"])
+def test_sample_edge_cover_subgraphs_respects_epoch_floor_with_positive_edges() -> None:
+    graph = nx.path_graph([f"P{i}" for i in range(1, 12)])
 
     plan = sample_edge_cover_subgraphs(
         graph=graph,
         num_subgraphs=5,
-        min_nodes=2,
-        max_nodes=2,
+        min_nodes=4,
+        max_nodes=4,
         strategy="DFS",
         seed=17,
     )
 
-    assert plan.covered_positive_edges == plan.total_positive_edges == 3
+    assert plan.covered_positive_edges == plan.total_positive_edges == 10
     assert plan.positive_edge_coverage_ratio == pytest.approx(1.0)
-    assert len(plan.subgraphs) == 3
+    assert len(plan.subgraphs) >= 5
 
 
 def test_sample_edge_cover_subgraphs_supports_zero_floor_and_still_covers_edges() -> None:
