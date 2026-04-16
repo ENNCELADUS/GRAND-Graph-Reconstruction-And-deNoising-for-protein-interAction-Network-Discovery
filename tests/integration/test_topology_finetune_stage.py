@@ -42,8 +42,7 @@ from src.topology.metrics import evaluate_graph_samples
 from src.topology.negative_sampling import prepare_topology_supervision_from_config
 from src.utils.config import ConfigDict, load_config
 from src.utils.data_io import build_dataloaders
-from tests.runtime_helpers import build_stage_runtime
-from tests.runtime_helpers import NoOpAccelerator
+from tests.runtime_helpers import NoOpAccelerator, build_stage_runtime
 from torch.utils.data import DataLoader
 
 

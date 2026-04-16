@@ -94,6 +94,7 @@ topology_finetune:
   bce_negative_ratio: 5
   min_nodes: 20
   max_nodes: 20
+  gradient_accumulation_steps: 8
   strategy: "mixed"
   pair_batch_size: 16
   decision_threshold: 0.5

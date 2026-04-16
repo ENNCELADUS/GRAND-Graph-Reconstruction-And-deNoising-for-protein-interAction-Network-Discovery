@@ -371,6 +371,17 @@ def _resolve_edge_chunk_size(
     return edge_chunk_size
 
 
+def _resolve_gradient_accumulation_steps(finetune_cfg: ConfigDict) -> int:
+    """Return the number of subgraphs to accumulate before optimizer step."""
+    steps = as_int(
+        finetune_cfg.get("gradient_accumulation_steps", 1),
+        "topology_finetune.gradient_accumulation_steps",
+    )
+    if steps <= 0:
+        raise ValueError("topology_finetune.gradient_accumulation_steps must be > 0")
+    return steps
+
+
 def _build_internal_validation_node_sets(
     *,
     finetune_cfg: ConfigDict,
@@ -934,6 +945,7 @@ def _fit_epoch(
     )
     strategy = as_str(finetune_cfg.get("strategy", "mixed"), "topology_finetune.strategy")
     negative_ratio = _resolve_bce_negative_ratio(finetune_cfg)
+    gradient_accumulation_steps = _resolve_gradient_accumulation_steps(finetune_cfg)
     edge_chunk_size = _resolve_edge_chunk_size(
         finetune_cfg=finetune_cfg,
         max_nodes=max_nodes,
@@ -964,11 +976,12 @@ def _fit_epoch(
     total_subgraphs = max(1, len(local_subgraphs))
 
     model.train()
+    if local_subgraphs:
+        optimizer.zero_grad(set_to_none=True)
     for subgraph_index, (nodes, subgraph_assigned_positive_edges) in enumerate(
         zip(local_subgraphs, local_assigned_positive_edges, strict=True)
     ):
         step_start = time.perf_counter()
-        optimizer.zero_grad(set_to_none=True)
         with accelerator.autocast():
             (
                 logits,
@@ -1018,8 +1031,20 @@ def _fit_epoch(
             )
             total_loss = bce_loss + topology_losses["total_topology"]
 
-        accelerator.backward(total_loss)
-        optimizer.step()
+        current_window_start = (subgraph_index // gradient_accumulation_steps) * (
+            gradient_accumulation_steps
+        )
+        current_window_size = min(
+            gradient_accumulation_steps,
+            len(local_subgraphs) - current_window_start,
+        )
+        accelerator.backward(total_loss / float(current_window_size))
+        is_accumulation_boundary = (subgraph_index + 1) % gradient_accumulation_steps == 0
+        is_last_subgraph = subgraph_index + 1 == len(local_subgraphs)
+        if is_accumulation_boundary or is_last_subgraph:
+            optimizer.step()
+            if not is_last_subgraph:
+                optimizer.zero_grad(set_to_none=True)
         train_forward_backward_seconds += time.perf_counter() - step_start
         _update_train_aggregates(
             aggregates=aggregates,
