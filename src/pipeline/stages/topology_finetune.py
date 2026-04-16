@@ -176,6 +176,23 @@ def _resolve_monitor_value(
     )
 
 
+def _resolve_epoch_seed(
+    *,
+    run_seed: int,
+    epoch_index: int,
+    distributed_context: DistributedContext,
+) -> int:
+    """Return the RNG seed for one topology fine-tune epoch.
+
+    This stage samples custom subgraphs instead of using a sharded dataloader. Under DDP,
+    all ranks therefore need the same epoch plan so they execute the same number of forward
+    and backward steps before the next collective.
+    """
+    if distributed_context.is_distributed:
+        return run_seed + epoch_index
+    return run_seed + (1000 * distributed_context.rank) + epoch_index
+
+
 def _resolve_supervision_dataset_path(
     *,
     finetune_cfg: ConfigDict,
@@ -814,7 +831,7 @@ def _fit_epoch(
     embedding_index: Mapping[str, str],
     optimizer: Optimizer,
     epoch_index: int,
-    rank_seed: int,
+    epoch_seed: int,
     input_dim: int,
     max_sequence_length: int,
     loss_weights: TopologyLossWeights,
@@ -843,7 +860,7 @@ def _fit_epoch(
         min_nodes=min_nodes,
         max_nodes=max_nodes,
         strategy=strategy,
-        seed=rank_seed + epoch_index,
+        seed=epoch_seed,
         overlap_penalty=overlap_penalty,
     )
     edge_cover_sampling_seconds = time.perf_counter() - sampling_start
@@ -877,7 +894,7 @@ def _fit_epoch(
                 embedding_repository=embedding_repository,
                 negative_lookup=negative_lookup,
                 negative_ratio=negative_ratio,
-                seed=(rank_seed + epoch_index) * 1000 + subgraph_index,
+                seed=(epoch_seed * 1000) + subgraph_index,
             )
             bce_loss = _masked_bce_loss(
                 logits=logits,
@@ -1286,7 +1303,11 @@ def run_topology_finetuning_stage(
             embedding_index=context.embedding_index,
             optimizer=context.optimizer,
             epoch_index=epoch,
-            rank_seed=context.run_seed + 1000 * runtime.rank,
+            epoch_seed=_resolve_epoch_seed(
+                run_seed=context.run_seed,
+                epoch_index=epoch,
+                distributed_context=runtime.distributed,
+            ),
             input_dim=context.input_dim,
             max_sequence_length=context.max_sequence_length,
             loss_weights=context.loss_weights,

@@ -18,6 +18,7 @@ from src.embed import EmbeddingCacheManifest
 from src.evaluate import Evaluator
 from src.pipeline.runtime import DistributedContext
 from src.pipeline.stages.topology_finetune import (
+    ValidationEpochResult,
     _build_internal_validation_node_sets,
     _evaluate_internal_validation_subgraphs,
     _forward_model,
@@ -26,7 +27,6 @@ from src.pipeline.stages.topology_finetune import (
     _resolve_monitor_mode,
     _resolve_monitor_value,
     _resolve_sampling_node_bounds,
-    ValidationEpochResult,
     run_topology_finetuning_stage,
 )
 from src.pipeline.stages.train import build_model
@@ -850,7 +850,7 @@ def test_run_topology_finetuning_stage_uses_shared_epoch_sampling_seed_under_ddp
     def _fake_sample_edge_cover_subgraphs(**kwargs: object) -> EdgeCoverEpochPlan:
         observed_rank_seeds.append((active_rank, int(kwargs["seed"])))
         return EdgeCoverEpochPlan(
-            subgraphs=tuple(),
+            subgraphs=(),
             total_positive_edges=0,
             covered_positive_edges=0,
             positive_edge_coverage_ratio=1.0,
