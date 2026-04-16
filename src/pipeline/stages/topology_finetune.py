@@ -139,6 +139,19 @@ class ValidationEpochResult:
     internal_validation_seconds: float
 
 
+@dataclass(frozen=True)
+class SubgraphForwardResult:
+    """Forward outputs and pair labels for one sampled training subgraph."""
+
+    nodes: tuple[str, ...]
+    logits: torch.Tensor
+    labels: torch.Tensor
+    bce_labels: torch.Tensor
+    bce_mask: torch.Tensor
+    pair_index_a: torch.Tensor
+    pair_index_b: torch.Tensor
+
+
 def _empty_validation_epoch_result() -> ValidationEpochResult:
     """Return a zeroed validation payload for non-main distributed ranks."""
     return ValidationEpochResult(
@@ -395,6 +408,17 @@ def _resolve_gradient_accumulation_steps(finetune_cfg: ConfigDict) -> int:
     return steps
 
 
+def _resolve_subgraphs_per_forward(finetune_cfg: ConfigDict) -> int:
+    """Return the number of subgraphs concatenated into one training forward pass."""
+    subgraphs_per_forward = as_int(
+        finetune_cfg.get("subgraphs_per_forward", 1),
+        "topology_finetune.subgraphs_per_forward",
+    )
+    if subgraphs_per_forward <= 0:
+        raise ValueError("topology_finetune.subgraphs_per_forward must be > 0")
+    return subgraphs_per_forward
+
+
 def _build_internal_validation_node_sets(
     *,
     finetune_cfg: ConfigDict,
@@ -618,6 +642,115 @@ def _concat_logits_and_pairs(
         torch.cat(pair_index_a_list, dim=0),
         torch.cat(pair_index_b_list, dim=0),
     )
+
+
+def _cat_padded_pair_embeddings(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Concatenate padded pair embedding tensors with a shared sequence length."""
+    if not tensors:
+        raise ValueError("At least one pair embedding tensor is required")
+    max_tokens = max(tensor.size(1) for tensor in tensors)
+    padded_tensors = [
+        torch.nn.functional.pad(tensor, (0, 0, 0, max_tokens - tensor.size(1)))
+        if tensor.size(1) < max_tokens
+        else tensor
+        for tensor in tensors
+    ]
+    return torch.cat(padded_tensors, dim=0)
+
+
+def _batch_subgraph_chunks(
+    *,
+    chunks: Sequence[SubgraphPairChunk],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    """Concatenate pair chunks from multiple subgraphs into one model batch."""
+    if not chunks:
+        raise ValueError("At least one subgraph pair chunk is required")
+    batch = {
+        "emb_a": _cat_padded_pair_embeddings([chunk.emb_a for chunk in chunks]),
+        "emb_b": _cat_padded_pair_embeddings([chunk.emb_b for chunk in chunks]),
+        "len_a": torch.cat([chunk.len_a for chunk in chunks], dim=0),
+        "len_b": torch.cat([chunk.len_b for chunk in chunks], dim=0),
+        "label": torch.cat([chunk.label for chunk in chunks], dim=0),
+        "pair_index_a": torch.cat([chunk.pair_index_a for chunk in chunks], dim=0),
+        "pair_index_b": torch.cat([chunk.pair_index_b for chunk in chunks], dim=0),
+        "bce_label": torch.cat([chunk.bce_label for chunk in chunks], dim=0),
+        "bce_mask": torch.cat([chunk.bce_mask for chunk in chunks], dim=0),
+    }
+    return move_batch_to_device(batch=batch, device=device)
+
+
+def _forward_subgraph_group(
+    *,
+    model: nn.Module,
+    graph: nx.Graph,
+    subgraphs: Sequence[tuple[str, ...]],
+    assigned_positive_edges: Sequence[frozenset[tuple[str, str]]],
+    cache_dir: Path,
+    embedding_index: Mapping[str, str],
+    input_dim: int,
+    max_sequence_length: int,
+    pair_batch_size: int,
+    device: torch.device,
+    embedding_repository: EmbeddingRepository,
+    negative_lookup: ExplicitNegativePairLookup | None,
+    negative_ratio: int,
+    epoch_seed: int,
+    subgraph_index_offset: int,
+) -> tuple[SubgraphForwardResult, ...]:
+    """Forward multiple subgraphs in one concatenated pair batch."""
+    grouped_chunks: list[tuple[tuple[str, ...], tuple[SubgraphPairChunk, ...]]] = []
+    all_chunks: list[SubgraphPairChunk] = []
+    for relative_index, (nodes, subgraph_assigned_positive_edges) in enumerate(
+        zip(subgraphs, assigned_positive_edges, strict=True)
+    ):
+        chunks = tuple(
+            iter_subgraph_pair_chunks(
+                graph=graph,
+                nodes=nodes,
+                assigned_positive_edges=subgraph_assigned_positive_edges,
+                cache_dir=cache_dir,
+                embedding_index=embedding_index,
+                input_dim=input_dim,
+                max_sequence_length=max_sequence_length,
+                pair_batch_size=pair_batch_size,
+                embedding_repository=embedding_repository,
+                negative_lookup=negative_lookup,
+                negative_ratio=negative_ratio,
+                seed=(epoch_seed * 1000) + subgraph_index_offset + relative_index,
+            )
+        )
+        grouped_chunks.append((tuple(nodes), chunks))
+        all_chunks.extend(chunks)
+
+    batch = _batch_subgraph_chunks(chunks=all_chunks, device=device)
+    logits = _squeeze_binary_logits(_forward_model(model=model, batch=batch)["logits"])
+    results: list[SubgraphForwardResult] = []
+    logit_offset = 0
+    for nodes, chunks in grouped_chunks:
+        pair_count = sum(int(chunk.label.numel()) for chunk in chunks)
+        next_offset = logit_offset + pair_count
+        results.append(
+            SubgraphForwardResult(
+                nodes=nodes,
+                logits=logits[logit_offset:next_offset],
+                labels=torch.cat([chunk.label for chunk in chunks], dim=0).to(device).float(),
+                bce_labels=torch.cat([chunk.bce_label for chunk in chunks], dim=0)
+                .to(device)
+                .float(),
+                bce_mask=torch.cat([chunk.bce_mask for chunk in chunks], dim=0)
+                .to(device)
+                .float(),
+                pair_index_a=torch.cat([chunk.pair_index_a for chunk in chunks], dim=0).to(
+                    device
+                ),
+                pair_index_b=torch.cat([chunk.pair_index_b for chunk in chunks], dim=0).to(
+                    device
+                ),
+            )
+        )
+        logit_offset = next_offset
+    return tuple(results)
 
 
 def _subgraph_adjacencies(
@@ -959,6 +1092,7 @@ def _fit_epoch(
     strategy = as_str(finetune_cfg.get("strategy", "mixed"), "topology_finetune.strategy")
     negative_ratio = _resolve_bce_negative_ratio(finetune_cfg)
     gradient_accumulation_steps = _resolve_gradient_accumulation_steps(finetune_cfg)
+    subgraphs_per_forward = _resolve_subgraphs_per_forward(finetune_cfg)
     edge_chunk_size = _resolve_edge_chunk_size(
         finetune_cfg=finetune_cfg,
         max_nodes=max_nodes,
@@ -991,87 +1125,172 @@ def _fit_epoch(
     model.train()
     if local_subgraphs:
         optimizer.zero_grad(set_to_none=True)
-    for subgraph_index, (nodes, subgraph_assigned_positive_edges) in enumerate(
-        zip(local_subgraphs, local_assigned_positive_edges, strict=True)
-    ):
-        step_start = time.perf_counter()
-        with accelerator.autocast():
-            (
-                logits,
-                labels,
-                bce_labels,
-                bce_mask,
-                pair_index_a,
-                pair_index_b,
-            ) = _concat_logits_and_pairs(
-                model=model,
-                graph=graph,
-                nodes=nodes,
-                assigned_positive_edges=subgraph_assigned_positive_edges,
-                cache_dir=cache_dir,
-                embedding_index=embedding_index,
-                input_dim=input_dim,
-                max_sequence_length=max_sequence_length,
-                pair_batch_size=pair_batch_size,
-                device=device,
-                embedding_repository=embedding_repository,
-                negative_lookup=negative_lookup,
-                negative_ratio=negative_ratio,
-                seed=(epoch_seed * 1000) + subgraph_index,
-            )
-            bce_loss = _masked_bce_loss(
-                logits=logits,
-                bce_labels=bce_labels,
-                bce_mask=bce_mask,
-                config=config,
-            )
-            pred_adjacency, target_adjacency = _subgraph_adjacencies(
-                num_nodes=len(nodes),
-                logits=logits,
-                labels=labels,
-                pair_index_a=pair_index_a,
-                pair_index_b=pair_index_b,
-            )
-            topology_losses = compute_topology_losses(
-                weights=loss_weights,
-                pred_adjacency=pred_adjacency,
-                target_adjacency=target_adjacency,
-                num_nodes=len(nodes),
-                pair_index_a=pair_index_a,
-                pair_index_b=pair_index_b,
-                pred_pair_probabilities=torch.sigmoid(logits),
-                target_pair_probabilities=labels,
-            )
-            total_loss = bce_loss + topology_losses["total_topology"]
+    if subgraphs_per_forward == 1:
+        for subgraph_index, (nodes, subgraph_assigned_positive_edges) in enumerate(
+            zip(local_subgraphs, local_assigned_positive_edges, strict=True)
+        ):
+            step_start = time.perf_counter()
+            with accelerator.autocast():
+                (
+                    logits,
+                    labels,
+                    bce_labels,
+                    bce_mask,
+                    pair_index_a,
+                    pair_index_b,
+                ) = _concat_logits_and_pairs(
+                    model=model,
+                    graph=graph,
+                    nodes=nodes,
+                    assigned_positive_edges=subgraph_assigned_positive_edges,
+                    cache_dir=cache_dir,
+                    embedding_index=embedding_index,
+                    input_dim=input_dim,
+                    max_sequence_length=max_sequence_length,
+                    pair_batch_size=pair_batch_size,
+                    device=device,
+                    embedding_repository=embedding_repository,
+                    negative_lookup=negative_lookup,
+                    negative_ratio=negative_ratio,
+                    seed=(epoch_seed * 1000) + subgraph_index,
+                )
+                bce_loss = _masked_bce_loss(
+                    logits=logits,
+                    bce_labels=bce_labels,
+                    bce_mask=bce_mask,
+                    config=config,
+                )
+                pred_adjacency, target_adjacency = _subgraph_adjacencies(
+                    num_nodes=len(nodes),
+                    logits=logits,
+                    labels=labels,
+                    pair_index_a=pair_index_a,
+                    pair_index_b=pair_index_b,
+                )
+                topology_losses = compute_topology_losses(
+                    weights=loss_weights,
+                    pred_adjacency=pred_adjacency,
+                    target_adjacency=target_adjacency,
+                    num_nodes=len(nodes),
+                    pair_index_a=pair_index_a,
+                    pair_index_b=pair_index_b,
+                    pred_pair_probabilities=torch.sigmoid(logits),
+                    target_pair_probabilities=labels,
+                )
+                total_loss = bce_loss + topology_losses["total_topology"]
 
-        current_window_start = (subgraph_index // gradient_accumulation_steps) * (
-            gradient_accumulation_steps
-        )
-        current_window_size = min(
-            gradient_accumulation_steps,
-            len(local_subgraphs) - current_window_start,
-        )
-        accelerator.backward(total_loss / float(current_window_size))
-        is_accumulation_boundary = (subgraph_index + 1) % gradient_accumulation_steps == 0
-        is_last_subgraph = subgraph_index + 1 == len(local_subgraphs)
-        if is_accumulation_boundary or is_last_subgraph:
-            optimizer.step()
-            if not is_last_subgraph:
-                optimizer.zero_grad(set_to_none=True)
-        train_forward_backward_seconds += time.perf_counter() - step_start
-        _update_train_aggregates(
-            aggregates=aggregates,
-            bce_loss=bce_loss,
-            topology_losses=topology_losses,
-            total_loss=total_loss,
-        )
-        log_epoch_progress(
-            logger,
-            epoch=epoch_index + 1,
-            step=subgraph_index + 1,
-            total_steps=total_subgraphs,
-            loss=aggregates["total"] / float(subgraph_index + 1),
-        )
+            current_window_start = (subgraph_index // gradient_accumulation_steps) * (
+                gradient_accumulation_steps
+            )
+            current_window_size = min(
+                gradient_accumulation_steps,
+                len(local_subgraphs) - current_window_start,
+            )
+            accelerator.backward(total_loss / float(current_window_size))
+            is_accumulation_boundary = (subgraph_index + 1) % gradient_accumulation_steps == 0
+            is_last_subgraph = subgraph_index + 1 == len(local_subgraphs)
+            if is_accumulation_boundary or is_last_subgraph:
+                optimizer.step()
+                if not is_last_subgraph:
+                    optimizer.zero_grad(set_to_none=True)
+            train_forward_backward_seconds += time.perf_counter() - step_start
+            _update_train_aggregates(
+                aggregates=aggregates,
+                bce_loss=bce_loss,
+                topology_losses=topology_losses,
+                total_loss=total_loss,
+            )
+            log_epoch_progress(
+                logger,
+                epoch=epoch_index + 1,
+                step=subgraph_index + 1,
+                total_steps=total_subgraphs,
+                loss=aggregates["total"] / float(subgraph_index + 1),
+            )
+    else:
+        for window_start in range(0, len(local_subgraphs), gradient_accumulation_steps):
+            window_end = min(window_start + gradient_accumulation_steps, len(local_subgraphs))
+            current_window_size = window_end - window_start
+            for group_start in range(window_start, window_end, subgraphs_per_forward):
+                step_start = time.perf_counter()
+                group_end = min(group_start + subgraphs_per_forward, window_end)
+                with accelerator.autocast():
+                    forward_results = _forward_subgraph_group(
+                        model=model,
+                        graph=graph,
+                        subgraphs=local_subgraphs[group_start:group_end],
+                        assigned_positive_edges=local_assigned_positive_edges[
+                            group_start:group_end
+                        ],
+                        cache_dir=cache_dir,
+                        embedding_index=embedding_index,
+                        input_dim=input_dim,
+                        max_sequence_length=max_sequence_length,
+                        pair_batch_size=pair_batch_size,
+                        device=device,
+                        embedding_repository=embedding_repository,
+                        negative_lookup=negative_lookup,
+                        negative_ratio=negative_ratio,
+                        epoch_seed=epoch_seed,
+                        subgraph_index_offset=group_start,
+                    )
+                    group_loss = torch.zeros((), dtype=torch.float32, device=device)
+                    group_updates: list[
+                        tuple[torch.Tensor, Mapping[str, torch.Tensor], torch.Tensor]
+                    ] = []
+                    for result in forward_results:
+                        bce_loss = _masked_bce_loss(
+                            logits=result.logits,
+                            bce_labels=result.bce_labels,
+                            bce_mask=result.bce_mask,
+                            config=config,
+                        )
+                        pred_adjacency, target_adjacency = _subgraph_adjacencies(
+                            num_nodes=len(result.nodes),
+                            logits=result.logits,
+                            labels=result.labels,
+                            pair_index_a=result.pair_index_a,
+                            pair_index_b=result.pair_index_b,
+                        )
+                        topology_losses = compute_topology_losses(
+                            weights=loss_weights,
+                            pred_adjacency=pred_adjacency,
+                            target_adjacency=target_adjacency,
+                            num_nodes=len(result.nodes),
+                            pair_index_a=result.pair_index_a,
+                            pair_index_b=result.pair_index_b,
+                            pred_pair_probabilities=torch.sigmoid(result.logits),
+                            target_pair_probabilities=result.labels,
+                        )
+                        total_loss = bce_loss + topology_losses["total_topology"]
+                        group_loss = group_loss + total_loss
+                        group_updates.append((bce_loss, topology_losses, total_loss))
+
+                accelerator.backward(group_loss / float(current_window_size))
+                is_last_window = window_end == len(local_subgraphs)
+                is_last_group_in_window = group_end == window_end
+                if is_last_group_in_window:
+                    optimizer.step()
+                    if not is_last_window:
+                        optimizer.zero_grad(set_to_none=True)
+                train_forward_backward_seconds += time.perf_counter() - step_start
+                for relative_index, (bce_loss, topology_losses, total_loss) in enumerate(
+                    group_updates
+                ):
+                    subgraph_index = group_start + relative_index
+                    _update_train_aggregates(
+                        aggregates=aggregates,
+                        bce_loss=bce_loss,
+                        topology_losses=topology_losses,
+                        total_loss=total_loss,
+                    )
+                    log_epoch_progress(
+                        logger,
+                        epoch=epoch_index + 1,
+                        step=subgraph_index + 1,
+                        total_steps=total_subgraphs,
+                        loss=aggregates["total"] / float(subgraph_index + 1),
+                    )
 
     aggregates["edge_cover_sampling_s"] = edge_cover_sampling_seconds
     aggregates["train_forward_backward_s"] = train_forward_backward_seconds

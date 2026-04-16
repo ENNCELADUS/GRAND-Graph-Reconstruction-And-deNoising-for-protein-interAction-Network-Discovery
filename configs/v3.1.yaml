@@ -94,6 +94,7 @@ topology_finetune:
   bce_negative_ratio: 5
   subgraph_node_range: [30, 60]
   gradient_accumulation_steps: 8
+  subgraphs_per_forward: 4
   strategy: "mixed"
   pair_batch_size: 16
   decision_threshold: 0.5
