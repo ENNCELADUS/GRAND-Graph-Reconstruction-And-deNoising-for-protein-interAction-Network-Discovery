@@ -33,7 +33,7 @@ data_config:
     pin_memory: true
     drop_last: true
     sampling:
-      strategy: "ohem"
+      strategy: "none"
       warmup_epochs: 5
       pool_multiplier: 4
       cap_protein: 4
@@ -87,23 +87,30 @@ training_config:
     enabled: false
 
 topology_finetune:
-  init_mode: "warm_start"
-  epochs: 15
-  subgraphs_per_epoch: 198
+  init_mode: "scratch"
+  epochs: 30
+  supervision_train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi_ratio5_exclusive.txt"
+  supervision_valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi_ratio5_exclusive.txt"
+  bce_negative_ratio: 5
   subgraph_node_range: [30, 30]
+  gradient_accumulation_steps: 8
+  subgraphs_per_forward: 2
   strategy: "mixed"
-  pair_batch_size: 16
-  decision_threshold: 0.5
+  pair_batch_size: 64
+  decision_threshold:
+    mode: "best_f1_on_valid"
   monitor_metric: "internal_val_graph_sim"
-  early_stopping_patience: 3
+  early_stopping_patience: 5
   optimizer:
     lr: 3.0e-6
     weight_decay: 3.0e-3
   losses:
-    alpha: 0.25
-    beta: 0.20
-    gamma: 0.10
-    delta: 0.10
+    # Scratch regime: keep topology as a weak structural prior until BCE learns
+    # a usable pairwise scorer. Relative-density was dominating the old setup.
+    alpha: 0.08
+    beta: 0.03
+    gamma: 0.02
+    delta: 0.02
     histogram_sigma: 1.5
     degree_bins: 32
     clustering_bins: 48

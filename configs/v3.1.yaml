@@ -33,7 +33,7 @@ data_config:
     pin_memory: true
     drop_last: true
     sampling:
-      strategy: "ohem"
+      strategy: "none"
       warmup_epochs: 5
       pool_multiplier: 4
       cap_protein: 4
@@ -94,9 +94,9 @@ topology_finetune:
   bce_negative_ratio: 5
   subgraph_node_range: [30, 60]
   gradient_accumulation_steps: 8
-  subgraphs_per_forward: 4
+  subgraphs_per_forward: 2
   strategy: "mixed"
-  pair_batch_size: 16
+  pair_batch_size: 32
   decision_threshold: 0.5
   monitor_metric: "internal_val_graph_sim"
   early_stopping_patience: 5

@@ -1045,7 +1045,7 @@ def test_run_topology_finetuning_stage_shards_subgraphs_across_ranks_under_ddp(
     ]
 
 
-def test_run_topology_finetuning_stage_runs_validation_only_on_main_rank_under_ddp(
+def test_run_topology_finetuning_stage_runs_validation_on_all_ranks_under_ddp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1134,8 +1134,8 @@ def test_run_topology_finetuning_stage_runs_validation_only_on_main_rank_under_d
     finally:
         os.chdir(previous_cwd)
 
-    assert observed_pair_validation_ranks == [0]
-    assert observed_internal_validation_ranks == [0]
+    assert observed_pair_validation_ranks == [0, 1]
+    assert observed_internal_validation_ranks == [0, 1]
 
 
 def test_fit_epoch_accumulates_gradients_before_optimizer_step(

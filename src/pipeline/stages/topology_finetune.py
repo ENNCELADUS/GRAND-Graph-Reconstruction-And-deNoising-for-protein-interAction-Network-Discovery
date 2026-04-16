@@ -1730,16 +1730,15 @@ def run_topology_finetuning_stage(
             global_subgraph_count=int(train_stats["planned_subgraphs"]),
         )
 
-        validation_result = (
-            _evaluate_validation_epoch(
-                config=config,
-                model=stage_model,
-                dataloaders=dataloaders,
-                device=device,
-                context=context,
-            )
-            if (not runtime.is_distributed or runtime.is_main_process)
-            else _empty_validation_epoch_result()
+        # Every rank must execute the validation path before the next collective.
+        # Restricting validation to rank 0 lets other ranks reach `_sync_flag()`
+        # early and deadlock inside NCCL while rank 0 is still evaluating.
+        validation_result = _evaluate_validation_epoch(
+            config=config,
+            model=stage_model,
+            dataloaders=dataloaders,
+            device=device,
+            context=context,
         )
         peak_gpu_mem_mb = (
             float(torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0))
