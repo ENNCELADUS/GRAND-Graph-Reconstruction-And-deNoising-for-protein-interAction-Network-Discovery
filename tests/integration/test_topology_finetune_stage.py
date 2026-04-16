@@ -705,7 +705,8 @@ def test_run_topology_finetuning_stage_uses_edge_cover_sampling_by_default(
 
     assert len(observed_training_calls) == 1
     assert observed_training_calls[0]["num_subgraphs"] == 0
-    assert observed_training_calls[0]["overlap_penalty"] == pytest.approx(0.5)
+    assert "overlap_penalty" not in observed_training_calls[0]
+    assert "edge_chunk_size" in observed_training_calls[0]
 
 
 def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path: Path) -> None:

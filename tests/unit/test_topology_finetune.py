@@ -135,6 +135,36 @@ def test_sample_edge_cover_subgraphs_uses_bounded_shuffle_chunk_plan() -> None:
     assert all(len(set(node_ids)) == len(node_ids) for node_ids in plan.subgraphs)
 
 
+def test_sample_edge_cover_subgraphs_assigns_each_positive_edge_exactly_once() -> None:
+    graph = nx.Graph()
+    graph.add_edges_from(
+        [
+            ("P1", "P2"),
+            ("P2", "P3"),
+            ("P1", "P3"),
+            ("P3", "P4"),
+        ]
+    )
+
+    plan = sample_edge_cover_subgraphs(
+        graph=graph,
+        num_subgraphs=0,
+        min_nodes=3,
+        max_nodes=3,
+        strategy="BFS",
+        seed=13,
+        edge_chunk_size=1,
+    )
+
+    assigned_edges = [
+        edge
+        for assigned_chunk in plan.assigned_positive_edges
+        for edge in assigned_chunk
+    ]
+    assert sorted(assigned_edges) == sorted(tuple(sorted(edge)) for edge in graph.edges())
+    assert len(assigned_edges) == len(set(assigned_edges))
+
+
 def test_sample_edge_cover_subgraphs_respects_minimum_floor_after_full_coverage() -> None:
     graph = nx.path_graph(["P1", "P2", "P3", "P4"])
 
@@ -327,6 +357,31 @@ def test_iter_subgraph_pair_chunks_materializes_all_labels(tmp_path: Path) -> No
     assert torch.cat([chunk.label for chunk in chunks], dim=0).tolist() == [1.0, 0.0, 1.0]
     assert chunks[0].emb_a.shape == torch.Size([2, 2, 4])
     assert chunks[0].emb_b.shape == torch.Size([2, 2, 4])
+
+
+def test_iter_subgraph_pair_chunks_uses_assigned_positive_edges_not_full_induced_graph(
+    tmp_path: Path,
+) -> None:
+    graph = nx.Graph()
+    graph.add_edges_from([("P1", "P2"), ("P1", "P3"), ("P2", "P3")])
+    embedding_index = _write_embedding_cache(tmp_path / "cache")
+
+    chunks = list(
+        iter_subgraph_pair_chunks(
+            graph=graph,
+            nodes=("P1", "P2", "P3"),
+            assigned_positive_edges=frozenset({("P1", "P2")}),
+            cache_dir=tmp_path / "cache",
+            embedding_index=embedding_index,
+            input_dim=4,
+            max_sequence_length=8,
+            pair_batch_size=8,
+        )
+    )
+
+    assert torch.cat([chunk.label for chunk in chunks], dim=0).tolist() == [1.0, 0.0, 0.0]
+    assert torch.cat([chunk.bce_label for chunk in chunks], dim=0).tolist() == [1.0, 0.0, 0.0]
+    assert torch.cat([chunk.bce_mask for chunk in chunks], dim=0).tolist() == [1.0, 0.0, 0.0]
 
 
 def test_embedding_repository_matches_cached_loader_and_evicts_by_byte_budget(
