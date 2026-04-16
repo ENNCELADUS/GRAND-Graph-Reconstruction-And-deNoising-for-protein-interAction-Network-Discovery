@@ -1016,6 +1016,99 @@ def test_run_topology_finetuning_stage_shards_subgraphs_across_ranks_under_ddp(
     ]
 
 
+def test_run_topology_finetuning_stage_runs_validation_only_on_main_rank_under_ddp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["init_mode"] = "scratch"
+    topology_cfg["epochs"] = 1
+
+    dataloaders = build_dataloaders(config=config)
+    observed_pair_validation_ranks: list[int] = []
+    observed_internal_validation_ranks: list[int] = []
+    active_rank = 0
+
+    def _fake_fit_epoch(**_: object) -> dict[str, float]:
+        return {
+            "bce": 0.0,
+            "graph_similarity": 0.0,
+            "relative_density": 0.0,
+            "degree_mmd": 0.0,
+            "clustering_mmd": 0.0,
+            "total": 0.0,
+            "planned_subgraphs": 1.0,
+            "covered_positive_edges": 1.0,
+            "total_positive_edges": 1.0,
+            "positive_edge_coverage_ratio": 1.0,
+            "mean_positive_edge_reuse": 1.0,
+            "edge_cover_sampling_s": 0.0,
+            "train_forward_backward_s": 0.0,
+        }
+
+    def _record_collect(
+        self: Evaluator,
+        *,
+        model: torch.nn.Module,
+        data_loader: DataLoader[Mapping[str, object]],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        del self, model, data_loader, device
+        observed_pair_validation_ranks.append(active_rank)
+        return (
+            torch.tensor([0, 1], dtype=torch.long),
+            torch.tensor([0.1, 0.9], dtype=torch.float32),
+            0.0,
+        )
+
+    def _record_internal_validation(**_: object) -> dict[str, float]:
+        observed_internal_validation_ranks.append(active_rank)
+        return {
+            "graph_sim": 0.0,
+            "relative_density": 0.0,
+            "deg_dist_mmd": 0.0,
+            "cc_mmd": 0.0,
+        }
+
+    monkeypatch.setattr(topology_finetune_stage, "_fit_epoch", _fake_fit_epoch)
+    monkeypatch.setattr(Evaluator, "collect_probabilities_and_labels", _record_collect)
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_evaluate_internal_validation_subgraphs",
+        _record_internal_validation,
+    )
+    monkeypatch.setattr(topology_finetune_stage.dist, "broadcast", lambda tensor, src: None)
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        for active_rank in (0, 1):
+            runtime = build_stage_runtime(
+                config,
+                stage_run_ids={"topology_finetune": f"topology_ft_rank_{active_rank}"},
+                distributed=DistributedContext(
+                    ddp_enabled=True,
+                    is_distributed=True,
+                    rank=active_rank,
+                    local_rank=active_rank,
+                    world_size=2,
+                ),
+            )
+            run_topology_finetuning_stage(
+                runtime,
+                build_model(config),
+                cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+                checkpoint_path=None,
+            )
+    finally:
+        os.chdir(previous_cwd)
+
+    assert observed_pair_validation_ranks == [0]
+    assert observed_internal_validation_ranks == [0]
+
+
 def test_run_topology_finetuning_stage_uses_accelerator_runtime(
     tmp_path: Path,
 ) -> None:
