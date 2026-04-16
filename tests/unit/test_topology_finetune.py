@@ -113,6 +113,28 @@ def test_sample_edge_cover_subgraphs_covers_all_positive_edges() -> None:
     assert all(len(set(node_ids)) == len(node_ids) for node_ids in plan.subgraphs)
 
 
+def test_sample_edge_cover_subgraphs_uses_bounded_shuffle_chunk_plan() -> None:
+    graph = nx.path_graph(["P1", "P2", "P3", "P4", "P5", "P6", "P7"])
+
+    plan = sample_edge_cover_subgraphs(
+        graph=graph,
+        num_subgraphs=0,
+        min_nodes=4,
+        max_nodes=4,
+        strategy="BFS",
+        seed=13,
+        edge_chunk_size=2,
+    )
+
+    assert isinstance(plan, EdgeCoverEpochPlan)
+    assert plan.total_positive_edges == 6
+    assert plan.covered_positive_edges == 6
+    assert plan.positive_edge_coverage_ratio == pytest.approx(1.0)
+    assert len(plan.subgraphs) == 3
+    assert all(2 <= len(node_ids) <= 4 for node_ids in plan.subgraphs)
+    assert all(len(set(node_ids)) == len(node_ids) for node_ids in plan.subgraphs)
+
+
 def test_sample_edge_cover_subgraphs_respects_minimum_floor_after_full_coverage() -> None:
     graph = nx.path_graph(["P1", "P2", "P3", "P4"])
 

@@ -911,6 +911,111 @@ def test_run_topology_finetuning_stage_uses_shared_epoch_sampling_seed_under_ddp
     assert observed_rank_seeds == [(0, 11), (1, 11)]
 
 
+def test_run_topology_finetuning_stage_shards_subgraphs_across_ranks_under_ddp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["init_mode"] = "scratch"
+    topology_cfg["epochs"] = 1
+
+    dataloaders = build_dataloaders(config=config)
+    observed_rank_nodes: list[tuple[int, tuple[str, ...]]] = []
+    active_rank = 0
+
+    def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
+        return EdgeCoverEpochPlan(
+            subgraphs=(
+                ("P1", "P2", "P3"),
+                ("P2", "P3", "P4"),
+                ("P3", "P4", "P5"),
+                ("P4", "P5", "P6"),
+            ),
+            total_positive_edges=4,
+            covered_positive_edges=4,
+            positive_edge_coverage_ratio=1.0,
+            mean_positive_edge_reuse=1.0,
+        )
+
+    def _fake_concat_logits_and_pairs(**kwargs: object) -> tuple[torch.Tensor, ...]:
+        nodes = tuple(cast(tuple[str, ...], kwargs["nodes"]))
+        observed_rank_nodes.append((active_rank, nodes))
+        pair_index_b = 1 if len(nodes) > 1 else 0
+        return (
+            torch.zeros(1, dtype=torch.float32, requires_grad=True),
+            torch.zeros(1, dtype=torch.float32),
+            torch.zeros(1, dtype=torch.float32),
+            torch.ones(1, dtype=torch.float32),
+            torch.tensor([0], dtype=torch.long),
+            torch.tensor([pair_index_b], dtype=torch.long),
+        )
+
+    def _fake_evaluate_validation_epoch(**_: object) -> ValidationEpochResult:
+        return ValidationEpochResult(
+            decision_threshold=0.5,
+            val_pair_stats={"val_loss": 0.0, "val_auprc": 0.0},
+            internal_val_topology_stats={
+                "graph_sim": 0.0,
+                "relative_density": 0.0,
+                "deg_dist_mmd": 0.0,
+                "cc_mmd": 0.0,
+            },
+            val_pair_pass_seconds=0.0,
+            threshold_resolution_seconds=0.0,
+            internal_validation_seconds=0.0,
+        )
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "sample_edge_cover_subgraphs",
+        _fake_sample_edge_cover_subgraphs,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_concat_logits_and_pairs",
+        _fake_concat_logits_and_pairs,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_evaluate_validation_epoch",
+        _fake_evaluate_validation_epoch,
+    )
+    monkeypatch.setattr(topology_finetune_stage.dist, "broadcast", lambda tensor, src: None)
+
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(tmp_path)
+        for active_rank in (0, 1):
+            runtime = build_stage_runtime(
+                config,
+                stage_run_ids={"topology_finetune": f"topology_ft_rank_{active_rank}"},
+                distributed=DistributedContext(
+                    ddp_enabled=True,
+                    is_distributed=True,
+                    rank=active_rank,
+                    local_rank=active_rank,
+                    world_size=2,
+                ),
+            )
+            run_topology_finetuning_stage(
+                runtime,
+                build_model(config),
+                cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+                checkpoint_path=None,
+            )
+    finally:
+        os.chdir(previous_cwd)
+
+    assert observed_rank_nodes == [
+        (0, ("P1", "P2", "P3")),
+        (0, ("P3", "P4", "P5")),
+        (1, ("P2", "P3", "P4")),
+        (1, ("P4", "P5", "P6")),
+    ]
+
+
 def test_run_topology_finetuning_stage_uses_accelerator_runtime(
     tmp_path: Path,
 ) -> None:
