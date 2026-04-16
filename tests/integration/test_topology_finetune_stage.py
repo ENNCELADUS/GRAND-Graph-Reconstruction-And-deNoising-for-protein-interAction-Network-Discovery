@@ -43,6 +43,7 @@ from src.topology.negative_sampling import prepare_topology_supervision_from_con
 from src.utils.config import ConfigDict, load_config
 from src.utils.data_io import build_dataloaders
 from tests.runtime_helpers import build_stage_runtime
+from tests.runtime_helpers import NoOpAccelerator
 from torch.utils.data import DataLoader
 
 
@@ -290,6 +291,19 @@ class _RecordingAccelerator:
     def save(self, obj: object, f: object, safe_serialization: bool = False) -> None:
         del safe_serialization
         torch.save(obj, f)
+
+
+class _CountingOptimizer:
+    def __init__(self) -> None:
+        self.step_calls = 0
+        self.zero_grad_calls = 0
+
+    def zero_grad(self, set_to_none: bool = False) -> None:
+        del set_to_none
+        self.zero_grad_calls += 1
+
+    def step(self) -> None:
+        self.step_calls += 1
 
 
 def test_load_supervision_graphs_excludes_val_edges_and_keeps_all_train_nodes(
@@ -1115,6 +1129,85 @@ def test_run_topology_finetuning_stage_runs_validation_only_on_main_rank_under_d
 
     assert observed_pair_validation_ranks == [0]
     assert observed_internal_validation_ranks == [0]
+
+
+def test_fit_epoch_accumulates_gradients_before_optimizer_step(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["gradient_accumulation_steps"] = 2
+
+    graph = nx.path_graph(["P1", "P2", "P3", "P4"])
+    optimizer = _CountingOptimizer()
+    accelerator = NoOpAccelerator()
+
+    def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
+        return EdgeCoverEpochPlan(
+            subgraphs=(("P1", "P2"), ("P2", "P3"), ("P3", "P4")),
+            assigned_positive_edges=(
+                frozenset({("P1", "P2")}),
+                frozenset({("P2", "P3")}),
+                frozenset({("P3", "P4")}),
+            ),
+            total_positive_edges=3,
+            covered_positive_edges=3,
+            positive_edge_coverage_ratio=1.0,
+            mean_positive_edge_reuse=1.0,
+        )
+
+    def _fake_concat_logits_and_pairs(**_: object) -> tuple[torch.Tensor, ...]:
+        return (
+            torch.zeros(1, dtype=torch.float32, requires_grad=True),
+            torch.ones(1, dtype=torch.float32),
+            torch.ones(1, dtype=torch.float32),
+            torch.ones(1, dtype=torch.float32),
+            torch.tensor([0], dtype=torch.long),
+            torch.tensor([1], dtype=torch.long),
+        )
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "sample_edge_cover_subgraphs",
+        _fake_sample_edge_cover_subgraphs,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_concat_logits_and_pairs",
+        _fake_concat_logits_and_pairs,
+    )
+
+    topology_finetune_stage._fit_epoch(
+        config=config,
+        model=torch.nn.Linear(1, 1),
+        device=torch.device("cpu"),
+        graph=graph,
+        cache_dir=tmp_path,
+        embedding_index={},
+        optimizer=cast(torch.optim.Optimizer, optimizer),
+        epoch_index=0,
+        epoch_seed=11,
+        input_dim=4,
+        max_sequence_length=8,
+        loss_weights=topology_finetune_stage.TopologyLossWeights(
+            alpha=0.0,
+            beta=0.0,
+            gamma=0.0,
+            delta=0.0,
+        ),
+        pair_batch_size=2,
+        use_amp=False,
+        accelerator=accelerator,
+        embedding_repository=cast(EmbeddingRepository, object()),
+        negative_lookup=None,
+        distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+    )
+
+    assert accelerator.backward_calls == 3
+    assert optimizer.step_calls == 2
+    assert optimizer.zero_grad_calls == 2
 
 
 def test_run_topology_finetuning_stage_uses_accelerator_runtime(
