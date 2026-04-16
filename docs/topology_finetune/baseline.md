@@ -222,6 +222,6 @@ topology_finetune:
 | [x] | P0 | Edge-cover sampling runs indefinitely | Replace with shuffle-and-chunk: O(|E|) instead of O(|E| * |V| * k) |
 | [x] | P1 | Edges duplicated across subgraphs | Partition edges into disjoint chunks before building subgraphs |
 | [x] | P1 | No gradient accumulation | Accumulate over N subgraphs before optimizer.step() |
-| [ ] | P2 | Fixed 20-node subgraphs | Variable size [30, 60] to adapt to local density |
-| [ ] | P2 | Sequential subgraph processing | Batch multiple subgraphs in one forward pass |
-| [ ] | P2 | Per-subgraph negative sampling | Pre-assign negatives to subgraphs at epoch plan time |
+| [x] | P2 | Fixed 20-node subgraphs | Variable size [30, 60] to adapt to local density |
+| [x] | P2 | Sequential subgraph processing | Batch multiple subgraphs in one forward pass |
+| [x] | P2 | Per-subgraph negative sampling | Pre-assign negatives to subgraphs at epoch plan time |
