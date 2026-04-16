@@ -140,6 +140,23 @@ class ValidationEpochResult:
     internal_validation_seconds: float
 
 
+def _empty_validation_epoch_result() -> ValidationEpochResult:
+    """Return a zeroed validation payload for non-main distributed ranks."""
+    return ValidationEpochResult(
+        decision_threshold=0.5,
+        val_pair_stats={"val_loss": 0.0, "val_auprc": 0.0},
+        internal_val_topology_stats={
+            "graph_sim": 0.0,
+            "relative_density": 0.0,
+            "deg_dist_mmd": 0.0,
+            "cc_mmd": 0.0,
+        },
+        val_pair_pass_seconds=0.0,
+        threshold_resolution_seconds=0.0,
+        internal_validation_seconds=0.0,
+    )
+
+
 def _topology_finetune_config(config: ConfigDict) -> ConfigDict:
     """Return ``topology_finetune`` config with schema validation."""
     finetune_cfg = config.get("topology_finetune", {})
@@ -1400,12 +1417,16 @@ def run_topology_finetuning_stage(
             global_subgraph_count=int(train_stats["planned_subgraphs"]),
         )
 
-        validation_result = _evaluate_validation_epoch(
-            config=config,
-            model=stage_model,
-            dataloaders=dataloaders,
-            device=device,
-            context=context,
+        validation_result = (
+            _evaluate_validation_epoch(
+                config=config,
+                model=stage_model,
+                dataloaders=dataloaders,
+                device=device,
+                context=context,
+            )
+            if (not runtime.is_distributed or runtime.is_main_process)
+            else _empty_validation_epoch_result()
         )
         peak_gpu_mem_mb = (
             float(torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0))
