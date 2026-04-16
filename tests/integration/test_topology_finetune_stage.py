@@ -335,16 +335,25 @@ def test_load_supervision_graphs_excludes_val_edges_and_keeps_all_train_nodes(
     }
 
 
-def test_resolve_sampling_node_bounds_caps_subgraphs_to_20_nodes() -> None:
+def test_resolve_sampling_node_bounds_uses_subgraph_node_range() -> None:
     min_nodes, max_nodes = _resolve_sampling_node_bounds(
         {
-            "min_nodes": 30,
-            "max_nodes": 50,
+            "subgraph_node_range": [30, 60],
         }
     )
 
     assert min_nodes == 30
-    assert max_nodes == 50
+    assert max_nodes == 60
+
+
+def test_resolve_sampling_node_bounds_rejects_legacy_min_max_config() -> None:
+    with pytest.raises(ValueError, match="subgraph_node_range"):
+        _resolve_sampling_node_bounds(
+            {
+                "min_nodes": 30,
+                "max_nodes": 60,
+            }
+        )
 
 
 def test_build_internal_validation_node_sets_matches_topology_eval_bucketing() -> None:
