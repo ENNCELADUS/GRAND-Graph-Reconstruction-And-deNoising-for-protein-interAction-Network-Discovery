@@ -572,6 +572,62 @@ def summarize_edge_cover_epoch(
     )
 
 
+def _default_edge_chunk_size(max_nodes: int) -> int:
+    """Return the default positive-edge chunk size for one subgraph core."""
+    if max_nodes <= 1:
+        raise ValueError("max_nodes must be greater than 1")
+    return max(1, (max_nodes * (max_nodes - 1)) // 4)
+
+
+def _partition_edges(
+    *,
+    positive_edges: Sequence[tuple[str, str]],
+    chunk_size: int,
+) -> tuple[tuple[tuple[str, str], ...], ...]:
+    """Partition shuffled positive edges into fixed-size chunks."""
+    if chunk_size <= 0:
+        raise ValueError("edge_chunk_size must be positive")
+    return tuple(
+        tuple(positive_edges[start : start + chunk_size])
+        for start in range(0, len(positive_edges), chunk_size)
+    )
+
+
+def _chunk_core_nodes(edge_chunk: Sequence[tuple[str, str]]) -> tuple[str, ...]:
+    """Return chunk core nodes in first-seen edge order."""
+    ordered_nodes: list[str] = []
+    seen: set[str] = set()
+    for node_a, node_b in edge_chunk:
+        if node_a not in seen:
+            ordered_nodes.append(node_a)
+            seen.add(node_a)
+        if node_b not in seen:
+            ordered_nodes.append(node_b)
+            seen.add(node_b)
+    return tuple(ordered_nodes)
+
+
+def _expand_chunk_nodes(
+    *,
+    graph: nx.Graph,
+    edge_chunk: Sequence[tuple[str, str]],
+    target_size: int,
+    strategy: str,
+    rng: random.Random,
+) -> tuple[str, ...]:
+    """Expand one positive-edge chunk into a node-induced training subgraph."""
+    core_nodes = _chunk_core_nodes(edge_chunk)
+    if len(core_nodes) >= target_size:
+        return core_nodes
+    if strategy == "BFS":
+        order = _build_bfs_order(graph=graph, seed_nodes=core_nodes, rng=rng)
+    elif strategy == "DFS":
+        order = _build_dfs_order(graph=graph, seed_nodes=core_nodes, rng=rng)
+    else:
+        order = _build_random_walk_order(graph=graph, seed_nodes=core_nodes, rng=rng)
+    return tuple(order[:target_size])
+
+
 def _select_seed_edge(
     *,
     positive_edges: Sequence[tuple[str, str]],
@@ -749,6 +805,7 @@ def sample_edge_cover_subgraphs(
     strategy: str,
     seed: int,
     overlap_penalty: float = 0.5,
+    edge_chunk_size: int | None = None,
 ) -> EdgeCoverEpochPlan:
     """Plan one epoch of training subgraphs with positive-edge coverage guarantees."""
     if num_subgraphs < 0:
@@ -771,65 +828,32 @@ def sample_edge_cover_subgraphs(
         return summarize_edge_cover_epoch(graph=graph, subgraphs=fallback_subgraphs)
 
     rng = random.Random(seed)
-    uncovered_edges = set(positive_edges)
-    edge_cover_counts = dict.fromkeys(positive_edges, 0)
-    graph_nodes = list(graph.nodes)
-    sampled_subgraphs: list[tuple[str, ...]] = []
-
-    while len(sampled_subgraphs) < num_subgraphs or uncovered_edges:
-        target_size = _sample_target_size(
+    shuffled_edges = list(positive_edges)
+    rng.shuffle(shuffled_edges)
+    resolved_edge_chunk_size = (
+        _default_edge_chunk_size(max_nodes)
+        if edge_chunk_size is None
+        else int(edge_chunk_size)
+    )
+    edge_chunks = _partition_edges(
+        positive_edges=shuffled_edges,
+        chunk_size=resolved_edge_chunk_size,
+    )
+    sampled_subgraphs = [
+        _expand_chunk_nodes(
             graph=graph,
-            min_nodes=min_nodes,
-            max_nodes=max_nodes,
-            rng=rng,
-        )
-        selected_strategy = _choose_sampling_strategy(strategy=normalized_strategy, rng=rng)
-
-        seed_edge = _select_seed_edge(
-            positive_edges=positive_edges,
-            uncovered_edges=uncovered_edges,
-            edge_cover_counts=edge_cover_counts,
-            rng=rng,
-        )
-        selected_nodes = [seed_edge[0], seed_edge[1]]
-        selected_set = set(selected_nodes)
-        traversal_rank = _traversal_rank(
-            graph=graph,
-            seed_nodes=selected_nodes,
-            strategy=selected_strategy,
-            rng=rng,
-        )
-
-        while len(selected_nodes) < target_size:
-            frontier = [
-                candidate
-                for candidate in graph_nodes
-                if candidate not in selected_set
-                and any(graph.has_edge(candidate, node) for node in selected_nodes)
-            ]
-            candidate_nodes = frontier or [
-                candidate for candidate in graph_nodes if candidate not in selected_set
-            ]
-            if not candidate_nodes:
-                break
-            next_node = _pick_next_node(
+            edge_chunk=edge_chunk,
+            target_size=_sample_target_size(
                 graph=graph,
-                selected_nodes=selected_nodes,
-                candidate_nodes=candidate_nodes,
-                uncovered_edges=uncovered_edges,
-                edge_cover_counts=edge_cover_counts,
-                traversal_rank=traversal_rank,
-                overlap_penalty=overlap_penalty,
+                min_nodes=min_nodes,
+                max_nodes=max_nodes,
                 rng=rng,
-            )
-            selected_nodes.append(next_node)
-            selected_set.add(next_node)
-
-        selected_tuple = tuple(selected_nodes)
-        sampled_subgraphs.append(selected_tuple)
-        for edge in _selected_positive_edges(graph=graph, nodes=selected_tuple):
-            edge_cover_counts[edge] += 1
-            uncovered_edges.discard(edge)
+            ),
+            strategy=_choose_sampling_strategy(strategy=normalized_strategy, rng=rng),
+            rng=rng,
+        )
+        for edge_chunk in edge_chunks
+    ]
 
     return summarize_edge_cover_epoch(graph=graph, subgraphs=sampled_subgraphs)
 

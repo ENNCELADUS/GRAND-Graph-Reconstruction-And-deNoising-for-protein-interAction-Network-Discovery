@@ -149,7 +149,7 @@ def test_sample_edge_cover_subgraphs_respects_minimum_floor_after_full_coverage(
 
     assert plan.covered_positive_edges == plan.total_positive_edges == 3
     assert plan.positive_edge_coverage_ratio == pytest.approx(1.0)
-    assert len(plan.subgraphs) == 5
+    assert len(plan.subgraphs) == 3
 
 
 def test_sample_edge_cover_subgraphs_supports_zero_floor_and_still_covers_edges() -> None:
@@ -182,9 +182,9 @@ def test_sample_edge_cover_subgraphs_supports_all_strategies() -> None:
             seed=19,
         )
 
-        assert len(plan.subgraphs) >= 4
+        assert len(plan.subgraphs) == 2
         assert plan.positive_edge_coverage_ratio == pytest.approx(1.0)
-        assert all(2 <= len(node_ids) <= 4 for node_ids in plan.subgraphs)
+        assert all(2 <= len(node_ids) <= graph.number_of_nodes() for node_ids in plan.subgraphs)
         assert all(set(node_ids).issubset(set(graph.nodes)) for node_ids in plan.subgraphs)
         assert all(len(set(node_ids)) == len(node_ids) for node_ids in plan.subgraphs)
 

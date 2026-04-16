@@ -357,6 +357,24 @@ def _resolve_bce_negative_ratio(finetune_cfg: ConfigDict) -> int:
     return negative_ratio
 
 
+def _resolve_edge_chunk_size(
+    *,
+    finetune_cfg: ConfigDict,
+    max_nodes: int,
+) -> int | None:
+    """Return the positive-edge chunk size for one topology epoch plan."""
+    raw_edge_chunk_size = finetune_cfg.get("edge_chunk_size")
+    if raw_edge_chunk_size is None:
+        return max(1, (max_nodes * (max_nodes - 1)) // 4)
+    edge_chunk_size = as_int(
+        raw_edge_chunk_size,
+        "topology_finetune.edge_chunk_size",
+    )
+    if edge_chunk_size <= 0:
+        raise ValueError("topology_finetune.edge_chunk_size must be > 0")
+    return edge_chunk_size
+
+
 def _build_internal_validation_node_sets(
     *,
     finetune_cfg: ConfigDict,
@@ -821,6 +839,56 @@ def _average_train_aggregates(
     }
 
 
+def _local_subgraphs_for_rank(
+    *,
+    subgraphs: Sequence[tuple[str, ...]],
+    distributed_context: DistributedContext,
+) -> tuple[tuple[str, ...], ...]:
+    """Return the rank-local slice of a shared topology epoch plan."""
+    if not distributed_context.is_distributed:
+        return tuple(subgraphs)
+    return tuple(subgraphs[distributed_context.rank :: distributed_context.world_size])
+
+
+def _reduce_train_stats(
+    *,
+    accelerator: AcceleratorLike,
+    device: torch.device,
+    train_stats: Mapping[str, float],
+    global_subgraph_count: int,
+) -> dict[str, float]:
+    """Reduce sharded train stats into one global epoch summary."""
+    reduced_loss_sums = reduce_scalar_mapping(
+        accelerator,
+        {key: train_stats[key] for key in TRAIN_LOSS_KEYS},
+        device=device,
+        reduction="sum",
+    )
+    denominator = float(max(1, global_subgraph_count))
+    reduced_train_stats = {key: value / denominator for key, value in reduced_loss_sums.items()}
+    reduced_train_stats.update(
+        {
+            "planned_subgraphs": float(global_subgraph_count),
+            "covered_positive_edges": float(train_stats["covered_positive_edges"]),
+            "total_positive_edges": float(train_stats["total_positive_edges"]),
+            "positive_edge_coverage_ratio": float(train_stats["positive_edge_coverage_ratio"]),
+            "mean_positive_edge_reuse": float(train_stats["mean_positive_edge_reuse"]),
+        }
+    )
+    reduced_train_stats.update(
+        reduce_scalar_mapping(
+            accelerator,
+            {
+                "edge_cover_sampling_s": train_stats["edge_cover_sampling_s"],
+                "train_forward_backward_s": train_stats["train_forward_backward_s"],
+            },
+            device=device,
+            reduction="mean",
+        )
+    )
+    return reduced_train_stats
+
+
 def _fit_epoch(
     *,
     config: ConfigDict,
@@ -840,6 +908,7 @@ def _fit_epoch(
     accelerator: AcceleratorLike,
     embedding_repository: EmbeddingRepository,
     negative_lookup: ExplicitNegativePairLookup | None,
+    distributed_context: DistributedContext,
     logger: logging.Logger | None = None,
 ) -> dict[str, float]:
     """Run one fine-tuning epoch over sampled train subgraphs."""
@@ -853,6 +922,10 @@ def _fit_epoch(
     strategy = as_str(finetune_cfg.get("strategy", "mixed"), "topology_finetune.strategy")
     overlap_penalty = _resolve_overlap_penalty(finetune_cfg)
     negative_ratio = _resolve_bce_negative_ratio(finetune_cfg)
+    edge_chunk_size = _resolve_edge_chunk_size(
+        finetune_cfg=finetune_cfg,
+        max_nodes=max_nodes,
+    )
     sampling_start = time.perf_counter()
     epoch_plan = sample_edge_cover_subgraphs(
         graph=graph,
@@ -862,15 +935,20 @@ def _fit_epoch(
         strategy=strategy,
         seed=epoch_seed,
         overlap_penalty=overlap_penalty,
+        edge_chunk_size=edge_chunk_size,
     )
     edge_cover_sampling_seconds = time.perf_counter() - sampling_start
     sampled_subgraphs = epoch_plan.subgraphs
+    local_subgraphs = _local_subgraphs_for_rank(
+        subgraphs=sampled_subgraphs,
+        distributed_context=distributed_context,
+    )
     aggregates = _initialize_train_aggregates(len(sampled_subgraphs), epoch_plan)
     train_forward_backward_seconds = 0.0
-    total_subgraphs = max(1, len(sampled_subgraphs))
+    total_subgraphs = max(1, len(local_subgraphs))
 
     model.train()
-    for subgraph_index, nodes in enumerate(sampled_subgraphs):
+    for subgraph_index, nodes in enumerate(local_subgraphs):
         step_start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         with accelerator.autocast():
@@ -938,13 +1016,9 @@ def _fit_epoch(
             loss=aggregates["total"] / float(subgraph_index + 1),
         )
 
-    averaged = _average_train_aggregates(
-        aggregates=aggregates,
-        num_subgraphs=len(sampled_subgraphs),
-    )
-    averaged["edge_cover_sampling_s"] = edge_cover_sampling_seconds
-    averaged["train_forward_backward_s"] = train_forward_backward_seconds
-    return averaged
+    aggregates["edge_cover_sampling_s"] = edge_cover_sampling_seconds
+    aggregates["train_forward_backward_s"] = train_forward_backward_seconds
+    return aggregates
 
 
 def _validate_embedding_cache(
@@ -1316,13 +1390,14 @@ def run_topology_finetuning_stage(
             accelerator=runtime.accelerator,
             embedding_repository=context.embedding_repository,
             negative_lookup=context.train_negative_lookup,
+            distributed_context=runtime.distributed,
             logger=logger,
         )
-        train_stats = reduce_scalar_mapping(
-            runtime.accelerator,
-            train_stats,
+        train_stats = _reduce_train_stats(
+            accelerator=runtime.accelerator,
             device=device,
-            reduction="mean",
+            train_stats=train_stats,
+            global_subgraph_count=int(train_stats["planned_subgraphs"]),
         )
 
         validation_result = _evaluate_validation_epoch(
