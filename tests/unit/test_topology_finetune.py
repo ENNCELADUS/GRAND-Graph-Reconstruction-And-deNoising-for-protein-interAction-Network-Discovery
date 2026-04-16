@@ -165,6 +165,43 @@ def test_sample_edge_cover_subgraphs_assigns_each_positive_edge_exactly_once() -
     assert len(assigned_edges) == len(set(assigned_edges))
 
 
+def test_sample_edge_cover_subgraphs_preassigns_each_negative_edge_at_most_once() -> None:
+    graph = nx.Graph()
+    graph.add_nodes_from(["P1", "P2", "P3", "P4"])
+    graph.add_edges_from([("P1", "P2"), ("P3", "P4")])
+    negative_lookup = ExplicitNegativePairLookup(
+        negative_pairs=frozenset(
+            {
+                ("P1", "P3"),
+                ("P1", "P4"),
+                ("P2", "P3"),
+                ("P2", "P4"),
+            }
+        ),
+        partners_by_node={},
+    )
+
+    plan = sample_edge_cover_subgraphs(
+        graph=graph,
+        num_subgraphs=0,
+        min_nodes=4,
+        max_nodes=4,
+        strategy="BFS",
+        seed=13,
+        edge_chunk_size=1,
+        negative_lookup=negative_lookup,
+        negative_ratio=2,
+    )
+
+    assigned_edges = [
+        edge
+        for assigned_chunk in plan.assigned_negative_edges
+        for edge in assigned_chunk
+    ]
+    assert sorted(assigned_edges) == sorted(negative_lookup.negative_pairs)
+    assert len(assigned_edges) == len(set(assigned_edges))
+
+
 def test_sample_edge_cover_subgraphs_respects_minimum_floor_after_full_coverage() -> None:
     graph = nx.path_graph(["P1", "P2", "P3", "P4"])
 
@@ -382,6 +419,43 @@ def test_iter_subgraph_pair_chunks_uses_assigned_positive_edges_not_full_induced
     assert torch.cat([chunk.label for chunk in chunks], dim=0).tolist() == [1.0, 0.0, 0.0]
     assert torch.cat([chunk.bce_label for chunk in chunks], dim=0).tolist() == [1.0, 0.0, 0.0]
     assert torch.cat([chunk.bce_mask for chunk in chunks], dim=0).tolist() == [1.0, 0.0, 0.0]
+
+
+def test_iter_subgraph_pair_chunks_uses_assigned_negative_edges_for_bce(
+    tmp_path: Path,
+) -> None:
+    graph = nx.Graph()
+    graph.add_edge("P1", "P2")
+    embedding_index = _write_embedding_cache(tmp_path / "cache")
+
+    chunks = list(
+        iter_subgraph_pair_chunks(
+            graph=graph,
+            nodes=("P1", "P2", "P3", "P4"),
+            assigned_positive_edges=frozenset({("P1", "P2")}),
+            assigned_negative_edges=frozenset({("P1", "P3")}),
+            cache_dir=tmp_path / "cache",
+            embedding_index=embedding_index,
+            input_dim=4,
+            max_sequence_length=8,
+            pair_batch_size=8,
+        )
+    )
+
+    pair_lookup = {
+        (int(index_a), int(index_b)): (float(bce_label), float(bce_mask))
+        for index_a, index_b, bce_label, bce_mask in zip(
+            torch.cat([chunk.pair_index_a for chunk in chunks], dim=0).tolist(),
+            torch.cat([chunk.pair_index_b for chunk in chunks], dim=0).tolist(),
+            torch.cat([chunk.bce_label for chunk in chunks], dim=0).tolist(),
+            torch.cat([chunk.bce_mask for chunk in chunks], dim=0).tolist(),
+            strict=True,
+        )
+    }
+
+    assert pair_lookup[(0, 1)] == pytest.approx((1.0, 1.0))
+    assert pair_lookup[(0, 2)] == pytest.approx((0.0, 1.0))
+    assert pair_lookup[(1, 2)] == pytest.approx((0.0, 0.0))
 
 
 def test_embedding_repository_matches_cached_loader_and_evicts_by_byte_budget(
