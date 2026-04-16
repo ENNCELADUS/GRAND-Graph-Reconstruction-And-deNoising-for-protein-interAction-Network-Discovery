@@ -228,15 +228,14 @@ def _build_finetune_config(tmp_path: Path) -> ConfigDict:
             "strategy": {"type": "none"},
             "domain_adaptation": {"enabled": False, "method": "none", "target_split": "test"},
         },
-        "topology_finetune": {
-            "epochs": 1,
-            "min_nodes": 3,
-            "max_nodes": 4,
-            "strategy": "mixed",
-            "overlap_penalty": 0.5,
-            "bce_negative_ratio": 0,
-            "pair_batch_size": 2,
-            "decision_threshold": 0.5,
+            "topology_finetune": {
+                "epochs": 1,
+                "min_nodes": 3,
+                "max_nodes": 4,
+                "strategy": "mixed",
+                "bce_negative_ratio": 0,
+                "pair_batch_size": 2,
+                "decision_threshold": 0.5,
             "optimizer": {"lr": 1e-3, "weight_decay": 0.0},
             "losses": {
                 "alpha": 0.5,
@@ -675,6 +674,7 @@ def test_run_topology_finetuning_stage_uses_edge_cover_sampling_by_default(
         observed_training_calls.append(dict(kwargs))
         return EdgeCoverEpochPlan(
             subgraphs=(("P1", "P2", "P3"),),
+            assigned_positive_edges=(frozenset({("P1", "P2"), ("P2", "P3")}),),
             total_positive_edges=2,
             covered_positive_edges=2,
             positive_edge_coverage_ratio=1.0,
@@ -852,6 +852,7 @@ def test_run_topology_finetuning_stage_uses_shared_epoch_sampling_seed_under_ddp
         observed_rank_seeds.append((active_rank, int(kwargs["seed"])))
         return EdgeCoverEpochPlan(
             subgraphs=(),
+            assigned_positive_edges=(),
             total_positive_edges=0,
             covered_positive_edges=0,
             positive_edge_coverage_ratio=1.0,
@@ -933,6 +934,12 @@ def test_run_topology_finetuning_stage_shards_subgraphs_across_ranks_under_ddp(
                 ("P2", "P3", "P4"),
                 ("P3", "P4", "P5"),
                 ("P4", "P5", "P6"),
+            ),
+            assigned_positive_edges=(
+                frozenset({("P1", "P2")}),
+                frozenset({("P2", "P3")}),
+                frozenset({("P3", "P4")}),
+                frozenset({("P4", "P5")}),
             ),
             total_positive_edges=4,
             covered_positive_edges=4,
@@ -1153,7 +1160,6 @@ def test_run_topology_finetuning_stage_supports_scratch_initialization(
     assert isinstance(topology_cfg, dict)
     topology_cfg["epochs"] = 0
     topology_cfg["init_mode"] = "scratch"
-    topology_cfg["overlap_penalty"] = 0.25
 
     model = build_model(config)
     dataloaders = build_dataloaders(config=config)

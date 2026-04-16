@@ -118,7 +118,6 @@ class TopologyFinetuneStageContext:
     optimizer: Optimizer
     evaluator: Evaluator
     loss_weights: TopologyLossWeights
-    overlap_penalty: float
     monitor_metric: str
     early_stopping: EarlyStopping
     best_checkpoint_path: Path
@@ -332,26 +331,6 @@ def _resolve_sampling_node_bounds(finetune_cfg: ConfigDict) -> tuple[int, int]:
     return min_nodes, max_nodes
 
 
-def _resolve_overlap_penalty(finetune_cfg: ConfigDict) -> float:
-    """Return overlap penalty for edge-cover sampling."""
-    overlap_penalty_raw = finetune_cfg.get("overlap_penalty")
-    if overlap_penalty_raw is None:
-        epoch_sampling_cfg = finetune_cfg.get("epoch_sampling", {})
-        if epoch_sampling_cfg is None:
-            epoch_sampling_cfg = {}
-        if not isinstance(epoch_sampling_cfg, dict):
-            raise ValueError("topology_finetune.epoch_sampling must be a mapping")
-        overlap_penalty_raw = epoch_sampling_cfg.get("overlap_penalty", 0.5)
-
-    overlap_penalty = as_float(
-        overlap_penalty_raw,
-        "topology_finetune.overlap_penalty",
-    )
-    if overlap_penalty < 0.0:
-        raise ValueError("topology_finetune.overlap_penalty must be >= 0")
-    return overlap_penalty
-
-
 def _resolve_init_mode(finetune_cfg: ConfigDict) -> str:
     """Return topology fine-tuning initialization mode."""
     init_mode = as_str(
@@ -527,6 +506,7 @@ def _iter_subgraph_forward_passes(
     model: nn.Module,
     graph: nx.Graph,
     nodes: Sequence[str],
+    assigned_positive_edges: frozenset[tuple[str, str]] | None = None,
     cache_dir: Path,
     embedding_index: Mapping[str, str],
     input_dim: int,
@@ -542,6 +522,7 @@ def _iter_subgraph_forward_passes(
     for chunk in iter_subgraph_pair_chunks(
         graph=graph,
         nodes=nodes,
+        assigned_positive_edges=assigned_positive_edges,
         cache_dir=cache_dir,
         embedding_index=embedding_index,
         input_dim=input_dim,
@@ -562,6 +543,7 @@ def _concat_logits_and_pairs(
     model: nn.Module,
     graph: nx.Graph,
     nodes: Sequence[str],
+    assigned_positive_edges: frozenset[tuple[str, str]] | None = None,
     cache_dir: Path,
     embedding_index: Mapping[str, str],
     input_dim: int,
@@ -585,6 +567,7 @@ def _concat_logits_and_pairs(
         model=model,
         graph=graph,
         nodes=nodes,
+        assigned_positive_edges=assigned_positive_edges,
         cache_dir=cache_dir,
         embedding_index=embedding_index,
         input_dim=input_dim,
@@ -867,6 +850,19 @@ def _local_subgraphs_for_rank(
     return tuple(subgraphs[distributed_context.rank :: distributed_context.world_size])
 
 
+def _local_assigned_edges_for_rank(
+    *,
+    assigned_positive_edges: Sequence[frozenset[tuple[str, str]]],
+    distributed_context: DistributedContext,
+) -> tuple[frozenset[tuple[str, str]], ...]:
+    """Return the rank-local assigned positive-edge slice."""
+    if not distributed_context.is_distributed:
+        return tuple(assigned_positive_edges)
+    return tuple(
+        assigned_positive_edges[distributed_context.rank :: distributed_context.world_size]
+    )
+
+
 def _reduce_train_stats(
     *,
     accelerator: AcceleratorLike,
@@ -937,7 +933,6 @@ def _fit_epoch(
         "topology_finetune.subgraphs_per_epoch",
     )
     strategy = as_str(finetune_cfg.get("strategy", "mixed"), "topology_finetune.strategy")
-    overlap_penalty = _resolve_overlap_penalty(finetune_cfg)
     negative_ratio = _resolve_bce_negative_ratio(finetune_cfg)
     edge_chunk_size = _resolve_edge_chunk_size(
         finetune_cfg=finetune_cfg,
@@ -951,13 +946,17 @@ def _fit_epoch(
         max_nodes=max_nodes,
         strategy=strategy,
         seed=epoch_seed,
-        overlap_penalty=overlap_penalty,
         edge_chunk_size=edge_chunk_size,
     )
     edge_cover_sampling_seconds = time.perf_counter() - sampling_start
     sampled_subgraphs = epoch_plan.subgraphs
+    assigned_positive_edges = epoch_plan.assigned_positive_edges
     local_subgraphs = _local_subgraphs_for_rank(
         subgraphs=sampled_subgraphs,
+        distributed_context=distributed_context,
+    )
+    local_assigned_positive_edges = _local_assigned_edges_for_rank(
+        assigned_positive_edges=assigned_positive_edges,
         distributed_context=distributed_context,
     )
     aggregates = _initialize_train_aggregates(len(sampled_subgraphs), epoch_plan)
@@ -965,7 +964,9 @@ def _fit_epoch(
     total_subgraphs = max(1, len(local_subgraphs))
 
     model.train()
-    for subgraph_index, nodes in enumerate(local_subgraphs):
+    for subgraph_index, (nodes, subgraph_assigned_positive_edges) in enumerate(
+        zip(local_subgraphs, local_assigned_positive_edges, strict=True)
+    ):
         step_start = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         with accelerator.autocast():
@@ -980,6 +981,7 @@ def _fit_epoch(
                 model=model,
                 graph=graph,
                 nodes=nodes,
+                assigned_positive_edges=subgraph_assigned_positive_edges,
                 cache_dir=cache_dir,
                 embedding_index=embedding_index,
                 input_dim=input_dim,
@@ -1152,7 +1154,6 @@ def _prepare_topology_finetune_stage_context(
         use_amp=use_amp,
         accelerator=accelerator,
     )
-    overlap_penalty = _resolve_overlap_penalty(finetune_cfg)
     return TopologyFinetuneStageContext(
         train_graph=train_graph,
         internal_val_graph=internal_val_graph,
@@ -1170,7 +1171,6 @@ def _prepare_topology_finetune_stage_context(
         optimizer=_build_optimizer(config=config, model=model),
         evaluator=evaluator,
         loss_weights=_parse_loss_weights(config),
-        overlap_penalty=overlap_penalty,
         monitor_metric=monitor_metric,
         early_stopping=EarlyStopping(
             patience=patience,
@@ -1370,7 +1370,6 @@ def run_topology_finetuning_stage(
             internal_validation_inference_batch_size=(
                 context.internal_validation_inference_batch_size
             ),
-            overlap_penalty=context.overlap_penalty,
         )
         if "validation_subgraphs" in finetune_cfg:
             log_stage_event(

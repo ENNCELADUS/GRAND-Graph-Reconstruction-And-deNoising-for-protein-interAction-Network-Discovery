@@ -97,7 +97,6 @@ topology_finetune:
   min_nodes: 20
   max_nodes: 20
   strategy: "mixed"
-  overlap_penalty: 0.5
   pair_batch_size: 16
   decision_threshold:
     mode: "best_f1_on_valid"

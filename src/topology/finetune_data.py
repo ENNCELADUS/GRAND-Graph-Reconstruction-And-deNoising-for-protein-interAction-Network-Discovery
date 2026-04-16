@@ -50,6 +50,7 @@ class EdgeCoverEpochPlan:
     """Training-epoch plan and summary for edge-cover sampling."""
 
     subgraphs: tuple[tuple[str, ...], ...]
+    assigned_positive_edges: tuple[frozenset[tuple[str, str]], ...]
     total_positive_edges: int
     covered_positive_edges: int
     positive_edge_coverage_ratio: float
@@ -508,23 +509,6 @@ def _build_random_walk_order(
     return order
 
 
-def _traversal_rank(
-    *,
-    graph: nx.Graph,
-    seed_nodes: Sequence[str],
-    strategy: str,
-    rng: random.Random,
-) -> dict[str, int]:
-    """Return a node-to-rank mapping for traversal tie-breaking."""
-    if strategy == "BFS":
-        order = _build_bfs_order(graph=graph, seed_nodes=seed_nodes, rng=rng)
-    elif strategy == "DFS":
-        order = _build_dfs_order(graph=graph, seed_nodes=seed_nodes, rng=rng)
-    else:
-        order = _build_random_walk_order(graph=graph, seed_nodes=seed_nodes, rng=rng)
-    return {node: index for index, node in enumerate(order)}
-
-
 def _selected_positive_edges(
     *,
     graph: nx.Graph,
@@ -544,12 +528,21 @@ def summarize_edge_cover_epoch(
     *,
     graph: nx.Graph,
     subgraphs: Sequence[Sequence[str]],
+    assigned_positive_edges: Sequence[Iterable[tuple[str, str]]] | None = None,
 ) -> EdgeCoverEpochPlan:
     """Summarize positive-edge coverage and reuse for a sampled epoch."""
     total_positive_edges = _graph_positive_edges(graph)
     edge_cover_counts: dict[tuple[str, str], int] = dict.fromkeys(total_positive_edges, 0)
-    for nodes in subgraphs:
-        for edge in _selected_positive_edges(graph=graph, nodes=nodes):
+    if assigned_positive_edges is None:
+        assigned_positive_edges = [
+            _selected_positive_edges(graph=graph, nodes=nodes) for nodes in subgraphs
+        ]
+    assigned_edge_sets = tuple(
+        frozenset(_canonical_edge(node_a, node_b) for node_a, node_b in edges)
+        for edges in assigned_positive_edges
+    )
+    for edge_set in assigned_edge_sets:
+        for edge in edge_set:
             edge_cover_counts[edge] += 1
 
     covered_positive_edges = sum(1 for count in edge_cover_counts.values() if count > 0)
@@ -565,6 +558,7 @@ def summarize_edge_cover_epoch(
 
     return EdgeCoverEpochPlan(
         subgraphs=tuple(tuple(nodes) for nodes in subgraphs),
+        assigned_positive_edges=assigned_edge_sets,
         total_positive_edges=total_positive_edge_count,
         covered_positive_edges=covered_positive_edges,
         positive_edge_coverage_ratio=coverage_ratio,
@@ -626,59 +620,6 @@ def _expand_chunk_nodes(
     else:
         order = _build_random_walk_order(graph=graph, seed_nodes=core_nodes, rng=rng)
     return tuple(order[:target_size])
-
-
-def _select_seed_edge(
-    *,
-    positive_edges: Sequence[tuple[str, str]],
-    uncovered_edges: set[tuple[str, str]],
-    edge_cover_counts: Mapping[tuple[str, str], int],
-    rng: random.Random,
-) -> tuple[str, str]:
-    """Select the next seed edge, preferring uncovered edges first."""
-    candidate_edges = list(uncovered_edges) if uncovered_edges else list(positive_edges)
-    rng.shuffle(candidate_edges)
-    return min(candidate_edges, key=lambda edge: (edge_cover_counts.get(edge, 0), edge))
-
-
-def _pick_next_node(
-    *,
-    graph: nx.Graph,
-    selected_nodes: Sequence[str],
-    candidate_nodes: Sequence[str],
-    uncovered_edges: set[tuple[str, str]],
-    edge_cover_counts: Mapping[tuple[str, str], int],
-    traversal_rank: Mapping[str, int],
-    overlap_penalty: float,
-    rng: random.Random,
-) -> str:
-    """Pick the next node using uncovered-edge gain, overlap, and traversal rank."""
-    shuffled_candidates = list(candidate_nodes)
-    rng.shuffle(shuffled_candidates)
-    max_rank = len(traversal_rank) + len(shuffled_candidates) + 1
-    selected_set = set(selected_nodes)
-
-    def _score(candidate: str) -> tuple[float, float, int]:
-        connecting_edges = [
-            _canonical_edge(candidate, node)
-            for node in selected_set
-            if graph.has_edge(candidate, node)
-        ]
-        uncovered_gain = float(sum(1 for edge in connecting_edges if edge in uncovered_edges))
-        overlap_cost = float(
-            sum(
-                edge_cover_counts.get(edge, 0)
-                for edge in connecting_edges
-                if edge not in uncovered_edges
-            )
-        )
-        return (
-            uncovered_gain,
-            -(overlap_penalty * overlap_cost),
-            -traversal_rank.get(candidate, max_rank),
-        )
-
-    return max(shuffled_candidates, key=_score)
 
 
 def sample_training_subgraphs(
@@ -804,14 +745,11 @@ def sample_edge_cover_subgraphs(
     max_nodes: int,
     strategy: str,
     seed: int,
-    overlap_penalty: float = 0.5,
     edge_chunk_size: int | None = None,
 ) -> EdgeCoverEpochPlan:
     """Plan one epoch of training subgraphs with positive-edge coverage guarantees."""
     if num_subgraphs < 0:
         raise ValueError("num_subgraphs must be non-negative")
-    if overlap_penalty < 0.0:
-        raise ValueError("overlap_penalty must be non-negative")
 
     normalized_strategy = _normalize_sampling_strategy(strategy)
 
@@ -854,14 +792,20 @@ def sample_edge_cover_subgraphs(
         )
         for edge_chunk in edge_chunks
     ]
+    assigned_positive_edges = tuple(frozenset(edge_chunk) for edge_chunk in edge_chunks)
 
-    return summarize_edge_cover_epoch(graph=graph, subgraphs=sampled_subgraphs)
+    return summarize_edge_cover_epoch(
+        graph=graph,
+        subgraphs=sampled_subgraphs,
+        assigned_positive_edges=assigned_positive_edges,
+    )
 
 
 def _subgraph_pair_tuples(
     *,
     graph: nx.Graph,
     nodes: tuple[str, ...],
+    assigned_positive_edges: frozenset[tuple[str, str]] | None = None,
     negative_lookup: ExplicitNegativePairLookup | None = None,
     negative_ratio: int = 1,
     rng: random.Random | None = None,
@@ -877,7 +821,12 @@ def _subgraph_pair_tuples(
         for index_b in range(index_a + 1, len(nodes)):
             protein_b = nodes[index_b]
             pair = _canonical_edge(protein_a, protein_b)
-            topology_label = 1.0 if graph.has_edge(protein_a, protein_b) else 0.0
+            pair_is_positive = (
+                pair in assigned_positive_edges
+                if assigned_positive_edges is not None
+                else graph.has_edge(protein_a, protein_b)
+            )
+            topology_label = 1.0 if pair_is_positive else 0.0
             if topology_label > 0.0:
                 positive_pairs.add(pair)
             elif negative_lookup is not None and protein_b in negative_lookup.partners_by_node.get(
@@ -889,6 +838,19 @@ def _subgraph_pair_tuples(
         raise ValueError("A sampled subgraph must contain at least one node pair")
 
     if negative_lookup is None:
+        if assigned_positive_edges is not None:
+            return [
+                (
+                    index_a,
+                    index_b,
+                    protein_a,
+                    protein_b,
+                    topology_label,
+                    topology_label,
+                    topology_label,
+                )
+                for index_a, index_b, protein_a, protein_b, topology_label, _, _ in pair_rows
+            ]
         return [
             (index_a, index_b, protein_a, protein_b, topology_label, topology_label, 1.0)
             for index_a, index_b, protein_a, protein_b, topology_label, _, _ in pair_rows
@@ -929,6 +891,7 @@ def iter_subgraph_pair_chunks(
     *,
     graph: nx.Graph,
     nodes: Sequence[str],
+    assigned_positive_edges: frozenset[tuple[str, str]] | None = None,
     cache_dir: Path,
     embedding_index: Mapping[str, str],
     input_dim: int,
@@ -965,6 +928,7 @@ def iter_subgraph_pair_chunks(
     pair_rows = _subgraph_pair_tuples(
         graph=graph,
         nodes=node_tuple,
+        assigned_positive_edges=assigned_positive_edges,
         negative_lookup=negative_lookup,
         negative_ratio=negative_ratio,
         rng=random.Random(seed) if seed is not None else None,
