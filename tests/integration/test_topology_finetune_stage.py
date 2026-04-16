@@ -228,14 +228,13 @@ def _build_finetune_config(tmp_path: Path) -> ConfigDict:
             "strategy": {"type": "none"},
             "domain_adaptation": {"enabled": False, "method": "none", "target_split": "test"},
         },
-            "topology_finetune": {
-                "epochs": 1,
-                "min_nodes": 3,
-                "max_nodes": 4,
-                "strategy": "mixed",
-                "bce_negative_ratio": 0,
-                "pair_batch_size": 2,
-                "decision_threshold": 0.5,
+        "topology_finetune": {
+            "epochs": 1,
+            "subgraph_node_range": [3, 4],
+            "strategy": "mixed",
+            "bce_negative_ratio": 0,
+            "pair_batch_size": 2,
+            "decision_threshold": 0.5,
             "optimizer": {"lr": 1e-3, "weight_decay": 0.0},
             "losses": {
                 "alpha": 0.5,

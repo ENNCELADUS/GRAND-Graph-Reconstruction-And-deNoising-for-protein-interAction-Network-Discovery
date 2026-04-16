@@ -320,14 +320,27 @@ def _parse_loss_weights(config: ConfigDict) -> TopologyLossWeights:
 
 def _resolve_sampling_node_bounds(finetune_cfg: ConfigDict) -> tuple[int, int]:
     """Resolve subgraph node limits for topology fine-tuning."""
-    max_nodes = as_int(finetune_cfg.get("max_nodes", 20), "topology_finetune.max_nodes")
-    min_nodes = as_int(finetune_cfg.get("min_nodes", max_nodes), "topology_finetune.min_nodes")
+    raw_range = finetune_cfg.get("subgraph_node_range")
+    if (
+        not isinstance(raw_range, Sequence)
+        or isinstance(raw_range, str | bytes)
+        or len(raw_range) != 2
+    ):
+        raise ValueError(
+            "topology_finetune.subgraph_node_range must be a two-item sequence "
+            "[min_nodes, max_nodes]"
+        )
+    min_nodes = as_int(raw_range[0], "topology_finetune.subgraph_node_range[0]")
+    max_nodes = as_int(raw_range[1], "topology_finetune.subgraph_node_range[1]")
     if min_nodes <= 0:
-        raise ValueError("topology_finetune.min_nodes must be positive")
+        raise ValueError("topology_finetune.subgraph_node_range[0] must be positive")
     if max_nodes <= 0:
-        raise ValueError("topology_finetune.max_nodes must be positive")
+        raise ValueError("topology_finetune.subgraph_node_range[1] must be positive")
     if min_nodes > max_nodes:
-        raise ValueError("topology_finetune.min_nodes must be <= topology_finetune.max_nodes")
+        raise ValueError(
+            "topology_finetune.subgraph_node_range[0] must be <= "
+            "topology_finetune.subgraph_node_range[1]"
+        )
     return min_nodes, max_nodes
 
 
