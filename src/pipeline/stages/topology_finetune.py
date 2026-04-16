@@ -369,7 +369,7 @@ def _resolve_init_mode(finetune_cfg: ConfigDict) -> str:
 
 
 def _resolve_bce_negative_ratio(finetune_cfg: ConfigDict) -> int:
-    """Return the per-subgraph negative-to-positive BCE ratio."""
+    """Return the epoch-plan negative-to-positive BCE ratio."""
     negative_ratio = as_int(
         finetune_cfg.get("bce_negative_ratio", 5),
         "topology_finetune.bce_negative_ratio",
@@ -555,6 +555,7 @@ def _iter_subgraph_forward_passes(
     graph: nx.Graph,
     nodes: Sequence[str],
     assigned_positive_edges: frozenset[tuple[str, str]] | None = None,
+    assigned_negative_edges: frozenset[tuple[str, str]] | None = None,
     cache_dir: Path,
     embedding_index: Mapping[str, str],
     input_dim: int,
@@ -562,24 +563,19 @@ def _iter_subgraph_forward_passes(
     pair_batch_size: int,
     device: torch.device,
     embedding_repository: EmbeddingRepository | None = None,
-    negative_lookup: ExplicitNegativePairLookup | None = None,
-    negative_ratio: int = 1,
-    seed: int | None = None,
 ) -> Iterator[tuple[SubgraphPairChunk, dict[str, torch.Tensor], torch.Tensor]]:
     """Yield device batches and squeezed logits for one sampled subgraph."""
     for chunk in iter_subgraph_pair_chunks(
         graph=graph,
         nodes=nodes,
         assigned_positive_edges=assigned_positive_edges,
+        assigned_negative_edges=assigned_negative_edges,
         cache_dir=cache_dir,
         embedding_index=embedding_index,
         input_dim=input_dim,
         max_sequence_length=max_sequence_length,
         pair_batch_size=pair_batch_size,
         embedding_repository=embedding_repository,
-        negative_lookup=negative_lookup,
-        negative_ratio=negative_ratio,
-        seed=seed,
     ):
         batch = _move_chunk_to_device(chunk=chunk, device=device)
         logits = _squeeze_binary_logits(_forward_model(model=model, batch=batch)["logits"])
@@ -592,6 +588,7 @@ def _concat_logits_and_pairs(
     graph: nx.Graph,
     nodes: Sequence[str],
     assigned_positive_edges: frozenset[tuple[str, str]] | None = None,
+    assigned_negative_edges: frozenset[tuple[str, str]] | None = None,
     cache_dir: Path,
     embedding_index: Mapping[str, str],
     input_dim: int,
@@ -599,9 +596,6 @@ def _concat_logits_and_pairs(
     pair_batch_size: int,
     device: torch.device,
     embedding_repository: EmbeddingRepository | None = None,
-    negative_lookup: ExplicitNegativePairLookup | None = None,
-    negative_ratio: int = 1,
-    seed: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Forward one sampled subgraph and collect all pair logits and labels."""
     logits_list: list[torch.Tensor] = []
@@ -616,6 +610,7 @@ def _concat_logits_and_pairs(
         graph=graph,
         nodes=nodes,
         assigned_positive_edges=assigned_positive_edges,
+        assigned_negative_edges=assigned_negative_edges,
         cache_dir=cache_dir,
         embedding_index=embedding_index,
         input_dim=input_dim,
@@ -623,9 +618,6 @@ def _concat_logits_and_pairs(
         pair_batch_size=pair_batch_size,
         device=device,
         embedding_repository=embedding_repository,
-        negative_lookup=negative_lookup,
-        negative_ratio=negative_ratio,
-        seed=seed,
     ):
         logits_list.append(logits)
         labels_list.append(batch["label"].float())
@@ -686,6 +678,7 @@ def _forward_subgraph_group(
     graph: nx.Graph,
     subgraphs: Sequence[tuple[str, ...]],
     assigned_positive_edges: Sequence[frozenset[tuple[str, str]]],
+    assigned_negative_edges: Sequence[frozenset[tuple[str, str]]],
     cache_dir: Path,
     embedding_index: Mapping[str, str],
     input_dim: int,
@@ -693,31 +686,28 @@ def _forward_subgraph_group(
     pair_batch_size: int,
     device: torch.device,
     embedding_repository: EmbeddingRepository,
-    negative_lookup: ExplicitNegativePairLookup | None,
-    negative_ratio: int,
-    epoch_seed: int,
-    subgraph_index_offset: int,
 ) -> tuple[SubgraphForwardResult, ...]:
     """Forward multiple subgraphs in one concatenated pair batch."""
     grouped_chunks: list[tuple[tuple[str, ...], tuple[SubgraphPairChunk, ...]]] = []
     all_chunks: list[SubgraphPairChunk] = []
-    for relative_index, (nodes, subgraph_assigned_positive_edges) in enumerate(
-        zip(subgraphs, assigned_positive_edges, strict=True)
+    for nodes, subgraph_assigned_positive_edges, subgraph_assigned_negative_edges in zip(
+        subgraphs,
+        assigned_positive_edges,
+        assigned_negative_edges,
+        strict=True,
     ):
         chunks = tuple(
             iter_subgraph_pair_chunks(
                 graph=graph,
                 nodes=nodes,
                 assigned_positive_edges=subgraph_assigned_positive_edges,
+                assigned_negative_edges=subgraph_assigned_negative_edges,
                 cache_dir=cache_dir,
                 embedding_index=embedding_index,
                 input_dim=input_dim,
                 max_sequence_length=max_sequence_length,
                 pair_batch_size=pair_batch_size,
                 embedding_repository=embedding_repository,
-                negative_lookup=negative_lookup,
-                negative_ratio=negative_ratio,
-                seed=(epoch_seed * 1000) + subgraph_index_offset + relative_index,
             )
         )
         grouped_chunks.append((tuple(nodes), chunks))
@@ -1007,17 +997,15 @@ def _local_subgraphs_for_rank(
     return tuple(subgraphs[distributed_context.rank :: distributed_context.world_size])
 
 
-def _local_assigned_edges_for_rank(
+def _local_edge_assignments_for_rank(
     *,
-    assigned_positive_edges: Sequence[frozenset[tuple[str, str]]],
+    assigned_edges: Sequence[frozenset[tuple[str, str]]],
     distributed_context: DistributedContext,
 ) -> tuple[frozenset[tuple[str, str]], ...]:
-    """Return the rank-local assigned positive-edge slice."""
+    """Return the rank-local assigned-edge slice."""
     if not distributed_context.is_distributed:
-        return tuple(assigned_positive_edges)
-    return tuple(
-        assigned_positive_edges[distributed_context.rank :: distributed_context.world_size]
-    )
+        return tuple(assigned_edges)
+    return tuple(assigned_edges[distributed_context.rank :: distributed_context.world_size])
 
 
 def _reduce_train_stats(
@@ -1106,16 +1094,25 @@ def _fit_epoch(
         strategy=strategy,
         seed=epoch_seed,
         edge_chunk_size=edge_chunk_size,
+        negative_lookup=negative_lookup,
+        negative_ratio=negative_ratio,
     )
     edge_cover_sampling_seconds = time.perf_counter() - sampling_start
     sampled_subgraphs = epoch_plan.subgraphs
     assigned_positive_edges = epoch_plan.assigned_positive_edges
+    assigned_negative_edges = epoch_plan.assigned_negative_edges or tuple(
+        frozenset() for _ in sampled_subgraphs
+    )
     local_subgraphs = _local_subgraphs_for_rank(
         subgraphs=sampled_subgraphs,
         distributed_context=distributed_context,
     )
-    local_assigned_positive_edges = _local_assigned_edges_for_rank(
-        assigned_positive_edges=assigned_positive_edges,
+    local_assigned_positive_edges = _local_edge_assignments_for_rank(
+        assigned_edges=assigned_positive_edges,
+        distributed_context=distributed_context,
+    )
+    local_assigned_negative_edges = _local_edge_assignments_for_rank(
+        assigned_edges=assigned_negative_edges,
         distributed_context=distributed_context,
     )
     aggregates = _initialize_train_aggregates(len(sampled_subgraphs), epoch_plan)
@@ -1126,8 +1123,17 @@ def _fit_epoch(
     if local_subgraphs:
         optimizer.zero_grad(set_to_none=True)
     if subgraphs_per_forward == 1:
-        for subgraph_index, (nodes, subgraph_assigned_positive_edges) in enumerate(
-            zip(local_subgraphs, local_assigned_positive_edges, strict=True)
+        for subgraph_index, (
+            nodes,
+            subgraph_assigned_positive_edges,
+            subgraph_assigned_negative_edges,
+        ) in enumerate(
+            zip(
+                local_subgraphs,
+                local_assigned_positive_edges,
+                local_assigned_negative_edges,
+                strict=True,
+            )
         ):
             step_start = time.perf_counter()
             with accelerator.autocast():
@@ -1143,6 +1149,7 @@ def _fit_epoch(
                     graph=graph,
                     nodes=nodes,
                     assigned_positive_edges=subgraph_assigned_positive_edges,
+                    assigned_negative_edges=subgraph_assigned_negative_edges,
                     cache_dir=cache_dir,
                     embedding_index=embedding_index,
                     input_dim=input_dim,
@@ -1150,9 +1157,6 @@ def _fit_epoch(
                     pair_batch_size=pair_batch_size,
                     device=device,
                     embedding_repository=embedding_repository,
-                    negative_lookup=negative_lookup,
-                    negative_ratio=negative_ratio,
-                    seed=(epoch_seed * 1000) + subgraph_index,
                 )
                 bce_loss = _masked_bce_loss(
                     logits=logits,
@@ -1222,6 +1226,9 @@ def _fit_epoch(
                         assigned_positive_edges=local_assigned_positive_edges[
                             group_start:group_end
                         ],
+                        assigned_negative_edges=local_assigned_negative_edges[
+                            group_start:group_end
+                        ],
                         cache_dir=cache_dir,
                         embedding_index=embedding_index,
                         input_dim=input_dim,
@@ -1229,10 +1236,6 @@ def _fit_epoch(
                         pair_batch_size=pair_batch_size,
                         device=device,
                         embedding_repository=embedding_repository,
-                        negative_lookup=negative_lookup,
-                        negative_ratio=negative_ratio,
-                        epoch_seed=epoch_seed,
-                        subgraph_index_offset=group_start,
                     )
                     group_loss = torch.zeros((), dtype=torch.float32, device=device)
                     group_updates: list[

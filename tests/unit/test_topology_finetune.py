@@ -540,14 +540,15 @@ def test_iter_subgraph_pair_chunks_uses_explicit_negative_masks_for_bce(tmp_path
         iter_subgraph_pair_chunks(
             graph=graph,
             nodes=("P1", "P2", "P3", "P4", "P5"),
+            assigned_positive_edges=frozenset({("P1", "P2"), ("P2", "P3")}),
+            assigned_negative_edges=frozenset(
+                {("P1", "P3"), ("P1", "P4"), ("P2", "P4"), ("P3", "P4")}
+            ),
             cache_dir=cache_dir,
             embedding_index=embedding_index,
             input_dim=4,
             max_sequence_length=8,
             pair_batch_size=3,
-            negative_lookup=negative_lookup,
-            negative_ratio=2,
-            seed=17,
         )
     )
 
@@ -571,6 +572,9 @@ def test_iter_subgraph_pair_chunks_uses_explicit_negative_masks_for_bce(tmp_path
     assert all_topology_labels.sum().item() == pytest.approx(2.0)
     assert all_bce_masks.sum().item() == pytest.approx(6.0)
     assert all_bce_labels.sum().item() == pytest.approx(2.0)
+    assert set(negative_lookup.negative_pairs).issuperset(
+        {("P1", "P3"), ("P1", "P4"), ("P2", "P4"), ("P3", "P4")}
+    )
     assert pair_lookup[(2, 4)] == pytest.approx((0.0, 0.0, 0.0))
     assert pair_lookup[(3, 4)] == pytest.approx((0.0, 0.0, 0.0))
 
@@ -606,14 +610,13 @@ def test_iter_subgraph_pair_chunks_clips_negative_count_when_ratio_is_infeasible
         iter_subgraph_pair_chunks(
             graph=graph,
             nodes=("P1", "P2", "P3", "P4"),
+            assigned_positive_edges=frozenset({("P1", "P2"), ("P2", "P3"), ("P3", "P4")}),
+            assigned_negative_edges=negative_lookup.negative_pairs,
             cache_dir=cache_dir,
             embedding_index=embedding_index,
             input_dim=4,
             max_sequence_length=8,
             pair_batch_size=8,
-            negative_lookup=negative_lookup,
-            negative_ratio=2,
-            seed=19,
         )
     )
 
