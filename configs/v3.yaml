@@ -94,9 +94,9 @@ topology_finetune:
   bce_negative_ratio: 5
   subgraph_node_range: [30, 60]
   gradient_accumulation_steps: 8
-  subgraphs_per_forward: 2
+  subgraphs_per_forward: 1
   strategy: "mixed"
-  pair_batch_size: 64
+  pair_batch_size: 32
   decision_threshold:
     mode: "best_f1_on_valid"
   monitor_metric: "internal_val_graph_sim"
@@ -130,7 +130,7 @@ evaluate:
     - "mcc"
 
 topology_evaluate:
-  inference_batch_size: 32
+  inference_batch_size: 128
   decision_threshold:
     mode: "best_f1_on_valid"
   save_pair_predictions: true

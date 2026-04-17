@@ -94,23 +94,21 @@ topology_finetune:
   bce_negative_ratio: 5
   subgraph_node_range: [40, 40]
   gradient_accumulation_steps: 8
-  subgraphs_per_forward: 2
+  subgraphs_per_forward: 1
   strategy: "mixed"
-  pair_batch_size: 64
+  pair_batch_size: 32
   decision_threshold:
     mode: "best_f1_on_valid"
   monitor_metric: "internal_val_graph_sim"
-  early_stopping_patience: 5
+  early_stopping_patience: 2
   optimizer:
     lr: 3.0e-6
     weight_decay: 3.0e-3
   losses:
-    # Scratch regime: keep topology as a weak structural prior until BCE learns
-    # a usable pairwise scorer. Relative-density was dominating the old setup.
-    alpha: 0.08
-    beta: 0.03
-    gamma: 0.02
-    delta: 0.02
+    alpha: 0.5    # Graph similarity
+    beta: 1.0     # Relative density
+    gamma: 0.3    # Degree MMD
+    delta: 0.3    # Clustering MMD
     histogram_sigma: 1.5
     degree_bins: 32
     clustering_bins: 48
@@ -130,7 +128,7 @@ evaluate:
     - "mcc"
 
 topology_evaluate:
-  inference_batch_size: 32
+  inference_batch_size: 64
   decision_threshold:
     mode: "best_f1_on_valid"
   save_pair_predictions: true
