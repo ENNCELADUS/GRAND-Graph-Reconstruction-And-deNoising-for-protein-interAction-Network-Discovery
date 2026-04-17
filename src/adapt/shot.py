@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 import torch.nn.functional as functional
@@ -102,7 +103,7 @@ class OutputHeadFeatureHook:
 
 def _unwrap_model(model: nn.Module) -> nn.Module:
     if isinstance(model, DistributedDataParallel):
-        return model.module
+        return cast(nn.Module, model.module)
     return model
 
 

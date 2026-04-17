@@ -1,7 +1,7 @@
 """Unit tests for OHEM selection utility."""
 
 import torch
-from src.utils.ohem_sample_strategy import OHEMSampleStrategy, select_ohem_indices
+from src.train.strategies.ohem import OHEMSampleStrategy, select_ohem_indices
 
 
 def test_select_ohem_indices_keeps_hardest() -> None:

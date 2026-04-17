@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-import src.run.stage_adapt as stage_adapt_module
+import src.pipeline.stages.adapt as stage_adapt_module
 import torch
 from src.adapt import (
     OutputHeadFeatureHook,
@@ -16,10 +16,9 @@ from src.adapt import (
     pseudo_label_loss,
     should_run_shot_adaptation,
 )
-from src.utils.distributed import DistributedContext
+from src.pipeline.runtime import DistributedContext
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
-from torch.utils.data.distributed import DistributedSampler
 
 
 def _base_config() -> dict[str, object]:
@@ -178,37 +177,8 @@ def test_pseudo_label_loss_binary_path() -> None:
     assert float(loss.item()) >= 0.0
 
 
-def test_stage_adapt_all_reduce_helper(monkeypatch: pytest.MonkeyPatch) -> None:
-    context = DistributedContext(
-        ddp_enabled=True,
-        is_distributed=True,
-        rank=0,
-        local_rank=0,
-        world_size=2,
-    )
-    tensor = torch.tensor([1.0, 2.0], dtype=torch.float32)
-
-    monkeypatch.setattr(stage_adapt_module.dist, "is_initialized", lambda: True)
-
-    def fake_all_reduce(value: torch.Tensor, op: object) -> None:
-        del op
-        value.mul_(2.0)
-
-    monkeypatch.setattr(stage_adapt_module.dist, "all_reduce", fake_all_reduce)
-
-    reduced = stage_adapt_module._all_reduce_sum(tensor, context)
-    assert torch.allclose(reduced, torch.tensor([2.0, 4.0], dtype=torch.float32))
-
-
 def test_compute_global_centroids_promotes_mixed_precision_inputs() -> None:
     config = parse_domain_adaptation_config(_base_config())
-    context = DistributedContext(
-        ddp_enabled=False,
-        is_distributed=False,
-        rank=0,
-        local_rank=0,
-        world_size=1,
-    )
     model = _HalfLogitHeadModel()
     loader = DataLoader(_TargetFeatureDataset(), batch_size=2, shuffle=False)
     feature_hook = OutputHeadFeatureHook(model=model)
@@ -221,7 +191,7 @@ def test_compute_global_centroids_promotes_mixed_precision_inputs() -> None:
             device=torch.device("cpu"),
             use_amp=False,
             adaptation_config=config,
-            distributed_context=context,
+            accelerator=_FakeAccelerator(),
         )
     finally:
         feature_hook.close()
@@ -252,6 +222,28 @@ class _TinyShotModel(nn.Module):
             nn.ReLU(),
             nn.Linear(4, 1),
         )
+
+
+class _FakeAccelerator:
+    def __init__(self) -> None:
+        self.device = torch.device("cpu")
+        self.autocast_calls = 0
+        self.backward_calls = 0
+        self.reduce_calls = 0
+
+    def autocast(self) -> object:
+        from contextlib import nullcontext
+
+        self.autocast_calls += 1
+        return nullcontext()
+
+    def backward(self, loss: torch.Tensor) -> None:
+        self.backward_calls += 1
+        loss.backward()
+
+    def reduce(self, value: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        self.reduce_calls += 1
+        return value
 
 
 def test_prepare_shot_optimizer_params_preserves_frozen_requires_grad_for_ddp() -> None:
@@ -292,7 +284,7 @@ def test_prepare_shot_optimizer_params_freezes_prefixes_without_ddp() -> None:
     assert all(not parameter.requires_grad for parameter in model.output_head.parameters())
 
 
-def test_build_target_loaders_uses_distributed_sampler_when_ddp_enabled() -> None:
+def test_build_target_loaders_keeps_plain_loaders_when_accelerator_handles_ddp() -> None:
     config: dict[str, object] = {
         "training_config": {
             "batch_size": 2,
@@ -327,7 +319,32 @@ def test_build_target_loaders_uses_distributed_sampler_when_ddp_enabled() -> Non
         distributed_context=context,
     )
 
-    assert isinstance(eval_loader.sampler, DistributedSampler)
-    assert isinstance(train_loader.sampler, DistributedSampler)
+    assert not type(eval_loader.sampler).__name__.endswith("DistributedSampler")
+    assert not type(train_loader.sampler).__name__.endswith("DistributedSampler")
     assert train_loader.drop_last is True
     assert eval_loader.drop_last is False
+
+
+def test_train_one_shot_epoch_uses_accelerator_backward_and_reduce() -> None:
+    model = _DummyHeadModel(feature_dim=2)
+    loader = DataLoader(_TargetFeatureDataset(), batch_size=1, shuffle=False)
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-2)
+    accelerator = _FakeAccelerator()
+
+    epoch_stats = stage_adapt_module._train_one_shot_epoch(
+        model=model,
+        loader=loader,
+        pseudo_labels=torch.tensor([0, 1], dtype=torch.long),
+        optimizer=optimizer,
+        scheduler=None,
+        accelerator=accelerator,
+        device=torch.device("cpu"),
+        use_amp=False,
+        adaptation_config=parse_domain_adaptation_config(_base_config()),
+        distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+    )
+
+    assert "total_loss" in epoch_stats
+    assert accelerator.autocast_calls == len(loader)
+    assert accelerator.backward_calls == len(loader)
+    assert accelerator.reduce_calls >= 1

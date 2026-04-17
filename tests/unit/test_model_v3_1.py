@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import torch
-from src.run import build_model
+from src.pipeline.stages.train import build_model
 
 # ---------------------------------------------------------------------------
 # Helpers

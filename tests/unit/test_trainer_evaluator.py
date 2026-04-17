@@ -5,14 +5,18 @@ from __future__ import annotations
 import logging
 
 import pytest
-import src.run as run_module
 import torch
 import torch.nn.functional as functional
 from src.evaluate import Evaluator
+from src.pipeline.runtime import DistributedContext
+from src.pipeline.stages.adapt import ADAPT_CSV_COLUMNS
+from src.pipeline.stages.evaluate import EVAL_CSV_COLUMNS
+from src.pipeline.stages.train import _training_validation_metrics
 from src.train.base import OptimizerConfig, SchedulerConfig, Trainer
+from src.train.strategies.ohem import OHEMSampleStrategy
 from src.utils.config import ConfigDict
 from src.utils.losses import LossConfig
-from src.utils.ohem_sample_strategy import OHEMSampleStrategy
+from tests.runtime_helpers import NoOpAccelerator
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -162,12 +166,65 @@ def test_trainer_runs_single_epoch() -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=len(loader),
+        accelerator=NoOpAccelerator(),
         ohem_strategy=OHEMSampleStrategy(target_batch_size=1, cap_protein=4),
     )
     metrics = trainer.train_one_epoch(loader)
     assert "loss" in metrics
     assert "lr" in metrics
     assert metrics["loss"] >= 0.0
+
+
+def test_trainer_uses_accelerator_runtime_for_backward_and_autocast() -> None:
+    model = TinyModel()
+    loader = DataLoader(TinyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
+    accelerator = NoOpAccelerator(
+        distributed=DistributedContext(ddp_enabled=True, is_distributed=True)
+    )
+    trainer = Trainer(
+        model=model,
+        device=torch.device("cpu"),
+        accelerator=accelerator,
+        optimizer_config=OptimizerConfig(optimizer_type="adamw", lr=1e-2),
+        scheduler_config=SchedulerConfig(scheduler_type="none"),
+        loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        use_amp=False,
+        total_epochs=1,
+        steps_per_epoch=len(loader),
+    )
+
+    trainer.train_one_epoch(loader)
+
+    assert accelerator.prepare_calls >= 1
+    assert accelerator.autocast_calls == len(loader)
+    assert accelerator.backward_calls == len(loader)
+
+
+def test_evaluator_uses_accelerator_runtime_for_autocast_and_metric_gather() -> None:
+    model = TinyModel()
+    loader = DataLoader(TinyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
+    accelerator = NoOpAccelerator(
+        distributed=DistributedContext(ddp_enabled=True, is_distributed=True)
+    )
+    evaluator = Evaluator(
+        metrics=["accuracy", "auprc"],
+        loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        decision_threshold=0.5,
+        use_amp=False,
+        accelerator=accelerator,
+        gather_for_metrics=True,
+    )
+
+    metrics = evaluator.evaluate(
+        model=model.eval(),
+        data_loader=loader,
+        device=torch.device("cpu"),
+        prefix=None,
+    )
+
+    assert "accuracy" in metrics
+    assert accelerator.autocast_calls == len(loader)
+    assert accelerator.gather_for_metrics_calls >= len(loader) * 2
 
 
 def test_trainer_handles_non_tensor_batch_fields() -> None:
@@ -187,21 +244,34 @@ def test_trainer_handles_non_tensor_batch_fields() -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=len(loader),
+        accelerator=NoOpAccelerator(),
     )
     metrics = trainer.train_one_epoch(loader)
     assert "loss" in metrics
     assert metrics["loss"] >= 0.0
 
 
-def test_trainer_heartbeat_logging(caplog: pytest.LogCaptureFixture) -> None:
+def test_trainer_heartbeat_logging_uses_low_frequency_epoch_progress(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     logger_name = "tests.trainer.heartbeat"
     trainer_logger = logging.getLogger(logger_name)
     trainer_logger.handlers.clear()
     trainer_logger.propagate = True
     trainer_logger.setLevel(logging.INFO)
 
+    class TenStepDataset(Dataset[dict[str, torch.Tensor]]):
+        def __len__(self) -> int:
+            return 10
+
+        def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+            value = float(index) / 10.0
+            feature = torch.tensor([value, value + 0.1, value + 0.2, value + 0.3])
+            label = torch.tensor(float(index % 2))
+            return {"x": feature, "label": label}
+
     model = TinyModel()
-    loader = DataLoader(TinyDataset(), batch_size=1, shuffle=False, collate_fn=_collate)
+    loader = DataLoader(TenStepDataset(), batch_size=1, shuffle=False, collate_fn=_collate)
     trainer = Trainer(
         model=model,
         device=torch.device("cpu"),
@@ -211,18 +281,23 @@ def test_trainer_heartbeat_logging(caplog: pytest.LogCaptureFixture) -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=len(loader),
+        accelerator=NoOpAccelerator(),
         logger=trainer_logger,
-        heartbeat_every_n_steps=2,
+        heartbeat_every_n_steps=1,
     )
 
     with caplog.at_level(logging.INFO, logger=logger_name):
         trainer.train_one_epoch(loader, epoch_index=0)
 
     messages = [record.getMessage() for record in caplog.records if record.name == logger_name]
-    assert any("Epoch 1 | Step 1/4" in message for message in messages)
-    assert any("Epoch 1 | Step 2/4" in message for message in messages)
-    assert any("Epoch 1 | Step 4/4" in message for message in messages)
-    assert not any("Epoch 1 | Step 3/4" in message for message in messages)
+    progress_messages = [message for message in messages if "Epoch Progress" in message]
+    assert len(progress_messages) == 5
+    assert any("Epoch: 1" in message and "Step: 1/10" in message for message in progress_messages)
+    assert any("Epoch: 1" in message and "Step: 3/10" in message for message in progress_messages)
+    assert any("Epoch: 1" in message and "Step: 6/10" in message for message in progress_messages)
+    assert any("Epoch: 1" in message and "Step: 9/10" in message for message in progress_messages)
+    assert any("Epoch: 1" in message and "Step: 10/10" in message for message in progress_messages)
+    assert not any("Step: 2/10" in message for message in progress_messages)
 
 
 def test_ohem_disables_pos_weight_for_selected_batch_loss() -> None:
@@ -236,6 +311,7 @@ def test_ohem_disables_pos_weight_for_selected_batch_loss() -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=1,
+        accelerator=NoOpAccelerator(),
         ohem_strategy=OHEMSampleStrategy(target_batch_size=2, cap_protein=4, warmup_epochs=0),
     )
     logits = torch.tensor([[0.0], [1.0], [-0.5]], dtype=torch.float32)
@@ -267,6 +343,7 @@ def test_ohem_training_mines_in_chunks_and_reduces_backward_batch() -> None:
         use_amp=False,
         total_epochs=1,
         steps_per_epoch=1,
+        accelerator=NoOpAccelerator(),
         ohem_strategy=OHEMSampleStrategy(target_batch_size=2, cap_protein=4, warmup_epochs=0),
     )
 
@@ -281,7 +358,7 @@ def test_training_csv_schema_header_order_regression() -> None:
             "validation_metrics": ["auprc", "auroc"],
         }
     }
-    validation_metrics = run_module._training_validation_metrics(training_cfg)
+    validation_metrics = _training_validation_metrics(training_cfg)
     header = [
         "Epoch",
         "Epoch Time",
@@ -302,7 +379,7 @@ def test_training_csv_schema_header_order_regression() -> None:
 
 
 def test_evaluate_csv_schema_header_order_and_required_columns() -> None:
-    assert run_module.EVAL_CSV_COLUMNS == [
+    assert EVAL_CSV_COLUMNS == [
         "split",
         "auroc",
         "auprc",
@@ -326,12 +403,12 @@ def test_evaluate_csv_schema_header_order_and_required_columns() -> None:
         "f1",
         "mcc",
     }
-    assert required_columns.issubset(set(run_module.EVAL_CSV_COLUMNS))
-    assert len(run_module.EVAL_CSV_COLUMNS) == len(required_columns)
+    assert required_columns.issubset(set(EVAL_CSV_COLUMNS))
+    assert len(EVAL_CSV_COLUMNS) == len(required_columns)
 
 
 def test_adapt_csv_schema_header_order_and_required_columns() -> None:
-    assert run_module.ADAPT_CSV_COLUMNS == [
+    assert ADAPT_CSV_COLUMNS == [
         "Epoch",
         "Epoch Time",
         "Entropy Loss",
@@ -348,6 +425,7 @@ def test_evaluator_returns_metric_dictionary() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "f1", "auroc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=NoOpAccelerator(),
     )
     model.eval()
     with torch.no_grad():
@@ -374,6 +452,7 @@ def test_evaluator_handles_non_tensor_batch_fields() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "f1", "auroc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=NoOpAccelerator(),
     )
     model.eval()
     with torch.no_grad():
@@ -393,6 +472,7 @@ def test_evaluator_without_prefix_returns_raw_metric_names() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "f1", "auroc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=NoOpAccelerator(),
     )
     model.eval()
     with torch.no_grad():
@@ -412,6 +492,7 @@ def test_compute_metrics_characterization_single_class_auc_and_unknown_metric() 
     evaluator = Evaluator(
         metrics=["auroc", "auprc", "accuracy", "unknown_metric"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=NoOpAccelerator(),
     )
     labels = torch.tensor([1, 1, 1, 1], dtype=torch.long)
     probabilities = torch.tensor([0.9, 0.8, 0.4, 0.2], dtype=torch.float32)
@@ -428,6 +509,7 @@ def test_compute_metrics_characterization_binary_metric_values() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "sensitivity", "specificity", "precision", "recall", "f1", "mcc"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=NoOpAccelerator(),
     )
     labels = torch.tensor([0, 0, 1, 1], dtype=torch.long)
     probabilities = torch.tensor([0.1, 0.6, 0.9, 0.2], dtype=torch.float32)
@@ -447,6 +529,7 @@ def test_compute_metrics_respects_custom_decision_threshold() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "precision", "recall", "f1"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=NoOpAccelerator(),
         decision_threshold=0.3,
     )
     labels = torch.tensor([0, 0, 1, 1], dtype=torch.long)
@@ -475,6 +558,7 @@ def test_select_best_f1_threshold_disables_grad_tracking() -> None:
     evaluator = Evaluator(
         metrics=["f1"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        accelerator=NoOpAccelerator(),
     )
 
     threshold = evaluator.select_best_f1_threshold(

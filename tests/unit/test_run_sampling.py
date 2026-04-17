@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import src.run as run_module
 import torch
+from src.pipeline.runtime import build_accelerator
+from src.pipeline.stages.train import build_trainer
 from src.utils.config import ConfigDict
 from torch import nn
 
@@ -32,10 +33,16 @@ def test_build_trainer_wires_ohem_warmup_epochs() -> None:
         },
     }
     model = nn.Linear(4, 1)
-    trainer, _ = run_module.build_trainer(
+    trainer, _ = build_trainer(
         config=config,
         model=model,
         device=torch.device("cpu"),
+        accelerator=build_accelerator(
+            requested_device="cpu",
+            ddp_enabled=False,
+            use_mixed_precision=False,
+            find_unused_parameters=False,
+        ),
         steps_per_epoch=2,
     )
     assert trainer.ohem_strategy is not None

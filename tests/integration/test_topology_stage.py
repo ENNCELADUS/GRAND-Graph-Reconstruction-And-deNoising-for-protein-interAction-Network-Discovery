@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-import src.run.stage_topology_evaluate as topology_stage
+import src.pipeline.stages.topology_evaluate as topology_stage
 import torch
-from src.run.stage_topology_evaluate import run_topology_evaluation_stage
-from src.run.stage_train import build_model
+from src.pipeline.runtime import DistributedContext
+from src.pipeline.stages.topology_evaluate import run_topology_evaluation_stage
+from src.pipeline.stages.train import build_model
 from src.utils.config import ConfigDict
 from src.utils.data_io import build_dataloaders
-from src.utils.distributed import DistributedContext
+from tests.runtime_helpers import build_stage_runtime
 from torch.utils.data import DataLoader
 
 
@@ -220,16 +221,17 @@ def test_run_topology_evaluation_stage_writes_expected_artifacts(tmp_path: Path)
         model = build_model(config)
         torch.save(model.state_dict(), Path(str(config["run_config"]["load_checkpoint_path"])))  # type: ignore[index]
         dataloaders = build_dataloaders(config=config)
-        distributed_context = DistributedContext(ddp_enabled=False, is_distributed=False)
+        checkpoint_path = Path(str(config["run_config"]["load_checkpoint_path"]))  # type: ignore[index]
         __import__("os").chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_evaluate": "topology_case"},
+        )
         run_topology_evaluation_stage(
-            config=config,
-            model=model,
-            device=torch.device("cpu"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-            run_id="topology_case",
-            checkpoint_path=Path(str(config["run_config"]["load_checkpoint_path"])),  # type: ignore[index]
-            distributed_context=distributed_context,
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
         )
     finally:
         __import__("os").chdir(previous_cwd)
@@ -256,43 +258,37 @@ def test_run_topology_evaluation_stage_non_main_rank_computes_topology_summary(
     torch.save(model.state_dict(), checkpoint_path)
     dataloaders = build_dataloaders(config=config)
 
-    monkeypatch.setattr(topology_stage.dist, "is_initialized", lambda: True)
-    monkeypatch.setattr(topology_stage.dist, "broadcast", lambda tensor, src: None)
     monkeypatch.setattr(
         topology_stage,
         "_build_topology_loader",
         lambda **_: (
             cast(DataLoader[dict[str, object]], dataloaders["test"]),
             [("P1", "P2"), ("P1", "P3"), ("P2", "P3")],
-            [1],
             3,
         ),
     )
-    monkeypatch.setattr(topology_stage, "_predict_topology_labels", lambda **_: [0])
-    monkeypatch.setattr(
-        topology_stage,
-        "_gather_ordered_predictions",
-        lambda **_: [1, 0, 1],
-    )
-    monkeypatch.setattr(topology_stage, "distributed_barrier", lambda context: None)
+    monkeypatch.setattr(topology_stage, "_predict_topology_labels", lambda **_: [1, 0, 1])
 
     previous_cwd = Path.cwd()
     try:
         __import__("os").chdir(tmp_path)
+        distributed_context = DistributedContext(
+            ddp_enabled=True,
+            is_distributed=True,
+            rank=1,
+            local_rank=1,
+            world_size=2,
+        )
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_evaluate": "topology_non_main"},
+            distributed=distributed_context,
+        )
         summary = run_topology_evaluation_stage(
-            config=config,
-            model=model,
-            device=torch.device("cpu"),
-            dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
-            run_id="topology_non_main",
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
             checkpoint_path=checkpoint_path,
-            distributed_context=DistributedContext(
-                ddp_enabled=True,
-                is_distributed=True,
-                rank=1,
-                local_rank=1,
-                world_size=2,
-            ),
         )
     finally:
         __import__("os").chdir(previous_cwd)

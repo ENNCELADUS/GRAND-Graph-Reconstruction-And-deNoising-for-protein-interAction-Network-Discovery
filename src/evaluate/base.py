@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
-from contextlib import nullcontext
 
 import torch
 from sklearn.metrics import (
@@ -21,6 +20,8 @@ from sklearn.metrics import (
 from torch import nn
 from torch.utils.data import DataLoader
 
+from src.pipeline.loops import forward_model, move_batch_to_device
+from src.pipeline.runtime import AcceleratorLike
 from src.train.config import LossConfig
 from src.utils.losses import binary_classification_loss
 
@@ -56,13 +57,17 @@ class Evaluator:
         metrics: list[str],
         loss_config: LossConfig,
         *,
+        accelerator: AcceleratorLike,
         decision_threshold: float = 0.5,
         use_amp: bool = False,
+        gather_for_metrics: bool = False,
     ) -> None:
         self.metrics = [metric.lower() for metric in metrics]
         self.loss_config = loss_config
         self.decision_threshold = self._validate_decision_threshold(decision_threshold)
         self.use_amp = use_amp
+        self.accelerator = accelerator
+        self.gather_metrics = gather_for_metrics
 
     @staticmethod
     def _validate_decision_threshold(decision_threshold: float) -> float:
@@ -83,13 +88,7 @@ class Evaluator:
     @staticmethod
     def _move_batch_to_device(batch: BatchInput, device: torch.device) -> BatchDict:
         """Move tensor fields to target device while preserving non-tensor fields."""
-        prepared_batch: BatchDict = {}
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor):
-                prepared_batch[key] = value.to(device)
-            else:
-                prepared_batch[key] = value
-        return prepared_batch
+        return move_batch_to_device(batch, device)
 
     @staticmethod
     def _forward_model(model: nn.Module, batch: BatchInput) -> dict[str, torch.Tensor]:
@@ -105,13 +104,7 @@ class Evaluator:
         Raises:
             ValueError: If model output is not a dictionary.
         """
-        try:
-            output = model(**batch)
-        except TypeError:
-            output = model(batch=batch)
-        if not isinstance(output, dict):
-            raise ValueError("Model forward output must be a dictionary")
-        return output
+        return forward_model(model, batch)
 
     @staticmethod
     def _binary_stats(labels: torch.Tensor, predictions: torch.Tensor) -> tuple[float, float]:
@@ -226,38 +219,38 @@ class Evaluator:
         """Collect probabilities, labels, and average loss for one loader."""
         all_probs: list[torch.Tensor] = []
         all_labels: list[torch.Tensor] = []
-        total_loss = 0.0
-        batch_count = 0
-        autocast_context = (
-            torch.autocast(device_type=device.type, enabled=True)
-            if self.use_amp and device.type in {"cpu", "cuda"}
-            else nullcontext()
-        )
-
-        with torch.inference_mode(), autocast_context:
+        all_losses: list[torch.Tensor] = []
+        with torch.inference_mode():
             for batch in data_loader:
-                batch_count += 1
                 prepared_batch = self._move_batch_to_device(batch=batch, device=device)
-                output = self._forward_model(model=model, batch=prepared_batch)
+                with self.accelerator.autocast():
+                    output = self._forward_model(model=model, batch=prepared_batch)
                 logits = output["logits"]
                 labels = self._batch_tensor(prepared_batch, "label").float()
-                loss = binary_classification_loss(
+                per_sample_loss = binary_classification_loss(
                     logits=logits,
                     labels=labels,
                     loss_config=self.loss_config,
-                    reduction="mean",
+                    reduction="none",
                 )
-                total_loss += float(loss.detach().item())
                 reduced_logits = (
                     logits.squeeze(-1) if logits.dim() > 1 and logits.size(-1) == 1 else logits
                 )
-                all_probs.append(torch.sigmoid(reduced_logits).detach().cpu())
-                all_labels.append(labels.detach().cpu())
+                probs = torch.sigmoid(reduced_logits).detach()
+                gathered_labels = labels.detach()
+                gathered_losses = per_sample_loss.detach()
+                if self.gather_metrics and self.accelerator.use_distributed:
+                    probs = self.accelerator.gather_for_metrics(probs)
+                    gathered_labels = self.accelerator.gather_for_metrics(gathered_labels)
+                    gathered_losses = self.accelerator.gather_for_metrics(gathered_losses)
+                all_probs.append(probs.cpu())
+                all_labels.append(gathered_labels.cpu())
+                all_losses.append(gathered_losses.cpu())
 
         return (
             torch.cat(all_labels, dim=0).long(),
             torch.cat(all_probs, dim=0),
-            total_loss / max(1, batch_count),
+            float(torch.cat(all_losses, dim=0).mean().item()),
         )
 
     @staticmethod
@@ -310,6 +303,34 @@ class Evaluator:
         )
         return self.best_f1_threshold(labels=labels, probabilities=probabilities)
 
+    def collect_probabilities_and_labels(
+        self,
+        model: nn.Module,
+        data_loader: DataLoader[Mapping[str, object]],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, float]:
+        """Collect labels, probabilities, and average loss from one loader pass."""
+        return self._collect_probabilities_and_labels(
+            model=model,
+            data_loader=data_loader,
+            device=device,
+        )
+
+    def metrics_from_outputs(
+        self,
+        *,
+        labels: torch.Tensor,
+        probabilities: torch.Tensor,
+        average_loss: float,
+        prefix: str | None = "val",
+    ) -> dict[str, float]:
+        """Compute metrics from precomputed labels/probabilities without another model pass."""
+        metric_values = self._compute_metrics(labels=labels, probabilities=probabilities)
+        metric_values["loss"] = average_loss
+        if prefix is None:
+            return metric_values
+        return {f"{prefix}_{key}": value for key, value in metric_values.items()}
+
     def evaluate(
         self,
         model: nn.Module,
@@ -330,13 +351,14 @@ class Evaluator:
         Returns:
             Metric dictionary with prefixed names.
         """
-        labels_tensor, probs_tensor, average_loss = self._collect_probabilities_and_labels(
+        labels_tensor, probs_tensor, average_loss = self.collect_probabilities_and_labels(
             model=model,
             data_loader=data_loader,
             device=device,
         )
-        metric_values = self._compute_metrics(labels=labels_tensor, probabilities=probs_tensor)
-        metric_values["loss"] = average_loss
-        if prefix is None:
-            return metric_values
-        return {f"{prefix}_{key}": value for key, value in metric_values.items()}
+        return self.metrics_from_outputs(
+            labels=labels_tensor,
+            probabilities=probs_tensor,
+            average_loss=average_loss,
+            prefix=prefix,
+        )

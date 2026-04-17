@@ -12,8 +12,11 @@ from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LRScheduler, OneCycleLR
 from torch.utils.data import DataLoader
 
+from src.pipeline.loops import forward_model, move_batch_to_device
+from src.pipeline.runtime import AcceleratorLike
 from src.train.config import LossConfig, OptimizerConfig, SchedulerConfig
 from src.train.strategies.ohem import OHEMSampleStrategy
+from src.utils.logging import log_epoch_progress
 from src.utils.losses import binary_classification_loss
 
 BatchValue = object
@@ -39,12 +42,14 @@ class Trainer:
         use_amp: bool,
         total_epochs: int,
         steps_per_epoch: int,
+        accelerator: AcceleratorLike,
         ohem_strategy: OHEMSampleStrategy | None = None,
         logger: logging.Logger | None = None,
         heartbeat_every_n_steps: int = 0,
     ) -> None:
         self.model = model
         self.device = device
+        self.accelerator = accelerator
         self.optimizer_config = optimizer_config
         self.scheduler_config = scheduler_config
         self.loss_config = loss_config
@@ -54,12 +59,9 @@ class Trainer:
         self.ohem_strategy = ohem_strategy
         self.logger = logger
         self.heartbeat_every_n_steps = max(0, int(heartbeat_every_n_steps))
-        self.scaler = torch.amp.GradScaler(  # type: ignore[attr-defined]
-            "cuda",
-            enabled=self.use_amp,
-        )
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
+        self._train_components_prepared = False
 
     def _trainable_parameters(self) -> list[nn.Parameter]:
         return [param for param in self.model.parameters() if param.requires_grad]
@@ -104,6 +106,48 @@ class Trainer:
         """Rebuild optimizer and scheduler after trainable params change."""
         self.optimizer = self._build_optimizer()
         self.scheduler = self._build_scheduler()
+        self._train_components_prepared = False
+
+    def prepare_training_components(
+        self,
+        train_loader: DataLoader[Mapping[str, object]],
+    ) -> DataLoader[Mapping[str, object]]:
+        """Wrap train-time model state with the accelerator runtime."""
+        if self._train_components_prepared:
+            return train_loader
+        if self.scheduler is None:
+            prepared = self.accelerator.prepare(
+                self.model,
+                self.optimizer,
+                train_loader,
+            )
+            self.model, self.optimizer, prepared_loader = cast(
+                tuple[nn.Module, Optimizer, DataLoader[Mapping[str, object]]],
+                prepared,
+            )
+        else:
+            prepared = self.accelerator.prepare(
+                self.model,
+                self.optimizer,
+                train_loader,
+                self.scheduler,
+            )
+            (
+                self.model,
+                self.optimizer,
+                prepared_loader,
+                self.scheduler,
+            ) = cast(
+                tuple[
+                    nn.Module,
+                    Optimizer,
+                    DataLoader[Mapping[str, object]],
+                    LRScheduler,
+                ],
+                prepared,
+            )
+        self._train_components_prepared = True
+        return prepared_loader
 
     @staticmethod
     def _required_batch_tensor(
@@ -125,22 +169,10 @@ class Trainer:
 
     def _move_batch_to_device(self, batch: BatchInput) -> BatchDict:
         """Move tensor fields to target device while preserving non-tensor fields."""
-        moved_batch: BatchDict = {}
-        for key, value in batch.items():
-            if isinstance(value, torch.Tensor):
-                moved_batch[key] = value.to(self.device)
-            else:
-                moved_batch[key] = value
-        return moved_batch
+        return move_batch_to_device(batch, self.device)
 
     def _forward_model(self, batch: BatchInput) -> dict[str, torch.Tensor]:
-        try:
-            output = self.model(**batch)
-        except TypeError:
-            output = self.model(batch=batch)
-        if not isinstance(output, dict):
-            raise ValueError("Model forward output must be a dictionary")
-        return output
+        return forward_model(self.model, batch)
 
     def _select_loss(
         self,
@@ -333,6 +365,7 @@ class Trainer:
         Returns:
             Aggregate epoch metrics, including average loss and learning rate.
         """
+        train_loader = self.prepare_training_components(train_loader)
         self.model.train()
         running_loss = 0.0
         batch_count = 0
@@ -353,11 +386,11 @@ class Trainer:
                 )
                 del prepared_batch
                 del selected_indices
-                with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                with self.accelerator.autocast():
                     output = self._forward_model(selected_batch)
                     loss = self._ohem_selected_batch_loss(output=output, batch=selected_batch)
             else:
-                with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+                with self.accelerator.autocast():
                     output = self._forward_model(prepared_batch)
                     loss = self._select_loss(
                         output=output,
@@ -365,42 +398,27 @@ class Trainer:
                         epoch_index=epoch_index,
                     )
 
-            if self.use_amp:
-                scaled_loss = self.scaler.scale(loss)
-                torch.autograd.backward(scaled_loss)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                torch.autograd.backward(loss)
-                self.optimizer.step()
+            self.accelerator.backward(loss)
+            self.optimizer.step()
 
             if self.scheduler is not None:
                 self.scheduler.step()
 
             running_loss += float(loss.detach().item())
-            if self._should_log_heartbeat(step=batch_count, total_steps=total_steps):
-                current_lr = float(self.optimizer.param_groups[0]["lr"])
-                if self.logger is not None:
-                    self.logger.info(
-                        "Epoch %d | Step %d/%d | Loss %.4f | LR %.4e",
-                        epoch_index + 1,
-                        batch_count,
-                        total_steps,
-                        running_loss / batch_count,
-                        current_lr,
-                    )
+            current_lr = float(self.optimizer.param_groups[0]["lr"])
+            log_epoch_progress(
+                self.logger,
+                epoch=epoch_index + 1,
+                step=batch_count,
+                total_steps=total_steps,
+                every_n_steps=self.heartbeat_every_n_steps,
+                loss=running_loss / batch_count,
+                lr=current_lr,
+            )
 
         average_loss = running_loss / max(1, batch_count)
         current_lr = float(self.optimizer.param_groups[0]["lr"])
         return {"loss": average_loss, "lr": current_lr}
-
-    def _should_log_heartbeat(self, step: int, total_steps: int) -> bool:
-        """Return whether heartbeat logs should be emitted for this step."""
-        if self.logger is None:
-            return False
-        if step == 1 or step == total_steps:
-            return True
-        return self.heartbeat_every_n_steps > 0 and step % self.heartbeat_every_n_steps == 0
 
 
 __all__ = [

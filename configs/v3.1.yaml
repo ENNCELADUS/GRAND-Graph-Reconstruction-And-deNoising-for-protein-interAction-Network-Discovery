@@ -33,7 +33,7 @@ data_config:
     pin_memory: true
     drop_last: true
     sampling:
-      strategy: "ohem"
+      strategy: "none"
       warmup_epochs: 5
       pool_multiplier: 4
       cap_protein: 4
@@ -92,11 +92,11 @@ topology_finetune:
   supervision_train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi_ratio5_exclusive.txt"
   supervision_valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi_ratio5_exclusive.txt"
   bce_negative_ratio: 5
-  min_nodes: 20
-  max_nodes: 20
+  subgraph_node_range: [30, 60]
+  gradient_accumulation_steps: 8
+  subgraphs_per_forward: 2
   strategy: "mixed"
-  overlap_penalty: 0.5
-  pair_batch_size: 16
+  pair_batch_size: 32
   decision_threshold: 0.5
   monitor_metric: "internal_val_graph_sim"
   early_stopping_patience: 5

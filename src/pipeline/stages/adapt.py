@@ -5,14 +5,13 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import cast
 
 import torch
-import torch.distributed as dist
 from torch import nn
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR, LRScheduler
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 
 from src.adapt import (
     DomainAdaptationConfig,
@@ -25,9 +24,9 @@ from src.adapt import (
     parse_domain_adaptation_config,
     pseudo_label_loss,
 )
-from src.run.stage_train import _build_stage_runtime, _load_checkpoint, _save_checkpoint
-from src.utils.config import ConfigDict, as_bool, as_int, extract_model_kwargs, get_section
-from src.utils.distributed import DistributedContext, distributed_barrier
+from src.pipeline.loops import forward_model, move_batch_to_device
+from src.pipeline.runtime import AcceleratorLike, DistributedContext, PipelineRuntime
+from src.utils.config import ConfigDict, as_bool, as_int, get_section
 from src.utils.logging import append_csv_row, log_stage_event
 
 BatchValue = object
@@ -50,33 +49,6 @@ def _centroid_accumulation_dtype(probs: torch.Tensor, features: torch.Tensor) ->
     if dtype in {torch.float16, torch.bfloat16}:
         return torch.float32
     return dtype
-
-
-def _move_batch_to_device(batch: BatchInput, device: torch.device) -> dict[str, BatchValue]:
-    """Move tensor fields to target device while preserving non-tensor fields."""
-    moved_batch: dict[str, BatchValue] = {}
-    for key, value in batch.items():
-        if isinstance(value, torch.Tensor):
-            moved_batch[key] = value.to(device)
-        else:
-            moved_batch[key] = value
-    return moved_batch
-
-
-def _forward_batch_without_labels(batch: BatchInput) -> dict[str, BatchValue]:
-    """Return model-input batch with labels removed for unlabeled SHOT adaptation."""
-    return {key: value for key, value in batch.items() if key != "label"}
-
-
-def _forward_model(model: nn.Module, batch: BatchInput) -> dict[str, torch.Tensor]:
-    """Execute model forward and validate output contract."""
-    try:
-        output = model(**batch)
-    except TypeError:
-        output = model(batch=batch)
-    if not isinstance(output, dict):
-        raise ValueError("Model forward output must be a dictionary")
-    return output
 
 
 def _infer_batch_size(batch: BatchInput) -> int:
@@ -106,6 +78,7 @@ def _build_target_loaders(
     distributed_context: DistributedContext,
 ) -> tuple[DataLoader[dict[str, object]], DataLoader[dict[str, object]]]:
     """Build deterministic target loaders for SHOT pseudo labeling and optimization."""
+    del distributed_context
     target_loader = dataloaders[adaptation_config.target_split]
     dataset = target_loader.dataset
     collate_fn = target_loader.collate_fn
@@ -123,43 +96,6 @@ def _build_target_loaders(
         dataloader_cfg.get("pin_memory", False),
         "data_config.dataloader.pin_memory",
     )
-
-    if distributed_context.is_distributed:
-        eval_sampler = DistributedSampler(
-            dataset=dataset,
-            num_replicas=distributed_context.world_size,
-            rank=distributed_context.rank,
-            shuffle=False,
-            drop_last=False,
-        )
-        train_sampler = DistributedSampler(
-            dataset=dataset,
-            num_replicas=distributed_context.world_size,
-            rank=distributed_context.rank,
-            shuffle=False,
-            drop_last=True,
-        )
-        eval_loader = DataLoader(
-            dataset=dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            drop_last=False,
-            sampler=eval_sampler,
-            collate_fn=collate_fn,
-        )
-        train_loader = DataLoader(
-            dataset=dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=num_workers,
-            pin_memory=pin_memory,
-            drop_last=True,
-            sampler=train_sampler,
-            collate_fn=collate_fn,
-        )
-        return eval_loader, train_loader
 
     eval_loader = DataLoader(
         dataset=dataset,
@@ -248,16 +184,9 @@ def _build_scheduler(
 
     def _lambda(step: int) -> float:
         progress = float(step) / float(max(1, total_steps))
-        return (1.0 + gamma * progress) ** (-power)
+        return float((1.0 + gamma * progress) ** (-power))
 
     return LambdaLR(optimizer=optimizer, lr_lambda=_lambda)
-
-
-def _all_reduce_sum(tensor: torch.Tensor, distributed_context: DistributedContext) -> torch.Tensor:
-    """All-reduce tensor sum when distributed execution is active."""
-    if distributed_context.is_distributed and dist.is_initialized():
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    return tensor
 
 
 def _compute_global_centroids(
@@ -267,19 +196,20 @@ def _compute_global_centroids(
     device: torch.device,
     use_amp: bool,
     adaptation_config: DomainAdaptationConfig,
-    distributed_context: DistributedContext,
+    accelerator: AcceleratorLike,
 ) -> torch.Tensor:
     """Compute global SHOT centroids from target features and class probabilities."""
+    del use_amp
     class_masses: torch.Tensor | None = None
     feature_sums: torch.Tensor | None = None
 
     model.eval()
     with torch.no_grad():
         for batch in loader:
-            prepared_batch = _move_batch_to_device(batch=batch, device=device)
-            forward_batch = _forward_batch_without_labels(prepared_batch)
-            with torch.autocast(device_type=device.type, enabled=use_amp):
-                output = _forward_model(model=model, batch=forward_batch)
+            prepared_batch = move_batch_to_device(batch=batch, device=device)
+            forward_batch = {key: value for key, value in prepared_batch.items() if key != "label"}
+            with accelerator.autocast():
+                output = forward_model(model=model, batch=forward_batch)
             logits = output["logits"]
             probs = logits_to_probabilities(logits=logits, epsilon=adaptation_config.epsilon)
             features = feature_hook.pop()
@@ -296,14 +226,16 @@ def _compute_global_centroids(
                 feature_sums = batch_feature_sums
                 class_masses = batch_class_masses
             else:
+                if class_masses is None:
+                    raise RuntimeError("SHOT class masses were not initialized")
                 feature_sums = feature_sums + batch_feature_sums
                 class_masses = class_masses + batch_class_masses
 
     if feature_sums is None or class_masses is None:
         raise ValueError("SHOT target loader produced no batches while computing centroids")
 
-    _all_reduce_sum(feature_sums, distributed_context)
-    _all_reduce_sum(class_masses, distributed_context)
+    feature_sums = accelerator.reduce(feature_sums, reduction="sum")
+    class_masses = accelerator.reduce(class_masses, reduction="sum")
     return compute_centroids(
         feature_sums=feature_sums,
         class_masses=class_masses,
@@ -319,17 +251,19 @@ def _compute_pseudo_labels(
     device: torch.device,
     use_amp: bool,
     adaptation_config: DomainAdaptationConfig,
+    accelerator: AcceleratorLike,
 ) -> torch.Tensor:
     """Compute fixed pseudo labels for one epoch in deterministic loader order."""
+    del use_amp
     pseudo_labels: list[torch.Tensor] = []
 
     model.eval()
     with torch.no_grad():
         for batch in loader:
-            prepared_batch = _move_batch_to_device(batch=batch, device=device)
-            forward_batch = _forward_batch_without_labels(prepared_batch)
-            with torch.autocast(device_type=device.type, enabled=use_amp):
-                _forward_model(model=model, batch=forward_batch)
+            prepared_batch = move_batch_to_device(batch=batch, device=device)
+            forward_batch = {key: value for key, value in prepared_batch.items() if key != "label"}
+            with accelerator.autocast():
+                forward_model(model=model, batch=forward_batch)
             features = feature_hook.pop()
             labels = assign_pseudo_labels(
                 features=features,
@@ -343,31 +277,20 @@ def _compute_pseudo_labels(
     return torch.cat(pseudo_labels, dim=0)
 
 
-def _reduce_mean_vector(
-    values: torch.Tensor,
-    distributed_context: DistributedContext,
-) -> torch.Tensor:
-    """Average metrics across ranks when distributed mode is active."""
-    result = values.clone()
-    _all_reduce_sum(result, distributed_context)
-    if distributed_context.is_distributed:
-        result = result / float(distributed_context.world_size)
-    return result
-
-
 def _train_one_shot_epoch(
     model: nn.Module,
     loader: DataLoader[dict[str, object]],
     pseudo_labels: torch.Tensor,
     optimizer: Optimizer,
     scheduler: LRScheduler | None,
-    scaler: torch.amp.GradScaler,
+    accelerator: AcceleratorLike,
     device: torch.device,
     use_amp: bool,
     adaptation_config: DomainAdaptationConfig,
     distributed_context: DistributedContext,
 ) -> dict[str, float]:
     """Run one SHOT optimization epoch on target data."""
+    del use_amp, distributed_context
     model.train()
     pseudo_offset = 0
     step_count = 0
@@ -385,12 +308,12 @@ def _train_one_shot_epoch(
         batch_pseudo = pseudo_labels[pseudo_offset:next_offset].to(device=device)
         pseudo_offset = next_offset
 
-        prepared_batch = _move_batch_to_device(batch=batch, device=device)
-        forward_batch = _forward_batch_without_labels(prepared_batch)
+        prepared_batch = move_batch_to_device(batch=batch, device=device)
+        forward_batch = {key: value for key, value in prepared_batch.items() if key != "label"}
 
-        model.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, enabled=use_amp):
-            output = _forward_model(model=model, batch=forward_batch)
+        optimizer.zero_grad(set_to_none=True)
+        with accelerator.autocast():
+            output = forward_model(model=model, batch=forward_batch)
             logits = output["logits"]
             probs = logits_to_probabilities(logits=logits, epsilon=adaptation_config.epsilon)
 
@@ -406,9 +329,8 @@ def _train_one_shot_epoch(
                 + adaptation_config.beta * pseudo_ce_value
             )
 
-        scaler.scale(total_loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
+        accelerator.backward(total_loss)
+        optimizer.step()
         if scheduler is not None:
             scheduler.step()
 
@@ -432,7 +354,7 @@ def _train_one_shot_epoch(
         device=device,
         dtype=torch.float64,
     )
-    reduced = _reduce_mean_vector(metrics, distributed_context)
+    reduced = accelerator.reduce(metrics, reduction="mean")
     return {
         "entropy_loss": float(reduced[0].item()),
         "diversity_loss": float(reduced[1].item()),
@@ -443,28 +365,26 @@ def _train_one_shot_epoch(
 
 
 def run_shot_adaptation_stage(
-    config: ConfigDict,
+    runtime: PipelineRuntime,
     model: nn.Module,
-    device: torch.device,
     dataloaders: dict[str, DataLoader[dict[str, object]]],
-    run_id: str,
+    *,
     checkpoint_path: Path,
-    distributed_context: DistributedContext,
 ) -> Path:
     """Run SHOT adaptation from one source checkpoint and return adapted checkpoint path."""
+    config = runtime.config.raw
+    device = runtime.device
     adaptation_config = parse_domain_adaptation_config(config)
     if not adaptation_config.enabled or adaptation_config.method != "shot":
         raise ValueError("run_shot_adaptation_stage requires enabled SHOT configuration")
 
-    model_name, _ = extract_model_kwargs(config)
-    log_dir, model_dir, logger = _build_stage_runtime(
-        model_name=model_name,
-        stage="adapt",
-        run_id=run_id,
-        distributed_context=distributed_context,
-    )
+    run_id = runtime.stage_run_id("adapt")
+    paths = runtime.stage_paths("adapt")
+    log_dir = paths.log_dir
+    model_dir = paths.model_dir
+    logger = runtime.stage_logger("adapt", log_dir / "log.log")
 
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         log_stage_event(
             logger,
             "stage_start",
@@ -473,22 +393,23 @@ def run_shot_adaptation_stage(
             method=adaptation_config.method,
         )
 
-    _load_checkpoint(model=model, checkpoint_path=checkpoint_path, device=device)
+    checkpoint_path_resolved = Path(checkpoint_path)
+    runtime.load_checkpoint(model, checkpoint_path_resolved)
 
-    if distributed_context.is_main_process:
-        log_stage_event(logger, "checkpoint_loaded", path=checkpoint_path)
+    if runtime.is_main_process:
+        log_stage_event(logger, "checkpoint_loaded", path=checkpoint_path_resolved)
 
     optimizer_params, trainable_params = _prepare_shot_optimizer_params(
         model=model,
         prefixes=adaptation_config.freeze_prefixes,
-        preserve_frozen_requires_grad=distributed_context.is_distributed,
+        preserve_frozen_requires_grad=runtime.is_distributed,
     )
 
     eval_loader, train_loader = _build_target_loaders(
         config=config,
         dataloaders=dataloaders,
         adaptation_config=adaptation_config,
-        distributed_context=distributed_context,
+        distributed_context=runtime.distributed,
     )
     steps_per_epoch = len(train_loader)
     if steps_per_epoch <= 0:
@@ -502,19 +423,41 @@ def run_shot_adaptation_stage(
         adaptation_config=adaptation_config,
         total_steps=adaptation_config.epochs * steps_per_epoch,
     )
-
-    device_cfg = get_section(config, "device_config")
-    use_amp = as_bool(
-        device_cfg.get("use_mixed_precision", False),
-        "device_config.use_mixed_precision",
-    )
-    scaler = torch.amp.GradScaler(  # type: ignore[attr-defined]
-        "cuda",
-        enabled=use_amp and device.type == "cuda",
-    )
+    if scheduler is None:
+        (
+            stage_model,
+            optimizer,
+            eval_loader,
+            train_loader,
+        ) = cast(
+            tuple[
+                nn.Module,
+                Optimizer,
+                DataLoader[dict[str, object]],
+                DataLoader[dict[str, object]],
+            ],
+            runtime.accelerator.prepare(model, optimizer, eval_loader, train_loader),
+        )
+    else:
+        (
+            stage_model,
+            optimizer,
+            eval_loader,
+            train_loader,
+            scheduler,
+        ) = cast(
+            tuple[
+                nn.Module,
+                Optimizer,
+                DataLoader[dict[str, object]],
+                DataLoader[dict[str, object]],
+                LRScheduler,
+            ],
+            runtime.accelerator.prepare(model, optimizer, eval_loader, train_loader, scheduler),
+        )
 
     csv_path = log_dir / "adapt_step.csv"
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         log_stage_event(
             logger,
             "adapt_config",
@@ -524,7 +467,12 @@ def run_shot_adaptation_stage(
             trainable_params=trainable_params,
         )
 
-    feature_hook = OutputHeadFeatureHook(model=model)
+    device_cfg = get_section(config, "device_config")
+    use_amp = as_bool(
+        device_cfg.get("use_mixed_precision", False),
+        "device_config.use_mixed_precision",
+    )
+    feature_hook = OutputHeadFeatureHook(model=stage_model)
     try:
         for epoch in range(adaptation_config.epochs):
             _set_loader_epoch(eval_loader, epoch)
@@ -532,39 +480,40 @@ def run_shot_adaptation_stage(
             epoch_start = time.perf_counter()
 
             centroids = _compute_global_centroids(
-                model=model,
+                model=stage_model,
                 loader=eval_loader,
                 feature_hook=feature_hook,
                 device=device,
                 use_amp=use_amp,
                 adaptation_config=adaptation_config,
-                distributed_context=distributed_context,
+                accelerator=runtime.accelerator,
             )
             pseudo_labels = _compute_pseudo_labels(
-                model=model,
+                model=stage_model,
                 loader=eval_loader,
                 feature_hook=feature_hook,
                 centroids=centroids,
                 device=device,
                 use_amp=use_amp,
                 adaptation_config=adaptation_config,
+                accelerator=runtime.accelerator,
             )
             epoch_stats = _train_one_shot_epoch(
-                model=model,
+                model=stage_model,
                 loader=train_loader,
                 pseudo_labels=pseudo_labels,
                 optimizer=optimizer,
                 scheduler=scheduler,
-                scaler=scaler,
+                accelerator=runtime.accelerator,
                 device=device,
                 use_amp=use_amp,
                 adaptation_config=adaptation_config,
-                distributed_context=distributed_context,
+                distributed_context=runtime.distributed,
             )
             epoch_seconds = time.perf_counter() - epoch_start
 
-            if distributed_context.is_main_process:
-                row: dict[str, float | int] = {
+            if runtime.is_main_process:
+                row: dict[str, float | int | str] = {
                     "Epoch": epoch + 1,
                     "Epoch Time": epoch_seconds,
                     "Entropy Loss": epoch_stats["entropy_loss"],
@@ -585,14 +534,14 @@ def run_shot_adaptation_stage(
                     total_loss=epoch_stats["total_loss"],
                     lr=epoch_stats["lr"],
                 )
-            distributed_barrier(distributed_context)
+            runtime.barrier()
     finally:
         feature_hook.close()
 
     adapted_checkpoint_path = model_dir / "best_model.pth"
-    if distributed_context.is_main_process:
-        _save_checkpoint(model=model, checkpoint_path=adapted_checkpoint_path)
+    runtime.save_checkpoint(stage_model, adapted_checkpoint_path)
+    if runtime.is_main_process:
         log_stage_event(logger, "checkpoint_saved", path=adapted_checkpoint_path)
         log_stage_event(logger, "stage_done", run_id=run_id)
-    distributed_barrier(distributed_context)
+    runtime.barrier()
     return adapted_checkpoint_path

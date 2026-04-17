@@ -1,7 +1,7 @@
 """Unit tests for model construction entrypoints."""
 
 import pytest
-from src.run import build_model
+from src.pipeline.stages.train import build_model
 
 
 def _base_config(model_name: str) -> dict[str, object]:

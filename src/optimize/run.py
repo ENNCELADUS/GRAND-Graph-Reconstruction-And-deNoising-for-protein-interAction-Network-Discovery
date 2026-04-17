@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import importlib
 import json
 import logging
 import os
@@ -12,6 +11,8 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
 
+import torch
+import torch.distributed as dist
 import yaml  # type: ignore[import-untyped]
 
 from src.optimize.backends.optuna_backend import OptunaResult, TrialRecord, run_optuna_optimization
@@ -23,6 +24,8 @@ from src.optimize.distributed import (
 )
 from src.optimize.search_space import extend_with_nas_lite, parse_search_space
 from src.optimize.trial_runner import run_best_full_pipeline
+from src.pipeline.engine import execute_pipeline
+from src.pipeline.runtime import DistributedContext
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -32,31 +35,11 @@ from src.utils.config import (
     get_section,
     load_config,
 )
-from src.utils.distributed import DistributedContext, cleanup_distributed, initialize_distributed
 from src.utils.logging import generate_run_id
 
 LOGGER = logging.getLogger(__name__)
 PipelineExecuteFn = Callable[[ConfigDict], None]
-PIPELINE_EXECUTE_FN: PipelineExecuteFn
-
-
-def _resolve_pipeline_execute_fn() -> PipelineExecuteFn:
-    """Resolve pipeline execute function from runtime module layout."""
-    run_module = importlib.import_module("src.run")
-    execute_fn = getattr(run_module, "execute_pipeline", None)
-    if callable(execute_fn):
-        return cast(PipelineExecuteFn, execute_fn)
-    return _fallback_pipeline_execute
-
-
-def _fallback_pipeline_execute(config: ConfigDict) -> None:
-    """Fallback to package orchestrator when ``src.run`` script module is unavailable."""
-    from src.run.pipeline_orchestrator import execute_pipeline
-
-    cast(PipelineExecuteFn, execute_pipeline)(config)
-
-
-PIPELINE_EXECUTE_FN = _resolve_pipeline_execute_fn()
+PIPELINE_EXECUTE_FN: PipelineExecuteFn = cast(PipelineExecuteFn, execute_pipeline)
 
 
 def parse_args() -> argparse.Namespace:
@@ -159,7 +142,7 @@ def run_optimization(
         if distributed_channel is not None:
             distributed_channel.send(OptimizationCommand(kind="stop"))
     finally:
-        cleanup_distributed(distributed_context)
+        _cleanup_optimization_distributed(distributed_context)
 
 
 def main() -> None:
@@ -222,12 +205,62 @@ def _initialize_optimization_distributed(*, execution_cfg: ConfigDict) -> Distri
         "optimization.execution.ddp_per_trial",
     )
     if world_size <= 1:
-        return initialize_distributed(False)
+        return DistributedContext(ddp_enabled=False, is_distributed=False)
     if not ddp_per_trial:
         raise ValueError(
             "Distributed optimization requires optimization.execution.ddp_per_trial=true"
         )
-    return initialize_distributed(True)
+    return _initialize_optimization_process_group()
+
+
+def _initialize_optimization_process_group() -> DistributedContext:
+    """Initialize one optimization-owned process group from torchrun env."""
+    if dist.is_initialized():
+        return DistributedContext(
+            ddp_enabled=True,
+            is_distributed=dist.get_world_size() > 1,
+            rank=int(dist.get_rank()),
+            local_rank=as_int(os.environ.get("LOCAL_RANK", "0"), "LOCAL_RANK"),
+            world_size=int(dist.get_world_size()),
+            owns_process_group=False,
+        )
+
+    world_size = as_int(os.environ.get("WORLD_SIZE", "1"), "WORLD_SIZE")
+    rank = as_int(os.environ.get("RANK", "0"), "RANK")
+    local_rank = as_int(os.environ.get("LOCAL_RANK", "0"), "LOCAL_RANK")
+    if world_size <= 1:
+        return DistributedContext(ddp_enabled=True, is_distributed=False)
+
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if backend == "nccl":
+        torch.cuda.set_device(local_rank)
+    dist.init_process_group(
+        backend=backend,
+        init_method="env://",
+        world_size=world_size,
+        rank=rank,
+    )
+    LOGGER.info(
+        "Initialized optimization process group (backend=%s rank=%d local_rank=%d world_size=%d).",
+        backend,
+        rank,
+        local_rank,
+        world_size,
+    )
+    return DistributedContext(
+        ddp_enabled=True,
+        is_distributed=True,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        owns_process_group=True,
+    )
+
+
+def _cleanup_optimization_distributed(context: DistributedContext) -> None:
+    """Destroy optimization-owned process groups after distributed runs."""
+    if context.is_distributed and context.owns_process_group and dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def _as_config_dict(value: object, field_name: str) -> ConfigDict:

@@ -33,7 +33,7 @@ data_config:
     pin_memory: true
     drop_last: true
     sampling:
-      strategy: "ohem"
+      strategy: "none"
       warmup_epochs: 5
       pool_multiplier: 4
       cap_protein: 4
@@ -79,9 +79,7 @@ training_config:
     anneal_strategy: "cos"
   loss:
     type: "bce_with_logits"
-    # topology_finetune applies BCE only on explicit PRING pair labels while
-    # keeping graph losses on the dense positive train subgraph.
-    pos_weight: 3.0
+    pos_weight: 1.0
     label_smoothing: 0.0
   strategy:
     type: "none"
@@ -94,18 +92,18 @@ topology_finetune:
   supervision_train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi_ratio5_exclusive.txt"
   supervision_valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi_ratio5_exclusive.txt"
   bce_negative_ratio: 5
-  min_nodes: 20
-  max_nodes: 20
+  subgraph_node_range: [30, 60]
+  gradient_accumulation_steps: 8
+  subgraphs_per_forward: 1
   strategy: "mixed"
-  overlap_penalty: 0.5
-  pair_batch_size: 16
+  pair_batch_size: 32
   decision_threshold:
     mode: "best_f1_on_valid"
   monitor_metric: "internal_val_graph_sim"
   early_stopping_patience: 5
   optimizer:
-    lr: 3.0e-6
-    weight_decay: 3.0e-3
+    lr: 5.0e-5
+    weight_decay: 0.01
   losses:
     # Scratch regime: keep topology as a weak structural prior until BCE learns
     # a usable pairwise scorer. Relative-density was dominating the old setup.
@@ -132,7 +130,7 @@ evaluate:
     - "mcc"
 
 topology_evaluate:
-  inference_batch_size: 32
+  inference_batch_size: 128
   decision_threshold:
     mode: "best_f1_on_valid"
   save_pair_predictions: true

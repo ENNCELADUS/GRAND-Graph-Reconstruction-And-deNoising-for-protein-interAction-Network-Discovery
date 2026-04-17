@@ -9,12 +9,11 @@ from pathlib import Path
 from typing import Literal, cast
 
 import torch
-import torch.distributed as dist
 from torch import nn
-from torch.nn.parallel import DistributedDataParallel
 
 from src.evaluate import Evaluator
 from src.model import V3, V3_1, V4, V5
+from src.pipeline.runtime import AcceleratorLike, PipelineRuntime
 from src.train.base import Trainer
 from src.train.config import LossConfig, OptimizerConfig, SchedulerConfig
 from src.train.strategies.lifecycle import NoOpStrategy, StagedUnfreezeStrategy, TrainingStrategy
@@ -29,24 +28,13 @@ from src.utils.config import (
     extract_model_kwargs,
     get_section,
 )
-from src.utils.distributed import DistributedContext, distributed_barrier
 from src.utils.early_stop import EarlyStopping
-from src.utils.logging import (
-    append_csv_row,
-    log_stage_event,
-    prepare_stage_directories,
-    setup_stage_logger,
-)
+from src.utils.logging import append_csv_row, log_stage_event
 
 AnnealStrategy = Literal["cos", "linear"]
 ModelFactory = Callable[[ConfigDict], nn.Module]
 DEFAULT_TRAINING_VAL_METRICS = ["auprc", "auroc"]
 DEFAULT_HEARTBEAT_EVERY_N_STEPS = 20
-
-
-def _stage_logger_name(model_name: str, stage: str, run_id: str, rank: int) -> str:
-    """Return stable logger name for one stage/run/rank tuple."""
-    return f"grand.{model_name}.{stage}.{run_id}.rank{rank}"
 
 
 def _training_logging_config(training_cfg: ConfigDict) -> ConfigDict:
@@ -148,49 +136,6 @@ def _training_heartbeat_every_n_steps(training_cfg: ConfigDict) -> int:
     return heartbeat_every_n_steps
 
 
-def _build_stage_logger(name: str, log_file: Path, enabled: bool) -> logging.Logger:
-    """Create stage logger for rank-aware logging behavior."""
-    if enabled:
-        return setup_stage_logger(name=name, log_file=log_file)
-    logger = logging.getLogger(name)
-    logger.propagate = False
-    if not logger.handlers:
-        logger.addHandler(logging.NullHandler())
-    return logger
-
-
-def _unwrap_model(model: nn.Module) -> nn.Module:
-    """Return underlying model when wrapped by DDP."""
-    if isinstance(model, DistributedDataParallel):
-        return cast(nn.Module, model.module)
-    return model
-
-
-def _build_stage_runtime(
-    model_name: str,
-    stage: str,
-    run_id: str,
-    distributed_context: DistributedContext,
-) -> tuple[Path, Path, logging.Logger]:
-    """Create artifact directories and stage logger for one stage."""
-    log_dir, model_dir = prepare_stage_directories(
-        model_name=model_name,
-        stage=stage,
-        run_id=run_id,
-    )
-    stage_logger = _build_stage_logger(
-        name=_stage_logger_name(
-            model_name=model_name,
-            stage=stage,
-            run_id=run_id,
-            rank=distributed_context.rank,
-        ),
-        log_file=log_dir / "log.log",
-        enabled=distributed_context.is_main_process,
-    )
-    return log_dir, model_dir, stage_logger
-
-
 def build_model(config: ConfigDict) -> nn.Module:
     """Build model from ``model_config``."""
     model_name, model_kwargs = extract_model_kwargs(config)
@@ -204,7 +149,8 @@ def build_trainer(
     config: ConfigDict,
     model: nn.Module,
     device: torch.device,
-    steps_per_epoch: int,
+    accelerator: AcceleratorLike,
+    steps_per_epoch: int = 1,
     logger: logging.Logger | None = None,
 ) -> tuple[Trainer, LossConfig]:
     """Instantiate trainer with optimizer/scheduler configs."""
@@ -273,6 +219,7 @@ def build_trainer(
     trainer = Trainer(
         model=model,
         device=device,
+        accelerator=accelerator,
         optimizer_config=optimizer_config,
         scheduler_config=scheduler_config,
         loss_config=loss_config,
@@ -309,36 +256,21 @@ def build_strategy(config: ConfigDict) -> TrainingStrategy:
     return NoOpStrategy()
 
 
-def _save_checkpoint(model: nn.Module, checkpoint_path: Path) -> None:
-    """Persist model weights to disk."""
-    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(_unwrap_model(model).state_dict(), checkpoint_path)
-
-
-def _load_checkpoint(model: nn.Module, checkpoint_path: Path, device: torch.device) -> None:
-    """Load model weights from disk."""
-    state_dict = torch.load(checkpoint_path, map_location=device)
-    _unwrap_model(model).load_state_dict(state_dict)
-
-
 def run_training_stage(
-    stage: str,
-    config: ConfigDict,
+    runtime: PipelineRuntime,
     model: nn.Module,
-    device: torch.device,
     dataloaders: dict[str, torch.utils.data.DataLoader[dict[str, object]]],
-    run_id: str,
-    distributed_context: DistributedContext,
 ) -> Path:
     """Run stage training loop."""
-    model_name, _ = extract_model_kwargs(config)
-    log_dir, model_dir, stage_logger = _build_stage_runtime(
-        model_name=model_name,
-        stage=stage,
-        run_id=run_id,
-        distributed_context=distributed_context,
-    )
-    if distributed_context.is_main_process:
+    stage = "train"
+    config = runtime.config.raw
+    device = runtime.device
+    run_id = runtime.stage_run_id(stage)
+    paths = runtime.stage_paths(stage)
+    log_dir = paths.log_dir
+    model_dir = paths.model_dir
+    stage_logger = runtime.stage_logger(stage, log_dir / "log.log")
+    if runtime.is_main_process:
         log_stage_event(
             stage_logger,
             "stage_start",
@@ -351,9 +283,12 @@ def run_training_stage(
         config=config,
         model=model,
         device=device,
+        accelerator=runtime.accelerator,
         steps_per_epoch=len(dataloaders["train"]),
         logger=stage_logger,
     )
+    train_loader = trainer.prepare_training_components(dataloaders["train"])
+    stage_model = trainer.model
     strategy = build_strategy(config)
 
     monitor_metric = as_str(
@@ -365,7 +300,13 @@ def run_training_stage(
         device_cfg.get("use_mixed_precision", False),
         "device_config.use_mixed_precision",
     )
-    evaluator = Evaluator(metrics=evaluator_metrics, loss_config=loss_config, use_amp=use_amp)
+    evaluator = Evaluator(
+        metrics=evaluator_metrics,
+        loss_config=loss_config,
+        use_amp=use_amp,
+        accelerator=runtime.accelerator,
+        gather_for_metrics=runtime.accelerator.use_distributed,
+    )
     monitor_key = f"val_{monitor_metric}"
     patience = as_int(
         training_cfg.get("early_stopping_patience", 5),
@@ -388,7 +329,7 @@ def run_training_stage(
         *[f"Val {metric}" for metric in validation_metrics],
         "Learning Rate",
     ]
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         log_stage_event(
             stage_logger,
             "train_config",
@@ -400,26 +341,26 @@ def run_training_stage(
 
     for epoch in range(epochs):
         epoch_start = time.perf_counter()
-        if distributed_context.is_main_process:
+        if runtime.is_main_process:
             log_stage_event(stage_logger, "epoch_start", epoch=epoch + 1)
-        train_sampler = dataloaders["train"].sampler
-        train_batch_sampler = getattr(dataloaders["train"], "batch_sampler", None)
+        train_sampler = train_loader.sampler
+        train_batch_sampler = getattr(train_loader, "batch_sampler", None)
         set_epoch_fn = getattr(train_batch_sampler, "set_epoch", None)
         if callable(set_epoch_fn):
             set_epoch_fn(epoch)
-        elif distributed_context.is_distributed and hasattr(train_sampler, "set_epoch"):
+        elif runtime.is_distributed and hasattr(train_sampler, "set_epoch"):
             train_sampler.set_epoch(epoch)
         strategy.on_epoch_begin(trainer, epoch)
-        train_stats = trainer.train_one_epoch(dataloaders["train"], epoch_index=epoch)
-        model.eval()
+        train_stats = trainer.train_one_epoch(train_loader, epoch_index=epoch)
+        stage_model.eval()
         with torch.no_grad():
             val_stats = evaluator.evaluate(
-                model=model,
+                model=stage_model,
                 data_loader=dataloaders["valid"],
                 device=device,
                 prefix="val",
             )
-        model.train()
+        stage_model.train()
         strategy.on_epoch_end(trainer, epoch)
         epoch_seconds = time.perf_counter() - epoch_start
 
@@ -432,16 +373,20 @@ def run_training_stage(
         }
         for metric in validation_metrics:
             row[f"Val {metric}"] = float(val_stats.get(f"val_{metric}", 0.0))
-        if distributed_context.is_main_process:
+        if runtime.is_main_process:
             append_csv_row(csv_path=csv_path, row=row, fieldnames=csv_headers)
             log_stage_event(stage_logger, "csv_written", epoch=epoch + 1)
 
         monitor_value = float(val_stats.get(monitor_key, 0.0))
         should_stop = False
-        if distributed_context.is_main_process:
+        save_best_checkpoint = False
+        if runtime.is_main_process:
             improved, should_stop = early_stopping.update(monitor_value)
-            if improved:
-                _save_checkpoint(model=model, checkpoint_path=best_checkpoint_path)
+            save_best_checkpoint = improved
+        save_best_checkpoint = _sync_flag(runtime, save_best_checkpoint)
+        if save_best_checkpoint:
+            runtime.save_checkpoint(stage_model, best_checkpoint_path)
+            if runtime.is_main_process:
                 log_stage_event(
                     stage_logger,
                     "best_saved",
@@ -449,19 +394,17 @@ def run_training_stage(
                     monitor=monitor_key,
                     value=monitor_value,
                 )
-            if not save_best_only:
-                epoch_checkpoint_path = model_dir / f"checkpoint_epoch_{epoch + 1:03d}.pth"
-                _save_checkpoint(
-                    model=model,
-                    checkpoint_path=epoch_checkpoint_path,
-                )
+        if not save_best_only:
+            epoch_checkpoint_path = model_dir / f"checkpoint_epoch_{epoch + 1:03d}.pth"
+            runtime.save_checkpoint(stage_model, epoch_checkpoint_path)
+            if runtime.is_main_process:
                 log_stage_event(
                     stage_logger,
                     "checkpoint_saved",
                     epoch=epoch + 1,
                 )
 
-        if distributed_context.is_main_process:
+        if runtime.is_main_process:
             val_metric_fields = {
                 f"val_{m}": float(val_stats.get(f"val_{m}", 0.0)) for m in validation_metrics
             }
@@ -474,23 +417,38 @@ def run_training_stage(
                 val_loss=float(val_stats.get("val_loss", 0.0)),
                 **val_metric_fields,
             )
-        if distributed_context.is_distributed:
-            stop_flag = torch.tensor([1 if should_stop else 0], device=device, dtype=torch.int64)
-            dist.broadcast(stop_flag, src=0)
-            should_stop = bool(int(stop_flag.item()))
+        if runtime.is_distributed:
+            stop_flag = torch.tensor(
+                [1 if should_stop and runtime.is_main_process else 0],
+                device=device,
+                dtype=torch.int64,
+            )
+            reduced_stop_flag = runtime.accelerator.reduce(stop_flag, reduction="sum")
+            should_stop = bool(int(reduced_stop_flag.item()) > 0)
         if should_stop:
-            if distributed_context.is_main_process:
+            if runtime.is_main_process:
                 log_stage_event(stage_logger, "early_stop", epoch=epoch + 1)
             break
 
-    if distributed_context.is_main_process and not best_checkpoint_path.exists():
-        _save_checkpoint(model=model, checkpoint_path=best_checkpoint_path)
+    fallback_save = runtime.is_main_process and not best_checkpoint_path.exists()
+    if _sync_flag(runtime, fallback_save):
+        runtime.save_checkpoint(stage_model, best_checkpoint_path)
+    if runtime.is_main_process and fallback_save:
         log_stage_event(stage_logger, "fallback_saved")
-    if distributed_context.is_main_process:
+    if runtime.is_main_process:
         log_stage_event(
             stage_logger,
             "stage_done",
             run_id=run_id,
         )
-    distributed_barrier(distributed_context)
+    runtime.barrier()
     return best_checkpoint_path
+
+
+def _sync_flag(runtime: PipelineRuntime, flag: bool) -> bool:
+    """Return a flag that is true on all ranks when any rank reports true."""
+    if not runtime.is_distributed:
+        return flag
+    flag_tensor = torch.tensor([1 if flag else 0], device=runtime.device, dtype=torch.int64)
+    reduced = runtime.accelerator.reduce(flag_tensor, reduction="sum")
+    return bool(int(reduced.item()) > 0)

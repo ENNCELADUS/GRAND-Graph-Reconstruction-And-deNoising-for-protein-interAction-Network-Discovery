@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J V3
+#SBATCH -J V3-Ablation-Subgraph-Size
 #SBATCH -p hexm
 #SBATCH -A hexm
 #SBATCH -N 1

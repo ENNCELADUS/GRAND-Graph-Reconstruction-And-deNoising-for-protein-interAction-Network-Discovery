@@ -6,11 +6,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-import src.run as run_module
-import src.run.pipeline_orchestrator as pipeline_orchestrator
+import src.pipeline.engine as run_module
+import src.pipeline.runtime as pipeline_runtime
 import torch
+from src.pipeline.runtime import PipelineRuntime
 from src.utils.config import ConfigDict
-from src.utils.distributed import DistributedContext
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -100,80 +100,78 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         return _DummyModel()
 
     def fake_run_training_stage(
-        stage: str,
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
-        distributed_context: DistributedContext,
     ) -> Path:
-        del config, model, device, dataloaders, distributed_context
-        calls.training.append((stage, run_id))
+        del model, dataloaders
+        stage = "train"
+        calls.training.append((stage, runtime.stage_run_id(stage)))
         return Path(f"artifacts/{stage}_best_model.pth")
 
     def fake_run_evaluation_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
+        *,
         checkpoint_path: Path,
-        distributed_context: DistributedContext,
     ) -> dict[str, float]:
-        del config, model, device, dataloaders, distributed_context
-        calls.evaluation.append((checkpoint_path, run_id))
+        del model, dataloaders
+        calls.evaluation.append((checkpoint_path, runtime.stage_run_id("evaluate")))
         return {"accuracy": 1.0}
 
     def fake_run_topology_finetuning_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
+        *,
         checkpoint_path: Path | None,
-        distributed_context: DistributedContext,
     ) -> Path:
-        del config, model, device, dataloaders, distributed_context
-        calls.topology_finetuning.append((checkpoint_path, run_id))
+        del model, dataloaders
+        calls.topology_finetuning.append(
+            (
+                checkpoint_path,
+                runtime.stage_run_id("topology_finetune"),
+            )
+        )
         return Path("artifacts/topology_finetune_best_model.pth")
 
     def fake_run_adaptation_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
+        *,
         checkpoint_path: Path,
-        distributed_context: DistributedContext,
     ) -> Path:
-        del config, model, device, dataloaders, distributed_context
-        calls.adaptation.append((checkpoint_path, run_id))
+        del model, dataloaders
+        calls.adaptation.append((checkpoint_path, runtime.stage_run_id("adapt")))
         return Path("artifacts/adapt_best_model.pth")
 
     def fake_run_topology_evaluation_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
+        *,
         checkpoint_path: Path,
-        distributed_context: DistributedContext,
     ) -> dict[str, float]:
-        del config, model, device, dataloaders, distributed_context
-        calls.topology_evaluation.append((checkpoint_path, run_id))
+        del model, dataloaders
+        calls.topology_evaluation.append(
+            (checkpoint_path, runtime.stage_run_id("topology_evaluate"))
+        )
         return {"graph_sim": 1.0}
 
-    def fake_initialize_distributed(ddp_enabled: bool) -> DistributedContext:
-        del ddp_enabled
-        return DistributedContext(ddp_enabled=False, is_distributed=False)
+    class _FakeAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = False
+        process_index = 0
+        local_process_index = 0
+        num_processes = 1
+        mixed_precision = "no"
 
-    def fake_cleanup_distributed(context: DistributedContext) -> None:
-        del context
-
-    def fake_resolve_device(device_name: str) -> torch.device:
-        del device_name
-        return torch.device("cpu")
+    def fake_build_accelerator(**kwargs: object) -> _FakeAccelerator:
+        del kwargs
+        return _FakeAccelerator()
 
     monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
     monkeypatch.setattr(run_module, "build_model", fake_build_model)
@@ -190,9 +188,7 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         "run_topology_evaluation_stage",
         fake_run_topology_evaluation_stage,
     )
-    monkeypatch.setattr(run_module, "initialize_distributed", fake_initialize_distributed)
-    monkeypatch.setattr(run_module, "cleanup_distributed", fake_cleanup_distributed)
-    monkeypatch.setattr(run_module, "resolve_device", fake_resolve_device)
+    monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
     return calls
 
 
@@ -226,6 +222,148 @@ def test_execute_pipeline_train_only(
     assert patched_pipeline.topology_evaluation == []
 
 
+def test_execute_pipeline_builds_accelerator_runtime_instead_of_manual_ddp(
+    base_config: ConfigDict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accelerator_calls: list[dict[str, object]] = []
+    stage_calls: list[str] = []
+
+    class _FakeAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = False
+        process_index = 0
+        local_process_index = 0
+        num_processes = 1
+        mixed_precision = "no"
+
+        def wait_for_everyone(self) -> None:
+            return None
+
+    def fake_build_accelerator(
+        *,
+        requested_device: str,
+        ddp_enabled: bool,
+        use_mixed_precision: bool,
+        find_unused_parameters: bool,
+    ) -> _FakeAccelerator:
+        accelerator_calls.append(
+            {
+                "requested_device": requested_device,
+                "ddp_enabled": ddp_enabled,
+                "use_mixed_precision": use_mixed_precision,
+                "find_unused_parameters": find_unused_parameters,
+            }
+        )
+        return _FakeAccelerator()
+
+    def fake_build_dataloaders(
+        *args: object,
+        **kwargs: object,
+    ) -> dict[str, DataLoader[dict[str, torch.Tensor]]]:
+        del args, kwargs
+        loader = DataLoader(_EmptyDataset(), batch_size=1)
+        return {"train": loader, "valid": loader, "test": loader}
+
+    def fake_build_model(*args: object, **kwargs: object) -> nn.Module:
+        del args, kwargs
+        return _DummyModel()
+
+    def fake_run_training_stage(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        stage_calls.append("train")
+        return Path("artifacts/train_best_model.pth")
+
+    monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
+    monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
+    monkeypatch.setattr(run_module, "build_model", fake_build_model)
+    monkeypatch.setattr(run_module, "run_training_stage", fake_run_training_stage)
+
+    run_cfg = base_config["run_config"]
+    assert isinstance(run_cfg, dict)
+    run_cfg["stages"] = ["train"]
+
+    run_module.execute_pipeline(base_config)
+
+    assert accelerator_calls == [
+        {
+            "requested_device": "cpu",
+            "ddp_enabled": False,
+            "use_mixed_precision": False,
+            "find_unused_parameters": False,
+        }
+    ]
+    assert stage_calls == ["train"]
+
+
+def test_execute_pipeline_uses_accelerator_device_without_resolve_device(
+    base_config: ConfigDict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_devices: list[torch.device] = []
+
+    class _FakeAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = False
+        process_index = 0
+        local_process_index = 0
+        num_processes = 1
+        mixed_precision = "no"
+
+        def wait_for_everyone(self) -> None:
+            return None
+
+    def fake_build_accelerator(**kwargs: object) -> _FakeAccelerator:
+        del kwargs
+        return _FakeAccelerator()
+
+    def fake_build_dataloaders(
+        config: ConfigDict,
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> dict[str, DataLoader[dict[str, torch.Tensor]]]:
+        del config, distributed, rank, world_size
+        loader = DataLoader(_EmptyDataset(), batch_size=1)
+        return {"train": loader, "valid": loader, "test": loader}
+
+    def fake_build_model(config: ConfigDict) -> nn.Module:
+        del config
+        return _DummyModel()
+
+    def fake_run_training_stage(
+        runtime: PipelineRuntime,
+        model: nn.Module,
+        dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+    ) -> Path:
+        del model, dataloaders
+        observed_devices.append(runtime.device)
+        return Path("artifacts/train_best_model.pth")
+
+    def fake_run_evaluation_stage(
+        runtime: PipelineRuntime,
+        model: nn.Module,
+        dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+        *,
+        checkpoint_path: Path,
+    ) -> dict[str, float]:
+        del model, dataloaders, checkpoint_path
+        observed_devices.append(runtime.device)
+        return {"accuracy": 1.0}
+
+    monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
+    monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
+    monkeypatch.setattr(run_module, "build_model", fake_build_model)
+    monkeypatch.setattr(run_module, "run_training_stage", fake_run_training_stage)
+    monkeypatch.setattr(run_module, "run_evaluation_stage", fake_run_evaluation_stage)
+
+    run_module.execute_pipeline(base_config)
+
+    assert observed_devices == [torch.device("cpu"), torch.device("cpu")]
+
+
 def test_execute_pipeline_distributed_worker_reuses_main_run_ids(
     base_config: ConfigDict,
     patched_pipeline: PipelineCalls,
@@ -236,23 +374,22 @@ def test_execute_pipeline_distributed_worker_reuses_main_run_ids(
     run_cfg["stages"] = ["train"]
     run_cfg["train_run_id"] = None
 
+    class _WorkerAccelerator:
+        device = torch.device("cpu")
+        is_main_process = False
+        use_distributed = True
+        process_index = 1
+        local_process_index = 1
+        num_processes = 2
+        mixed_precision = "no"
+
     monkeypatch.setattr(
         run_module,
-        "initialize_distributed",
-        lambda ddp_enabled: DistributedContext(
-            ddp_enabled=ddp_enabled,
-            is_distributed=True,
-            rank=1,
-            local_rank=1,
-            world_size=2,
-        ),
+        "build_accelerator",
+        lambda **kwargs: _WorkerAccelerator(),
+        raising=False,
     )
-    monkeypatch.setattr(
-        run_module,
-        "DistributedDataParallel",
-        lambda model, **kwargs: model,
-    )
-    monkeypatch.setattr(pipeline_orchestrator.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(pipeline_runtime.torch.distributed, "is_initialized", lambda: True)
 
     def fake_broadcast_object_list(payload: list[object], src: int) -> None:
         del src
@@ -265,7 +402,7 @@ def test_execute_pipeline_distributed_worker_reuses_main_run_ids(
         }
 
     monkeypatch.setattr(
-        pipeline_orchestrator.torch.distributed,
+        pipeline_runtime.torch.distributed,
         "broadcast_object_list",
         fake_broadcast_object_list,
     )
@@ -279,8 +416,8 @@ def test_execute_pipeline_distributed_worker_reuses_main_run_ids(
         ]
     )
     monkeypatch.setattr(
-        pipeline_orchestrator,
-        "generate_run_id",
+        pipeline_runtime,
+        "_default_generate_run_id",
         lambda existing_value: next(generated_run_ids),
     )
 
@@ -496,15 +633,13 @@ def test_execute_pipeline_topology_finetune_launches_without_runtime_supervision
     call_order: list[str] = []
 
     def _fake_run_topology_finetuning_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
+        *,
         checkpoint_path: Path | None,
-        distributed_context: DistributedContext,
     ) -> Path:
-        del config, model, device, dataloaders, run_id, checkpoint_path, distributed_context
+        del runtime, model, dataloaders, checkpoint_path
         call_order.append("stage")
         return Path("artifacts/topology_finetune_best_model.pth")
 
@@ -581,22 +716,7 @@ def test_execute_pipeline_staged_unfreeze_enables_ddp_find_unused(
         "initial_trainable_prefixes": ["output_head"],
     }
 
-    ddp_call: dict[str, object] = {}
-
-    class _FakeDDP(nn.Module):
-        def __init__(
-            self,
-            module: nn.Module,
-            device_ids: list[int] | None = None,
-            find_unused_parameters: bool = False,
-        ) -> None:
-            super().__init__()
-            self.module = module
-            ddp_call["device_ids"] = device_ids
-            ddp_call["find_unused_parameters"] = find_unused_parameters
-
-        def forward(self, *args: object, **kwargs: object) -> object:
-            return self.module(*args, **kwargs)
+    accelerator_call: dict[str, object] = {}
 
     def fake_build_dataloaders(
         config: ConfigDict,
@@ -612,47 +732,35 @@ def test_execute_pipeline_staged_unfreeze_enables_ddp_find_unused(
         del config
         return _DummyModel()
 
-    def fake_initialize_distributed(ddp_enabled: bool) -> DistributedContext:
-        del ddp_enabled
-        return DistributedContext(
-            ddp_enabled=True,
-            is_distributed=True,
-            rank=0,
-            local_rank=0,
-            world_size=2,
-        )
+    class _FakeAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = True
+        process_index = 0
+        local_process_index = 0
+        num_processes = 2
+        mixed_precision = "no"
 
-    def fake_cleanup_distributed(context: DistributedContext) -> None:
-        del context
-
-    def fake_resolve_device(device_name: str) -> torch.device:
-        del device_name
-        return torch.device("cpu")
+    def fake_build_accelerator(**kwargs: object) -> _FakeAccelerator:
+        accelerator_call.update(kwargs)
+        return _FakeAccelerator()
 
     def fake_run_training_stage(
-        stage: str,
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
-        distributed_context: DistributedContext,
     ) -> Path:
-        del stage, config, model, device, dataloaders, run_id, distributed_context
+        del runtime, model, dataloaders
         return Path("artifacts/train_best_model.pth")
 
     monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
     monkeypatch.setattr(run_module, "build_model", fake_build_model)
-    monkeypatch.setattr(run_module, "initialize_distributed", fake_initialize_distributed)
-    monkeypatch.setattr(run_module, "cleanup_distributed", fake_cleanup_distributed)
-    monkeypatch.setattr(run_module, "resolve_device", fake_resolve_device)
+    monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
     monkeypatch.setattr(run_module, "run_training_stage", fake_run_training_stage)
-    monkeypatch.setattr(run_module, "DistributedDataParallel", _FakeDDP)
 
     run_module.execute_pipeline(base_config)
 
-    assert ddp_call["device_ids"] is None
-    assert ddp_call["find_unused_parameters"] is True
+    assert accelerator_call["find_unused_parameters"] is True
 
 
 def test_execute_pipeline_shot_adaptation_enables_ddp_find_unused(
@@ -677,22 +785,7 @@ def test_execute_pipeline_shot_adaptation_enables_ddp_find_unused(
         "target_split": "test",
     }
 
-    ddp_call: dict[str, object] = {}
-
-    class _FakeDDP(nn.Module):
-        def __init__(
-            self,
-            module: nn.Module,
-            device_ids: list[int] | None = None,
-            find_unused_parameters: bool = False,
-        ) -> None:
-            super().__init__()
-            self.module = module
-            ddp_call["device_ids"] = device_ids
-            ddp_call["find_unused_parameters"] = find_unused_parameters
-
-        def forward(self, *args: object, **kwargs: object) -> object:
-            return self.module(*args, **kwargs)
+    accelerator_call: dict[str, object] = {}
 
     def fake_build_dataloaders(
         config: ConfigDict,
@@ -708,57 +801,45 @@ def test_execute_pipeline_shot_adaptation_enables_ddp_find_unused(
         del config
         return _DummyModel()
 
-    def fake_initialize_distributed(ddp_enabled: bool) -> DistributedContext:
-        del ddp_enabled
-        return DistributedContext(
-            ddp_enabled=True,
-            is_distributed=True,
-            rank=0,
-            local_rank=0,
-            world_size=2,
-        )
+    class _FakeAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = True
+        process_index = 0
+        local_process_index = 0
+        num_processes = 2
+        mixed_precision = "no"
 
-    def fake_cleanup_distributed(context: DistributedContext) -> None:
-        del context
-
-    def fake_resolve_device(device_name: str) -> torch.device:
-        del device_name
-        return torch.device("cpu")
+    def fake_build_accelerator(**kwargs: object) -> _FakeAccelerator:
+        accelerator_call.update(kwargs)
+        return _FakeAccelerator()
 
     def fake_run_adaptation_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
+        *,
         checkpoint_path: Path,
-        distributed_context: DistributedContext,
     ) -> Path:
-        del config, model, device, dataloaders, run_id, checkpoint_path, distributed_context
+        del runtime, model, dataloaders, checkpoint_path
         return Path("artifacts/adapt_best_model.pth")
 
     def fake_run_evaluation_stage(
-        config: ConfigDict,
+        runtime: PipelineRuntime,
         model: nn.Module,
-        device: torch.device,
         dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
-        run_id: str,
+        *,
         checkpoint_path: Path,
-        distributed_context: DistributedContext,
     ) -> dict[str, float]:
-        del config, model, device, dataloaders, run_id, checkpoint_path, distributed_context
+        del runtime, model, dataloaders, checkpoint_path
         return {"accuracy": 1.0}
 
     monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
     monkeypatch.setattr(run_module, "build_model", fake_build_model)
-    monkeypatch.setattr(run_module, "initialize_distributed", fake_initialize_distributed)
-    monkeypatch.setattr(run_module, "cleanup_distributed", fake_cleanup_distributed)
-    monkeypatch.setattr(run_module, "resolve_device", fake_resolve_device)
+    monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
     monkeypatch.setattr(run_module, "run_shot_adaptation_stage", fake_run_adaptation_stage)
     monkeypatch.setattr(run_module, "run_evaluation_stage", fake_run_evaluation_stage)
-    monkeypatch.setattr(run_module, "DistributedDataParallel", _FakeDDP)
 
     run_module.execute_pipeline(base_config)
 
-    assert ddp_call["device_ids"] is None
-    assert ddp_call["find_unused_parameters"] is True
+    assert accelerator_call["find_unused_parameters"] is True

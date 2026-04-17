@@ -12,7 +12,7 @@ if __package__ in {None, ""}:
 
 def _main() -> None:
     """Delegate execution to package entrypoint."""
-    from src.run import main
+    from src.pipeline.__main__ import main
 
     main()
 

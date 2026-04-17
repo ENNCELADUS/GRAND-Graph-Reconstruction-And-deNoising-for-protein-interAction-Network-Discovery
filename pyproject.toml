@@ -23,6 +23,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Bio-Informatics",
 ]
 dependencies = [
+    "accelerate==1.13.0",
     "esm==3.2.1.post1",
     "networkx==3.6.1",
     "numpy==2.3.5",
@@ -73,6 +74,7 @@ markers = [
 line-length = 100
 target-version = "py310"
 src = ["src", "src_ml", "tests"]
+extend-exclude = [".codex"]
 
 [tool.ruff.lint]
 select = [

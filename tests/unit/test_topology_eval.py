@@ -7,7 +7,10 @@ from pathlib import Path
 
 import networkx as nx
 import pytest
-from src.run.stage_topology_evaluate import (
+import torch
+from src.pipeline.runtime import DistributedContext
+from src.pipeline.stages.topology_evaluate import (
+    _gather_ordered_predictions,
     _ordered_predictions_from_shards,
     write_topology_predictions,
 )
@@ -142,6 +145,40 @@ def test_ordered_predictions_from_shards_rejects_incomplete_results() -> None:
             total_records=3,
             shard_payloads=[{"indices": [0, 2], "predictions": [1, 0]}],
         )
+
+
+class _FakeAccelerator:
+    def __init__(self) -> None:
+        self.device = torch.device("cpu")
+        self.use_distributed = True
+        self.gather_for_metrics_calls = 0
+
+    def gather_for_metrics(self, tensor: torch.Tensor) -> torch.Tensor:
+        self.gather_for_metrics_calls += 1
+        if self.gather_for_metrics_calls == 1:
+            return torch.tensor([0, 2, 1, 3], dtype=tensor.dtype)
+        return torch.tensor([1, 0, 0, 1], dtype=tensor.dtype)
+
+
+def test_gather_ordered_predictions_uses_accelerator_collectives() -> None:
+    accelerator = _FakeAccelerator()
+
+    ordered_predictions = _gather_ordered_predictions(
+        local_indices=[0, 2],
+        local_predictions=[1, 0],
+        total_records=4,
+        distributed_context=DistributedContext(
+            ddp_enabled=True,
+            is_distributed=True,
+            rank=0,
+            local_rank=0,
+            world_size=2,
+        ),
+        accelerator=accelerator,
+    )
+
+    assert ordered_predictions == [1, 0, 0, 1]
+    assert accelerator.gather_for_metrics_calls == 2
 
 
 def test_build_human_table2_rows_merges_baselines_and_v3() -> None:

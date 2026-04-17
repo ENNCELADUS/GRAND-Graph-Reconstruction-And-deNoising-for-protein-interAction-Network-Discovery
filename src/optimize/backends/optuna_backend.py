@@ -51,9 +51,19 @@ class _StudyProtocol(Protocol):
 
     trials: Sequence[object]
     user_attrs: Mapping[str, object]
+    best_value: float
+    best_params: Mapping[str, object]
 
     def set_user_attr(self, key: str, value: object) -> None:
         """Set study-level user attr."""
+
+    def optimize(
+        self,
+        func: object,
+        n_trials: int | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        """Run the study optimization loop."""
 
 
 @dataclass(frozen=True)

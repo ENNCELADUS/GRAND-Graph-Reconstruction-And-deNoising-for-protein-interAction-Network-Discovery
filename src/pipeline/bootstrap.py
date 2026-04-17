@@ -13,22 +13,14 @@ import torch
 
 
 def parse_args() -> argparse.Namespace:
-    """Parse command line arguments.
-
-    Returns:
-        Parsed CLI namespace with the config path.
-    """
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Run GRAND training/evaluation pipeline.")
     parser.add_argument("--config", type=str, required=True, help="Path to config YAML.")
     return parser.parse_args()
 
 
 def set_global_seed(seed: int) -> None:
-    """Set random seeds for reproducibility.
-
-    Args:
-        seed: Global random seed.
-    """
+    """Set random seeds for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -36,7 +28,7 @@ def set_global_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _rank_from_env() -> int:
+def rank_from_env() -> int:
     """Parse global rank from environment, defaulting to zero."""
     rank_raw = os.environ.get("RANK", "0")
     try:
@@ -46,14 +38,17 @@ def _rank_from_env() -> int:
 
 
 def configure_root_logging(logging_module: ModuleType, rank: int) -> None:
-    """Configure process-level logging.
-
-    Args:
-        logging_module: Logging module shim for testability.
-        rank: Process global rank.
-    """
+    """Configure process-level logging."""
     logging_module.captureWarnings(True)
     if rank == 0:
         logging_module.basicConfig(level=logging.INFO, force=True)
         return
     logging_module.basicConfig(level=logging.CRITICAL, force=True)
+
+
+__all__ = [
+    "configure_root_logging",
+    "parse_args",
+    "rank_from_env",
+    "set_global_seed",
+]
