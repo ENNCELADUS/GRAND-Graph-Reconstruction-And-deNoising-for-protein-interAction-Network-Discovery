@@ -87,8 +87,8 @@ training_config:
     enabled: false
 
 topology_finetune:
-  init_mode: "scratch"
-  epochs: 30
+  init_mode: "warm_start"
+  epochs: 12
   supervision_train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi_ratio5_exclusive.txt"
   supervision_valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi_ratio5_exclusive.txt"
   bce_negative_ratio: 5
@@ -96,22 +96,27 @@ topology_finetune:
   gradient_accumulation_steps: 8
   subgraphs_per_forward: 1
   strategy: "mixed"
-  pair_batch_size: 32
+  pair_batch_size: 16
   decision_threshold:
-    mode: "best_f1_on_valid"
-  monitor_metric: "internal_val_graph_sim"
-  early_stopping_patience: 2
+    mode: "fixed"
+    value: 0.5
+  monitor_metric: "val_loss"
+  early_stopping_patience: 4
   optimizer:
-    lr: 3.0e-6
-    weight_decay: 3.0e-3
+    lr: 6.0e-6
+    weight_decay: 6.0e-3
+  loss_weight_schedule:
+    warmup_epochs: 0
+    ramp_epochs: 1
+    schedule: "linear"
   losses:
-    alpha: 0.5    # Graph similarity
-    beta: 1.0     # Relative density
-    gamma: 0.3    # Degree MMD
-    delta: 0.3    # Clustering MMD
-    histogram_sigma: 1.5
-    degree_bins: 32
-    clustering_bins: 48
+    alpha: 0.35   # Graph similarity
+    beta: 0.45    # Relative density
+    gamma: 0.15   # Degree MMD
+    delta: 0.15   # Clustering MMD
+    histogram_sigma: 1.25
+    degree_bins: 48
+    clustering_bins: 64
 
 evaluate:
   decision_threshold:

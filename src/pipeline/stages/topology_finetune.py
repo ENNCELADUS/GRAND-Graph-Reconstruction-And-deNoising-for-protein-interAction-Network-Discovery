@@ -70,6 +70,8 @@ TOPOLOGY_FINETUNE_CSV_COLUMNS = [
     "Train Deg MMD",
     "Train Clus MMD",
     "Train Total Loss",
+    "Val Pair Loss",
+    "Val Topology Loss",
     "Val Loss",
     "Val auprc",
     "Internal Val graph_sim",
@@ -149,6 +151,8 @@ class ValidationEpochResult:
     val_pair_pass_seconds: float
     threshold_resolution_seconds: float
     internal_validation_seconds: float
+    val_topology_loss: float = 0.0
+    val_total_loss: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -188,6 +192,8 @@ def _empty_validation_epoch_result() -> ValidationEpochResult:
         val_pair_pass_seconds=0.0,
         threshold_resolution_seconds=0.0,
         internal_validation_seconds=0.0,
+        val_topology_loss=0.0,
+        val_total_loss=0.0,
     )
 
 
@@ -211,11 +217,16 @@ def _resolve_monitor_value(
     monitor_metric: str,
     val_pair_stats: Mapping[str, float],
     internal_val_topology_stats: Mapping[str, float],
+    val_total_loss: float | None = None,
 ) -> float:
     """Resolve the scalar value used for checkpoint selection and early stopping."""
     return float(
         {
-            "val_loss": float(val_pair_stats.get("val_loss", 0.0)),
+            "val_loss": (
+                float(val_total_loss)
+                if val_total_loss is not None
+                else float(val_pair_stats.get("val_loss", 0.0))
+            ),
             "internal_val_graph_sim": internal_val_topology_stats["graph_sim"],
             "val_graph_sim": internal_val_topology_stats["graph_sim"],
             "internal_val_relative_density": -abs(
@@ -1302,6 +1313,24 @@ def _reduce_train_stats(
     return reduced_train_stats
 
 
+def _validation_topology_loss(
+    *,
+    loss_weights: TopologyLossWeights,
+    internal_val_topology_stats: Mapping[str, float],
+) -> float:
+    """Return the weighted hard-metric topology penalty used in validation monitoring."""
+    graph_similarity_loss = 1.0 - float(internal_val_topology_stats["graph_sim"])
+    relative_density_loss = (float(internal_val_topology_stats["relative_density"]) - 1.0) ** 2
+    degree_mmd = float(internal_val_topology_stats["deg_dist_mmd"])
+    clustering_mmd = float(internal_val_topology_stats["cc_mmd"])
+    return (
+        loss_weights.alpha * graph_similarity_loss
+        + loss_weights.beta * relative_density_loss
+        + loss_weights.gamma * degree_mmd
+        + loss_weights.delta * clustering_mmd
+    )
+
+
 def _fit_epoch(
     *,
     config: ConfigDict,
@@ -1720,6 +1749,7 @@ def _evaluate_validation_epoch(
     dataloaders: dict[str, DataLoader[dict[str, object]]],
     device: torch.device,
     context: TopologyFinetuneStageContext,
+    loss_weights: TopologyLossWeights,
 ) -> ValidationEpochResult:
     """Run pairwise validation and sampled topology validation for one epoch."""
     model.eval()
@@ -1756,6 +1786,11 @@ def _evaluate_validation_epoch(
         compute_spectral_stats=context.internal_validation_compute_spectral_stats,
     )
     internal_validation_seconds = time.perf_counter() - internal_validation_start
+    val_pair_loss = float(val_pair_stats.get("val_loss", 0.0))
+    val_topology_loss = _validation_topology_loss(
+        loss_weights=loss_weights,
+        internal_val_topology_stats=internal_val_topology_stats,
+    )
     return ValidationEpochResult(
         decision_threshold=decision_threshold,
         val_pair_stats=val_pair_stats,
@@ -1763,6 +1798,8 @@ def _evaluate_validation_epoch(
         val_pair_pass_seconds=val_pair_pass_seconds,
         threshold_resolution_seconds=threshold_resolution_seconds,
         internal_validation_seconds=internal_validation_seconds,
+        val_topology_loss=val_topology_loss,
+        val_total_loss=val_pair_loss + val_topology_loss,
     )
 
 
@@ -1787,7 +1824,9 @@ def _build_epoch_csv_row(
         "Train Deg MMD": train_stats["degree_mmd"],
         "Train Clus MMD": train_stats["clustering_mmd"],
         "Train Total Loss": train_stats["total"],
-        "Val Loss": float(val_pair_stats.get("val_loss", 0.0)),
+        "Val Pair Loss": float(val_pair_stats.get("val_loss", 0.0)),
+        "Val Topology Loss": validation_result.val_topology_loss,
+        "Val Loss": validation_result.val_total_loss,
         "Val auprc": float(val_pair_stats.get("val_auprc", 0.0)),
         "Internal Val graph_sim": internal_val_topology_stats["graph_sim"],
         "Internal Val relative_density": internal_val_topology_stats["relative_density"],
@@ -1824,7 +1863,10 @@ def _build_best_metrics_payload(
         "epoch": float(epoch),
         "monitor_metric": monitor_metric,
         "monitor_value": monitor_value,
-        "val_loss": float(val_pair_stats.get("val_loss", 0.0)),
+        "val_loss": validation_result.val_total_loss,
+        "val_pair_loss": float(val_pair_stats.get("val_loss", 0.0)),
+        "val_topology_loss": validation_result.val_topology_loss,
+        "val_total_loss": validation_result.val_total_loss,
         "val_auprc": float(val_pair_stats.get("val_auprc", 0.0)),
         "internal_val_graph_sim": internal_val_topology_stats["graph_sim"],
         "internal_val_relative_density": internal_val_topology_stats["relative_density"],
@@ -1950,6 +1992,13 @@ def run_topology_finetuning_stage(
             train_stats=train_stats,
             global_subgraph_count=int(train_stats["planned_subgraphs"]),
         )
+        effective_validation_loss_weights = replace(
+            context.loss_weights,
+            alpha=context.loss_weights.alpha * float(train_stats["topology_loss_scale"]),
+            beta=context.loss_weights.beta * float(train_stats["topology_loss_scale"]),
+            gamma=context.loss_weights.gamma * float(train_stats["topology_loss_scale"]),
+            delta=context.loss_weights.delta * float(train_stats["topology_loss_scale"]),
+        )
 
         # Every rank must execute the validation path before the next collective.
         # Restricting validation to rank 0 lets other ranks reach `_sync_flag()`
@@ -1960,6 +2009,7 @@ def run_topology_finetuning_stage(
             dataloaders=dataloaders,
             device=device,
             context=context,
+            loss_weights=effective_validation_loss_weights,
         )
         peak_gpu_mem_mb = (
             float(torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0))
@@ -1971,6 +2021,7 @@ def run_topology_finetuning_stage(
             monitor_metric=context.monitor_metric,
             val_pair_stats=validation_result.val_pair_stats,
             internal_val_topology_stats=validation_result.internal_val_topology_stats,
+            val_total_loss=validation_result.val_total_loss,
         )
         should_stop = False
         save_best_checkpoint = False
