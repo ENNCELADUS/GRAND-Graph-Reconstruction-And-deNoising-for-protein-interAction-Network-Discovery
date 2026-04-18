@@ -1605,14 +1605,16 @@ def test_fit_epoch_skips_topology_work_during_warmup_single_forward(
             mean_positive_edge_reuse=1.0,
         )
 
-    def _fake_concat_logits_and_pairs(**_: object) -> tuple[torch.Tensor, ...]:
-        return (
-            torch.zeros(1, dtype=torch.float32, requires_grad=True),
-            torch.ones(1, dtype=torch.float32),
-            torch.ones(1, dtype=torch.float32),
-            torch.ones(1, dtype=torch.float32),
-            torch.tensor([0], dtype=torch.long),
-            torch.tensor([1], dtype=torch.long),
+    def _unexpected_concat_logits_and_pairs(**_: object) -> tuple[torch.Tensor, ...]:
+        raise AssertionError("warmup should not forward all subgraph pairs")
+
+    def _fake_forward_supervised_task(
+        **_: object,
+    ) -> topology_finetune_stage.SupervisedForwardResult:
+        return topology_finetune_stage.SupervisedForwardResult(
+            logits=torch.zeros(1, dtype=torch.float32, requires_grad=True),
+            bce_labels=torch.ones(1, dtype=torch.float32),
+            bce_mask=torch.ones(1, dtype=torch.float32),
         )
 
     def _unexpected_subgraph_adjacencies(**_: object) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1629,7 +1631,12 @@ def test_fit_epoch_skips_topology_work_during_warmup_single_forward(
     monkeypatch.setattr(
         topology_finetune_stage,
         "_concat_logits_and_pairs",
-        _fake_concat_logits_and_pairs,
+        _unexpected_concat_logits_and_pairs,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_forward_supervised_task",
+        _fake_forward_supervised_task,
     )
     monkeypatch.setattr(
         topology_finetune_stage,
@@ -1705,36 +1712,25 @@ def test_fit_epoch_skips_topology_work_during_warmup_grouped_forward(
             mean_positive_edge_reuse=1.0,
         )
 
-    def _fake_iter_subgraph_pair_chunks(**kwargs: object) -> Sequence[SubgraphPairChunk]:
-        nodes = tuple(cast(Sequence[str], kwargs["nodes"]))
-        return (
-            SubgraphPairChunk(
-                nodes=nodes,
-                emb_a=torch.zeros((1, 1, 4), dtype=torch.float32),
-                emb_b=torch.ones((1, 1, 4), dtype=torch.float32),
-                len_a=torch.ones(1, dtype=torch.long),
-                len_b=torch.ones(1, dtype=torch.long),
-                label=torch.ones(1, dtype=torch.float32),
-                pair_index_a=torch.zeros(1, dtype=torch.long),
-                pair_index_b=torch.ones(1, dtype=torch.long),
-                bce_label=torch.ones(1, dtype=torch.float32),
-                bce_mask=torch.ones(1, dtype=torch.float32),
-            ),
-        )
+    def _unexpected_forward_subgraph_group(**_: object) -> tuple[
+        topology_finetune_stage.SubgraphForwardResult,
+        ...,
+    ]:
+        raise AssertionError("warmup should not forward grouped all-pairs subgraphs")
 
-    def _fake_forward_model(
+    def _fake_forward_supervised_group(
         *,
-        model: torch.nn.Module,
-        batch: Mapping[str, torch.Tensor],
-    ) -> dict[str, torch.Tensor]:
-        del model
-        return {
-            "logits": torch.zeros(
-                int(batch["label"].numel()),
-                dtype=torch.float32,
-                requires_grad=True,
+        tasks: Sequence[topology_finetune_stage.LocalSubgraphTask],
+        **_: object,
+    ) -> tuple[topology_finetune_stage.SupervisedForwardResult, ...]:
+        return tuple(
+            topology_finetune_stage.SupervisedForwardResult(
+                logits=torch.zeros(1, dtype=torch.float32, requires_grad=True),
+                bce_labels=torch.ones(1, dtype=torch.float32),
+                bce_mask=torch.ones(1, dtype=torch.float32),
             )
-        }
+            for _ in tasks
+        )
 
     def _unexpected_subgraph_adjacencies(**_: object) -> tuple[torch.Tensor, torch.Tensor]:
         raise AssertionError("warmup should skip topology adjacency construction")
@@ -1749,10 +1745,14 @@ def test_fit_epoch_skips_topology_work_during_warmup_grouped_forward(
     )
     monkeypatch.setattr(
         topology_finetune_stage,
-        "iter_subgraph_pair_chunks",
-        _fake_iter_subgraph_pair_chunks,
+        "_forward_subgraph_group",
+        _unexpected_forward_subgraph_group,
     )
-    monkeypatch.setattr(topology_finetune_stage, "_forward_model", _fake_forward_model)
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_forward_supervised_group",
+        _fake_forward_supervised_group,
+    )
     monkeypatch.setattr(
         topology_finetune_stage,
         "_subgraph_adjacencies",
@@ -2033,6 +2033,12 @@ def test_run_topology_finetuning_stage_supports_scratch_initialization(
     assert isinstance(topology_cfg, dict)
     topology_cfg["epochs"] = 0
     topology_cfg["init_mode"] = "scratch"
+    topology_cfg["bce_negative_ratio"] = 2
+    topology_cfg["loss_weight_schedule"] = {
+        "warmup_epochs": 1,
+        "ramp_epochs": 1,
+        "schedule": "linear",
+    }
 
     model = build_model(config)
     dataloaders = build_dataloaders(config=config)
@@ -2056,10 +2062,108 @@ def test_run_topology_finetuning_stage_supports_scratch_initialization(
     assert isinstance(final_linear, torch.nn.Linear)
     assert final_linear.bias is not None
     assert final_linear.bias.item() == pytest.approx(
-        torch.logit(torch.tensor(2.0 / 45.0, dtype=torch.float32)).item(),
+        torch.logit(torch.tensor(1.0 / 3.0, dtype=torch.float32)).item(),
         rel=1e-6,
     )
     assert best_checkpoint == Path("models/v3/topology_finetune/topology_ft_case/best_model.pth")
+
+
+def test_evaluate_validation_epoch_skips_internal_topology_validation_during_warmup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["internal_validation_warmup_cadence"] = 0
+    model = build_model(config)
+    dataloaders = build_dataloaders(config=config)
+    train_graph, internal_val_graph = _load_supervision_graphs(config=config)
+    embedding_index = {
+        protein_id: f"embeddings/{protein_id}.pt"
+        for protein_id in ("P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10")
+    }
+    embedding_repository = EmbeddingRepository(
+        cache_dir=Path(str(config["data_config"]["embeddings"]["cache_dir"])),  # type: ignore[index]
+        embedding_index=embedding_index,
+        input_dim=4,
+        max_sequence_length=8,
+        max_cache_bytes=1_024,
+    )
+    context = topology_finetune_stage.TopologyFinetuneStageContext(
+        train_graph=train_graph,
+        internal_val_graph=internal_val_graph,
+        train_negative_lookup=topology_finetune_stage.ExplicitNegativePairLookup(
+            negative_pairs=frozenset(),
+            partners_by_node={},
+        ),
+        cache_dir=Path(str(config["data_config"]["embeddings"]["cache_dir"])),  # type: ignore[index]
+        embedding_index=embedding_index,
+        embedding_repository=embedding_repository,
+        input_dim=4,
+        max_sequence_length=8,
+        pair_batch_size=2,
+        internal_validation_inference_batch_size=2,
+        internal_validation_compute_spectral_stats=False,
+        epochs=1,
+        run_seed=11,
+        use_amp=False,
+        optimizer=torch.optim.AdamW(model.parameters(), lr=1e-3),
+        evaluator=Evaluator(
+            metrics=["auprc"],
+            loss_config=topology_finetune_stage._build_loss_config(config["training_config"]),  # type: ignore[arg-type]
+            accelerator=NoOpAccelerator(),
+        ),
+        loss_weights=topology_finetune_stage.TopologyLossWeights(),
+        loss_weight_schedule=topology_finetune_stage.TopologyLossWeightSchedule(
+            warmup_epochs=1,
+            ramp_epochs=1,
+        ),
+        loss_normalization=topology_finetune_stage.TopologyLossNormalizationConfig(),
+        gradnorm=topology_finetune_stage.TopologyGradNormConfig(),
+        adaptive_loss_state=topology_finetune_stage.TopologyAdaptiveLossState(),
+        monitor_metric="val_auprc",
+        early_stopping=topology_finetune_stage.EarlyStopping(patience=1, mode="max"),
+        best_checkpoint_path=tmp_path / "best.pth",
+        metrics_path=tmp_path / "metrics.json",
+        csv_path=tmp_path / "metrics.csv",
+        internal_validation_node_sets={},
+        internal_validation_plan=build_internal_validation_plan(
+            graph=internal_val_graph,
+            sampled_subgraphs={3: [("P1", "P2", "P3")]},
+        ),
+    )
+
+    def _unexpected_internal_validation(**_: object) -> dict[str, float]:
+        raise AssertionError("internal topology validation should be skipped during warmup")
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_evaluate_internal_validation_subgraphs",
+        _unexpected_internal_validation,
+    )
+
+    result = topology_finetune_stage._evaluate_validation_epoch(
+        config=config,
+        model=model,
+        dataloaders=cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+        device=torch.device("cpu"),
+        context=context,
+        loss_weights=topology_finetune_stage.TopologyLossWeights(),
+        epoch_index=0,
+        topology_loss_scale=0.0,
+        previous_topology_loss_scale=None,
+    )
+
+    assert result.internal_val_topology_stats == pytest.approx(
+        {
+            "graph_sim": 0.0,
+            "relative_density": 0.0,
+            "deg_dist_mmd": 0.0,
+            "cc_mmd": 0.0,
+        }
+    )
+    assert result.internal_validation_seconds == pytest.approx(0.0)
 
 
 def test_run_topology_finetuning_stage_requires_prepared_supervision_files(

@@ -19,6 +19,7 @@ from src.topology.finetune_data import (
     build_internal_validation_plan,
     build_pair_supervision_graph,
     filter_graph_to_embedding_index,
+    iter_supervised_pair_chunks,
     iter_subgraph_pair_chunks,
     load_split_node_ids,
     sample_edge_cover_subgraphs,
@@ -220,6 +221,31 @@ def test_sample_edge_cover_subgraphs_preassigns_each_negative_edge_at_most_once(
     assert len(assigned_edges) == len(set(assigned_edges))
 
 
+def test_sample_edge_cover_subgraphs_assigns_global_negatives_outside_subgraph_nodes() -> None:
+    graph = nx.Graph()
+    graph.add_nodes_from(["P1", "P2", "P3", "P4"])
+    graph.add_edge("P1", "P2")
+    negative_lookup = ExplicitNegativePairLookup(
+        negative_pairs=frozenset({("P3", "P4")}),
+        partners_by_node={},
+    )
+
+    plan = sample_edge_cover_subgraphs(
+        graph=graph,
+        num_subgraphs=0,
+        min_nodes=2,
+        max_nodes=2,
+        strategy="BFS",
+        seed=13,
+        edge_chunk_size=1,
+        negative_lookup=negative_lookup,
+        negative_ratio=1,
+    )
+
+    assert plan.subgraphs == (("P1", "P2"),)
+    assert plan.assigned_negative_edges == (frozenset({("P3", "P4")}),)
+
+
 def test_sample_edge_cover_subgraphs_respects_epoch_floor_with_positive_edges() -> None:
     graph = nx.path_graph([f"P{i}" for i in range(1, 12)])
 
@@ -414,7 +440,7 @@ def test_iter_subgraph_pair_chunks_materializes_all_labels(tmp_path: Path) -> No
     assert chunks[0].emb_b.shape == torch.Size([2, 2, 4])
 
 
-def test_iter_subgraph_pair_chunks_uses_assigned_positive_edges_not_full_induced_graph(
+def test_iter_subgraph_pair_chunks_keeps_topology_labels_independent_of_bce_assignment(
     tmp_path: Path,
 ) -> None:
     graph = nx.Graph()
@@ -434,9 +460,37 @@ def test_iter_subgraph_pair_chunks_uses_assigned_positive_edges_not_full_induced
         )
     )
 
-    assert torch.cat([chunk.label for chunk in chunks], dim=0).tolist() == [1.0, 0.0, 0.0]
+    assert torch.cat([chunk.label for chunk in chunks], dim=0).tolist() == [1.0, 1.0, 1.0]
     assert torch.cat([chunk.bce_label for chunk in chunks], dim=0).tolist() == [1.0, 0.0, 0.0]
     assert torch.cat([chunk.bce_mask for chunk in chunks], dim=0).tolist() == [1.0, 0.0, 0.0]
+
+
+def test_iter_supervised_pair_chunks_includes_out_of_subgraph_negative_pairs(
+    tmp_path: Path,
+) -> None:
+    cache_dir = tmp_path / "cache"
+    embedding_index = _write_embedding_cache(cache_dir)
+
+    chunks = list(
+        iter_supervised_pair_chunks(
+            positive_edges=frozenset({("P1", "P2")}),
+            negative_edges=frozenset({("P3", "P4")}),
+            cache_dir=cache_dir,
+            embedding_index=embedding_index,
+            input_dim=4,
+            max_sequence_length=8,
+            pair_batch_size=8,
+        )
+    )
+
+    assert len(chunks) == 1
+    chunk = chunks[0]
+    assert chunk.nodes == ("P1", "P2", "P3", "P4")
+    assert chunk.label.tolist() == [1.0, 0.0]
+    assert chunk.bce_label is not None
+    assert chunk.bce_mask is not None
+    assert chunk.bce_label.tolist() == [1.0, 0.0]
+    assert chunk.bce_mask.tolist() == [1.0, 1.0]
 
 
 def test_iter_subgraph_pair_chunks_uses_assigned_negative_edges_for_bce(
