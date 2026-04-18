@@ -111,6 +111,28 @@ def test_evaluate_graph_samples_returns_official_summary_shape() -> None:
     assert result["per_node_size"][4]["graph_count"] == 1
 
 
+def test_evaluate_graph_samples_can_skip_spectral_stats(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gt_graphs = {3: [nx.path_graph(["A", "B", "C"])]}
+    pred_graphs = {3: [nx.Graph([("A", "B")])]}
+
+    def _unexpected_spectral_stats(*args: object, **kwargs: object) -> float:
+        raise AssertionError("spectral_stats should be skipped when disabled")
+
+    monkeypatch.setattr("src.topology.metrics.spectral_stats", _unexpected_spectral_stats)
+
+    result = evaluate_graph_samples(
+        pred_graphs_by_size=pred_graphs,
+        gt_graphs_by_size=gt_graphs,
+        include_spectral_stats=False,
+    )
+
+    assert "laplacian_eigen_mmd" not in result["details"]
+    assert "laplacian_eigen_mmd" not in result["summary"]
+    assert "laplacian_eigen_mmd" not in result["per_node_size"][3]
+
+
 def test_write_topology_predictions_emits_pring_format(tmp_path: Path) -> None:
     output_path = tmp_path / "all_test_ppi_pred.txt"
 

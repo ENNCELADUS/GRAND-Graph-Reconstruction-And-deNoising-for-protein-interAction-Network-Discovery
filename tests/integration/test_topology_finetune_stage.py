@@ -291,6 +291,67 @@ class _RecordingAccelerator:
         torch.save(obj, f)
 
 
+class _DistributedValidationAccelerator(_RecordingAccelerator):
+    def __init__(
+        self,
+        *,
+        peer_indices: Sequence[int],
+        peer_predictions: Sequence[int],
+    ) -> None:
+        super().__init__()
+        self.use_distributed = True
+        self.is_main_process = True
+        self.process_index = 0
+        self.local_process_index = 0
+        self.num_processes = 2
+        self._peer_indices = [int(index) for index in peer_indices]
+        self._peer_predictions = [int(prediction) for prediction in peer_predictions]
+        self._gather_calls = 0
+
+    def gather(self, value: torch.Tensor) -> torch.Tensor:
+        self._gather_calls += 1
+        if self._gather_calls == 1:
+            return torch.tensor(
+                [int(value[0].item()), len(self._peer_indices)],
+                dtype=value.dtype,
+                device=value.device,
+            )
+        if self._gather_calls == 2:
+            padded_peer = self.pad_across_processes(
+                torch.tensor(self._peer_indices, dtype=value.dtype, device=value.device),
+                dim=0,
+                pad_index=-1,
+            )
+            return torch.cat((value, padded_peer), dim=0)
+        if self._gather_calls == 3:
+            padded_peer = self.pad_across_processes(
+                torch.tensor(self._peer_predictions, dtype=value.dtype, device=value.device),
+                dim=0,
+                pad_index=0,
+            )
+            return torch.cat((value, padded_peer), dim=0)
+        raise AssertionError("unexpected gather call")
+
+    def pad_across_processes(
+        self,
+        value: torch.Tensor,
+        dim: int = 0,
+        pad_index: int = 0,
+        pad_first: bool = False,
+    ) -> torch.Tensor:
+        del dim, pad_first
+        target_length = max(value.numel(), len(self._peer_indices))
+        if value.numel() >= target_length:
+            return value
+        padding = torch.full(
+            (target_length - value.numel(),),
+            fill_value=pad_index,
+            dtype=value.dtype,
+            device=value.device,
+        )
+        return torch.cat((value, padding), dim=0)
+
+
 class _CountingOptimizer:
     def __init__(self) -> None:
         self.step_calls = 0
@@ -355,7 +416,7 @@ def test_resolve_sampling_node_bounds_rejects_legacy_min_max_config() -> None:
         )
 
 
-def test_build_internal_validation_node_sets_matches_topology_eval_bucketing() -> None:
+def test_build_internal_validation_node_sets_uses_optimized_default_sample_count() -> None:
     graph = nx.path_graph([f"P{i}" for i in range(1, 221)])
 
     node_sets = _build_internal_validation_node_sets(
@@ -365,12 +426,27 @@ def test_build_internal_validation_node_sets_matches_topology_eval_bucketing() -
     )
 
     assert sorted(node_sets) == list(TOPOLOGY_EVAL_NODE_SIZES)
-    assert all(
-        len(node_sets[node_size]) == TOPOLOGY_EVAL_SAMPLES_PER_SIZE for node_size in node_sets
-    )
+    assert all(len(node_sets[node_size]) == 20 for node_size in node_sets)
     assert all(
         all(len(nodes) == node_size for nodes in node_sets[node_size]) for node_size in node_sets
     )
+
+
+def test_build_internal_validation_node_sets_respects_configured_size_buckets() -> None:
+    graph = nx.path_graph([f"P{i}" for i in range(1, 221)])
+
+    node_sets = _build_internal_validation_node_sets(
+        finetune_cfg={
+            "strategy": "mixed",
+            "internal_validation_node_sizes": [40, 80],
+            "internal_validation_samples_per_size": 3,
+        },
+        graph=graph,
+        seed=11,
+    )
+
+    assert sorted(node_sets) == [40, 80]
+    assert all(len(node_sets[node_size]) == 3 for node_size in node_sets)
 
 
 def test_build_internal_validation_node_sets_uses_graph_size_fallback_when_under_20() -> None:
@@ -384,7 +460,7 @@ def test_build_internal_validation_node_sets_uses_graph_size_fallback_when_under
     )
 
     assert sorted(node_sets) == [3]
-    assert len(node_sets[3]) == TOPOLOGY_EVAL_SAMPLES_PER_SIZE
+    assert len(node_sets[3]) == 20
     assert all(nodes == ("P1", "P2", "P3") for nodes in node_sets[3])
 
 
@@ -623,9 +699,157 @@ def test_evaluate_internal_validation_subgraphs_matches_per_subgraph_baseline(
     expected_summary = evaluate_graph_samples(
         pred_graphs_by_size=expected_pred_graphs,
         gt_graphs_by_size=expected_target_graphs,
+        include_spectral_stats=False,
     )["summary"]
 
     assert batched_summary == pytest.approx(expected_summary)
+
+
+def test_evaluate_internal_validation_subgraphs_shards_rank_local_work_and_merges_summary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    graph = nx.Graph()
+    graph.add_edges_from(
+        [
+            ("P1", "P2"),
+            ("P2", "P3"),
+            ("P3", "P4"),
+            ("P4", "P5"),
+            ("P5", "P6"),
+        ]
+    )
+    cache_dir = tmp_path / "cache"
+    _write_embedding_cache(
+        cache_dir=cache_dir,
+        embeddings={
+            protein_id: torch.full((2, 4), float(index), dtype=torch.float32)
+            for index, protein_id in enumerate(("P1", "P2", "P3", "P4", "P5", "P6"), start=1)
+        },
+        input_dim=4,
+        max_sequence_length=8,
+    )
+    embedding_index = {
+        protein_id: f"embeddings/{protein_id}.pt"
+        for protein_id in ("P1", "P2", "P3", "P4", "P5", "P6")
+    }
+    sampled_subgraphs = {
+        3: [
+            ("P1", "P2", "P3"),
+            ("P2", "P3", "P4"),
+            ("P3", "P4", "P5"),
+            ("P4", "P5", "P6"),
+        ]
+    }
+    validation_plan = build_internal_validation_plan(
+        graph=graph,
+        sampled_subgraphs=sampled_subgraphs,
+    )
+    embedding_repository = EmbeddingRepository(
+        cache_dir=cache_dir,
+        embedding_index=embedding_index,
+        input_dim=4,
+        max_sequence_length=8,
+        max_cache_bytes=1_024,
+    )
+
+    class _ToyModel(torch.nn.Module):
+        def forward(
+            self,
+            emb_a: torch.Tensor,
+            emb_b: torch.Tensor,
+            len_a: torch.Tensor,
+            len_b: torch.Tensor,
+            **_: object,
+        ) -> dict[str, torch.Tensor]:
+            del len_a, len_b
+            scores = emb_a[:, 0, 0] + emb_b[:, 0, 0]
+            return {"logits": (scores - 7.0) * 10.0}
+
+    model = _ToyModel().eval()
+    expected_pred_graphs = {
+        3: [
+            topology_finetune_stage._predict_hard_subgraph(
+                model=model,
+                graph=graph,
+                nodes=nodes,
+                cache_dir=cache_dir,
+                embedding_index=embedding_index,
+                input_dim=4,
+                max_sequence_length=8,
+                pair_batch_size=3,
+                threshold=0.5,
+                device=torch.device("cpu"),
+                embedding_repository=embedding_repository,
+            )
+            for nodes in sampled_subgraphs[3]
+        ]
+    }
+    expected_target_graphs = {
+        3: [graph.subgraph(nodes).copy() for nodes in sampled_subgraphs[3]]
+    }
+    expected_summary = evaluate_graph_samples(
+        pred_graphs_by_size=expected_pred_graphs,
+        gt_graphs_by_size=expected_target_graphs,
+        include_spectral_stats=False,
+    )["summary"]
+
+    processed_subgraph_indices: set[int] = set()
+    original_validation_pair_batch = topology_finetune_stage._validation_pair_batch
+
+    def _record_validation_pair_batch(
+        *,
+        pair_records: Sequence[topology_finetune_stage.InternalValidationPairRecord],
+        embedding_repository: EmbeddingRepository,
+    ) -> dict[str, torch.Tensor]:
+        processed_subgraph_indices.update(
+            int(record.subgraph_index) for record in pair_records
+        )
+        return original_validation_pair_batch(
+            pair_records=pair_records,
+            embedding_repository=embedding_repository,
+        )
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_validation_pair_batch",
+        _record_validation_pair_batch,
+    )
+
+    bucket = validation_plan.buckets[0]
+    peer_indices = [
+        index
+        for index, record in enumerate(bucket.pair_records)
+        if record.subgraph_index % 2 == 1
+    ]
+    peer_predictions = [
+        int(
+            expected_pred_graphs[3][record.subgraph_index].has_edge(
+                record.protein_a,
+                record.protein_b,
+            )
+        )
+        for index, record in enumerate(bucket.pair_records)
+        if index in peer_indices
+    ]
+    accelerator = _DistributedValidationAccelerator(
+        peer_indices=peer_indices,
+        peer_predictions=peer_predictions,
+    )
+
+    summary = _evaluate_internal_validation_subgraphs(
+        model=model,
+        validation_plan=validation_plan,
+        embedding_repository=embedding_repository,
+        inference_batch_size=16,
+        threshold=0.5,
+        device=torch.device("cpu"),
+        accelerator=accelerator,
+        compute_spectral_stats=False,
+    )
+
+    assert summary == pytest.approx(expected_summary)
+    assert processed_subgraph_indices == {0, 2}
 
 
 def test_run_topology_finetuning_stage_reuses_single_validation_pass_for_threshold(
