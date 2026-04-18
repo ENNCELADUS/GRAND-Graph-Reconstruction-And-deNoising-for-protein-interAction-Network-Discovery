@@ -1039,11 +1039,20 @@ def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path
     assert (log_dir / "topology_finetune_metrics.json").exists()
     assert (log_dir / "log.log").exists()
     with (log_dir / "topology_finetune_step.csv").open("r", encoding="utf-8", newline="") as handle:
-        header = DictReader(handle).fieldnames
+        reader = DictReader(handle)
+        header = reader.fieldnames
+        rows = list(reader)
     assert header is not None
     assert "Planned Subgraphs" in header
     assert "Positive Edge Coverage Ratio" in header
     assert "Mean Positive Edge Reuse" in header
+    assert "All Subgraph Pairs" in header
+    assert "Supervised Pairs" in header
+    assert "BCE Positive Pairs" in header
+    assert "BCE Target Negative Pairs" in header
+    assert "BCE Negative Pairs" in header
+    assert "BCE Negative Ratio" in header
+    assert "BCE Supervised Fraction" in header
     assert "edge_cover_sampling_s" in header
     assert "train_forward_backward_s" in header
     assert "val_pair_pass_s" in header
@@ -1051,6 +1060,11 @@ def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path
     assert "internal_val_topology_s" in header
     assert "Topology Loss Scale" in header
     assert "peak_gpu_mem_mb" in header
+    assert rows
+    first_row = rows[0]
+    assert int(first_row["Supervised Pairs"]) == int(first_row["BCE Positive Pairs"]) + int(
+        first_row["BCE Negative Pairs"]
+    )
     log_text = (log_dir / "log.log").read_text(encoding="utf-8")
     assert "Epoch Progress" in log_text
     assert "Legacy Validation Subgraphs Ignored" in log_text
@@ -1712,7 +1726,9 @@ def test_fit_epoch_skips_topology_work_during_warmup_grouped_forward(
             mean_positive_edge_reuse=1.0,
         )
 
-    def _unexpected_forward_subgraph_group(**_: object) -> tuple[
+    def _unexpected_forward_subgraph_group(
+        **_: object,
+    ) -> tuple[
         topology_finetune_stage.SubgraphForwardResult,
         ...,
     ]:

@@ -36,6 +36,7 @@ from src.topology.finetune_data import (
     build_internal_validation_plan,
     build_pair_supervision_graph,
     iter_subgraph_pair_chunks,
+    iter_supervised_pair_chunks,
     load_split_node_ids,
     sample_edge_cover_subgraphs,
     sample_topology_evaluation_subgraphs,
@@ -91,6 +92,13 @@ TOPOLOGY_FINETUNE_CSV_COLUMNS = [
     "Total Positive Edges",
     "Positive Edge Coverage Ratio",
     "Mean Positive Edge Reuse",
+    "All Subgraph Pairs",
+    "Supervised Pairs",
+    "BCE Positive Pairs",
+    "BCE Target Negative Pairs",
+    "BCE Negative Pairs",
+    "BCE Negative Ratio",
+    "BCE Supervised Fraction",
     "edge_cover_sampling_s",
     "train_forward_backward_s",
     "val_pair_pass_s",
@@ -180,6 +188,15 @@ class SubgraphForwardResult:
 
 
 @dataclass(frozen=True)
+class SupervisedForwardResult:
+    """Forward outputs for explicitly supervised BCE pairs."""
+
+    logits: torch.Tensor
+    bce_labels: torch.Tensor
+    bce_mask: torch.Tensor
+
+
+@dataclass(frozen=True)
 class LocalSubgraphTask:
     """Rank-local train task, including DDP padding participation."""
 
@@ -187,6 +204,15 @@ class LocalSubgraphTask:
     assigned_positive_edges: frozenset[tuple[str, str]]
     assigned_negative_edges: frozenset[tuple[str, str]]
     is_padding: bool = False
+
+
+@dataclass(frozen=True)
+class ScratchBiasInitialization:
+    """Details for scratch-mode output bias initialization."""
+
+    bias: float
+    positive_probability: float
+    source: str
 
 
 def _empty_internal_validation_summary() -> dict[str, float]:
@@ -632,6 +658,17 @@ def _resolve_internal_validation_inference_batch_size(finetune_cfg: ConfigDict) 
     return batch_size
 
 
+def _resolve_internal_validation_warmup_cadence(finetune_cfg: ConfigDict) -> int:
+    """Return internal topology-validation cadence while topology loss is disabled."""
+    cadence = as_int(
+        finetune_cfg.get("internal_validation_warmup_cadence", 0),
+        "topology_finetune.internal_validation_warmup_cadence",
+    )
+    if cadence < 0:
+        raise ValueError("topology_finetune.internal_validation_warmup_cadence must be >= 0")
+    return cadence
+
+
 def _resolve_embedding_cache_max_bytes(finetune_cfg: ConfigDict) -> int:
     """Return the byte ceiling for the stage-local embedding cache."""
     max_bytes = as_int(
@@ -920,6 +957,80 @@ def _forward_subgraph_group(
         )
         logit_offset = next_offset
     return tuple(results)
+
+
+def _forward_supervised_task(
+    *,
+    model: nn.Module,
+    task: LocalSubgraphTask,
+    cache_dir: Path,
+    embedding_index: Mapping[str, str],
+    input_dim: int,
+    max_sequence_length: int,
+    pair_batch_size: int,
+    device: torch.device,
+    embedding_repository: EmbeddingRepository,
+) -> SupervisedForwardResult:
+    """Forward explicitly supervised BCE pairs for one local task."""
+    logits_list: list[torch.Tensor] = []
+    labels_list: list[torch.Tensor] = []
+    mask_list: list[torch.Tensor] = []
+    for chunk in iter_supervised_pair_chunks(
+        positive_edges=task.assigned_positive_edges,
+        negative_edges=task.assigned_negative_edges,
+        cache_dir=cache_dir,
+        embedding_index=embedding_index,
+        input_dim=input_dim,
+        max_sequence_length=max_sequence_length,
+        pair_batch_size=pair_batch_size,
+        embedding_repository=embedding_repository,
+    ):
+        batch = _move_chunk_to_device(chunk=chunk, device=device)
+        logits = _squeeze_binary_logits(_forward_model(model=model, batch=batch)["logits"])
+        logits_list.append(logits)
+        labels_list.append(batch["bce_label"].float())
+        mask_list.append(batch["bce_mask"].float())
+
+    if not logits_list:
+        return SupervisedForwardResult(
+            logits=torch.zeros(0, dtype=torch.float32, device=device, requires_grad=True),
+            bce_labels=torch.zeros(0, dtype=torch.float32, device=device),
+            bce_mask=torch.zeros(0, dtype=torch.float32, device=device),
+        )
+    return SupervisedForwardResult(
+        logits=torch.cat(logits_list, dim=0),
+        bce_labels=torch.cat(labels_list, dim=0),
+        bce_mask=torch.cat(mask_list, dim=0),
+    )
+
+
+def _forward_supervised_group(
+    *,
+    model: nn.Module,
+    tasks: Sequence[LocalSubgraphTask],
+    cache_dir: Path,
+    embedding_index: Mapping[str, str],
+    input_dim: int,
+    max_sequence_length: int,
+    pair_batch_size: int,
+    device: torch.device,
+    embedding_repository: EmbeddingRepository,
+) -> tuple[SupervisedForwardResult, ...]:
+    """Forward explicitly supervised BCE pairs for a group of local tasks."""
+    return tuple(
+        _forward_supervised_task(
+            model=model,
+            task=task,
+            cache_dir=cache_dir,
+            embedding_index=embedding_index,
+            input_dim=input_dim,
+            max_sequence_length=max_sequence_length,
+            pair_batch_size=pair_batch_size,
+            device=device,
+            embedding_repository=embedding_repository,
+        )
+        for task in tasks
+    )
 
 
 def _subgraph_adjacencies(
@@ -1228,15 +1339,23 @@ def _masked_bce_loss(
     )
     bce_mask_sum = bce_mask.sum()
     if float(bce_mask_sum.detach().item()) <= 0.0:
-        return torch.zeros((), dtype=per_pair_bce.dtype, device=per_pair_bce.device)
+        return logits.sum() * 0.0
     return (per_pair_bce * bce_mask).sum() / bce_mask_sum
 
 
 def _initialize_train_aggregates(
     epoch_plan_size: int,
     epoch_plan: EdgeCoverEpochPlan,
+    negative_ratio: int,
 ) -> dict[str, float]:
     """Create aggregate storage for one topology fine-tuning epoch."""
+    all_subgraph_pairs = sum(
+        len(subgraph) * (len(subgraph) - 1) // 2 for subgraph in epoch_plan.subgraphs
+    )
+    bce_positive_pairs = sum(len(edges) for edges in epoch_plan.assigned_positive_edges)
+    bce_target_negative_pairs = bce_positive_pairs * negative_ratio
+    bce_negative_pairs = sum(len(edges) for edges in epoch_plan.assigned_negative_edges)
+    supervised_pairs = bce_positive_pairs + bce_negative_pairs
     return {
         "bce": 0.0,
         "graph_similarity": 0.0,
@@ -1249,6 +1368,13 @@ def _initialize_train_aggregates(
         "total_positive_edges": float(epoch_plan.total_positive_edges),
         "positive_edge_coverage_ratio": float(epoch_plan.positive_edge_coverage_ratio),
         "mean_positive_edge_reuse": float(epoch_plan.mean_positive_edge_reuse),
+        "all_subgraph_pairs": float(all_subgraph_pairs),
+        "supervised_pairs": float(supervised_pairs),
+        "bce_positive_pairs": float(bce_positive_pairs),
+        "bce_target_negative_pairs": float(bce_target_negative_pairs),
+        "bce_negative_pairs": float(bce_negative_pairs),
+        "bce_negative_ratio": float(bce_negative_pairs / max(1, bce_positive_pairs)),
+        "bce_supervised_fraction": float(supervised_pairs / max(1, all_subgraph_pairs)),
     }
 
 
@@ -1323,7 +1449,9 @@ def _gradnorm_reference_parameters(
         unwrapped_model = cast(nn.Module, unwrap_model(model))
     output_head = getattr(unwrapped_model, "output_head", None)
     if isinstance(output_head, nn.Module):
-        params = tuple(parameter for parameter in output_head.parameters() if parameter.requires_grad)
+        params = tuple(
+            parameter for parameter in output_head.parameters() if parameter.requires_grad
+        )
         if params:
             return params
     return tuple(parameter for parameter in unwrapped_model.parameters() if parameter.requires_grad)
@@ -1338,20 +1466,61 @@ def _graph_positive_edge_probability(graph: nx.Graph) -> float:
     return float(graph.number_of_edges() / possible_edges)
 
 
+def _supervised_positive_probability(
+    *,
+    train_graph: nx.Graph,
+    train_negative_lookup: ExplicitNegativePairLookup,
+    negative_ratio: int,
+) -> float | None:
+    """Return the supervised BCE positive rate when explicit negatives are available."""
+    positive_count = int(train_graph.number_of_edges())
+    if positive_count <= 0 or negative_ratio <= 0 or not train_negative_lookup.negative_pairs:
+        return None
+    desired_negative_count = positive_count * negative_ratio
+    negative_count = min(len(train_negative_lookup.negative_pairs), desired_negative_count)
+    if negative_count <= 0:
+        return None
+    return float(positive_count / float(positive_count + negative_count))
+
+
 def _initialize_scratch_output_bias(
     *,
     model: nn.Module,
     train_graph: nx.Graph,
+    train_negative_lookup: ExplicitNegativePairLookup,
+    negative_ratio: int,
+    loss_weight_schedule: TopologyLossWeightSchedule,
     accelerator: AcceleratorLike,
-) -> float:
-    """Initialize scratch-mode output bias from the train-graph edge prior."""
+) -> ScratchBiasInitialization:
+    """Initialize scratch-mode output bias from the best available training prior."""
     unwrap_model = getattr(accelerator, "unwrap_model", None)
     unwrapped_model = model
     if callable(unwrap_model):
         unwrapped_model = cast(nn.Module, unwrap_model(model))
-    return initialize_output_head_bias_with_prior(
+    first_epoch_topology_scale = topology_loss_scale(epoch=0, schedule=loss_weight_schedule)
+    supervised_probability = (
+        _supervised_positive_probability(
+            train_graph=train_graph,
+            train_negative_lookup=train_negative_lookup,
+            negative_ratio=negative_ratio,
+        )
+        if first_epoch_topology_scale <= 0.0
+        else None
+    )
+    if supervised_probability is None:
+        positive_probability = _graph_positive_edge_probability(train_graph)
+        source = "graph_density"
+    else:
+        positive_probability = supervised_probability
+        source = "supervised_bce"
+    bias = initialize_output_head_bias_with_prior(
         unwrapped_model,
-        positive_edge_probability=_graph_positive_edge_probability(train_graph),
+        positive_edge_probability=positive_probability,
+    )
+    return ScratchBiasInitialization(
+        bias=bias,
+        positive_probability=positive_probability,
+        source=source,
     )
 
 
@@ -1468,6 +1637,13 @@ def _reduce_train_stats(
             "total_positive_edges": float(train_stats["total_positive_edges"]),
             "positive_edge_coverage_ratio": float(train_stats["positive_edge_coverage_ratio"]),
             "mean_positive_edge_reuse": float(train_stats["mean_positive_edge_reuse"]),
+            "all_subgraph_pairs": float(train_stats.get("all_subgraph_pairs", 0.0)),
+            "supervised_pairs": float(train_stats.get("supervised_pairs", 0.0)),
+            "bce_positive_pairs": float(train_stats.get("bce_positive_pairs", 0.0)),
+            "bce_target_negative_pairs": float(train_stats.get("bce_target_negative_pairs", 0.0)),
+            "bce_negative_pairs": float(train_stats.get("bce_negative_pairs", 0.0)),
+            "bce_negative_ratio": float(train_stats.get("bce_negative_ratio", 0.0)),
+            "bce_supervised_fraction": float(train_stats.get("bce_supervised_fraction", 0.0)),
             "topology_loss_scale": float(train_stats.get("topology_loss_scale", 1.0)),
         }
     )
@@ -1569,7 +1745,22 @@ def _fit_epoch(
         assigned_negative_edges=assigned_negative_edges,
         distributed_context=distributed_context,
     )
-    aggregates = _initialize_train_aggregates(len(sampled_subgraphs), epoch_plan)
+    aggregates = _initialize_train_aggregates(
+        len(sampled_subgraphs),
+        epoch_plan,
+        negative_ratio,
+    )
+    if (
+        logger is not None
+        and aggregates["bce_negative_pairs"] < aggregates["bce_target_negative_pairs"]
+    ):
+        log_stage_event(
+            logger,
+            "bce_negative_assignment_clipped",
+            target_negative_pairs=int(aggregates["bce_target_negative_pairs"]),
+            actual_negative_pairs=int(aggregates["bce_negative_pairs"]),
+            bce_negative_ratio=negative_ratio,
+        )
     train_forward_backward_seconds = 0.0
     resolved_loss_weight_schedule = loss_weight_schedule or TopologyLossWeightSchedule()
     resolved_loss_normalization = loss_normalization or TopologyLossNormalizationConfig()
@@ -1595,7 +1786,7 @@ def _fit_epoch(
     gradnorm_reference_parameters = (
         _gradnorm_reference_parameters(model=model, accelerator=accelerator)
         if resolved_gradnorm.enabled
-        else tuple()
+        else ()
     )
     if local_tasks:
         optimizer.zero_grad(set_to_none=True)
@@ -1603,37 +1794,59 @@ def _fit_epoch(
         for task_index, task in enumerate(local_tasks):
             step_start = time.perf_counter()
             with accelerator.autocast():
-                (
-                    logits,
-                    labels,
-                    bce_labels,
-                    bce_mask,
-                    pair_index_a,
-                    pair_index_b,
-                ) = _concat_logits_and_pairs(
-                    model=model,
-                    graph=graph,
-                    nodes=task.nodes,
-                    assigned_positive_edges=task.assigned_positive_edges,
-                    assigned_negative_edges=task.assigned_negative_edges,
-                    cache_dir=cache_dir,
-                    embedding_index=embedding_index,
-                    input_dim=input_dim,
-                    max_sequence_length=max_sequence_length,
-                    pair_batch_size=pair_batch_size,
-                    device=device,
-                    embedding_repository=embedding_repository,
-                )
-                bce_loss = _masked_bce_loss(
-                    logits=logits,
-                    bce_labels=bce_labels,
-                    bce_mask=bce_mask,
-                    config=config,
-                )
+                supervised_result: SupervisedForwardResult | None = None
+                if skip_topology_during_warmup or task.assigned_negative_edges:
+                    supervised_result = _forward_supervised_task(
+                        model=model,
+                        task=task,
+                        cache_dir=cache_dir,
+                        embedding_index=embedding_index,
+                        input_dim=input_dim,
+                        max_sequence_length=max_sequence_length,
+                        pair_batch_size=pair_batch_size,
+                        device=device,
+                        embedding_repository=embedding_repository,
+                    )
+                    bce_loss = _masked_bce_loss(
+                        logits=supervised_result.logits,
+                        bce_labels=supervised_result.bce_labels,
+                        bce_mask=supervised_result.bce_mask,
+                        config=config,
+                    )
                 if skip_topology_during_warmup:
+                    if supervised_result is None:
+                        raise RuntimeError("warmup requires supervised BCE forward results")
                     topology_losses = _zero_topology_losses(reference=bce_loss)
                     total_loss = bce_loss
                 else:
+                    (
+                        logits,
+                        labels,
+                        all_pair_bce_labels,
+                        all_pair_bce_mask,
+                        pair_index_a,
+                        pair_index_b,
+                    ) = _concat_logits_and_pairs(
+                        model=model,
+                        graph=graph,
+                        nodes=task.nodes,
+                        assigned_positive_edges=task.assigned_positive_edges,
+                        assigned_negative_edges=task.assigned_negative_edges,
+                        cache_dir=cache_dir,
+                        embedding_index=embedding_index,
+                        input_dim=input_dim,
+                        max_sequence_length=max_sequence_length,
+                        pair_batch_size=pair_batch_size,
+                        device=device,
+                        embedding_repository=embedding_repository,
+                    )
+                    if supervised_result is None:
+                        bce_loss = _masked_bce_loss(
+                            logits=logits,
+                            bce_labels=all_pair_bce_labels,
+                            bce_mask=all_pair_bce_mask,
+                            config=config,
+                        )
                     pred_adjacency, target_adjacency = _subgraph_adjacencies(
                         num_nodes=len(task.nodes),
                         logits=logits,
@@ -1721,24 +1934,42 @@ def _fit_epoch(
                 group_end = min(group_start + subgraphs_per_forward, window_end)
                 group_tasks = local_tasks[group_start:group_end]
                 with accelerator.autocast():
-                    forward_results = _forward_subgraph_group(
-                        model=model,
-                        graph=graph,
-                        subgraphs=tuple(task.nodes for task in group_tasks),
-                        assigned_positive_edges=tuple(
-                            task.assigned_positive_edges for task in group_tasks
-                        ),
-                        assigned_negative_edges=tuple(
-                            task.assigned_negative_edges for task in group_tasks
-                        ),
-                        cache_dir=cache_dir,
-                        embedding_index=embedding_index,
-                        input_dim=input_dim,
-                        max_sequence_length=max_sequence_length,
-                        pair_batch_size=pair_batch_size,
-                        device=device,
-                        embedding_repository=embedding_repository,
+                    needs_separate_bce_forward = skip_topology_during_warmup or any(
+                        task.assigned_negative_edges for task in group_tasks
                     )
+                    supervised_results: tuple[SupervisedForwardResult, ...] = ()
+                    if needs_separate_bce_forward:
+                        supervised_results = _forward_supervised_group(
+                            model=model,
+                            tasks=group_tasks,
+                            cache_dir=cache_dir,
+                            embedding_index=embedding_index,
+                            input_dim=input_dim,
+                            max_sequence_length=max_sequence_length,
+                            pair_batch_size=pair_batch_size,
+                            device=device,
+                            embedding_repository=embedding_repository,
+                        )
+                    forward_results: tuple[SubgraphForwardResult, ...] = ()
+                    if not skip_topology_during_warmup:
+                        forward_results = _forward_subgraph_group(
+                            model=model,
+                            graph=graph,
+                            subgraphs=tuple(task.nodes for task in group_tasks),
+                            assigned_positive_edges=tuple(
+                                task.assigned_positive_edges for task in group_tasks
+                            ),
+                            assigned_negative_edges=tuple(
+                                task.assigned_negative_edges for task in group_tasks
+                            ),
+                            cache_dir=cache_dir,
+                            embedding_index=embedding_index,
+                            input_dim=input_dim,
+                            max_sequence_length=max_sequence_length,
+                            pair_batch_size=pair_batch_size,
+                            device=device,
+                            embedding_repository=embedding_repository,
+                        )
                     group_loss = torch.zeros((), dtype=torch.float32, device=device)
                     group_updates: list[
                         tuple[
@@ -1748,17 +1979,37 @@ def _fit_epoch(
                             torch.Tensor,
                         ]
                     ] = []
-                    for task, result in zip(group_tasks, forward_results, strict=True):
-                        bce_loss = _masked_bce_loss(
-                            logits=result.logits,
-                            bce_labels=result.bce_labels,
-                            bce_mask=result.bce_mask,
-                            config=config,
+                    for result_index, task in enumerate(group_tasks):
+                        supervised_result = (
+                            supervised_results[result_index] if needs_separate_bce_forward else None
                         )
                         if skip_topology_during_warmup:
+                            if supervised_result is None:
+                                raise RuntimeError("warmup requires supervised BCE forward results")
+                            bce_loss = _masked_bce_loss(
+                                logits=supervised_result.logits,
+                                bce_labels=supervised_result.bce_labels,
+                                bce_mask=supervised_result.bce_mask,
+                                config=config,
+                            )
                             topology_losses = _zero_topology_losses(reference=bce_loss)
                             total_loss = bce_loss
                         else:
+                            result = forward_results[result_index]
+                            if supervised_result is None:
+                                bce_loss = _masked_bce_loss(
+                                    logits=result.logits,
+                                    bce_labels=result.bce_labels,
+                                    bce_mask=result.bce_mask,
+                                    config=config,
+                                )
+                            else:
+                                bce_loss = _masked_bce_loss(
+                                    logits=supervised_result.logits,
+                                    bce_labels=supervised_result.bce_labels,
+                                    bce_mask=supervised_result.bce_mask,
+                                    config=config,
+                                )
                             pred_adjacency, target_adjacency = _subgraph_adjacencies(
                                 num_nodes=len(result.nodes),
                                 logits=result.logits,
@@ -1857,6 +2108,21 @@ def _validate_embedding_cache(
         "Embedding cache is missing train-graph proteins required by topology_finetune: "
         f"{preview} (missing={len(missing_graph_nodes)})"
     )
+
+
+def _should_run_internal_validation(
+    *,
+    finetune_cfg: ConfigDict,
+    epoch_index: int,
+    topology_loss_scale_value: float,
+    previous_topology_loss_scale: float | None,
+) -> bool:
+    """Return whether to run expensive internal topology validation this epoch."""
+    del previous_topology_loss_scale
+    if topology_loss_scale_value > 0.0:
+        return True
+    cadence = _resolve_internal_validation_warmup_cadence(finetune_cfg)
+    return cadence > 0 and (epoch_index + 1) % cadence == 0
 
 
 def _prepare_topology_finetune_stage_context(
@@ -2001,8 +2267,12 @@ def _evaluate_validation_epoch(
     device: torch.device,
     context: TopologyFinetuneStageContext,
     loss_weights: TopologyLossWeights,
+    epoch_index: int,
+    topology_loss_scale: float,
+    previous_topology_loss_scale: float | None,
 ) -> ValidationEpochResult:
     """Run pairwise validation and sampled topology validation for one epoch."""
+    finetune_cfg = _topology_finetune_config(config)
     model.eval()
     with torch.no_grad():
         val_pair_start = time.perf_counter()
@@ -2025,18 +2295,28 @@ def _evaluate_validation_epoch(
         probabilities=probabilities,
     )
     threshold_resolution_seconds = time.perf_counter() - threshold_start
-    internal_validation_start = time.perf_counter()
-    internal_val_topology_stats = _evaluate_internal_validation_subgraphs(
-        model=model,
-        validation_plan=context.internal_validation_plan,
-        embedding_repository=context.embedding_repository,
-        inference_batch_size=context.internal_validation_inference_batch_size,
-        threshold=decision_threshold,
-        device=device,
-        accelerator=context.evaluator.accelerator,
-        compute_spectral_stats=context.internal_validation_compute_spectral_stats,
+    should_run_internal_validation = _should_run_internal_validation(
+        finetune_cfg=finetune_cfg,
+        epoch_index=epoch_index,
+        topology_loss_scale_value=topology_loss_scale,
+        previous_topology_loss_scale=previous_topology_loss_scale,
     )
-    internal_validation_seconds = time.perf_counter() - internal_validation_start
+    if should_run_internal_validation:
+        internal_validation_start = time.perf_counter()
+        internal_val_topology_stats = _evaluate_internal_validation_subgraphs(
+            model=model,
+            validation_plan=context.internal_validation_plan,
+            embedding_repository=context.embedding_repository,
+            inference_batch_size=context.internal_validation_inference_batch_size,
+            threshold=decision_threshold,
+            device=device,
+            accelerator=context.evaluator.accelerator,
+            compute_spectral_stats=context.internal_validation_compute_spectral_stats,
+        )
+        internal_validation_seconds = time.perf_counter() - internal_validation_start
+    else:
+        internal_val_topology_stats = _empty_internal_validation_summary()
+        internal_validation_seconds = 0.0
     val_pair_loss = float(val_pair_stats.get("val_loss", 0.0))
     val_topology_loss = _validation_topology_loss(
         loss_weights=loss_weights,
@@ -2088,6 +2368,13 @@ def _build_epoch_csv_row(
         "Total Positive Edges": int(train_stats["total_positive_edges"]),
         "Positive Edge Coverage Ratio": train_stats["positive_edge_coverage_ratio"],
         "Mean Positive Edge Reuse": train_stats["mean_positive_edge_reuse"],
+        "All Subgraph Pairs": int(train_stats["all_subgraph_pairs"]),
+        "Supervised Pairs": int(train_stats["supervised_pairs"]),
+        "BCE Positive Pairs": int(train_stats["bce_positive_pairs"]),
+        "BCE Target Negative Pairs": int(train_stats["bce_target_negative_pairs"]),
+        "BCE Negative Pairs": int(train_stats["bce_negative_pairs"]),
+        "BCE Negative Ratio": train_stats["bce_negative_ratio"],
+        "BCE Supervised Fraction": train_stats["bce_supervised_fraction"],
         "edge_cover_sampling_s": train_stats["edge_cover_sampling_s"],
         "train_forward_backward_s": train_stats["train_forward_backward_s"],
         "val_pair_pass_s": validation_result.val_pair_pass_seconds,
@@ -2128,6 +2415,13 @@ def _build_best_metrics_payload(
         "total_positive_edges": train_stats["total_positive_edges"],
         "positive_edge_coverage_ratio": train_stats["positive_edge_coverage_ratio"],
         "mean_positive_edge_reuse": train_stats["mean_positive_edge_reuse"],
+        "all_subgraph_pairs": train_stats["all_subgraph_pairs"],
+        "supervised_pairs": train_stats["supervised_pairs"],
+        "bce_positive_pairs": train_stats["bce_positive_pairs"],
+        "bce_target_negative_pairs": train_stats["bce_target_negative_pairs"],
+        "bce_negative_pairs": train_stats["bce_negative_pairs"],
+        "bce_negative_ratio": train_stats["bce_negative_ratio"],
+        "bce_supervised_fraction": train_stats["bce_supervised_fraction"],
     }
 
 
@@ -2175,17 +2469,21 @@ def run_topology_finetuning_stage(
         accelerator=runtime.accelerator,
     )
     if init_mode == "scratch":
-        applied_bias = _initialize_scratch_output_bias(
+        bias_initialization = _initialize_scratch_output_bias(
             model=model,
             train_graph=context.train_graph,
+            train_negative_lookup=context.train_negative_lookup,
+            negative_ratio=_resolve_bce_negative_ratio(finetune_cfg),
+            loss_weight_schedule=context.loss_weight_schedule,
             accelerator=runtime.accelerator,
         )
         if runtime.is_main_process:
             log_stage_event(
                 logger,
                 "scratch_output_bias_initialized",
-                positive_edge_probability=_graph_positive_edge_probability(context.train_graph),
-                bias=applied_bias,
+                positive_edge_probability=bias_initialization.positive_probability,
+                source=bias_initialization.source,
+                bias=bias_initialization.bias,
             )
     stage_model, prepared_optimizer = cast(
         tuple[nn.Module, Optimizer],
@@ -2220,6 +2518,7 @@ def run_topology_finetuning_stage(
                 reason="fixed_topology_eval_buckets",
             )
 
+    previous_topology_loss_scale: float | None = None
     for epoch in range(context.epochs):
         epoch_start = time.perf_counter()
         if device.type == "cuda":
@@ -2277,7 +2576,11 @@ def run_topology_finetuning_stage(
             device=device,
             context=context,
             loss_weights=effective_validation_loss_weights,
+            epoch_index=epoch,
+            topology_loss_scale=float(train_stats["topology_loss_scale"]),
+            previous_topology_loss_scale=previous_topology_loss_scale,
         )
+        previous_topology_loss_scale = float(train_stats["topology_loss_scale"])
         peak_gpu_mem_mb = (
             float(torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0))
             if device.type == "cuda"
@@ -2343,6 +2646,13 @@ def run_topology_finetuning_stage(
                 total_positive_edges=int(train_stats["total_positive_edges"]),
                 positive_edge_coverage_ratio=train_stats["positive_edge_coverage_ratio"],
                 mean_positive_edge_reuse=train_stats["mean_positive_edge_reuse"],
+                all_subgraph_pairs=int(train_stats["all_subgraph_pairs"]),
+                supervised_pairs=int(train_stats["supervised_pairs"]),
+                bce_positive_pairs=int(train_stats["bce_positive_pairs"]),
+                bce_target_negative_pairs=int(train_stats["bce_target_negative_pairs"]),
+                bce_negative_pairs=int(train_stats["bce_negative_pairs"]),
+                bce_negative_ratio=train_stats["bce_negative_ratio"],
+                bce_supervised_fraction=train_stats["bce_supervised_fraction"],
                 edge_cover_sampling_s=train_stats["edge_cover_sampling_s"],
                 train_forward_backward_s=train_stats["train_forward_backward_s"],
                 val_pair_pass_s=validation_result.val_pair_pass_seconds,

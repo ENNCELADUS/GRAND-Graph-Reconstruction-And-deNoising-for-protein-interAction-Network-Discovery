@@ -627,20 +627,6 @@ def _resolve_epoch_edge_chunk_size(
     return min(requested_chunk_size, floor_chunk_size)
 
 
-def _negative_edges_within_nodes(
-    *,
-    nodes: Sequence[str],
-    negative_lookup: ExplicitNegativePairLookup,
-) -> set[tuple[str, str]]:
-    """Return explicit negative pairs fully contained in a node set."""
-    node_set = set(nodes)
-    return {
-        negative_edge
-        for negative_edge in negative_lookup.negative_pairs
-        if negative_edge[0] in node_set and negative_edge[1] in node_set
-    }
-
-
 def _assign_negative_edges_to_subgraphs(
     *,
     subgraphs: Sequence[Sequence[str]],
@@ -655,23 +641,18 @@ def _assign_negative_edges_to_subgraphs(
     if negative_lookup is None or negative_ratio == 0:
         return tuple(frozenset() for _ in subgraphs)
 
+    all_negatives = sorted(negative_lookup.negative_pairs)
+    rng.shuffle(all_negatives)
+    offset = 0
     assigned_negative_edges: list[frozenset[tuple[str, str]]] = []
-    used_negative_edges: set[tuple[str, str]] = set()
-    for nodes, positive_edges in zip(subgraphs, assigned_positive_edges, strict=True):
+    for positive_edges in assigned_positive_edges:
         desired_negative_count = len(tuple(positive_edges)) * negative_ratio
-        if desired_negative_count <= 0:
+        if desired_negative_count <= 0 or offset >= len(all_negatives):
             assigned_negative_edges.append(frozenset())
             continue
-        candidates = sorted(
-            _negative_edges_within_nodes(nodes=nodes, negative_lookup=negative_lookup)
-            - used_negative_edges
-        )
-        if len(candidates) <= desired_negative_count:
-            selected_edges = tuple(candidates)
-        else:
-            selected_edges = tuple(rng.sample(candidates, desired_negative_count))
-        used_negative_edges.update(selected_edges)
-        assigned_negative_edges.append(frozenset(selected_edges))
+        next_offset = min(offset + desired_negative_count, len(all_negatives))
+        assigned_negative_edges.append(frozenset(all_negatives[offset:next_offset]))
+        offset = next_offset
     return tuple(assigned_negative_edges)
 
 
@@ -929,21 +910,28 @@ def _subgraph_pair_tuples(
         for index_b in range(index_a + 1, len(nodes)):
             protein_b = nodes[index_b]
             pair = _canonical_edge(protein_a, protein_b)
-            pair_is_positive = (
-                pair in assigned_positive_edges
-                if assigned_positive_edges is not None
-                else graph.has_edge(protein_a, protein_b)
+            topology_label = 1.0 if graph.has_edge(protein_a, protein_b) else 0.0
+            pair_is_assigned_positive = (
+                assigned_positive_edges is not None and pair in assigned_positive_edges
             )
-            topology_label = 1.0 if pair_is_positive else 0.0
             pair_is_assigned_negative = (
                 assigned_negative_edges is not None and pair in assigned_negative_edges
             )
             has_assigned_supervision = (
                 assigned_positive_edges is not None or assigned_negative_edges is not None
             )
+            bce_label = (
+                1.0
+                if pair_is_assigned_positive
+                else 0.0
+                if has_assigned_supervision
+                else topology_label
+            )
             bce_mask = (
                 1.0
-                if not has_assigned_supervision or topology_label > 0.0 or pair_is_assigned_negative
+                if not has_assigned_supervision
+                or pair_is_assigned_positive
+                or pair_is_assigned_negative
                 else 0.0
             )
             pair_rows.append(
@@ -953,7 +941,7 @@ def _subgraph_pair_tuples(
                     protein_a,
                     protein_b,
                     topology_label,
-                    topology_label,
+                    bce_label,
                     bce_mask,
                 )
             )
@@ -1045,4 +1033,85 @@ def iter_subgraph_pair_chunks(
                 [bce_mask for _, _, _, _, _, _, bce_mask in rows],
                 dtype=torch.float32,
             ),
+        )
+
+
+def iter_supervised_pair_chunks(
+    *,
+    positive_edges: Iterable[tuple[str, str]],
+    negative_edges: Iterable[tuple[str, str]],
+    cache_dir: Path,
+    embedding_index: Mapping[str, str],
+    input_dim: int,
+    max_sequence_length: int,
+    pair_batch_size: int,
+    embedding_repository: EmbeddingRepository | None = None,
+) -> Iterator[SubgraphPairChunk]:
+    """Yield explicitly supervised BCE pairs as train-stage-compatible chunks."""
+    if pair_batch_size <= 0:
+        raise ValueError("pair_batch_size must be positive")
+
+    pair_rows = [
+        (*_canonical_edge(node_a, node_b), 1.0)
+        for node_a, node_b in sorted({_canonical_edge(*edge) for edge in positive_edges})
+    ]
+    pair_rows.extend(
+        (*_canonical_edge(node_a, node_b), 0.0)
+        for node_a, node_b in sorted({_canonical_edge(*edge) for edge in negative_edges})
+    )
+    if not pair_rows:
+        return
+
+    node_tuple = tuple(
+        sorted({node for node_a, node_b, _ in pair_rows for node in (node_a, node_b)})
+    )
+    node_index = {node: index for index, node in enumerate(node_tuple)}
+    if embedding_repository is not None:
+        embeddings = embedding_repository.get_many(node_tuple)
+    else:
+        embeddings = {
+            protein_id: load_cached_embedding(
+                cache_dir=cache_dir,
+                index=embedding_index,
+                protein_id=protein_id,
+                expected_input_dim=input_dim,
+                max_sequence_length=max_sequence_length,
+            )
+            for protein_id in node_tuple
+        }
+
+    for chunk_start in range(0, len(pair_rows), pair_batch_size):
+        rows = pair_rows[chunk_start : chunk_start + pair_batch_size]
+        emb_a = pad_sequence(
+            [embeddings[protein_a] for protein_a, _, _ in rows],
+            batch_first=True,
+        )
+        emb_b = pad_sequence(
+            [embeddings[protein_b] for _, protein_b, _ in rows],
+            batch_first=True,
+        )
+        labels = torch.tensor([label for _, _, label in rows], dtype=torch.float32)
+        yield SubgraphPairChunk(
+            nodes=node_tuple,
+            emb_a=emb_a,
+            emb_b=emb_b,
+            len_a=torch.tensor(
+                [embeddings[protein_a].size(0) for protein_a, _, _ in rows],
+                dtype=torch.long,
+            ),
+            len_b=torch.tensor(
+                [embeddings[protein_b].size(0) for _, protein_b, _ in rows],
+                dtype=torch.long,
+            ),
+            label=labels,
+            pair_index_a=torch.tensor(
+                [node_index[protein_a] for protein_a, _, _ in rows],
+                dtype=torch.long,
+            ),
+            pair_index_b=torch.tensor(
+                [node_index[protein_b] for _, protein_b, _ in rows],
+                dtype=torch.long,
+            ),
+            bce_label=labels,
+            bce_mask=torch.ones_like(labels),
         )
