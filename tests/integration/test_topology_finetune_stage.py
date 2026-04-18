@@ -1729,7 +1729,11 @@ def test_fit_epoch_skips_topology_work_during_warmup_grouped_forward(
     ) -> dict[str, torch.Tensor]:
         del model
         return {
-            "logits": torch.zeros(int(batch["label"].numel()), dtype=torch.float32, requires_grad=True)
+            "logits": torch.zeros(
+                int(batch["label"].numel()),
+                dtype=torch.float32,
+                requires_grad=True,
+            )
         }
 
     def _unexpected_subgraph_adjacencies(**_: object) -> tuple[torch.Tensor, torch.Tensor]:

@@ -1183,6 +1183,18 @@ def _update_train_aggregates(
     aggregates["total"] += float(total_loss.detach().item())
 
 
+def _zero_topology_losses(*, reference: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Return zero-valued topology losses on the same device and dtype as ``reference``."""
+    zero = torch.zeros((), dtype=reference.dtype, device=reference.device)
+    return {
+        "graph_similarity": zero,
+        "relative_density": zero,
+        "degree_mmd": zero,
+        "clustering_mmd": zero,
+        "total_topology": zero,
+    }
+
+
 def _average_train_aggregates(
     *,
     aggregates: Mapping[str, float],
@@ -1408,6 +1420,7 @@ def _fit_epoch(
         gamma=loss_weights.gamma * current_topology_loss_scale,
         delta=loss_weights.delta * current_topology_loss_scale,
     )
+    skip_topology_during_warmup = current_topology_loss_scale <= 0.0
     real_local_subgraphs = sum(1 for task in local_tasks if not task.is_padding)
     total_subgraphs = max(1, real_local_subgraphs)
     completed_real_subgraphs = 0
@@ -1446,24 +1459,28 @@ def _fit_epoch(
                     bce_mask=bce_mask,
                     config=config,
                 )
-                pred_adjacency, target_adjacency = _subgraph_adjacencies(
-                    num_nodes=len(task.nodes),
-                    logits=logits,
-                    labels=labels,
-                    pair_index_a=pair_index_a,
-                    pair_index_b=pair_index_b,
-                )
-                topology_losses = compute_topology_losses(
-                    weights=effective_loss_weights,
-                    pred_adjacency=pred_adjacency,
-                    target_adjacency=target_adjacency,
-                    num_nodes=len(task.nodes),
-                    pair_index_a=pair_index_a,
-                    pair_index_b=pair_index_b,
-                    pred_pair_probabilities=torch.sigmoid(logits),
-                    target_pair_probabilities=labels,
-                )
-                total_loss = bce_loss + topology_losses["total_topology"]
+                if skip_topology_during_warmup:
+                    topology_losses = _zero_topology_losses(reference=bce_loss)
+                    total_loss = bce_loss
+                else:
+                    pred_adjacency, target_adjacency = _subgraph_adjacencies(
+                        num_nodes=len(task.nodes),
+                        logits=logits,
+                        labels=labels,
+                        pair_index_a=pair_index_a,
+                        pair_index_b=pair_index_b,
+                    )
+                    topology_losses = compute_topology_losses(
+                        weights=effective_loss_weights,
+                        pred_adjacency=pred_adjacency,
+                        target_adjacency=target_adjacency,
+                        num_nodes=len(task.nodes),
+                        pair_index_a=pair_index_a,
+                        pair_index_b=pair_index_b,
+                        pred_pair_probabilities=torch.sigmoid(logits),
+                        target_pair_probabilities=labels,
+                    )
+                    total_loss = bce_loss + topology_losses["total_topology"]
                 backward_loss = total_loss * 0.0 if task.is_padding else total_loss
 
             current_window_start = (task_index // gradient_accumulation_steps) * (
@@ -1539,24 +1556,28 @@ def _fit_epoch(
                             bce_mask=result.bce_mask,
                             config=config,
                         )
-                        pred_adjacency, target_adjacency = _subgraph_adjacencies(
-                            num_nodes=len(result.nodes),
-                            logits=result.logits,
-                            labels=result.labels,
-                            pair_index_a=result.pair_index_a,
-                            pair_index_b=result.pair_index_b,
-                        )
-                        topology_losses = compute_topology_losses(
-                            weights=effective_loss_weights,
-                            pred_adjacency=pred_adjacency,
-                            target_adjacency=target_adjacency,
-                            num_nodes=len(result.nodes),
-                            pair_index_a=result.pair_index_a,
-                            pair_index_b=result.pair_index_b,
-                            pred_pair_probabilities=torch.sigmoid(result.logits),
-                            target_pair_probabilities=result.labels,
-                        )
-                        total_loss = bce_loss + topology_losses["total_topology"]
+                        if skip_topology_during_warmup:
+                            topology_losses = _zero_topology_losses(reference=bce_loss)
+                            total_loss = bce_loss
+                        else:
+                            pred_adjacency, target_adjacency = _subgraph_adjacencies(
+                                num_nodes=len(result.nodes),
+                                logits=result.logits,
+                                labels=result.labels,
+                                pair_index_a=result.pair_index_a,
+                                pair_index_b=result.pair_index_b,
+                            )
+                            topology_losses = compute_topology_losses(
+                                weights=effective_loss_weights,
+                                pred_adjacency=pred_adjacency,
+                                target_adjacency=target_adjacency,
+                                num_nodes=len(result.nodes),
+                                pair_index_a=result.pair_index_a,
+                                pair_index_b=result.pair_index_b,
+                                pred_pair_probabilities=torch.sigmoid(result.logits),
+                                target_pair_probabilities=result.labels,
+                            )
+                            total_loss = bce_loss + topology_losses["total_topology"]
                         task_loss = total_loss * 0.0 if task.is_padding else total_loss
                         group_loss = group_loss + task_loss
                         group_updates.append((task, bce_loss, topology_losses, total_loss))
