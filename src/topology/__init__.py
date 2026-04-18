@@ -28,6 +28,7 @@ from src.topology.metrics import (
     compute_relative_density,
     evaluate_graph_samples,
     evaluate_predicted_graph,
+    merge_graph_sample_evaluations,
     reconstruct_graph,
 )
 from src.topology.report import (
@@ -52,6 +53,7 @@ __all__ = [
     "compute_topology_losses",
     "evaluate_graph_samples",
     "evaluate_predicted_graph",
+    "merge_graph_sample_evaluations",
     "filter_graph_to_embedding_index",
     "iter_subgraph_pair_chunks",
     "load_split_node_ids",

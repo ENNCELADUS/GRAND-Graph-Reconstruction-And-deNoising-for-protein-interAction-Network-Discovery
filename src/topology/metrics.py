@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import partial
 from typing import Any
 
@@ -284,6 +284,59 @@ def evaluate_graph_samples(
         "details": graph_level_results,
         "summary": summary,
         "per_node_size": per_node_size,
+    }
+
+
+def merge_graph_sample_evaluations(
+    *,
+    shard_results: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Merge node-size-disjoint graph-evaluation shard results."""
+    merged_details: MetricDict = {}
+    merged_per_node_size: dict[int, dict[str, float | int]] = {}
+
+    for shard_result in shard_results:
+        details = shard_result.get("details", {})
+        per_node_size = shard_result.get("per_node_size", {})
+        if not isinstance(details, Mapping):
+            raise ValueError("shard_result.details must be a mapping")
+        if not isinstance(per_node_size, Mapping):
+            raise ValueError("shard_result.per_node_size must be a mapping")
+
+        for metric_name, values_by_size in details.items():
+            if not isinstance(values_by_size, Mapping):
+                raise ValueError("details values must be mappings keyed by node size")
+            metric_bucket = merged_details.setdefault(str(metric_name), {})
+            for node_size, values in values_by_size.items():
+                node_size_int = int(node_size)
+                if node_size_int in metric_bucket:
+                    raise ValueError(
+                        f"Duplicate node-size shard for metric {metric_name}: {node_size_int}"
+                    )
+                if isinstance(values, list):
+                    metric_bucket[node_size_int] = [float(value) for value in values]
+                else:
+                    metric_bucket[node_size_int] = float(values)
+
+        for node_size, values in per_node_size.items():
+            node_size_int = int(node_size)
+            if node_size_int in merged_per_node_size:
+                raise ValueError(f"Duplicate per-node-size shard: {node_size_int}")
+            if not isinstance(values, Mapping):
+                raise ValueError("per_node_size values must be mappings")
+            merged_per_node_size[node_size_int] = {
+                key: int(value) if key == "graph_count" else float(value)
+                for key, value in values.items()
+            }
+
+    summary = {
+        metric_name: _summary_metric_value(metric_name, values_by_size)
+        for metric_name, values_by_size in merged_details.items()
+    }
+    return {
+        "details": merged_details,
+        "summary": summary,
+        "per_node_size": merged_per_node_size,
     }
 
 

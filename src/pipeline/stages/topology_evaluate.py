@@ -26,6 +26,7 @@ from src.pipeline.stages.train import _build_loss_config
 from src.topology import (
     evaluate_predicted_graph,
     load_human_table2_baselines,
+    merge_graph_sample_evaluations,
     reconstruct_graph,
     write_human_table2_reports,
 )
@@ -384,6 +385,80 @@ def _maybe_write_comparison_report(
     )
 
 
+def _empty_graph_evaluation_result() -> dict[str, Any]:
+    """Return an empty graph-evaluation payload for ranks with no assigned buckets."""
+    return {"details": {}, "summary": {}, "per_node_size": {}}
+
+
+def _shard_test_graph_nodes_for_rank(
+    *,
+    test_graph_nodes: Mapping[int, list[list[str]]],
+    distributed_context: DistributedContext,
+) -> dict[int, list[list[str]]]:
+    """Return the node-size buckets assigned to the current rank.
+
+    Buckets are assigned in descending node-size order to reduce the risk that one rank
+    receives only the largest and most expensive evaluations.
+    """
+    if not distributed_context.is_distributed:
+        return {
+            int(node_size): list(node_lists)
+            for node_size, node_lists in test_graph_nodes.items()
+        }
+
+    ordered_node_sizes = sorted((int(node_size) for node_size in test_graph_nodes), reverse=True)
+    local_node_sizes = ordered_node_sizes[
+        distributed_context.rank :: distributed_context.world_size
+    ]
+    return {
+        node_size: list(test_graph_nodes[node_size])
+        for node_size in sorted(local_node_sizes)
+    }
+
+
+def _evaluate_predicted_graph_sharded(
+    *,
+    pred_graph: torch.Tensor | object,
+    gt_graph: torch.Tensor | object,
+    test_graph_nodes: Mapping[int, list[list[str]]],
+    distributed_context: DistributedContext,
+) -> dict[str, Any]:
+    """Evaluate topology metrics on rank-local node-size buckets and merge the results."""
+    if (
+        not distributed_context.is_distributed
+        or not dist.is_available()
+        or not dist.is_initialized()
+    ):
+        return evaluate_predicted_graph(
+            pred_graph=cast(Any, pred_graph),
+            gt_graph=cast(Any, gt_graph),
+            test_graph_nodes=test_graph_nodes,
+        )
+
+    local_test_graph_nodes = _shard_test_graph_nodes_for_rank(
+        test_graph_nodes=test_graph_nodes,
+        distributed_context=distributed_context,
+    )
+    local_result = (
+        evaluate_predicted_graph(
+            pred_graph=cast(Any, pred_graph),
+            gt_graph=cast(Any, gt_graph),
+            test_graph_nodes=local_test_graph_nodes,
+        )
+        if local_test_graph_nodes
+        else _empty_graph_evaluation_result()
+    )
+    gathered_results: list[dict[str, Any] | None] = [None] * distributed_context.world_size
+    dist.all_gather_object(gathered_results, local_result)
+    return merge_graph_sample_evaluations(
+        shard_results=[
+            cast(Mapping[str, Any], shard_result)
+            for shard_result in gathered_results
+            if shard_result is not None
+        ]
+    )
+
+
 def run_topology_evaluation_stage(
     runtime: PipelineRuntime,
     model: torch.nn.Module,
@@ -486,10 +561,11 @@ def run_topology_evaluation_stage(
         gt_graph = pickle.load(handle)
     with sampled_nodes_path.open("rb") as handle:
         test_graph_nodes = pickle.load(handle)
-    topology_result = evaluate_predicted_graph(
+    topology_result = _evaluate_predicted_graph_sharded(
         pred_graph=pred_graph,
         gt_graph=gt_graph,
         test_graph_nodes=test_graph_nodes,
+        distributed_context=runtime.distributed,
     )
 
     if runtime.is_main_process:

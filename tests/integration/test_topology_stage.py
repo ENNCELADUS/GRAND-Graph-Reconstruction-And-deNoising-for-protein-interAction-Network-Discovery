@@ -7,9 +7,9 @@ import pickle
 from pathlib import Path
 from typing import cast
 
+import numpy as np
 import pytest
 import src.pipeline.stages.topology_evaluate as topology_stage
-import numpy as np
 import torch
 from src.pipeline.runtime import DistributedContext
 from src.pipeline.stages.topology_evaluate import run_topology_evaluation_stage
