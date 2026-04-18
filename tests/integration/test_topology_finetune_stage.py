@@ -32,7 +32,6 @@ from src.pipeline.stages.topology_finetune import (
 from src.pipeline.stages.train import build_model
 from src.topology.finetune_data import (
     TOPOLOGY_EVAL_NODE_SIZES,
-    TOPOLOGY_EVAL_SAMPLES_PER_SIZE,
     EdgeCoverEpochPlan,
     EmbeddingRepository,
     SubgraphPairChunk,

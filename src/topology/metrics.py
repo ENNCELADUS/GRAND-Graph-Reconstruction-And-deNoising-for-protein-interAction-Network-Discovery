@@ -207,6 +207,7 @@ def evaluate_graph_samples(
     *,
     pred_graphs_by_size: Mapping[int, list[nx.Graph]],
     gt_graphs_by_size: Mapping[int, list[nx.Graph]],
+    include_spectral_stats: bool = True,
 ) -> dict[str, Any]:
     """Evaluate predicted and ground-truth graph samples grouped by node size."""
     if set(pred_graphs_by_size) != set(gt_graphs_by_size):
@@ -217,8 +218,9 @@ def evaluate_graph_samples(
         "relative_density": {},
         "deg_dist_mmd": {},
         "cc_mmd": {},
-        "laplacian_eigen_mmd": {},
     }
+    if include_spectral_stats:
+        graph_level_results["laplacian_eigen_mmd"] = {}
     per_node_size: dict[int, dict[str, float | int]] = {}
 
     for node_size, gt_graphs in gt_graphs_by_size.items():
@@ -257,21 +259,22 @@ def evaluate_graph_samples(
 
         deg_dist_mmd = compute_mmd(pred_deg_dist, gt_deg_dist)
         cc_mmd = clustering_stats(gt_graphs, pred_graphs)
-        laplacian_eigen_mmd = spectral_stats(gt_graphs, pred_graphs)
 
         graph_level_results["graph_sim"][node_size] = graph_sim_values
         graph_level_results["relative_density"][node_size] = density_values
         graph_level_results["deg_dist_mmd"][node_size] = deg_dist_mmd
         graph_level_results["cc_mmd"][node_size] = cc_mmd
-        graph_level_results["laplacian_eigen_mmd"][node_size] = laplacian_eigen_mmd
         per_node_size[node_size] = {
             "graph_count": len(gt_graphs),
             "graph_sim": float(np.mean(graph_sim_values)) if graph_sim_values else 0.0,
             "relative_density": float(np.mean(density_values)) if density_values else 0.0,
             "deg_dist_mmd": deg_dist_mmd,
             "cc_mmd": cc_mmd,
-            "laplacian_eigen_mmd": laplacian_eigen_mmd,
         }
+        if include_spectral_stats:
+            laplacian_eigen_mmd = spectral_stats(gt_graphs, pred_graphs)
+            graph_level_results["laplacian_eigen_mmd"][node_size] = laplacian_eigen_mmd
+            per_node_size[node_size]["laplacian_eigen_mmd"] = laplacian_eigen_mmd
 
     summary = {
         metric_name: _summary_metric_value(metric_name, values_by_size)

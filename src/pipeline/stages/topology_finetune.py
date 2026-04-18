@@ -25,10 +25,10 @@ from src.pipeline.runtime import AcceleratorLike, DistributedContext, PipelineRu
 from src.pipeline.stages.train import _build_loss_config
 from src.topology.finetune_data import (
     TOPOLOGY_EVAL_NODE_SIZES,
-    TOPOLOGY_EVAL_SAMPLES_PER_SIZE,
     EdgeCoverEpochPlan,
     EmbeddingRepository,
     ExplicitNegativePairLookup,
+    InternalValidationNodeBucketPlan,
     InternalValidationPairRecord,
     InternalValidationPlan,
     SubgraphPairChunk,
@@ -96,6 +96,13 @@ TRAIN_LOSS_KEYS = (
     "clustering_mmd",
     "total",
 )
+INTERNAL_VALIDATION_SUMMARY_KEYS = (
+    "graph_sim",
+    "relative_density",
+    "deg_dist_mmd",
+    "cc_mmd",
+)
+DEFAULT_INTERNAL_VALIDATION_SAMPLES_PER_SIZE = 20
 
 
 @dataclass(frozen=True)
@@ -112,6 +119,7 @@ class TopologyFinetuneStageContext:
     max_sequence_length: int
     pair_batch_size: int
     internal_validation_inference_batch_size: int
+    internal_validation_compute_spectral_stats: bool
     epochs: int
     run_seed: int
     use_amp: bool
@@ -162,17 +170,17 @@ class LocalSubgraphTask:
     is_padding: bool = False
 
 
+def _empty_internal_validation_summary() -> dict[str, float]:
+    """Return zeroed internal-validation summary metrics."""
+    return dict.fromkeys(INTERNAL_VALIDATION_SUMMARY_KEYS, 0.0)
+
+
 def _empty_validation_epoch_result() -> ValidationEpochResult:
     """Return a zeroed validation payload for non-main distributed ranks."""
     return ValidationEpochResult(
         decision_threshold=0.5,
         val_pair_stats={"val_loss": 0.0, "val_auprc": 0.0},
-        internal_val_topology_stats={
-            "graph_sim": 0.0,
-            "relative_density": 0.0,
-            "deg_dist_mmd": 0.0,
-            "cc_mmd": 0.0,
-        },
+        internal_val_topology_stats=_empty_internal_validation_summary(),
         val_pair_pass_seconds=0.0,
         threshold_resolution_seconds=0.0,
         internal_validation_seconds=0.0,
@@ -436,13 +444,50 @@ def _build_internal_validation_node_sets(
     seed: int,
 ) -> dict[int, list[tuple[str, ...]]]:
     """Build topology-evaluate-style node buckets for internal validation."""
-    del finetune_cfg
     return sample_topology_evaluation_subgraphs(
         graph=graph,
         seed=seed,
         strategy="mixed",
-        node_sizes=TOPOLOGY_EVAL_NODE_SIZES,
-        samples_per_size=TOPOLOGY_EVAL_SAMPLES_PER_SIZE,
+        node_sizes=_resolve_internal_validation_node_sizes(finetune_cfg),
+        samples_per_size=_resolve_internal_validation_samples_per_size(finetune_cfg),
+    )
+
+
+def _resolve_internal_validation_node_sizes(finetune_cfg: ConfigDict) -> tuple[int, ...]:
+    """Return the node-size buckets used for internal topology validation."""
+    raw_node_sizes = finetune_cfg.get("internal_validation_node_sizes", TOPOLOGY_EVAL_NODE_SIZES)
+    if not isinstance(raw_node_sizes, Sequence) or isinstance(raw_node_sizes, (str, bytes)):
+        raise ValueError("topology_finetune.internal_validation_node_sizes must be a sequence")
+    node_sizes = [
+        as_int(node_size, "topology_finetune.internal_validation_node_sizes")
+        for node_size in raw_node_sizes
+    ]
+    if not node_sizes:
+        raise ValueError("topology_finetune.internal_validation_node_sizes must not be empty")
+    if any(node_size <= 0 for node_size in node_sizes):
+        raise ValueError("topology_finetune.internal_validation_node_sizes must be > 0")
+    return tuple(dict.fromkeys(node_sizes))
+
+
+def _resolve_internal_validation_samples_per_size(finetune_cfg: ConfigDict) -> int:
+    """Return the number of internal-validation subgraphs sampled per node size."""
+    samples_per_size = as_int(
+        finetune_cfg.get(
+            "internal_validation_samples_per_size",
+            DEFAULT_INTERNAL_VALIDATION_SAMPLES_PER_SIZE,
+        ),
+        "topology_finetune.internal_validation_samples_per_size",
+    )
+    if samples_per_size <= 0:
+        raise ValueError("topology_finetune.internal_validation_samples_per_size must be > 0")
+    return samples_per_size
+
+
+def _resolve_internal_validation_compute_spectral_stats(finetune_cfg: ConfigDict) -> bool:
+    """Return whether internal validation should compute Laplacian spectral metrics."""
+    return as_bool(
+        finetune_cfg.get("internal_validation_compute_spectral_stats", False),
+        "topology_finetune.internal_validation_compute_spectral_stats",
     )
 
 
@@ -836,6 +881,16 @@ def _chunked_pair_records(
         yield pair_records[start : start + batch_size]
 
 
+def _chunked_indexed_pair_records(
+    *,
+    indexed_pair_records: Sequence[tuple[int, InternalValidationPairRecord]],
+    batch_size: int,
+) -> Iterator[Sequence[tuple[int, InternalValidationPairRecord]]]:
+    """Yield contiguous slices of globally indexed pair records."""
+    for start in range(0, len(indexed_pair_records), batch_size):
+        yield indexed_pair_records[start : start + batch_size]
+
+
 def _validation_pair_batch(
     *,
     pair_records: Sequence[InternalValidationPairRecord],
@@ -869,6 +924,80 @@ def _validation_pair_batch(
     }
 
 
+def _local_internal_validation_pair_records(
+    *,
+    bucket: InternalValidationNodeBucketPlan,
+    accelerator: AcceleratorLike,
+) -> tuple[tuple[int, InternalValidationPairRecord], ...]:
+    """Return the rank-local slice of internal-validation pair records."""
+    if not accelerator.use_distributed:
+        return tuple(enumerate(bucket.pair_records))
+    return tuple(
+        (global_index, record)
+        for global_index, record in enumerate(bucket.pair_records)
+        if record.subgraph_index % accelerator.num_processes == accelerator.process_index
+    )
+
+
+def _ordered_internal_validation_predictions(
+    *,
+    local_indices: Sequence[int],
+    local_predictions: Sequence[int],
+    total_records: int,
+    accelerator: AcceleratorLike,
+) -> list[int]:
+    """Gather sharded internal-validation predictions and restore global order."""
+    if len(local_indices) != len(local_predictions):
+        raise ValueError("local_indices and local_predictions must have matching lengths")
+
+    if not accelerator.use_distributed:
+        ordered: list[int | None] = [None] * total_records
+        for index, prediction in zip(local_indices, local_predictions, strict=True):
+            ordered[int(index)] = int(prediction)
+    else:
+        local_length = torch.tensor(
+            [len(local_indices)],
+            dtype=torch.long,
+            device=accelerator.device,
+        )
+        gathered_lengths = accelerator.gather(local_length).detach().cpu().tolist()
+        padded_indices = accelerator.pad_across_processes(
+            torch.tensor(local_indices, dtype=torch.long, device=accelerator.device),
+            dim=0,
+            pad_index=-1,
+        )
+        padded_predictions = accelerator.pad_across_processes(
+            torch.tensor(local_predictions, dtype=torch.long, device=accelerator.device),
+            dim=0,
+            pad_index=0,
+        )
+        gathered_indices = accelerator.gather(padded_indices).detach().cpu()
+        gathered_predictions = accelerator.gather(padded_predictions).detach().cpu()
+        ordered = [None] * total_records
+        max_length = max(gathered_lengths, default=0)
+        offset = 0
+        for shard_length in gathered_lengths:
+            shard_indices = gathered_indices[offset : offset + max_length][:shard_length].tolist()
+            shard_predictions = gathered_predictions[offset : offset + max_length][
+                :shard_length
+            ].tolist()
+            for index, prediction in zip(shard_indices, shard_predictions, strict=True):
+                if index < 0 or index >= total_records:
+                    raise ValueError(f"Internal-validation pair index out of bounds: {index}")
+                if ordered[index] is not None:
+                    raise ValueError(
+                        f"Duplicate internal-validation prediction for pair index {index}"
+                    )
+                ordered[index] = int(prediction)
+            offset += max_length
+
+    missing_indices = [index for index, prediction in enumerate(ordered) if prediction is None]
+    if missing_indices:
+        preview = ", ".join(str(index) for index in missing_indices[:10])
+        raise ValueError(f"Missing internal-validation predictions for indices: {preview}")
+    return [int(prediction) for prediction in ordered if prediction is not None]
+
+
 def _evaluate_internal_validation_subgraphs(
     *,
     model: nn.Module,
@@ -878,6 +1007,7 @@ def _evaluate_internal_validation_subgraphs(
     threshold: float,
     device: torch.device,
     accelerator: AcceleratorLike,
+    compute_spectral_stats: bool = False,
 ) -> dict[str, float]:
     """Compute internal subgraph topology metrics on fixed validation samples."""
     pred_graphs_by_size: dict[int, list[nx.Graph]] = {}
@@ -885,13 +1015,17 @@ def _evaluate_internal_validation_subgraphs(
 
     with torch.no_grad():
         for bucket in validation_plan.buckets:
-            pred_subgraphs = [nx.Graph() for _ in bucket.sampled_subgraphs]
-            for subgraph, nodes in zip(pred_subgraphs, bucket.sampled_subgraphs, strict=True):
-                subgraph.add_nodes_from(nodes)
-            for pair_batch in _chunked_pair_records(
-                pair_records=bucket.pair_records,
+            local_pair_records = _local_internal_validation_pair_records(
+                bucket=bucket,
+                accelerator=accelerator,
+            )
+            local_pair_indices: list[int] = []
+            local_pair_predictions: list[int] = []
+            for indexed_pair_batch in _chunked_indexed_pair_records(
+                indexed_pair_records=local_pair_records,
                 batch_size=inference_batch_size,
             ):
+                pair_batch = [record for _, record in indexed_pair_batch]
                 prepared_batch = move_batch_to_device(
                     batch=_validation_pair_batch(
                         pair_records=pair_batch,
@@ -904,21 +1038,49 @@ def _evaluate_internal_validation_subgraphs(
                         _forward_model(model=model, batch=prepared_batch)["logits"]
                     )
                 probabilities = torch.sigmoid(logits).detach().cpu().tolist()
-                for record, probability in zip(pair_batch, probabilities, strict=True):
-                    if float(probability) < threshold:
-                        continue
-                    pred_subgraphs[record.subgraph_index].add_edge(
-                        bucket.sampled_subgraphs[record.subgraph_index][record.pair_index_a],
-                        bucket.sampled_subgraphs[record.subgraph_index][record.pair_index_b],
-                    )
+                for (global_index, _), probability in zip(
+                    indexed_pair_batch,
+                    probabilities,
+                    strict=True,
+                ):
+                    local_pair_indices.append(global_index)
+                    local_pair_predictions.append(int(float(probability) >= threshold))
+
+            ordered_predictions = _ordered_internal_validation_predictions(
+                local_indices=local_pair_indices,
+                local_predictions=local_pair_predictions,
+                total_records=len(bucket.pair_records),
+                accelerator=accelerator,
+            )
+            if accelerator.use_distributed and not accelerator.is_main_process:
+                continue
+
+            pred_subgraphs = [nx.Graph() for _ in bucket.sampled_subgraphs]
+            for subgraph, nodes in zip(pred_subgraphs, bucket.sampled_subgraphs, strict=True):
+                subgraph.add_nodes_from(nodes)
+            for record, prediction in zip(bucket.pair_records, ordered_predictions, strict=True):
+                if prediction <= 0:
+                    continue
+                pred_subgraphs[record.subgraph_index].add_edge(
+                    bucket.sampled_subgraphs[record.subgraph_index][record.pair_index_a],
+                    bucket.sampled_subgraphs[record.subgraph_index][record.pair_index_b],
+                )
             pred_graphs_by_size[bucket.node_size] = pred_subgraphs
             target_graphs_by_size[bucket.node_size] = list(bucket.target_subgraphs)
+
+    if accelerator.use_distributed and not accelerator.is_main_process:
+        return _empty_internal_validation_summary()
 
     result = evaluate_graph_samples(
         pred_graphs_by_size=pred_graphs_by_size,
         gt_graphs_by_size=target_graphs_by_size,
+        include_spectral_stats=compute_spectral_stats,
     )
-    return cast(dict[str, float], result["summary"])
+    summary = cast(Mapping[str, float], result["summary"])
+    return {
+        metric_name: float(summary[metric_name])
+        for metric_name in INTERNAL_VALIDATION_SUMMARY_KEYS
+    }
 
 
 def _masked_bce_loss(
@@ -1402,6 +1564,9 @@ def _prepare_topology_finetune_stage_context(
     internal_validation_inference_batch_size = _resolve_internal_validation_inference_batch_size(
         finetune_cfg
     )
+    internal_validation_compute_spectral_stats = (
+        _resolve_internal_validation_compute_spectral_stats(finetune_cfg)
+    )
     epochs = as_int(
         finetune_cfg.get("epochs", training_cfg.get("epochs", 1)),
         "topology_finetune.epochs",
@@ -1479,6 +1644,7 @@ def _prepare_topology_finetune_stage_context(
         max_sequence_length=max_sequence_length,
         pair_batch_size=pair_batch_size,
         internal_validation_inference_batch_size=internal_validation_inference_batch_size,
+        internal_validation_compute_spectral_stats=internal_validation_compute_spectral_stats,
         epochs=epochs,
         run_seed=run_seed,
         use_amp=use_amp,
@@ -1538,6 +1704,7 @@ def _evaluate_validation_epoch(
         threshold=decision_threshold,
         device=device,
         accelerator=context.evaluator.accelerator,
+        compute_spectral_stats=context.internal_validation_compute_spectral_stats,
     )
     internal_validation_seconds = time.perf_counter() - internal_validation_start
     return ValidationEpochResult(
@@ -1683,6 +1850,9 @@ def run_topology_finetuning_stage(
             pair_batch_size=context.pair_batch_size,
             internal_validation_inference_batch_size=(
                 context.internal_validation_inference_batch_size
+            ),
+            internal_validation_compute_spectral_stats=(
+                context.internal_validation_compute_spectral_stats
             ),
         )
         if "validation_subgraphs" in finetune_cfg:
