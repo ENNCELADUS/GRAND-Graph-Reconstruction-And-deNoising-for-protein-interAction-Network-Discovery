@@ -1588,6 +1588,217 @@ def test_fit_epoch_batches_multiple_subgraphs_into_one_forward(
     assert observed_forward_batch_sizes == [2, 2]
 
 
+def test_fit_epoch_skips_topology_work_during_warmup_single_forward(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    graph = nx.path_graph(["P1", "P2", "P3"])
+
+    def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
+        return EdgeCoverEpochPlan(
+            subgraphs=(("P1", "P2"),),
+            assigned_positive_edges=(frozenset({("P1", "P2")}),),
+            total_positive_edges=1,
+            covered_positive_edges=1,
+            positive_edge_coverage_ratio=1.0,
+            mean_positive_edge_reuse=1.0,
+        )
+
+    def _fake_concat_logits_and_pairs(**_: object) -> tuple[torch.Tensor, ...]:
+        return (
+            torch.zeros(1, dtype=torch.float32, requires_grad=True),
+            torch.ones(1, dtype=torch.float32),
+            torch.ones(1, dtype=torch.float32),
+            torch.ones(1, dtype=torch.float32),
+            torch.tensor([0], dtype=torch.long),
+            torch.tensor([1], dtype=torch.long),
+        )
+
+    def _unexpected_subgraph_adjacencies(**_: object) -> tuple[torch.Tensor, torch.Tensor]:
+        raise AssertionError("warmup should skip topology adjacency construction")
+
+    def _unexpected_topology_losses(**_: object) -> dict[str, torch.Tensor]:
+        raise AssertionError("warmup should skip topology loss computation")
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "sample_edge_cover_subgraphs",
+        _fake_sample_edge_cover_subgraphs,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_concat_logits_and_pairs",
+        _fake_concat_logits_and_pairs,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_subgraph_adjacencies",
+        _unexpected_subgraph_adjacencies,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "compute_topology_losses",
+        _unexpected_topology_losses,
+    )
+
+    train_stats = topology_finetune_stage._fit_epoch(
+        config=config,
+        model=torch.nn.Linear(1, 1),
+        device=torch.device("cpu"),
+        graph=graph,
+        cache_dir=tmp_path,
+        embedding_index={},
+        optimizer=cast(torch.optim.Optimizer, _CountingOptimizer()),
+        epoch_index=0,
+        epoch_seed=11,
+        input_dim=4,
+        max_sequence_length=8,
+        loss_weights=topology_finetune_stage.TopologyLossWeights(
+            alpha=0.5,
+            beta=1.0,
+            gamma=0.3,
+            delta=0.2,
+        ),
+        loss_weight_schedule=topology_finetune_stage.TopologyLossWeightSchedule(
+            warmup_epochs=2,
+            ramp_epochs=1,
+        ),
+        pair_batch_size=2,
+        use_amp=False,
+        accelerator=NoOpAccelerator(),
+        embedding_repository=cast(EmbeddingRepository, object()),
+        negative_lookup=None,
+        distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+    )
+
+    assert train_stats["topology_loss_scale"] == pytest.approx(0.0)
+    assert train_stats["bce"] > 0.0
+    assert train_stats["total"] == pytest.approx(train_stats["bce"])
+    assert train_stats["graph_similarity"] == pytest.approx(0.0)
+    assert train_stats["relative_density"] == pytest.approx(0.0)
+    assert train_stats["degree_mmd"] == pytest.approx(0.0)
+    assert train_stats["clustering_mmd"] == pytest.approx(0.0)
+
+
+def test_fit_epoch_skips_topology_work_during_warmup_grouped_forward(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["gradient_accumulation_steps"] = 2
+    topology_cfg["subgraphs_per_forward"] = 2
+    graph = nx.path_graph(["P1", "P2", "P3", "P4"])
+
+    def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
+        return EdgeCoverEpochPlan(
+            subgraphs=(("P1", "P2"), ("P2", "P3")),
+            assigned_positive_edges=(
+                frozenset({("P1", "P2")}),
+                frozenset({("P2", "P3")}),
+            ),
+            total_positive_edges=2,
+            covered_positive_edges=2,
+            positive_edge_coverage_ratio=1.0,
+            mean_positive_edge_reuse=1.0,
+        )
+
+    def _fake_iter_subgraph_pair_chunks(**kwargs: object) -> Sequence[SubgraphPairChunk]:
+        nodes = tuple(cast(Sequence[str], kwargs["nodes"]))
+        return (
+            SubgraphPairChunk(
+                nodes=nodes,
+                emb_a=torch.zeros((1, 1, 4), dtype=torch.float32),
+                emb_b=torch.ones((1, 1, 4), dtype=torch.float32),
+                len_a=torch.ones(1, dtype=torch.long),
+                len_b=torch.ones(1, dtype=torch.long),
+                label=torch.ones(1, dtype=torch.float32),
+                pair_index_a=torch.zeros(1, dtype=torch.long),
+                pair_index_b=torch.ones(1, dtype=torch.long),
+                bce_label=torch.ones(1, dtype=torch.float32),
+                bce_mask=torch.ones(1, dtype=torch.float32),
+            ),
+        )
+
+    def _fake_forward_model(
+        *,
+        model: torch.nn.Module,
+        batch: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        del model
+        return {
+            "logits": torch.zeros(int(batch["label"].numel()), dtype=torch.float32, requires_grad=True)
+        }
+
+    def _unexpected_subgraph_adjacencies(**_: object) -> tuple[torch.Tensor, torch.Tensor]:
+        raise AssertionError("warmup should skip topology adjacency construction")
+
+    def _unexpected_topology_losses(**_: object) -> dict[str, torch.Tensor]:
+        raise AssertionError("warmup should skip topology loss computation")
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "sample_edge_cover_subgraphs",
+        _fake_sample_edge_cover_subgraphs,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "iter_subgraph_pair_chunks",
+        _fake_iter_subgraph_pair_chunks,
+    )
+    monkeypatch.setattr(topology_finetune_stage, "_forward_model", _fake_forward_model)
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_subgraph_adjacencies",
+        _unexpected_subgraph_adjacencies,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "compute_topology_losses",
+        _unexpected_topology_losses,
+    )
+
+    train_stats = topology_finetune_stage._fit_epoch(
+        config=config,
+        model=torch.nn.Linear(1, 1),
+        device=torch.device("cpu"),
+        graph=graph,
+        cache_dir=tmp_path,
+        embedding_index={},
+        optimizer=cast(torch.optim.Optimizer, _CountingOptimizer()),
+        epoch_index=0,
+        epoch_seed=11,
+        input_dim=4,
+        max_sequence_length=8,
+        loss_weights=topology_finetune_stage.TopologyLossWeights(
+            alpha=0.5,
+            beta=1.0,
+            gamma=0.3,
+            delta=0.2,
+        ),
+        loss_weight_schedule=topology_finetune_stage.TopologyLossWeightSchedule(
+            warmup_epochs=2,
+            ramp_epochs=1,
+        ),
+        pair_batch_size=8,
+        use_amp=False,
+        accelerator=NoOpAccelerator(),
+        embedding_repository=cast(EmbeddingRepository, object()),
+        negative_lookup=None,
+        distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+    )
+
+    assert train_stats["topology_loss_scale"] == pytest.approx(0.0)
+    assert train_stats["bce"] > 0.0
+    assert train_stats["total"] == pytest.approx(train_stats["bce"])
+    assert train_stats["graph_similarity"] == pytest.approx(0.0)
+    assert train_stats["relative_density"] == pytest.approx(0.0)
+    assert train_stats["degree_mmd"] == pytest.approx(0.0)
+    assert train_stats["clustering_mmd"] == pytest.approx(0.0)
+
+
 def _run_fit_epoch_for_rank(
     *,
     tmp_path: Path,
