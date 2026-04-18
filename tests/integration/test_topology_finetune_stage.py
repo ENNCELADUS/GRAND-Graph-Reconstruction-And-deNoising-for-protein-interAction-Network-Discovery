@@ -480,6 +480,25 @@ def test_resolve_internal_validation_threshold_uses_validation_selected_mode(
     assert mode == "best_f1_on_valid"
 
 
+def test_parse_loss_weight_schedule_reads_warmup_ramp_and_schedule(
+    tmp_path: Path,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["loss_weight_schedule"] = {
+        "warmup_epochs": 5,
+        "ramp_epochs": 4,
+        "schedule": "cosine",
+    }
+
+    schedule = topology_finetune_stage._parse_loss_weight_schedule(topology_cfg)
+
+    assert schedule.warmup_epochs == 5
+    assert schedule.ramp_epochs == 4
+    assert schedule.schedule == "cosine"
+
+
 def test_resolve_monitor_mode_uses_min_for_val_loss() -> None:
     assert _resolve_monitor_mode("val_loss") == "min"
     assert _resolve_monitor_mode("val_auprc") == "max"
@@ -1000,10 +1019,12 @@ def test_run_topology_finetuning_stage_warm_starts_and_writes_artifacts(tmp_path
     assert "val_pair_pass_s" in header
     assert "val_threshold_s" in header
     assert "internal_val_topology_s" in header
+    assert "Topology Loss Scale" in header
     assert "peak_gpu_mem_mb" in header
     log_text = (log_dir / "log.log").read_text(encoding="utf-8")
     assert "Epoch Progress" in log_text
     assert "Legacy Validation Subgraphs Ignored" in log_text
+    assert "Topo Loss Scale" in log_text
 
     updated_state = torch.load(best_checkpoint_path, map_location="cpu")
     assert any(
@@ -1852,3 +1873,22 @@ def test_v3_configs_omit_validation_mode() -> None:
         topology_cfg = config["topology_finetune"]
         assert isinstance(topology_cfg, dict)
         assert "validation_mode" not in topology_cfg
+
+
+def test_v3_topology_finetune_uses_fixed_threshold_scheduler_and_patience() -> None:
+    config = load_config("configs/v3.yaml")
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+
+    decision_threshold = topology_cfg["decision_threshold"]
+    assert isinstance(decision_threshold, dict)
+    assert decision_threshold == {"mode": "fixed", "value": 0.5}
+    assert topology_cfg["early_stopping_patience"] == 8
+
+    loss_weight_schedule = topology_cfg["loss_weight_schedule"]
+    assert isinstance(loss_weight_schedule, dict)
+    assert loss_weight_schedule == {
+        "warmup_epochs": 5,
+        "ramp_epochs": 5,
+        "schedule": "linear",
+    }

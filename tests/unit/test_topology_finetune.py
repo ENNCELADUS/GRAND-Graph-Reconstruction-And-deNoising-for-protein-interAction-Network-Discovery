@@ -7,6 +7,7 @@ from pathlib import Path
 
 import networkx as nx
 import pytest
+import src.topology.finetune_losses as finetune_losses_module
 import torch
 from src.topology.finetune_data import (
     EdgeCoverEpochPlan,
@@ -748,3 +749,52 @@ def test_compute_topology_losses_pairwise_path_matches_dense_path() -> None:
         "total_topology",
     ):
         assert pairwise_losses[key].item() == pytest.approx(dense_losses[key].item(), abs=1e-6)
+
+
+def test_topology_loss_scale_respects_warmup_and_linear_ramp() -> None:
+    schedule = finetune_losses_module.TopologyLossWeightSchedule(
+        warmup_epochs=2,
+        ramp_epochs=3,
+        schedule="linear",
+    )
+
+    assert finetune_losses_module.topology_loss_scale(epoch=0, schedule=schedule) == pytest.approx(
+        0.0
+    )
+    assert finetune_losses_module.topology_loss_scale(epoch=1, schedule=schedule) == pytest.approx(
+        0.0
+    )
+    assert finetune_losses_module.topology_loss_scale(epoch=2, schedule=schedule) == pytest.approx(
+        0.0
+    )
+    assert finetune_losses_module.topology_loss_scale(epoch=3, schedule=schedule) == pytest.approx(
+        1.0 / 3.0
+    )
+    assert finetune_losses_module.topology_loss_scale(epoch=4, schedule=schedule) == pytest.approx(
+        2.0 / 3.0
+    )
+    assert finetune_losses_module.topology_loss_scale(epoch=5, schedule=schedule) == pytest.approx(
+        1.0
+    )
+
+
+def test_topology_loss_scale_supports_cosine_ramp() -> None:
+    schedule = finetune_losses_module.TopologyLossWeightSchedule(
+        warmup_epochs=1,
+        ramp_epochs=4,
+        schedule="cosine",
+    )
+
+    assert finetune_losses_module.topology_loss_scale(epoch=0, schedule=schedule) == pytest.approx(
+        0.0
+    )
+    assert finetune_losses_module.topology_loss_scale(epoch=1, schedule=schedule) == pytest.approx(
+        0.0
+    )
+    assert finetune_losses_module.topology_loss_scale(epoch=3, schedule=schedule) == pytest.approx(
+        0.5,
+        abs=1e-6,
+    )
+    assert finetune_losses_module.topology_loss_scale(epoch=5, schedule=schedule) == pytest.approx(
+        1.0
+    )
