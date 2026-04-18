@@ -97,10 +97,10 @@ Do not apply GradNorm directly to the raw four topology terms. It should be a se
 ## Implementation Checklist
 
 - [x] Verify topology warmup/ramp is active and logged
-- [ ] Replace RD with log-ratio + SmoothL1
-- [ ] Add EMA normalization for topology terms
-- [ ] Add sparse-prior bias init for scratch mode
-- [ ] Add grouped GradNorm dynamic task weighting
+- [x] Replace RD with log-ratio + SmoothL1
+- [x] Add EMA normalization for topology terms
+- [x] Add sparse-prior bias init for scratch mode
+- [x] Add grouped GradNorm dynamic task weighting
 
 ## Success Criteria
 

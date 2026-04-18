@@ -121,6 +121,17 @@ topology_finetune:
     histogram_sigma: 1.5
     degree_bins: 32
     clustering_bins: 48
+    rd_loss_form: "log_ratio_huber"
+  loss_normalization:
+    enabled: true
+    ema_decay: 0.95
+    clip_value: 5.0
+  gradnorm:
+    enabled: true
+    alpha: 0.5
+    learning_rate: 0.02
+    min_weight: 0.2
+    max_weight: 5.0
 
 evaluate:
   decision_threshold:

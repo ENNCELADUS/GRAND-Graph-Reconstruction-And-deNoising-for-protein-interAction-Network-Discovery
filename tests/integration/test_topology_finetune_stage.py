@@ -2056,7 +2056,7 @@ def test_run_topology_finetuning_stage_supports_scratch_initialization(
     assert isinstance(final_linear, torch.nn.Linear)
     assert final_linear.bias is not None
     assert final_linear.bias.item() == pytest.approx(
-        torch.logit(torch.tensor(3.0 / 45.0, dtype=torch.float32)).item(),
+        torch.logit(torch.tensor(2.0 / 45.0, dtype=torch.float32)).item(),
         rel=1e-6,
     )
     assert best_checkpoint == Path("models/v3/topology_finetune/topology_ft_case/best_model.pth")

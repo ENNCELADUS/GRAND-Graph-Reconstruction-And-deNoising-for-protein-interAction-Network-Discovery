@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from math import cos, pi
 
 import torch
+import torch.nn.functional as functional
 
 EPSILON = 1.0e-8
 DEFAULT_DEGREE_BINS = 64
@@ -23,6 +24,7 @@ class TopologyLossWeights:
     histogram_sigma: float = 1.0
     degree_bins: int = DEFAULT_DEGREE_BINS
     clustering_bins: int = DEFAULT_CLUSTERING_BINS
+    rd_loss_form: str = "log_ratio_huber"
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,7 @@ def soft_relative_density_loss(
     *,
     pred_adjacency: torch.Tensor,
     target_adjacency: torch.Tensor,
+    loss_form: str = "log_ratio_huber",
     eps: float = EPSILON,
 ) -> torch.Tensor:
     """Squared deviation of differentiable relative density from 1."""
@@ -123,8 +126,12 @@ def soft_relative_density_loss(
     target_density = target_adjacency.sum() / normalizer
     if float(target_density.detach().item()) <= eps:
         return pred_density.square()
-    relative_density = pred_density / (target_density + eps)
-    return (relative_density - 1.0).square()
+    return _relative_density_penalty(
+        pred_density=pred_density,
+        target_density=target_density,
+        loss_form=loss_form,
+        eps=eps,
+    )
 
 
 def _pairwise_relative_density_loss(
@@ -132,6 +139,7 @@ def _pairwise_relative_density_loss(
     num_nodes: int,
     pred_pair_probabilities: torch.Tensor,
     target_pair_probabilities: torch.Tensor,
+    loss_form: str = "log_ratio_huber",
     eps: float = EPSILON,
 ) -> torch.Tensor:
     """Squared deviation of relative density computed from pair vectors."""
@@ -142,8 +150,34 @@ def _pairwise_relative_density_loss(
     target_density = (2.0 * target_pair_probabilities.sum()) / normalizer
     if float(target_density.detach().item()) <= eps:
         return pred_density.square()
+    return _relative_density_penalty(
+        pred_density=pred_density,
+        target_density=target_density,
+        loss_form=loss_form,
+        eps=eps,
+    )
+
+
+def _relative_density_penalty(
+    *,
+    pred_density: torch.Tensor,
+    target_density: torch.Tensor,
+    loss_form: str,
+    eps: float,
+) -> torch.Tensor:
+    """Return the configured relative-density penalty."""
     relative_density = pred_density / (target_density + eps)
-    return (relative_density - 1.0).square()
+    if loss_form == "squared_ratio":
+        return (relative_density - 1.0).square()
+
+    log_ratio = torch.log((pred_density + eps) / (target_density + eps))
+    if loss_form == "log_ratio":
+        return log_ratio.square()
+    if loss_form == "log_ratio_huber":
+        return functional.smooth_l1_loss(log_ratio, torch.zeros_like(log_ratio))
+    raise ValueError(
+        "rd_loss_form must be one of {'squared_ratio', 'log_ratio', 'log_ratio_huber'}"
+    )
 
 
 def _soft_histogram(
@@ -351,6 +385,7 @@ def compute_topology_losses(
             num_nodes=num_nodes,
             pred_pair_probabilities=pred_pair_probabilities,
             target_pair_probabilities=target_pair_probabilities,
+            loss_form=weights.rd_loss_form,
         )
         degree_mmd = _degree_distribution_mmd_from_pairs(
             num_nodes=num_nodes,
@@ -373,6 +408,7 @@ def compute_topology_losses(
         relative_density = soft_relative_density_loss(
             pred_adjacency=pred_adjacency,
             target_adjacency=target_adjacency,
+            loss_form=weights.rd_loss_form,
         )
         degree_mmd = _degree_distribution_mmd(
             pred_adjacency=pred_adjacency,

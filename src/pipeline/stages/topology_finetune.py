@@ -47,6 +47,14 @@ from src.topology.finetune_losses import (
     compute_topology_losses,
     topology_loss_scale,
 )
+from src.topology.loss_balancing import (
+    TopologyAdaptiveLossState,
+    TopologyGradNormConfig,
+    TopologyLossNormalizationConfig,
+    initialize_output_head_bias_with_prior,
+    normalize_topology_loss_terms,
+    update_gradnorm_task_weights,
+)
 from src.topology.metrics import evaluate_graph_samples
 from src.utils.config import (
     ConfigDict,
@@ -132,6 +140,9 @@ class TopologyFinetuneStageContext:
     evaluator: Evaluator
     loss_weights: TopologyLossWeights
     loss_weight_schedule: TopologyLossWeightSchedule
+    loss_normalization: TopologyLossNormalizationConfig
+    gradnorm: TopologyGradNormConfig
+    adaptive_loss_state: TopologyAdaptiveLossState
     monitor_metric: str
     early_stopping: EarlyStopping
     best_checkpoint_path: Path
@@ -344,6 +355,15 @@ def _parse_loss_weights(config: ConfigDict) -> TopologyLossWeights:
     loss_cfg = finetune_cfg.get("losses", {})
     if not isinstance(loss_cfg, dict):
         raise ValueError("topology_finetune.losses must be a mapping")
+    rd_loss_form = as_str(
+        loss_cfg.get("rd_loss_form", "log_ratio_huber"),
+        "topology_finetune.losses.rd_loss_form",
+    ).lower()
+    if rd_loss_form not in {"squared_ratio", "log_ratio", "log_ratio_huber"}:
+        raise ValueError(
+            "topology_finetune.losses.rd_loss_form must be one of "
+            "{'squared_ratio', 'log_ratio', 'log_ratio_huber'}"
+        )
     return TopologyLossWeights(
         alpha=as_float(loss_cfg.get("alpha", 0.5), "topology_finetune.losses.alpha"),
         beta=as_float(loss_cfg.get("beta", 1.0), "topology_finetune.losses.beta"),
@@ -361,6 +381,7 @@ def _parse_loss_weights(config: ConfigDict) -> TopologyLossWeights:
             loss_cfg.get("clustering_bins", 100),
             "topology_finetune.losses.clustering_bins",
         ),
+        rd_loss_form=rd_loss_form,
     )
 
 
@@ -391,6 +412,70 @@ def _parse_loss_weight_schedule(finetune_cfg: ConfigDict) -> TopologyLossWeightS
         warmup_epochs=warmup_epochs,
         ramp_epochs=ramp_epochs,
         schedule=schedule,
+    )
+
+
+def _parse_loss_normalization_config(
+    finetune_cfg: ConfigDict,
+) -> TopologyLossNormalizationConfig:
+    """Parse topology-loss normalization config."""
+    raw_config = finetune_cfg.get("loss_normalization", {})
+    if not isinstance(raw_config, dict):
+        raise ValueError("topology_finetune.loss_normalization must be a mapping")
+    ema_decay = as_float(
+        raw_config.get("ema_decay", 0.95),
+        "topology_finetune.loss_normalization.ema_decay",
+    )
+    clip_value = as_float(
+        raw_config.get("clip_value", 5.0),
+        "topology_finetune.loss_normalization.clip_value",
+    )
+    if not 0.0 <= ema_decay < 1.0:
+        raise ValueError("topology_finetune.loss_normalization.ema_decay must be in [0, 1)")
+    if clip_value <= 0.0:
+        raise ValueError("topology_finetune.loss_normalization.clip_value must be > 0")
+    return TopologyLossNormalizationConfig(
+        enabled=as_bool(
+            raw_config.get("enabled", False),
+            "topology_finetune.loss_normalization.enabled",
+        ),
+        ema_decay=ema_decay,
+        clip_value=clip_value,
+    )
+
+
+def _parse_gradnorm_config(finetune_cfg: ConfigDict) -> TopologyGradNormConfig:
+    """Parse grouped GradNorm config."""
+    raw_config = finetune_cfg.get("gradnorm", {})
+    if not isinstance(raw_config, dict):
+        raise ValueError("topology_finetune.gradnorm must be a mapping")
+    alpha = as_float(raw_config.get("alpha", 0.5), "topology_finetune.gradnorm.alpha")
+    learning_rate = as_float(
+        raw_config.get("learning_rate", 0.02),
+        "topology_finetune.gradnorm.learning_rate",
+    )
+    min_weight = as_float(
+        raw_config.get("min_weight", 0.2),
+        "topology_finetune.gradnorm.min_weight",
+    )
+    max_weight = as_float(
+        raw_config.get("max_weight", 5.0),
+        "topology_finetune.gradnorm.max_weight",
+    )
+    if alpha < 0.0:
+        raise ValueError("topology_finetune.gradnorm.alpha must be >= 0")
+    if learning_rate <= 0.0:
+        raise ValueError("topology_finetune.gradnorm.learning_rate must be > 0")
+    if min_weight <= 0.0:
+        raise ValueError("topology_finetune.gradnorm.min_weight must be > 0")
+    if max_weight < min_weight:
+        raise ValueError("topology_finetune.gradnorm.max_weight must be >= min_weight")
+    return TopologyGradNormConfig(
+        enabled=as_bool(raw_config.get("enabled", False), "topology_finetune.gradnorm.enabled"),
+        alpha=alpha,
+        learning_rate=learning_rate,
+        min_weight=min_weight,
+        max_weight=max_weight,
     )
 
 
@@ -1195,6 +1280,81 @@ def _zero_topology_losses(*, reference: torch.Tensor) -> dict[str, torch.Tensor]
     }
 
 
+def _group_topology_objectives(
+    *,
+    topology_losses: Mapping[str, torch.Tensor],
+    loss_weights: TopologyLossWeights,
+) -> dict[str, torch.Tensor]:
+    """Group normalized topology losses into density and shape objectives."""
+    density_objective = loss_weights.beta * topology_losses["relative_density"]
+    shape_objective = (
+        loss_weights.alpha * topology_losses["graph_similarity"]
+        + loss_weights.gamma * topology_losses["degree_mmd"]
+        + loss_weights.delta * topology_losses["clustering_mmd"]
+    )
+    return {
+        "density": density_objective,
+        "shape": shape_objective,
+    }
+
+
+def _task_weighted_total_loss(
+    *,
+    bce_loss: torch.Tensor,
+    topology_objectives: Mapping[str, torch.Tensor],
+    task_weights: Mapping[str, float],
+) -> torch.Tensor:
+    """Return the BCE + grouped-topology total under task weights."""
+    total_loss = task_weights.get("bce", 1.0) * bce_loss
+    total_loss = total_loss + task_weights.get("density", 1.0) * topology_objectives["density"]
+    total_loss = total_loss + task_weights.get("shape", 1.0) * topology_objectives["shape"]
+    return total_loss
+
+
+def _gradnorm_reference_parameters(
+    *,
+    model: nn.Module,
+    accelerator: AcceleratorLike,
+) -> tuple[nn.Parameter, ...]:
+    """Return the parameters used to measure grouped GradNorm magnitudes."""
+    unwrap_model = getattr(accelerator, "unwrap_model", None)
+    unwrapped_model = model
+    if callable(unwrap_model):
+        unwrapped_model = cast(nn.Module, unwrap_model(model))
+    output_head = getattr(unwrapped_model, "output_head", None)
+    if isinstance(output_head, nn.Module):
+        params = tuple(parameter for parameter in output_head.parameters() if parameter.requires_grad)
+        if params:
+            return params
+    return tuple(parameter for parameter in unwrapped_model.parameters() if parameter.requires_grad)
+
+
+def _graph_positive_edge_probability(graph: nx.Graph) -> float:
+    """Return the train-graph positive-edge prior probability."""
+    num_nodes = graph.number_of_nodes()
+    if num_nodes < 2:
+        raise ValueError("Topology scratch initialization requires at least 2 nodes")
+    possible_edges = num_nodes * (num_nodes - 1) / 2.0
+    return float(graph.number_of_edges() / possible_edges)
+
+
+def _initialize_scratch_output_bias(
+    *,
+    model: nn.Module,
+    train_graph: nx.Graph,
+    accelerator: AcceleratorLike,
+) -> float:
+    """Initialize scratch-mode output bias from the train-graph edge prior."""
+    unwrap_model = getattr(accelerator, "unwrap_model", None)
+    unwrapped_model = model
+    if callable(unwrap_model):
+        unwrapped_model = cast(nn.Module, unwrap_model(model))
+    return initialize_output_head_bias_with_prior(
+        unwrapped_model,
+        positive_edge_probability=_graph_positive_edge_probability(train_graph),
+    )
+
+
 def _average_train_aggregates(
     *,
     aggregates: Mapping[str, float],
@@ -1357,13 +1517,16 @@ def _fit_epoch(
     input_dim: int,
     max_sequence_length: int,
     loss_weights: TopologyLossWeights,
-    loss_weight_schedule: TopologyLossWeightSchedule | None = None,
     pair_batch_size: int,
     use_amp: bool,
     accelerator: AcceleratorLike,
     embedding_repository: EmbeddingRepository,
     negative_lookup: ExplicitNegativePairLookup | None,
     distributed_context: DistributedContext,
+    loss_weight_schedule: TopologyLossWeightSchedule | None = None,
+    loss_normalization: TopologyLossNormalizationConfig | None = None,
+    gradnorm: TopologyGradNormConfig | None = None,
+    adaptive_loss_state: TopologyAdaptiveLossState | None = None,
     logger: logging.Logger | None = None,
 ) -> dict[str, float]:
     """Run one fine-tuning epoch over sampled train subgraphs."""
@@ -1409,6 +1572,9 @@ def _fit_epoch(
     aggregates = _initialize_train_aggregates(len(sampled_subgraphs), epoch_plan)
     train_forward_backward_seconds = 0.0
     resolved_loss_weight_schedule = loss_weight_schedule or TopologyLossWeightSchedule()
+    resolved_loss_normalization = loss_normalization or TopologyLossNormalizationConfig()
+    resolved_gradnorm = gradnorm or TopologyGradNormConfig()
+    resolved_adaptive_loss_state = adaptive_loss_state or TopologyAdaptiveLossState()
     current_topology_loss_scale = topology_loss_scale(
         epoch=epoch_index,
         schedule=resolved_loss_weight_schedule,
@@ -1426,6 +1592,11 @@ def _fit_epoch(
     completed_real_subgraphs = 0
 
     model.train()
+    gradnorm_reference_parameters = (
+        _gradnorm_reference_parameters(model=model, accelerator=accelerator)
+        if resolved_gradnorm.enabled
+        else tuple()
+    )
     if local_tasks:
         optimizer.zero_grad(set_to_none=True)
     if subgraphs_per_forward == 1:
@@ -1480,7 +1651,35 @@ def _fit_epoch(
                         pred_pair_probabilities=torch.sigmoid(logits),
                         target_pair_probabilities=labels,
                     )
-                    total_loss = bce_loss + topology_losses["total_topology"]
+                    normalized_topology_losses = normalize_topology_loss_terms(
+                        raw_terms={
+                            "graph_similarity": topology_losses["graph_similarity"],
+                            "relative_density": topology_losses["relative_density"],
+                            "degree_mmd": topology_losses["degree_mmd"],
+                            "clustering_mmd": topology_losses["clustering_mmd"],
+                        },
+                        state=resolved_adaptive_loss_state,
+                        config=resolved_loss_normalization,
+                    )
+                    topology_objectives = _group_topology_objectives(
+                        topology_losses=normalized_topology_losses,
+                        loss_weights=effective_loss_weights,
+                    )
+                    task_weights = update_gradnorm_task_weights(
+                        task_losses={
+                            "bce": bce_loss,
+                            "density": topology_objectives["density"],
+                            "shape": topology_objectives["shape"],
+                        },
+                        state=resolved_adaptive_loss_state,
+                        reference_parameters=gradnorm_reference_parameters,
+                        config=resolved_gradnorm,
+                    )
+                    total_loss = _task_weighted_total_loss(
+                        bce_loss=bce_loss,
+                        topology_objectives=topology_objectives,
+                        task_weights=task_weights,
+                    )
                 backward_loss = total_loss * 0.0 if task.is_padding else total_loss
 
             current_window_start = (task_index // gradient_accumulation_steps) * (
@@ -1577,7 +1776,35 @@ def _fit_epoch(
                                 pred_pair_probabilities=torch.sigmoid(result.logits),
                                 target_pair_probabilities=result.labels,
                             )
-                            total_loss = bce_loss + topology_losses["total_topology"]
+                            normalized_topology_losses = normalize_topology_loss_terms(
+                                raw_terms={
+                                    "graph_similarity": topology_losses["graph_similarity"],
+                                    "relative_density": topology_losses["relative_density"],
+                                    "degree_mmd": topology_losses["degree_mmd"],
+                                    "clustering_mmd": topology_losses["clustering_mmd"],
+                                },
+                                state=resolved_adaptive_loss_state,
+                                config=resolved_loss_normalization,
+                            )
+                            topology_objectives = _group_topology_objectives(
+                                topology_losses=normalized_topology_losses,
+                                loss_weights=effective_loss_weights,
+                            )
+                            task_weights = update_gradnorm_task_weights(
+                                task_losses={
+                                    "bce": bce_loss,
+                                    "density": topology_objectives["density"],
+                                    "shape": topology_objectives["shape"],
+                                },
+                                state=resolved_adaptive_loss_state,
+                                reference_parameters=gradnorm_reference_parameters,
+                                config=resolved_gradnorm,
+                            )
+                            total_loss = _task_weighted_total_loss(
+                                bce_loss=bce_loss,
+                                topology_objectives=topology_objectives,
+                                task_weights=task_weights,
+                            )
                         task_loss = total_loss * 0.0 if task.is_padding else total_loss
                         group_loss = group_loss + task_loss
                         group_updates.append((task, bce_loss, topology_losses, total_loss))
@@ -1750,6 +1977,9 @@ def _prepare_topology_finetune_stage_context(
         evaluator=evaluator,
         loss_weights=_parse_loss_weights(config),
         loss_weight_schedule=_parse_loss_weight_schedule(finetune_cfg),
+        loss_normalization=_parse_loss_normalization_config(finetune_cfg),
+        gradnorm=_parse_gradnorm_config(finetune_cfg),
+        adaptive_loss_state=TopologyAdaptiveLossState(),
         monitor_metric=monitor_metric,
         early_stopping=EarlyStopping(
             patience=patience,
@@ -1944,6 +2174,19 @@ def run_topology_finetuning_stage(
         distributed_context=runtime.distributed,
         accelerator=runtime.accelerator,
     )
+    if init_mode == "scratch":
+        applied_bias = _initialize_scratch_output_bias(
+            model=model,
+            train_graph=context.train_graph,
+            accelerator=runtime.accelerator,
+        )
+        if runtime.is_main_process:
+            log_stage_event(
+                logger,
+                "scratch_output_bias_initialized",
+                positive_edge_probability=_graph_positive_edge_probability(context.train_graph),
+                bias=applied_bias,
+            )
     stage_model, prepared_optimizer = cast(
         tuple[nn.Module, Optimizer],
         runtime.accelerator.prepare(model, context.optimizer),
@@ -1999,6 +2242,9 @@ def run_topology_finetuning_stage(
             max_sequence_length=context.max_sequence_length,
             loss_weights=context.loss_weights,
             loss_weight_schedule=context.loss_weight_schedule,
+            loss_normalization=context.loss_normalization,
+            gradnorm=context.gradnorm,
+            adaptive_loss_state=context.adaptive_loss_state,
             pair_batch_size=context.pair_batch_size,
             use_amp=context.use_amp,
             accelerator=runtime.accelerator,
