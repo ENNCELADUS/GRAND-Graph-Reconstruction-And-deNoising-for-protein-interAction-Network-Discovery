@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import pickle
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import networkx as nx
 import pytest
 import src.topology.finetune_losses as finetune_losses_module
 import torch
+import torch.nn.functional as functional
 from src.topology.finetune_data import (
     EdgeCoverEpochPlan,
     EmbeddingRepository,
@@ -674,6 +676,29 @@ def test_soft_topology_losses_match_hard_metric_limits() -> None:
 
     assert gs_loss.item() == pytest.approx(0.5)
     assert rd_loss.item() == pytest.approx(0.0)
+
+
+def test_soft_relative_density_loss_log_ratio_huber_stays_bounded_for_large_overdensity() -> None:
+    num_nodes = 10
+    target_adjacency = torch.zeros((num_nodes, num_nodes), dtype=torch.float32)
+    target_adjacency[0, 1] = 1.0
+    target_adjacency[1, 0] = 1.0
+
+    pred_adjacency = torch.ones((num_nodes, num_nodes), dtype=torch.float32)
+    pred_adjacency.fill_diagonal_(0.0)
+
+    rd_loss = soft_relative_density_loss(
+        pred_adjacency=pred_adjacency,
+        target_adjacency=target_adjacency,
+        loss_form="log_ratio_huber",
+    )
+
+    expected = functional.smooth_l1_loss(
+        torch.tensor(math.log(45.0), dtype=torch.float32),
+        torch.tensor(0.0, dtype=torch.float32),
+    )
+    assert rd_loss.item() == pytest.approx(expected.item(), rel=1e-6)
+    assert rd_loss.item() < 10.0
 
 
 def test_compute_topology_losses_returns_weighted_total() -> None:

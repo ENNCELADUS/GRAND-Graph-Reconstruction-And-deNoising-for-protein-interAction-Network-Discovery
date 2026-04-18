@@ -2052,6 +2052,13 @@ def test_run_topology_finetuning_stage_supports_scratch_initialization(
     finally:
         os.chdir(previous_cwd)
 
+    final_linear = model.output_head.layers[-1]
+    assert isinstance(final_linear, torch.nn.Linear)
+    assert final_linear.bias is not None
+    assert final_linear.bias.item() == pytest.approx(
+        torch.logit(torch.tensor(3.0 / 45.0, dtype=torch.float32)).item(),
+        rel=1e-6,
+    )
     assert best_checkpoint == Path("models/v3/topology_finetune/topology_ft_case/best_model.pth")
 
 
@@ -2136,6 +2143,28 @@ def test_v3_topology_finetune_uses_fixed_threshold_scheduler_and_patience() -> N
         "warmup_epochs": 5,
         "ramp_epochs": 5,
         "schedule": "linear",
+    }
+
+    losses_cfg = topology_cfg["losses"]
+    assert isinstance(losses_cfg, dict)
+    assert losses_cfg["rd_loss_form"] == "log_ratio_huber"
+
+    normalization_cfg = topology_cfg["loss_normalization"]
+    assert isinstance(normalization_cfg, dict)
+    assert normalization_cfg == {
+        "enabled": True,
+        "ema_decay": 0.95,
+        "clip_value": 5.0,
+    }
+
+    gradnorm_cfg = topology_cfg["gradnorm"]
+    assert isinstance(gradnorm_cfg, dict)
+    assert gradnorm_cfg == {
+        "enabled": True,
+        "alpha": 0.5,
+        "learning_rate": 0.02,
+        "min_weight": 0.2,
+        "max_weight": 5.0,
     }
 
 
