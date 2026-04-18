@@ -519,6 +519,42 @@ def test_resolve_monitor_value_reads_val_loss() -> None:
     assert monitor_value == pytest.approx(0.42)
 
 
+def test_validation_topology_loss_matches_weighted_hard_metric_penalties() -> None:
+    loss = topology_finetune_stage._validation_topology_loss(
+        loss_weights=topology_finetune_stage.TopologyLossWeights(
+            alpha=0.5,
+            beta=1.0,
+            gamma=0.3,
+            delta=0.2,
+        ),
+        internal_val_topology_stats={
+            "graph_sim": 0.8,
+            "relative_density": 1.1,
+            "deg_dist_mmd": 0.4,
+            "cc_mmd": 0.5,
+        },
+    )
+
+    expected = 0.5 * (1.0 - 0.8) + (1.1 - 1.0) ** 2 + 0.3 * 0.4 + 0.2 * 0.5
+    assert loss == pytest.approx(expected)
+
+
+def test_resolve_monitor_value_prefers_weighted_total_for_val_loss() -> None:
+    monitor_value = _resolve_monitor_value(
+        monitor_metric="val_loss",
+        val_pair_stats={"val_loss": 0.42, "val_auprc": 0.91},
+        internal_val_topology_stats={
+            "graph_sim": 0.2,
+            "relative_density": 1.1,
+            "deg_dist_mmd": 0.3,
+            "cc_mmd": 0.4,
+        },
+        val_total_loss=0.77,
+    )
+
+    assert monitor_value == pytest.approx(0.77)
+
+
 def test_forward_model_uses_activation_checkpointing_during_training(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1886,3 +1922,41 @@ def test_v3_topology_finetune_uses_fixed_threshold_scheduler_and_patience() -> N
         "ramp_epochs": 5,
         "schedule": "linear",
     }
+
+
+def test_0407_ablation_configs_use_warm_start_val_loss_recipe() -> None:
+    for config_path in sorted(Path("configs/v3/ablations/0407").glob("ws_n*.yaml")):
+        config = load_config(config_path)
+        topology_cfg = config["topology_finetune"]
+        assert isinstance(topology_cfg, dict)
+
+        decision_threshold = topology_cfg["decision_threshold"]
+        assert isinstance(decision_threshold, dict)
+        assert topology_cfg["init_mode"] == "warm_start"
+        assert topology_cfg["epochs"] == 12
+        assert topology_cfg["pair_batch_size"] == 16
+        assert decision_threshold == {"mode": "fixed", "value": 0.5}
+        assert topology_cfg["monitor_metric"] == "val_loss"
+        assert topology_cfg["early_stopping_patience"] == 4
+
+        optimizer_cfg = topology_cfg["optimizer"]
+        assert isinstance(optimizer_cfg, dict)
+        assert optimizer_cfg == {"lr": 6.0e-6, "weight_decay": 6.0e-3}
+
+        loss_weight_schedule = topology_cfg["loss_weight_schedule"]
+        assert isinstance(loss_weight_schedule, dict)
+        assert loss_weight_schedule == {
+            "warmup_epochs": 0,
+            "ramp_epochs": 1,
+            "schedule": "linear",
+        }
+
+        losses_cfg = topology_cfg["losses"]
+        assert isinstance(losses_cfg, dict)
+        assert losses_cfg["alpha"] == pytest.approx(0.35)
+        assert losses_cfg["beta"] == pytest.approx(0.45)
+        assert losses_cfg["gamma"] == pytest.approx(0.15)
+        assert losses_cfg["delta"] == pytest.approx(0.15)
+        assert losses_cfg["histogram_sigma"] == pytest.approx(1.25)
+        assert losses_cfg["degree_bins"] == 48
+        assert losses_cfg["clustering_bins"] == 64
