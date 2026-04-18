@@ -9,6 +9,7 @@ from typing import cast
 
 import pytest
 import src.pipeline.stages.topology_evaluate as topology_stage
+import numpy as np
 import torch
 from src.pipeline.runtime import DistributedContext
 from src.pipeline.stages.topology_evaluate import run_topology_evaluation_stage
@@ -245,6 +246,143 @@ def test_run_topology_evaluation_stage_writes_expected_artifacts(tmp_path: Path)
     log_text = (log_dir / "log.log").read_text(encoding="utf-8")
     assert "Decision Threshold" in log_text
     assert "best_f1_on_valid" in log_text
+
+
+def _fake_sharded_topology_result(node_sizes: tuple[int, ...]) -> dict[str, object]:
+    details: dict[str, dict[int, list[float] | float]] = {
+        "graph_sim": {},
+        "relative_density": {},
+        "deg_dist_mmd": {},
+        "cc_mmd": {},
+        "laplacian_eigen_mmd": {},
+    }
+    per_node_size: dict[int, dict[str, float | int]] = {}
+    for node_size in node_sizes:
+        graph_sim_values = [node_size / 100.0]
+        relative_density_values = [1.0 + (node_size / 1000.0)]
+        deg_dist_mmd = node_size / 10.0
+        cc_mmd = node_size / 20.0
+        laplacian_eigen_mmd = node_size / 40.0
+        details["graph_sim"][node_size] = graph_sim_values
+        details["relative_density"][node_size] = relative_density_values
+        details["deg_dist_mmd"][node_size] = deg_dist_mmd
+        details["cc_mmd"][node_size] = cc_mmd
+        details["laplacian_eigen_mmd"][node_size] = laplacian_eigen_mmd
+        per_node_size[node_size] = {
+            "graph_count": 1,
+            "graph_sim": graph_sim_values[0],
+            "relative_density": relative_density_values[0],
+            "deg_dist_mmd": deg_dist_mmd,
+            "cc_mmd": cc_mmd,
+            "laplacian_eigen_mmd": laplacian_eigen_mmd,
+        }
+    summary = {
+        "graph_sim": float(np.mean([values[0] for values in details["graph_sim"].values()])),
+        "relative_density": float(
+            np.mean([values[0] for values in details["relative_density"].values()])
+        ),
+        "deg_dist_mmd": float(np.mean(list(details["deg_dist_mmd"].values()))),
+        "cc_mmd": float(np.mean(list(details["cc_mmd"].values()))),
+        "laplacian_eigen_mmd": float(np.mean(list(details["laplacian_eigen_mmd"].values()))),
+    }
+    return {
+        "details": details,
+        "summary": summary,
+        "per_node_size": per_node_size,
+    }
+
+
+def test_run_topology_evaluation_stage_shards_graph_metrics_under_ddp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_topology_config(tmp_path)
+    processed_dir = (
+        Path(str(config["data_config"]["benchmark"]["processed_dir"]))  # type: ignore[index]
+    )
+    with (processed_dir / "test_sampled_nodes.pkl").open("wb") as handle:
+        pickle.dump(
+            {
+                20: [["P1"]],
+                40: [["P2"]],
+                60: [["P3"]],
+                80: [["P4"]],
+            },
+            handle,
+        )
+
+    checkpoint_path = Path(str(config["run_config"]["load_checkpoint_path"]))  # type: ignore[index]
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    model = build_model(config)
+    torch.save(model.state_dict(), checkpoint_path)
+    dataloaders = build_dataloaders(config=config)
+
+    monkeypatch.setattr(
+        topology_stage,
+        "_build_topology_loader",
+        lambda **_: (
+            cast(DataLoader[dict[str, object]], dataloaders["test"]),
+            [("P1", "P2"), ("P1", "P3"), ("P2", "P3")],
+            3,
+        ),
+    )
+    monkeypatch.setattr(topology_stage, "_predict_topology_labels", lambda **_: [1, 0, 1])
+    monkeypatch.setattr(topology_stage, "_resolve_decision_threshold", lambda **_: (0.5, "fixed"))
+
+    observed_local_node_sizes: list[tuple[int, ...]] = []
+
+    def _record_local_graph_eval(
+        *,
+        pred_graph: object,
+        gt_graph: object,
+        test_graph_nodes: object,
+    ) -> dict[str, object]:
+        del pred_graph, gt_graph
+        assert isinstance(test_graph_nodes, dict)
+        node_sizes = tuple(sorted(int(node_size) for node_size in test_graph_nodes))
+        observed_local_node_sizes.append(node_sizes)
+        return _fake_sharded_topology_result(node_sizes)
+
+    def _fake_all_gather_object(
+        object_list: list[object | None],
+        local_result: object,
+    ) -> None:
+        object_list[0] = _fake_sharded_topology_result((40, 80))
+        object_list[1] = local_result
+
+    monkeypatch.setattr(topology_stage, "evaluate_predicted_graph", _record_local_graph_eval)
+    monkeypatch.setattr(topology_stage.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(topology_stage.dist, "all_gather_object", _fake_all_gather_object)
+
+    previous_cwd = Path.cwd()
+    try:
+        __import__("os").chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_evaluate": "topology_sharded"},
+            distributed=DistributedContext(
+                ddp_enabled=True,
+                is_distributed=True,
+                rank=1,
+                local_rank=1,
+                world_size=2,
+            ),
+        )
+        summary = run_topology_evaluation_stage(
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
+        )
+    finally:
+        __import__("os").chdir(previous_cwd)
+
+    expected_summary = cast(
+        dict[str, float],
+        _fake_sharded_topology_result((20, 40, 60, 80))["summary"],
+    )
+    assert observed_local_node_sizes == [(20, 60)]
+    assert summary == pytest.approx(expected_summary)
 
 
 def test_run_topology_evaluation_stage_non_main_rank_computes_topology_summary(
