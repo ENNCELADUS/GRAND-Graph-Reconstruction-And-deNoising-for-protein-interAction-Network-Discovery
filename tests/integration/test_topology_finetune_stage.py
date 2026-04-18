@@ -1934,7 +1934,8 @@ def test_0407_ablation_configs_use_warm_start_val_loss_recipe() -> None:
         assert isinstance(decision_threshold, dict)
         assert topology_cfg["init_mode"] == "warm_start"
         assert topology_cfg["epochs"] == 12
-        assert topology_cfg["pair_batch_size"] == 16
+        assert topology_cfg["pair_batch_size"] == 32
+        assert topology_cfg["internal_validation_inference_batch_size"] == 128
         assert decision_threshold == {"mode": "fixed", "value": 0.5}
         assert topology_cfg["monitor_metric"] == "val_loss"
         assert topology_cfg["early_stopping_patience"] == 4
@@ -1960,3 +1961,7 @@ def test_0407_ablation_configs_use_warm_start_val_loss_recipe() -> None:
         assert losses_cfg["histogram_sigma"] == pytest.approx(1.25)
         assert losses_cfg["degree_bins"] == 48
         assert losses_cfg["clustering_bins"] == 64
+
+        topology_eval_cfg = config["topology_evaluate"]
+        assert isinstance(topology_eval_cfg, dict)
+        assert topology_eval_cfg["inference_batch_size"] == 128
