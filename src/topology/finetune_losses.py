@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from math import cos, pi
 
 import torch
 
@@ -22,6 +23,40 @@ class TopologyLossWeights:
     histogram_sigma: float = 1.0
     degree_bins: int = DEFAULT_DEGREE_BINS
     clustering_bins: int = DEFAULT_CLUSTERING_BINS
+
+
+@dataclass(frozen=True)
+class TopologyLossWeightSchedule:
+    """Epoch-wise schedule for scaling topology loss weights."""
+
+    warmup_epochs: int = 0
+    ramp_epochs: int = 0
+    schedule: str = "linear"
+
+
+def topology_loss_scale(*, epoch: int, schedule: TopologyLossWeightSchedule) -> float:
+    """Return the topology-loss scale for a zero-based epoch index."""
+    if epoch < 0:
+        raise ValueError("epoch must be >= 0")
+    if schedule.warmup_epochs < 0:
+        raise ValueError("warmup_epochs must be >= 0")
+    if schedule.ramp_epochs < 0:
+        raise ValueError("ramp_epochs must be >= 0")
+    schedule_name = schedule.schedule.lower()
+    if schedule_name not in {"linear", "cosine"}:
+        raise ValueError("schedule must be 'linear' or 'cosine'")
+
+    if epoch < schedule.warmup_epochs:
+        return 0.0
+
+    ramp_epoch = epoch - schedule.warmup_epochs
+    if schedule.ramp_epochs == 0 or ramp_epoch >= schedule.ramp_epochs:
+        return 1.0
+
+    progress = ramp_epoch / float(schedule.ramp_epochs)
+    if schedule_name == "cosine":
+        return 0.5 * (1.0 - cos(pi * progress))
+    return progress
 
 
 def build_symmetric_adjacency(

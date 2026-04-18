@@ -100,12 +100,17 @@ topology_finetune:
   internal_validation_samples_per_size: 20
   internal_validation_compute_spectral_stats: false
   decision_threshold:
-    mode: "best_f1_on_valid"
+    mode: "fixed"
+    value: 0.5
   monitor_metric: "internal_val_graph_sim"
-  early_stopping_patience: 5
+  early_stopping_patience: 8
   optimizer:
     lr: 5.0e-5
     weight_decay: 0.01
+  loss_weight_schedule:
+    warmup_epochs: 5
+    ramp_epochs: 5
+    schedule: "linear"
   losses:
     # Scratch regime: keep topology as a weak structural prior until BCE learns
     # a usable pairwise scorer. Relative-density was dominating the old setup.

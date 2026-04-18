@@ -803,9 +803,7 @@ def test_evaluate_internal_validation_subgraphs_shards_rank_local_work_and_merge
             for nodes in sampled_subgraphs[3]
         ]
     }
-    expected_target_graphs = {
-        3: [graph.subgraph(nodes).copy() for nodes in sampled_subgraphs[3]]
-    }
+    expected_target_graphs = {3: [graph.subgraph(nodes).copy() for nodes in sampled_subgraphs[3]]}
     expected_summary = evaluate_graph_samples(
         pred_graphs_by_size=expected_pred_graphs,
         gt_graphs_by_size=expected_target_graphs,
@@ -820,9 +818,7 @@ def test_evaluate_internal_validation_subgraphs_shards_rank_local_work_and_merge
         pair_records: Sequence[topology_finetune_stage.InternalValidationPairRecord],
         embedding_repository: EmbeddingRepository,
     ) -> dict[str, torch.Tensor]:
-        processed_subgraph_indices.update(
-            int(record.subgraph_index) for record in pair_records
-        )
+        processed_subgraph_indices.update(int(record.subgraph_index) for record in pair_records)
         return original_validation_pair_batch(
             pair_records=pair_records,
             embedding_repository=embedding_repository,
@@ -836,9 +832,7 @@ def test_evaluate_internal_validation_subgraphs_shards_rank_local_work_and_merge
 
     bucket = validation_plan.buckets[0]
     peer_indices = [
-        index
-        for index, record in enumerate(bucket.pair_records)
-        if record.subgraph_index % 2 == 1
+        index for index, record in enumerate(bucket.pair_records) if record.subgraph_index % 2 == 1
     ]
     peer_predictions = [
         int(

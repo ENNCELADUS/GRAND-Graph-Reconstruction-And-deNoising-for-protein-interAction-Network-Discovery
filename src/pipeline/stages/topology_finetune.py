@@ -42,8 +42,10 @@ from src.topology.finetune_data import (
 )
 from src.topology.finetune_losses import (
     TopologyLossWeights,
+    TopologyLossWeightSchedule,
     build_symmetric_adjacency,
     compute_topology_losses,
+    topology_loss_scale,
 )
 from src.topology.metrics import evaluate_graph_samples
 from src.utils.config import (
@@ -85,6 +87,7 @@ TOPOLOGY_FINETUNE_CSV_COLUMNS = [
     "val_threshold_s",
     "internal_val_topology_s",
     "peak_gpu_mem_mb",
+    "Topology Loss Scale",
     "Learning Rate",
 ]
 
@@ -126,6 +129,7 @@ class TopologyFinetuneStageContext:
     optimizer: Optimizer
     evaluator: Evaluator
     loss_weights: TopologyLossWeights
+    loss_weight_schedule: TopologyLossWeightSchedule
     monitor_metric: str
     early_stopping: EarlyStopping
     best_checkpoint_path: Path
@@ -346,6 +350,36 @@ def _parse_loss_weights(config: ConfigDict) -> TopologyLossWeights:
             loss_cfg.get("clustering_bins", 100),
             "topology_finetune.losses.clustering_bins",
         ),
+    )
+
+
+def _parse_loss_weight_schedule(finetune_cfg: ConfigDict) -> TopologyLossWeightSchedule:
+    """Parse topology-loss weight scheduling from ``topology_finetune`` config."""
+    raw_schedule = finetune_cfg.get("loss_weight_schedule", {})
+    if not isinstance(raw_schedule, dict):
+        raise ValueError("topology_finetune.loss_weight_schedule must be a mapping")
+    warmup_epochs = as_int(
+        raw_schedule.get("warmup_epochs", 0),
+        "topology_finetune.loss_weight_schedule.warmup_epochs",
+    )
+    ramp_epochs = as_int(
+        raw_schedule.get("ramp_epochs", 0),
+        "topology_finetune.loss_weight_schedule.ramp_epochs",
+    )
+    if warmup_epochs < 0:
+        raise ValueError("topology_finetune.loss_weight_schedule.warmup_epochs must be >= 0")
+    if ramp_epochs < 0:
+        raise ValueError("topology_finetune.loss_weight_schedule.ramp_epochs must be >= 0")
+    schedule = as_str(
+        raw_schedule.get("schedule", "linear"),
+        "topology_finetune.loss_weight_schedule.schedule",
+    ).lower()
+    if schedule not in {"linear", "cosine"}:
+        raise ValueError("topology_finetune.loss_weight_schedule.schedule must be linear or cosine")
+    return TopologyLossWeightSchedule(
+        warmup_epochs=warmup_epochs,
+        ramp_epochs=ramp_epochs,
+        schedule=schedule,
     )
 
 
@@ -1078,8 +1112,7 @@ def _evaluate_internal_validation_subgraphs(
     )
     summary = cast(Mapping[str, float], result["summary"])
     return {
-        metric_name: float(summary[metric_name])
-        for metric_name in INTERNAL_VALIDATION_SUMMARY_KEYS
+        metric_name: float(summary[metric_name]) for metric_name in INTERNAL_VALIDATION_SUMMARY_KEYS
     }
 
 
@@ -1252,6 +1285,7 @@ def _reduce_train_stats(
             "total_positive_edges": float(train_stats["total_positive_edges"]),
             "positive_edge_coverage_ratio": float(train_stats["positive_edge_coverage_ratio"]),
             "mean_positive_edge_reuse": float(train_stats["mean_positive_edge_reuse"]),
+            "topology_loss_scale": float(train_stats.get("topology_loss_scale", 1.0)),
         }
     )
     reduced_train_stats.update(
@@ -1282,6 +1316,7 @@ def _fit_epoch(
     input_dim: int,
     max_sequence_length: int,
     loss_weights: TopologyLossWeights,
+    loss_weight_schedule: TopologyLossWeightSchedule | None = None,
     pair_batch_size: int,
     use_amp: bool,
     accelerator: AcceleratorLike,
@@ -1332,6 +1367,18 @@ def _fit_epoch(
     )
     aggregates = _initialize_train_aggregates(len(sampled_subgraphs), epoch_plan)
     train_forward_backward_seconds = 0.0
+    resolved_loss_weight_schedule = loss_weight_schedule or TopologyLossWeightSchedule()
+    current_topology_loss_scale = topology_loss_scale(
+        epoch=epoch_index,
+        schedule=resolved_loss_weight_schedule,
+    )
+    effective_loss_weights = replace(
+        loss_weights,
+        alpha=loss_weights.alpha * current_topology_loss_scale,
+        beta=loss_weights.beta * current_topology_loss_scale,
+        gamma=loss_weights.gamma * current_topology_loss_scale,
+        delta=loss_weights.delta * current_topology_loss_scale,
+    )
     real_local_subgraphs = sum(1 for task in local_tasks if not task.is_padding)
     total_subgraphs = max(1, real_local_subgraphs)
     completed_real_subgraphs = 0
@@ -1378,7 +1425,7 @@ def _fit_epoch(
                     pair_index_b=pair_index_b,
                 )
                 topology_losses = compute_topology_losses(
-                    weights=loss_weights,
+                    weights=effective_loss_weights,
                     pred_adjacency=pred_adjacency,
                     target_adjacency=target_adjacency,
                     num_nodes=len(task.nodes),
@@ -1471,7 +1518,7 @@ def _fit_epoch(
                             pair_index_b=result.pair_index_b,
                         )
                         topology_losses = compute_topology_losses(
-                            weights=loss_weights,
+                            weights=effective_loss_weights,
                             pred_adjacency=pred_adjacency,
                             target_adjacency=target_adjacency,
                             num_nodes=len(result.nodes),
@@ -1513,6 +1560,7 @@ def _fit_epoch(
 
     aggregates["edge_cover_sampling_s"] = edge_cover_sampling_seconds
     aggregates["train_forward_backward_s"] = train_forward_backward_seconds
+    aggregates["topology_loss_scale"] = current_topology_loss_scale
     return aggregates
 
 
@@ -1651,6 +1699,7 @@ def _prepare_topology_finetune_stage_context(
         optimizer=_build_optimizer(config=config, model=model),
         evaluator=evaluator,
         loss_weights=_parse_loss_weights(config),
+        loss_weight_schedule=_parse_loss_weight_schedule(finetune_cfg),
         monitor_metric=monitor_metric,
         early_stopping=EarlyStopping(
             patience=patience,
@@ -1755,6 +1804,7 @@ def _build_epoch_csv_row(
         "val_threshold_s": validation_result.threshold_resolution_seconds,
         "internal_val_topology_s": validation_result.internal_validation_seconds,
         "peak_gpu_mem_mb": peak_gpu_mem_mb,
+        "Topology Loss Scale": train_stats["topology_loss_scale"],
         "Learning Rate": float(optimizer.param_groups[0]["lr"]),
     }
 
@@ -1885,6 +1935,7 @@ def run_topology_finetuning_stage(
             input_dim=context.input_dim,
             max_sequence_length=context.max_sequence_length,
             loss_weights=context.loss_weights,
+            loss_weight_schedule=context.loss_weight_schedule,
             pair_batch_size=context.pair_batch_size,
             use_amp=context.use_amp,
             accelerator=runtime.accelerator,
@@ -1980,6 +2031,7 @@ def run_topology_finetuning_stage(
                 val_threshold_s=validation_result.threshold_resolution_seconds,
                 internal_val_topology_s=validation_result.internal_validation_seconds,
                 peak_gpu_mem_mb=peak_gpu_mem_mb,
+                topo_loss_scale=train_stats["topology_loss_scale"],
             )
 
         if runtime.is_distributed:
