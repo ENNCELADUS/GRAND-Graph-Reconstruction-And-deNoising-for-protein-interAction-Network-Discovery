@@ -108,7 +108,7 @@ topology_finetune:
     weight_decay: 6.0e-3
   loss_weight_schedule:
     warmup_epochs: 0
-    ramp_epochs: 1
+    ramp_epochs: 0
     schedule: "linear"
   losses:
     alpha: 0.35   # Graph similarity
