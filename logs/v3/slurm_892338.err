@@ -1,0 +1,581 @@
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+INFO:src.pipeline.__main__:Loaded config: configs/v3.yaml
+WARNING:accelerate.utils.other:[RANK 0] Detected kernel version 3.10.0, which is below the recommended minimum of 5.5.0; this can cause the process to hang. It is recommended to upgrade the kernel to the minimum version or higher.
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+
+2026-04-19 03:32:45 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-04-19 03:32:45 INFO Stage Start | Checkpoint: None | Init Mode: scratch | Run Id: 20260419_033202
+2026-04-19 03:33:33 INFO Scratch Output Bias Initialized | Bias: -1.1562 | Positive Edge Probability: 0.2394 | Source: supervised_bce
+2026-04-19 03:33:33 INFO Finetune Config | Epochs: 30 | Internal Validation Compute Spectral Stats: False | Internal Validation Inference Batch Size: 128 | Internal Validation Node Sizes: [20, 40, 60, 80, 100, 120, 140, 160, 180, 200] | Internal Validation Pairs: 1529000 | Internal Validation Subgraphs: 200 | Monitor: internal_val_graph_sim | Pair Batch Size: 32
+2026-04-19 03:33:48 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-04-19 03:33:55 INFO Epoch Progress | Epoch: 1 | Loss: 0.5378 | Progress: 0% | Step: 1/385
+2026-04-19 03:43:31 INFO Epoch Progress | Epoch: 1 | Loss: 0.4997 | Progress: 25% | Step: 97/385
+2026-04-19 03:53:06 INFO Epoch Progress | Epoch: 1 | Loss: 0.4779 | Progress: 50% | Step: 194/385
+2026-04-19 03:59:02 INFO Epoch Progress | Epoch: 1 | Loss: 0.4948 | Progress: 76% | Step: 291/385
+2026-04-19 04:00:48 INFO Epoch Progress | Epoch: 1 | Loss: 0.3882 | Progress: 100% | Step: 385/385
+2026-04-19 04:05:18 INFO Best Saved | Epoch: 1 | Monitor: internal_val_graph_sim | Value: 0.0000
+2026-04-19 04:05:18 INFO Epoch Done | All Subgraph Pairs: 2685799 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0759 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 14.9796 | Epoch: 1 | Internal Val Graph Sim: 0.0000 | Internal Val Topology S: 0.0000 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 23500.8184 | Planned Subgraphs: 1540 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 0.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 1484.4396 | Train Loss: 0.3900 | Val AUPRC: 0.4992 | Val Pair Pass S: 264.9850 | Val Threshold S: 0.0000
+2026-04-19 04:05:28 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-04-19 04:05:36 INFO Epoch Progress | Epoch: 2 | Loss: 3.5356 | Progress: 0% | Step: 1/386
+2026-04-19 04:15:22 INFO Epoch Progress | Epoch: 2 | Loss: 1.6663 | Progress: 25% | Step: 97/386
+2026-04-19 04:25:07 INFO Epoch Progress | Epoch: 2 | Loss: 1.0777 | Progress: 50% | Step: 194/386
+2026-04-19 04:31:09 INFO Epoch Progress | Epoch: 2 | Loss: 0.9865 | Progress: 75% | Step: 291/386
+2026-04-19 04:33:02 INFO Epoch Progress | Epoch: 2 | Loss: 0.7629 | Progress: 100% | Step: 386/386
+2026-04-19 04:37:24 INFO Epoch Done | All Subgraph Pairs: 2684985 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0759 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 11.5143 | Epoch: 2 | Internal Val Graph Sim: 0.0000 | Internal Val Topology S: 0.0000 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 23400.7480 | Planned Subgraphs: 1542 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 0.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 1516.6743 | Train Loss: 0.7661 | Val AUPRC: 0.4861 | Val Pair Pass S: 249.6277 | Val Threshold S: 0.0000
+2026-04-19 04:37:33 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-04-19 04:37:41 INFO Epoch Progress | Epoch: 3 | Loss: 3.1763 | Progress: 0% | Step: 1/386
+2026-04-19 04:47:28 INFO Epoch Progress | Epoch: 3 | Loss: 1.4363 | Progress: 25% | Step: 97/386
+2026-04-19 04:57:13 INFO Epoch Progress | Epoch: 3 | Loss: 0.9619 | Progress: 50% | Step: 194/386
+2026-04-19 05:03:14 INFO Epoch Progress | Epoch: 3 | Loss: 0.9139 | Progress: 75% | Step: 291/386
+2026-04-19 05:05:07 INFO Epoch Progress | Epoch: 3 | Loss: 0.7164 | Progress: 100% | Step: 386/386
+2026-04-19 05:09:41 INFO Epoch Done | All Subgraph Pairs: 2687490 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0758 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 9.7723 | Epoch: 3 | Internal Val Graph Sim: 0.0000 | Internal Val Topology S: 0.0000 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 23381.0049 | Planned Subgraphs: 1541 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 0.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 1515.6750 | Train Loss: 0.7202 | Val AUPRC: 0.5158 | Val Pair Pass S: 264.0801 | Val Threshold S: 0.0000
+2026-04-19 05:09:54 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-04-19 05:10:02 INFO Epoch Progress | Epoch: 4 | Loss: 3.0385 | Progress: 0% | Step: 1/386
+2026-04-19 05:19:42 INFO Epoch Progress | Epoch: 4 | Loss: 1.4244 | Progress: 25% | Step: 97/386
+2026-04-19 05:29:26 INFO Epoch Progress | Epoch: 4 | Loss: 0.9526 | Progress: 50% | Step: 194/386
+2026-04-19 05:35:28 INFO Epoch Progress | Epoch: 4 | Loss: 0.8837 | Progress: 75% | Step: 291/386
+2026-04-19 05:37:21 INFO Epoch Progress | Epoch: 4 | Loss: 0.6947 | Progress: 100% | Step: 386/386
+2026-04-19 05:41:50 INFO Epoch Done | All Subgraph Pairs: 2685634 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0759 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 13.6733 | Epoch: 4 | Internal Val Graph Sim: 0.0000 | Internal Val Topology S: 0.0000 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 23611.1245 | Planned Subgraphs: 1541 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 0.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 1515.9532 | Train Loss: 0.6942 | Val AUPRC: 0.5158 | Val Pair Pass S: 246.1165 | Val Threshold S: 0.0000
+2026-04-19 05:42:04 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-04-19 05:42:10 INFO Epoch Progress | Epoch: 5 | Loss: 2.8969 | Progress: 0% | Step: 1/385
+2026-04-19 05:51:50 INFO Epoch Progress | Epoch: 5 | Loss: 2.1209 | Progress: 25% | Step: 97/385
+2026-04-19 06:01:37 INFO Epoch Progress | Epoch: 5 | Loss: 1.3359 | Progress: 50% | Step: 194/385
+2026-04-19 06:07:39 INFO Epoch Progress | Epoch: 5 | Loss: 1.2717 | Progress: 76% | Step: 291/385
+2026-04-19 06:09:26 INFO Epoch Progress | Epoch: 5 | Loss: 1.0577 | Progress: 100% | Step: 385/385
+2026-04-19 06:13:57 INFO Epoch Done | All Subgraph Pairs: 2684283 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0759 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 13.2394 | Epoch: 5 | Internal Val Graph Sim: 0.0000 | Internal Val Topology S: 0.0000 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 23603.4736 | Planned Subgraphs: 1540 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 0.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 1506.5820 | Train Loss: 1.0589 | Val AUPRC: 0.4860 | Val Pair Pass S: 249.5500 | Val Threshold S: 0.0000
+2026-04-19 06:14:07 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-04-19 06:14:15 INFO Epoch Progress | Epoch: 6 | Loss: 2.3208 | Progress: 0% | Step: 1/386
+2026-04-19 06:24:00 INFO Epoch Progress | Epoch: 6 | Loss: 1.2421 | Progress: 25% | Step: 97/386
+2026-04-19 06:33:43 INFO Epoch Progress | Epoch: 6 | Loss: 0.8687 | Progress: 50% | Step: 194/386
+2026-04-19 06:39:46 INFO Epoch Progress | Epoch: 6 | Loss: 0.8250 | Progress: 75% | Step: 291/386
+2026-04-19 06:41:38 INFO Epoch Progress | Epoch: 6 | Loss: 0.6526 | Progress: 100% | Step: 386/386
+2026-04-19 06:46:05 INFO Epoch Done | All Subgraph Pairs: 2687043 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0758 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 10.0565 | Epoch: 6 | Internal Val Graph Sim: 0.0000 | Internal Val Topology S: 0.0000 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 23380.6875 | Planned Subgraphs: 1542 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 0.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 1513.4204 | Train Loss: 0.6566 | Val AUPRC: 0.4917 | Val Pair Pass S: 266.3044 | Val Threshold S: 0.0000
+2026-04-19 06:46:20 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-04-19 06:47:02 INFO Epoch Progress | Epoch: 7 | Loss: 2.7958 | Progress: 0% | Step: 1/386
+[rank3]: Traceback (most recent call last):
+[rank3]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank3]:   File "<frozen runpy>", line 88, in _run_code
+[rank3]:   File "/public/home/wangar2023/grand/src/run.py", line 21, in <module>
+[rank3]:     _main()
+[rank3]:   File "/public/home/wangar2023/grand/src/run.py", line 17, in _main
+[rank3]:     main()
+[rank3]:   File "/public/home/wangar2023/grand/src/pipeline/__main__.py", line 22, in main
+[rank3]:     execute_pipeline(config.raw)
+[rank3]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 141, in execute_pipeline
+[rank3]:     execute_pipeline_with_runtime(
+[rank3]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 224, in execute_pipeline_with_runtime
+[rank3]:     finetuned_checkpoint_path = run_topology_finetuning_stage_fn(
+[rank3]:                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_finetune.py", line 2526, in run_topology_finetuning_stage
+[rank3]:     train_stats = _fit_epoch(
+[rank3]:                   ^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_finetune.py", line 1881, in _fit_epoch
+[rank3]:     task_weights = update_gradnorm_task_weights(
+[rank3]:                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/src/topology/loss_balancing.py", line 102, in update_gradnorm_task_weights
+[rank3]:     grad_norms = {
+[rank3]:                  ^
+[rank3]:   File "/public/home/wangar2023/grand/src/topology/loss_balancing.py", line 103, in <dictcomp>
+[rank3]:     name: _gradient_norm(loss=loss, reference_parameters=params)
+[rank3]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/src/topology/loss_balancing.py", line 157, in _gradient_norm
+[rank3]:     grads = torch.autograd.grad(
+[rank3]:             ^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/autograd/__init__.py", line 515, in grad
+[rank3]:     result = _engine_run_backward(
+[rank3]:              ^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank3]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1173, in unpack_hook
+[rank3]:     _run_fn_with_dynamo_disabled(frame.recompute_fn, *args)
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/_compile.py", line 54, in inner
+[rank3]:     return disable_fn(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank3]:     return fn(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1139, in _run_fn_with_dynamo_disabled
+[rank3]:     return fn(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1591, in recompute_fn
+[rank3]:     fn(*args, **kwargs)
+[rank3]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_finetune.py", line 754, in <lambda>
+[rank3]:     lambda emb_a, emb_b, len_a, len_b: model(
+[rank3]:                                        ^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1666, in forward
+[rank3]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank3]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1492, in _run_ddp_forward
+[rank3]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/accelerate/utils/operations.py", line 823, in forward
+[rank3]:     return model_forward(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/accelerate/utils/operations.py", line 811, in __call__
+[rank3]:     return convert_to_fp32(self.model_forward(*args, **kwargs))
+[rank3]:                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/amp/autocast_mode.py", line 44, in decorate_autocast
+[rank3]:     return func(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 494, in forward
+[rank3]:     cls_representation = self.cross_attention(encoded_a, encoded_b, lengths_a, lengths_b)
+[rank3]:                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 292, in forward
+[rank3]:     h_a, h_b, cls_token = layer(h_a, h_b, cls_token, mask_a, mask_b)
+[rank3]:                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 224, in forward
+[rank3]:     h_a = self._attend(h_a, h_b, mask_b)
+[rank3]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 197, in _attend
+[rank3]:     attn_out, _ = self.attn(query_norm, key_value, key_value, key_padding_mask=key_padding_mask)
+[rank3]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank3]:     return self._call_impl(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank3]:     return forward_call(*args, **kwargs)
+[rank3]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/activation.py", line 1491, in forward
+[rank3]:     attn_output, attn_output_weights = F.multi_head_attention_forward(
+[rank3]:                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/functional.py", line 6590, in multi_head_attention_forward
+[rank3]:     attn_output_weights = softmax(attn_output_weights, dim=-1)
+[rank3]:                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/functional.py", line 2157, in softmax
+[rank3]:     ret = input.softmax(dim)
+[rank3]:           ^^^^^^^^^^^^^^^^^^
+[rank3]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 856.00 MiB. GPU 3 has a total capacity of 44.55 GiB of which 612.69 MiB is free. Including non-PyTorch memory, this process has 43.94 GiB memory in use. Of the allocated memory 43.02 GiB is allocated by PyTorch, and 470.71 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank0]:   File "<frozen runpy>", line 88, in _run_code
+[rank0]:   File "/public/home/wangar2023/grand/src/run.py", line 21, in <module>
+[rank0]:     _main()
+[rank0]:   File "/public/home/wangar2023/grand/src/run.py", line 17, in _main
+[rank0]:     main()
+[rank0]:   File "/public/home/wangar2023/grand/src/pipeline/__main__.py", line 22, in main
+[rank0]:     execute_pipeline(config.raw)
+[rank0]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 141, in execute_pipeline
+[rank0]:     execute_pipeline_with_runtime(
+[rank0]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 224, in execute_pipeline_with_runtime
+[rank0]:     finetuned_checkpoint_path = run_topology_finetuning_stage_fn(
+[rank0]:                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_finetune.py", line 2526, in run_topology_finetuning_stage
+[rank0]:     train_stats = _fit_epoch(
+[rank0]:                   ^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_finetune.py", line 1881, in _fit_epoch
+[rank0]:     task_weights = update_gradnorm_task_weights(
+[rank0]:                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/src/topology/loss_balancing.py", line 102, in update_gradnorm_task_weights
+[rank0]:     grad_norms = {
+[rank0]:                  ^
+[rank0]:   File "/public/home/wangar2023/grand/src/topology/loss_balancing.py", line 103, in <dictcomp>
+[rank0]:     name: _gradient_norm(loss=loss, reference_parameters=params)
+[rank0]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/src/topology/loss_balancing.py", line 157, in _gradient_norm
+[rank0]:     grads = torch.autograd.grad(
+[rank0]:             ^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/autograd/__init__.py", line 515, in grad
+[rank0]:     result = _engine_run_backward(
+[rank0]:              ^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank0]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1173, in unpack_hook
+[rank0]:     _run_fn_with_dynamo_disabled(frame.recompute_fn, *args)
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/_compile.py", line 54, in inner
+[rank0]:     return disable_fn(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank0]:     return fn(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1139, in _run_fn_with_dynamo_disabled
+[rank0]:     return fn(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1591, in recompute_fn
+[rank0]:     fn(*args, **kwargs)
+[rank0]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_finetune.py", line 754, in <lambda>
+[rank0]:     lambda emb_a, emb_b, len_a, len_b: model(
+[rank0]:                                        ^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1666, in forward
+[rank0]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank0]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1492, in _run_ddp_forward
+[rank0]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/accelerate/utils/operations.py", line 823, in forward
+[rank0]:     return model_forward(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/accelerate/utils/operations.py", line 811, in __call__
+[rank0]:     return convert_to_fp32(self.model_forward(*args, **kwargs))
+[rank0]:                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/amp/autocast_mode.py", line 44, in decorate_autocast
+[rank0]:     return func(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 494, in forward
+[rank0]:     cls_representation = self.cross_attention(encoded_a, encoded_b, lengths_a, lengths_b)
+[rank0]:                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 292, in forward
+[rank0]:     h_a, h_b, cls_token = layer(h_a, h_b, cls_token, mask_a, mask_b)
+[rank0]:                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 227, in forward
+[rank0]:     h_b = self._attend(h_b, h_a, mask_a)
+[rank0]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 197, in _attend
+[rank0]:     attn_out, _ = self.attn(query_norm, key_value, key_value, key_padding_mask=key_padding_mask)
+[rank0]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank0]:     return self._call_impl(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank0]:     return forward_call(*args, **kwargs)
+[rank0]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/activation.py", line 1491, in forward
+[rank0]:     attn_output, attn_output_weights = F.multi_head_attention_forward(
+[rank0]:                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/functional.py", line 6594, in multi_head_attention_forward
+[rank0]:     attn_output = torch.bmm(attn_output_weights, v)
+[rank0]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 384.00 MiB. GPU 0 has a total capacity of 44.55 GiB of which 174.69 MiB is free. Including non-PyTorch memory, this process has 44.37 GiB memory in use. Of the allocated memory 43.60 GiB is allocated by PyTorch, and 332.48 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank2]: Traceback (most recent call last):
+[rank2]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank2]:   File "<frozen runpy>", line 88, in _run_code
+[rank2]:   File "/public/home/wangar2023/grand/src/run.py", line 21, in <module>
+[rank2]:     _main()
+[rank2]:   File "/public/home/wangar2023/grand/src/run.py", line 17, in _main
+[rank2]:     main()
+[rank2]:   File "/public/home/wangar2023/grand/src/pipeline/__main__.py", line 22, in main
+[rank2]:     execute_pipeline(config.raw)
+[rank2]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 141, in execute_pipeline
+[rank2]:     execute_pipeline_with_runtime(
+[rank2]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 224, in execute_pipeline_with_runtime
+[rank2]:     finetuned_checkpoint_path = run_topology_finetuning_stage_fn(
+[rank2]:                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_finetune.py", line 2526, in run_topology_finetuning_stage
+[rank2]:     train_stats = _fit_epoch(
+[rank2]:                   ^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_finetune.py", line 1881, in _fit_epoch
+[rank2]:     task_weights = update_gradnorm_task_weights(
+[rank2]:                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/src/topology/loss_balancing.py", line 102, in update_gradnorm_task_weights
+[rank2]:     grad_norms = {
+[rank2]:                  ^
+[rank2]:   File "/public/home/wangar2023/grand/src/topology/loss_balancing.py", line 103, in <dictcomp>
+[rank2]:     name: _gradient_norm(loss=loss, reference_parameters=params)
+[rank2]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/src/topology/loss_balancing.py", line 157, in _gradient_norm
+[rank2]:     grads = torch.autograd.grad(
+[rank2]:             ^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/autograd/__init__.py", line 515, in grad
+[rank2]:     result = _engine_run_backward(
+[rank2]:              ^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank2]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1173, in unpack_hook
+[rank2]:     _run_fn_with_dynamo_disabled(frame.recompute_fn, *args)
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/_compile.py", line 54, in inner
+[rank2]:     return disable_fn(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank2]:     return fn(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1139, in _run_fn_with_dynamo_disabled
+[rank2]:     return fn(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1591, in recompute_fn
+[rank2]:     fn(*args, **kwargs)
+[rank2]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_finetune.py", line 754, in <lambda>
+[rank2]:     lambda emb_a, emb_b, len_a, len_b: model(
+[rank2]:                                        ^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1666, in forward
+[rank2]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank2]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1492, in _run_ddp_forward
+[rank2]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/accelerate/utils/operations.py", line 823, in forward
+[rank2]:     return model_forward(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/accelerate/utils/operations.py", line 811, in __call__
+[rank2]:     return convert_to_fp32(self.model_forward(*args, **kwargs))
+[rank2]:                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/amp/autocast_mode.py", line 44, in decorate_autocast
+[rank2]:     return func(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 494, in forward
+[rank2]:     cls_representation = self.cross_attention(encoded_a, encoded_b, lengths_a, lengths_b)
+[rank2]:                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 292, in forward
+[rank2]:     h_a, h_b, cls_token = layer(h_a, h_b, cls_token, mask_a, mask_b)
+[rank2]:                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 224, in forward
+[rank2]:     h_a = self._attend(h_a, h_b, mask_b)
+[rank2]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 197, in _attend
+[rank2]:     attn_out, _ = self.attn(query_norm, key_value, key_value, key_padding_mask=key_padding_mask)
+[rank2]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank2]:     return self._call_impl(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank2]:     return forward_call(*args, **kwargs)
+[rank2]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/activation.py", line 1491, in forward
+[rank2]:     attn_output, attn_output_weights = F.multi_head_attention_forward(
+[rank2]:                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/functional.py", line 6594, in multi_head_attention_forward
+[rank2]:     attn_output = torch.bmm(attn_output_weights, v)
+[rank2]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 474.00 MiB. GPU 2 has a total capacity of 44.55 GiB of which 134.69 MiB is free. Including non-PyTorch memory, this process has 44.41 GiB memory in use. Of the allocated memory 43.49 GiB is allocated by PyTorch, and 480.29 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank1]:   File "<frozen runpy>", line 88, in _run_code
+[rank1]:   File "/public/home/wangar2023/grand/src/run.py", line 21, in <module>
+[rank1]:     _main()
+[rank1]:   File "/public/home/wangar2023/grand/src/run.py", line 17, in _main
+[rank1]:     main()
+[rank1]:   File "/public/home/wangar2023/grand/src/pipeline/__main__.py", line 22, in main
+[rank1]:     execute_pipeline(config.raw)
+[rank1]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 141, in execute_pipeline
+[rank1]:     execute_pipeline_with_runtime(
+[rank1]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 224, in execute_pipeline_with_runtime
+[rank1]:     finetuned_checkpoint_path = run_topology_finetuning_stage_fn(
+[rank1]:                                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_finetune.py", line 2526, in run_topology_finetuning_stage
+[rank1]:     train_stats = _fit_epoch(
+[rank1]:                   ^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_finetune.py", line 1881, in _fit_epoch
+[rank1]:     task_weights = update_gradnorm_task_weights(
+[rank1]:                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/src/topology/loss_balancing.py", line 102, in update_gradnorm_task_weights
+[rank1]:     grad_norms = {
+[rank1]:                  ^
+[rank1]:   File "/public/home/wangar2023/grand/src/topology/loss_balancing.py", line 103, in <dictcomp>
+[rank1]:     name: _gradient_norm(loss=loss, reference_parameters=params)
+[rank1]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/src/topology/loss_balancing.py", line 157, in _gradient_norm
+[rank1]:     grads = torch.autograd.grad(
+[rank1]:             ^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/autograd/__init__.py", line 515, in grad
+[rank1]:     result = _engine_run_backward(
+[rank1]:              ^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/autograd/graph.py", line 865, in _engine_run_backward
+[rank1]:     return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1173, in unpack_hook
+[rank1]:     _run_fn_with_dynamo_disabled(frame.recompute_fn, *args)
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/_compile.py", line 54, in inner
+[rank1]:     return disable_fn(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+[rank1]:     return fn(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1139, in _run_fn_with_dynamo_disabled
+[rank1]:     return fn(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/utils/checkpoint.py", line 1591, in recompute_fn
+[rank1]:     fn(*args, **kwargs)
+[rank1]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_finetune.py", line 754, in <lambda>
+[rank1]:     lambda emb_a, emb_b, len_a, len_b: model(
+[rank1]:                                        ^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1666, in forward
+[rank1]:     else self._run_ddp_forward(*inputs, **kwargs)
+[rank1]:          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/parallel/distributed.py", line 1492, in _run_ddp_forward
+[rank1]:     return self.module(*inputs, **kwargs)  # type: ignore[index]
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/accelerate/utils/operations.py", line 823, in forward
+[rank1]:     return model_forward(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/accelerate/utils/operations.py", line 811, in __call__
+[rank1]:     return convert_to_fp32(self.model_forward(*args, **kwargs))
+[rank1]:                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/amp/autocast_mode.py", line 44, in decorate_autocast
+[rank1]:     return func(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 494, in forward
+[rank1]:     cls_representation = self.cross_attention(encoded_a, encoded_b, lengths_a, lengths_b)
+[rank1]:                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 292, in forward
+[rank1]:     h_a, h_b, cls_token = layer(h_a, h_b, cls_token, mask_a, mask_b)
+[rank1]:                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 227, in forward
+[rank1]:     h_b = self._attend(h_b, h_a, mask_a)
+[rank1]:           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/src/model/v3.py", line 197, in _attend
+[rank1]:     attn_out, _ = self.attn(query_norm, key_value, key_value, key_padding_mask=key_padding_mask)
+[rank1]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+[rank1]:     return self._call_impl(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+[rank1]:     return forward_call(*args, **kwargs)
+[rank1]:            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/modules/activation.py", line 1491, in forward
+[rank1]:     attn_output, attn_output_weights = F.multi_head_attention_forward(
+[rank1]:                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/functional.py", line 6590, in multi_head_attention_forward
+[rank1]:     attn_output_weights = softmax(attn_output_weights, dim=-1)
+[rank1]:                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/nn/functional.py", line 2157, in softmax
+[rank1]:     ret = input.softmax(dim)
+[rank1]:           ^^^^^^^^^^^^^^^^^^
+[rank1]: torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 860.00 MiB. GPU 1 has a total capacity of 44.55 GiB of which 658.69 MiB is free. Including non-PyTorch memory, this process has 43.89 GiB memory in use. Of the allocated memory 43.11 GiB is allocated by PyTorch, and 337.10 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+W0419 06:47:22.466000 126205 .venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 126411 closing signal SIGTERM
+W0419 06:47:22.468000 126205 .venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 126412 closing signal SIGTERM
+W0419 06:47:22.469000 126205 .venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 126413 closing signal SIGTERM
+E0419 06:47:24.749000 126205 .venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:984] failed (exitcode: 1) local_rank: 3 (pid: 126414) of binary: /public/home/wangar2023/grand/.venv/bin/python3
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/run.py", line 995, in <module>
+    main()
+  File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/run.py", line 991, in main
+    run(args)
+  File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/run.py", line 982, in run
+    elastic_launch(
+  File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+src.run FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-04-19_06:47:24
+  host      : hexm01
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 126411)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 126411
+[2]:
+  time      : 2026-04-19_06:47:24
+  host      : hexm01
+  rank      : 1 (local_rank: 1)
+  exitcode  : -15 (pid: 126412)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 126412
+[3]:
+  time      : 2026-04-19_06:47:24
+  host      : hexm01
+  rank      : 2 (local_rank: 2)
+  exitcode  : -15 (pid: 126413)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 126413
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-04-19_06:47:22
+  host      : hexm01
+  rank      : 3 (local_rank: 3)
+  exitcode  : 1 (pid: 126414)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

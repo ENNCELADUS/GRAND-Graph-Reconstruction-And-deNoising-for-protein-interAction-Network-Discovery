@@ -2,11 +2,11 @@ run_config:
   stages: ["topology_finetune", "evaluate", "topology_evaluate"]
   seed: 47
   train_run_id: 20260308_002906
-  topology_finetune_run_id: null
+  topology_finetune_run_id: "density_fixed_n20"
   adapt_run_id: null
-  eval_run_id: null
-  topology_eval_run_id: null
-  load_checkpoint_path: null
+  eval_run_id: "density_fixed_n20"
+  topology_eval_run_id: "density_fixed_n20"
+  load_checkpoint_path: "models/v3/train/20260308_002906/best_model.pth"
   save_best_only: true
 
 device_config:
@@ -80,62 +80,50 @@ training_config:
   loss:
     type: "bce_with_logits"
     pos_weight: 1.0
-    label_smoothing: 0.0
+    label_smoothing: 0.05
   strategy:
     type: "none"
   domain_adaptation:
     enabled: false
 
 topology_finetune:
-  init_mode: "scratch"
-  epochs: 30
+  init_mode: "warm_start"
+  epochs: 20
   supervision_train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi_ratio5_exclusive.txt"
   supervision_valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi_ratio5_exclusive.txt"
   bce_negative_ratio: 5
-  subgraph_node_range: [30, 60]
-  gradient_accumulation_steps: 1
+  subgraph_node_range: [20, 20]
+  gradient_accumulation_steps: 6
   subgraphs_per_forward: 1
   strategy: "mixed"
   pair_batch_size: 32
-  internal_validation_samples_per_size: 20
-  internal_validation_compute_spectral_stats: false
+  internal_validation_inference_batch_size: 128
   decision_threshold:
     mode: "fixed"
-    value: 0.5
-  monitor_metric: "internal_val_graph_sim"
-  early_stopping_patience: 8
+    value: 0.50
+  monitor_metric: "val_loss"
+  early_stopping_patience: 5
   optimizer:
-    lr: 5.0e-5
-    weight_decay: 0.01
+    lr: 8.0e-6
+    weight_decay: 6.0e-3
   loss_weight_schedule:
-    warmup_epochs: 5
-    ramp_epochs: 5
-    schedule: "linear"
+    warmup_epochs: 0
+    ramp_epochs: 2
+    schedule: "cosine"
   losses:
-    # Scratch regime: keep topology as a weak structural prior until BCE learns
-    # a usable pairwise scorer. Relative-density was dominating the old setup.
-    alpha: 0.08
-    beta: 0.03
-    gamma: 0.02
-    delta: 0.02
-    histogram_sigma: 1.5
-    degree_bins: 32
-    clustering_bins: 48
-    rd_loss_form: "log_ratio_huber"
-  loss_normalization:
-    enabled: true
-    ema_decay: 0.95
-    clip_value: 5.0
-  gradnorm:
-    enabled: true
-    alpha: 0.5
-    learning_rate: 0.02
-    min_weight: 0.2
-    max_weight: 5.0
+    alpha: 0.35
+    beta: 0.70
+    gamma: 0.15
+    delta: 0.15
+    rd_loss_form: "squared_ratio"
+    histogram_sigma: 1.25
+    degree_bins: 48
+    clustering_bins: 64
 
 evaluate:
   decision_threshold:
-    mode: "best_f1_on_valid"
+    mode: "fixed"
+    value: 0.50
   metrics:
     - "auroc"
     - "auprc"
@@ -150,6 +138,7 @@ evaluate:
 topology_evaluate:
   inference_batch_size: 128
   decision_threshold:
-    mode: "best_f1_on_valid"
+    mode: "fixed"
+    value: 0.50
   save_pair_predictions: true
   report_baselines: "src/topology/baselines/pring_human_table2.json"
