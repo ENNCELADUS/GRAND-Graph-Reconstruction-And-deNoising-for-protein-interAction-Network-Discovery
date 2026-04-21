@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from csv import DictReader
 from pathlib import Path
 from typing import cast
@@ -255,10 +255,26 @@ class _RecordingAccelerator:
         self.local_process_index = 0
         self.num_processes = 1
         self.mixed_precision = "no"
+        self._gradient_accumulation_steps = 1
+        self.gradient_accumulation_steps_history = [1]
+        self.sync_gradients = True
         self.prepare_calls = 0
         self.autocast_calls = 0
         self.backward_calls = 0
         self.reduce_calls = 0
+        self.accumulate_calls = 0
+        self.accumulate_steps_seen: list[int] = []
+        self.no_sync_calls = 0
+        self.step = 0
+
+    @property
+    def gradient_accumulation_steps(self) -> int:
+        return self._gradient_accumulation_steps
+
+    @gradient_accumulation_steps.setter
+    def gradient_accumulation_steps(self, value: int) -> None:
+        self._gradient_accumulation_steps = int(value)
+        self.gradient_accumulation_steps_history.append(self._gradient_accumulation_steps)
 
     def prepare(self, *components: object) -> tuple[object, ...]:
         self.prepare_calls += 1
@@ -273,6 +289,24 @@ class _RecordingAccelerator:
     def backward(self, loss: torch.Tensor) -> None:
         self.backward_calls += 1
         loss.backward()
+
+    def accumulate(self, *models: torch.nn.Module) -> object:
+        from contextlib import nullcontext
+
+        del models
+        self.accumulate_calls += 1
+        self.step += 1
+        steps = max(1, int(self.gradient_accumulation_steps))
+        self.accumulate_steps_seen.append(steps)
+        self.sync_gradients = self.step % steps == 0
+        return nullcontext()
+
+    def no_sync(self, model: torch.nn.Module) -> object:
+        from contextlib import nullcontext
+
+        del model
+        self.no_sync_calls += 1
+        return nullcontext()
 
     def reduce(self, value: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
         del reduction
@@ -352,15 +386,20 @@ class _DistributedValidationAccelerator(_RecordingAccelerator):
 
 
 class _CountingOptimizer:
-    def __init__(self) -> None:
+    def __init__(self, *, should_apply: Callable[[], bool] | None = None) -> None:
         self.step_calls = 0
         self.zero_grad_calls = 0
+        self._should_apply = should_apply
 
     def zero_grad(self, set_to_none: bool = False) -> None:
         del set_to_none
+        if self._should_apply is not None and not self._should_apply():
+            return
         self.zero_grad_calls += 1
 
     def step(self) -> None:
+        if self._should_apply is not None and not self._should_apply():
+            return
         self.step_calls += 1
 
 
@@ -1436,8 +1475,8 @@ def test_fit_epoch_accumulates_gradients_before_optimizer_step(
     topology_cfg["gradient_accumulation_steps"] = 2
 
     graph = nx.path_graph(["P1", "P2", "P3", "P4"])
-    optimizer = _CountingOptimizer()
     accelerator = NoOpAccelerator()
+    optimizer = _CountingOptimizer()
 
     def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
         return EdgeCoverEpochPlan(
@@ -1501,6 +1540,10 @@ def test_fit_epoch_accumulates_gradients_before_optimizer_step(
     )
 
     assert accelerator.backward_calls == 3
+    assert accelerator.accumulate_calls == 3
+    assert accelerator.accumulate_steps_seen == [2, 2, 1]
+    assert accelerator.no_sync_calls == 0
+    assert accelerator.gradient_accumulation_steps == 1
     assert optimizer.step_calls == 2
     assert optimizer.zero_grad_calls == 2
 
@@ -1517,6 +1560,7 @@ def test_fit_epoch_batches_multiple_subgraphs_into_one_forward(
 
     graph = nx.path_graph(["P1", "P2", "P3", "P4", "P5"])
     optimizer = _CountingOptimizer()
+    accelerator = NoOpAccelerator()
     observed_forward_batch_sizes: list[int] = []
 
     def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
@@ -1593,13 +1637,125 @@ def test_fit_epoch_batches_multiple_subgraphs_into_one_forward(
         ),
         pair_batch_size=8,
         use_amp=False,
-        accelerator=NoOpAccelerator(),
+        accelerator=accelerator,
         embedding_repository=cast(EmbeddingRepository, object()),
         negative_lookup=None,
         distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
     )
 
     assert observed_forward_batch_sizes == [2, 2]
+    assert accelerator.accumulate_calls == 2
+    assert accelerator.accumulate_steps_seen == [2, 2]
+    assert accelerator.no_sync_calls == 0
+    assert accelerator.gradient_accumulation_steps == 1
+
+
+def test_fit_epoch_accumulates_grouped_partial_window_with_dynamic_window_size(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["gradient_accumulation_steps"] = 4
+    topology_cfg["subgraphs_per_forward"] = 2
+
+    graph = nx.path_graph(["P1", "P2", "P3", "P4", "P5", "P6"])
+    optimizer = _CountingOptimizer()
+    accelerator = NoOpAccelerator()
+
+    def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
+        return EdgeCoverEpochPlan(
+            subgraphs=(
+                ("P1", "P2"),
+                ("P2", "P3"),
+                ("P3", "P4"),
+                ("P4", "P5"),
+                ("P5", "P6"),
+            ),
+            assigned_positive_edges=(
+                frozenset({("P1", "P2")}),
+                frozenset({("P2", "P3")}),
+                frozenset({("P3", "P4")}),
+                frozenset({("P4", "P5")}),
+                frozenset({("P5", "P6")}),
+            ),
+            total_positive_edges=5,
+            covered_positive_edges=5,
+            positive_edge_coverage_ratio=1.0,
+            mean_positive_edge_reuse=1.0,
+        )
+
+    def _fake_iter_subgraph_pair_chunks(**kwargs: object) -> Sequence[SubgraphPairChunk]:
+        nodes = tuple(cast(Sequence[str], kwargs["nodes"]))
+        return (
+            SubgraphPairChunk(
+                nodes=nodes,
+                emb_a=torch.zeros((1, 1, 4), dtype=torch.float32),
+                emb_b=torch.ones((1, 1, 4), dtype=torch.float32),
+                len_a=torch.ones(1, dtype=torch.long),
+                len_b=torch.ones(1, dtype=torch.long),
+                label=torch.ones(1, dtype=torch.float32),
+                pair_index_a=torch.zeros(1, dtype=torch.long),
+                pair_index_b=torch.ones(1, dtype=torch.long),
+                bce_label=torch.ones(1, dtype=torch.float32),
+                bce_mask=torch.ones(1, dtype=torch.float32),
+            ),
+        )
+
+    def _fake_forward_model(
+        *,
+        model: torch.nn.Module,
+        batch: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        del model
+        batch_size = int(batch["label"].numel())
+        return {"logits": torch.zeros(batch_size, dtype=torch.float32, requires_grad=True)}
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "sample_edge_cover_subgraphs",
+        _fake_sample_edge_cover_subgraphs,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "iter_subgraph_pair_chunks",
+        _fake_iter_subgraph_pair_chunks,
+    )
+    monkeypatch.setattr(topology_finetune_stage, "_forward_model", _fake_forward_model)
+
+    topology_finetune_stage._fit_epoch(
+        config=config,
+        model=torch.nn.Linear(1, 1),
+        device=torch.device("cpu"),
+        graph=graph,
+        cache_dir=tmp_path,
+        embedding_index={},
+        optimizer=cast(torch.optim.Optimizer, optimizer),
+        epoch_index=0,
+        epoch_seed=11,
+        input_dim=4,
+        max_sequence_length=8,
+        loss_weights=topology_finetune_stage.TopologyLossWeights(
+            alpha=0.0,
+            beta=0.0,
+            gamma=0.0,
+            delta=0.0,
+        ),
+        pair_batch_size=8,
+        use_amp=False,
+        accelerator=accelerator,
+        embedding_repository=cast(EmbeddingRepository, object()),
+        negative_lookup=None,
+        distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+    )
+
+    assert accelerator.accumulate_calls == 3
+    assert accelerator.accumulate_steps_seen == [2, 2, 1]
+    assert accelerator.no_sync_calls == 0
+    assert accelerator.gradient_accumulation_steps == 1
+    assert optimizer.step_calls == 2
+    assert optimizer.zero_grad_calls == 2
 
 
 def test_fit_epoch_skips_topology_work_during_warmup_single_forward(

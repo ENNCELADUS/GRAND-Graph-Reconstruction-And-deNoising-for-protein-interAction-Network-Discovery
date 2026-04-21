@@ -28,11 +28,29 @@ class NoOpAccelerator:
         self.local_process_index = context.local_rank
         self.num_processes = context.world_size
         self.mixed_precision = "no"
+        self._gradient_accumulation_steps = 1
+        self.gradient_accumulation_steps_history = [1]
+        self.sync_gradients = True
         self.prepare_calls = 0
         self.autocast_calls = 0
         self.backward_calls = 0
         self.gather_for_metrics_calls = 0
         self.reduce_calls = 0
+        self.accumulate_calls = 0
+        self.accumulate_steps_seen: list[int] = []
+        self.no_sync_calls = 0
+        self.step = 0
+
+    @property
+    def gradient_accumulation_steps(self) -> int:
+        """Return the current accumulation window size."""
+        return self._gradient_accumulation_steps
+
+    @gradient_accumulation_steps.setter
+    def gradient_accumulation_steps(self, value: int) -> None:
+        """Track accumulation window changes like Accelerate does."""
+        self._gradient_accumulation_steps = int(value)
+        self.gradient_accumulation_steps_history.append(self._gradient_accumulation_steps)
 
     def prepare(self, *components: object) -> object:
         """Return components unchanged while matching accelerate's single-item behavior."""
@@ -50,6 +68,22 @@ class NoOpAccelerator:
         """Backpropagate a loss tensor."""
         self.backward_calls += 1
         loss.backward()
+
+    def accumulate(self, *models: torch.nn.Module) -> object:
+        """Return a no-op accumulation context with sync boundary tracking."""
+        del models
+        self.accumulate_calls += 1
+        self.step += 1
+        steps = max(1, int(self.gradient_accumulation_steps))
+        self.accumulate_steps_seen.append(steps)
+        self.sync_gradients = self.step % steps == 0
+        return nullcontext()
+
+    def no_sync(self, model: torch.nn.Module) -> object:
+        """Return a no-op no_sync context."""
+        del model
+        self.no_sync_calls += 1
+        return nullcontext()
 
     def gather_for_metrics(self, value: torch.Tensor) -> torch.Tensor:
         """Return metric tensors unchanged."""

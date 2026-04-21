@@ -244,6 +244,7 @@ def test_execute_pipeline_builds_accelerator_runtime_instead_of_manual_ddp(
     def fake_build_accelerator(
         *,
         requested_device: str,
+        backend: str,
         ddp_enabled: bool,
         use_mixed_precision: bool,
         find_unused_parameters: bool,
@@ -251,6 +252,7 @@ def test_execute_pipeline_builds_accelerator_runtime_instead_of_manual_ddp(
         accelerator_calls.append(
             {
                 "requested_device": requested_device,
+                "backend": backend,
                 "ddp_enabled": ddp_enabled,
                 "use_mixed_precision": use_mixed_precision,
                 "find_unused_parameters": find_unused_parameters,
@@ -289,12 +291,70 @@ def test_execute_pipeline_builds_accelerator_runtime_instead_of_manual_ddp(
     assert accelerator_calls == [
         {
             "requested_device": "cpu",
+            "backend": "ddp",
             "ddp_enabled": False,
             "use_mixed_precision": False,
             "find_unused_parameters": False,
         }
     ]
     assert stage_calls == ["train"]
+
+
+def test_execute_pipeline_forwards_backend_without_topology_gradient_accumulation(
+    base_config: ConfigDict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    accelerator_call: dict[str, object] = {}
+
+    class _FakeAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = False
+        process_index = 0
+        local_process_index = 0
+        num_processes = 1
+        mixed_precision = "no"
+
+        def wait_for_everyone(self) -> None:
+            return None
+
+    def fake_build_accelerator(**kwargs: object) -> _FakeAccelerator:
+        accelerator_call.update(kwargs)
+        return _FakeAccelerator()
+
+    def fake_build_dataloaders(
+        *args: object,
+        **kwargs: object,
+    ) -> dict[str, DataLoader[dict[str, torch.Tensor]]]:
+        del args, kwargs
+        loader = DataLoader(_EmptyDataset(), batch_size=1)
+        return {"train": loader, "valid": loader, "test": loader}
+
+    def fake_build_model(*args: object, **kwargs: object) -> nn.Module:
+        del args, kwargs
+        return _DummyModel()
+
+    def fake_run_training_stage(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        return Path("artifacts/train_best_model.pth")
+
+    device_cfg = base_config["device_config"]
+    assert isinstance(device_cfg, dict)
+    device_cfg["backend"] = "deepspeed"
+    base_config["topology_finetune"] = {"gradient_accumulation_steps": 8}
+    run_cfg = base_config["run_config"]
+    assert isinstance(run_cfg, dict)
+    run_cfg["stages"] = ["train"]
+
+    monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
+    monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
+    monkeypatch.setattr(run_module, "build_model", fake_build_model)
+    monkeypatch.setattr(run_module, "run_training_stage", fake_run_training_stage)
+
+    run_module.execute_pipeline(base_config)
+
+    assert accelerator_call["backend"] == "deepspeed"
+    assert "gradient_accumulation_steps" not in accelerator_call
 
 
 def test_execute_pipeline_uses_accelerator_device_without_resolve_device(
