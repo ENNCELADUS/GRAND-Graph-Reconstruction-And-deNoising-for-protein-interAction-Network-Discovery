@@ -587,7 +587,7 @@ def _reset_accelerator_accumulation_state(accelerator: AcceleratorLike) -> None:
     accelerator.gradient_accumulation_steps = 1
     accelerator.sync_gradients = True
     if hasattr(accelerator, "step"):
-        setattr(accelerator, "step", 0)
+        accelerator.step = 0
 
 
 def _resolve_subgraphs_per_forward(finetune_cfg: ConfigDict) -> int:
@@ -1962,7 +1962,9 @@ def _fit_epoch(
                 window_end = min(window_start + gradient_accumulation_steps, len(local_tasks))
                 groups_in_window = max(
                     1,
-                    (window_end - window_start + subgraphs_per_forward - 1) // subgraphs_per_forward,
+                    (
+                        window_end - window_start + subgraphs_per_forward - 1
+                    ) // subgraphs_per_forward,
                 )
                 accelerator.gradient_accumulation_steps = groups_in_window
                 for group_start in range(window_start, window_end, subgraphs_per_forward):
