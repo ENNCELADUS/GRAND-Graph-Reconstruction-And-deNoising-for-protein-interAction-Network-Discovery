@@ -23,6 +23,81 @@ if [ ! -d ".venv" ]; then
   exit 1
 fi
 
+detect_torch_cuda_version() {
+  uv run --locked --no-sync --offline python - <<'PY'
+import torch
+
+print(torch.version.cuda or "")
+PY
+}
+
+configure_cuda_toolkit() {
+  local requested_cuda_version="${GRAND_CUDA_VERSION:-}"
+  local resolved_cuda_home=""
+  local selected_cuda_version=""
+  local torch_cuda_version=""
+  local torch_cuda_major=""
+  local candidate_path=""
+
+  if command -v module >/dev/null 2>&1; then
+    module load cuda/12.1 || true
+  fi
+
+  if [[ -n "${CUDA_HOME:-}" && -x "${CUDA_HOME}/bin/nvcc" ]]; then
+    resolved_cuda_home="${CUDA_HOME}"
+  fi
+
+  torch_cuda_version="$(detect_torch_cuda_version)"
+  torch_cuda_version="${torch_cuda_version//$'\n'/}"
+
+  if [[ -z "${requested_cuda_version}" && -n "${torch_cuda_version}" ]]; then
+    requested_cuda_version="${torch_cuda_version}"
+  fi
+
+  if [[ -z "${resolved_cuda_home}" && -n "${requested_cuda_version}" ]]; then
+    candidate_path="/public/software/CUDA/cuda-${requested_cuda_version}"
+    if [[ -x "${candidate_path}/bin/nvcc" ]]; then
+      resolved_cuda_home="${candidate_path}"
+    fi
+  fi
+
+  if [[ -z "${resolved_cuda_home}" && -n "${torch_cuda_version}" ]]; then
+    torch_cuda_major="${torch_cuda_version%%.*}"
+    while IFS= read -r candidate_path; do
+      resolved_cuda_home="${candidate_path}"
+    done < <(find /public/software/CUDA -maxdepth 1 -type d -name "cuda-${torch_cuda_major}.*" | sort -V)
+  fi
+
+  if [[ -z "${resolved_cuda_home}" && -x /public/software/CUDA/cuda-12.1/bin/nvcc ]]; then
+    resolved_cuda_home="/public/software/CUDA/cuda-12.1"
+  fi
+
+  if [[ -z "${resolved_cuda_home}" ]]; then
+    echo "DeepSpeed requires a CUDA toolkit with nvcc, but none was found." >&2
+    echo "Set CUDA_HOME or GRAND_CUDA_VERSION before running." >&2
+    exit 1
+  fi
+
+  export CUDA_HOME="${resolved_cuda_home}"
+  export PATH="${CUDA_HOME}/bin:${PATH}"
+  export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
+
+  if ! command -v nvcc >/dev/null 2>&1; then
+    echo "DeepSpeed requires a CUDA toolkit with nvcc, but nvcc was not found." >&2
+    echo "Tried CUDA_HOME=${CUDA_HOME:-unset}. Load a CUDA module or set CUDA_HOME before running." >&2
+    exit 1
+  fi
+
+  selected_cuda_version="${CUDA_HOME##*/cuda-}"
+  if [[ -n "${torch_cuda_version}" && "${selected_cuda_version}" != "${torch_cuda_version}" ]]; then
+    export DS_SKIP_CUDA_CHECK="${DS_SKIP_CUDA_CHECK:-1}"
+    echo "Warning: torch was built against CUDA ${torch_cuda_version}, but using toolkit ${selected_cuda_version} at ${CUDA_HOME}." >&2
+    echo "Set GRAND_CUDA_VERSION or CUDA_HOME to an exact-match toolkit to avoid DS_SKIP_CUDA_CHECK=1." >&2
+  fi
+}
+
+configure_cuda_toolkit
+
 # Automatically detect number of GPUs from SLURM allocation
 NGPUS=$(nvidia-smi -L | wc -l)
 echo "Detected $NGPUS GPUs"
