@@ -37,6 +37,7 @@ class DeviceSettings:
     """Normalized device runtime configuration."""
 
     requested_device: str
+    backend: str
     ddp_enabled: bool
     use_mixed_precision: bool
     find_unused_parameters: bool
@@ -100,6 +101,7 @@ class PipelineConfig:
                     device_cfg.get("device", "cpu"),
                     "device_config.device",
                 ),
+                backend=_device_backend(device_cfg.get("backend", "ddp")),
                 ddp_enabled=as_bool(
                     device_cfg.get("ddp_enabled", False),
                     "device_config.ddp_enabled",
@@ -138,6 +140,14 @@ def _optional_str(value: object) -> str | None:
     if isinstance(value, str) and value:
         return value
     return None
+
+
+def _device_backend(value: object) -> str:
+    """Return validated accelerator backend selection."""
+    backend = as_str(value, "device_config.backend").lower()
+    if backend not in {"ddp", "deepspeed"}:
+        raise ValueError("device_config.backend must be 'ddp' or 'deepspeed'")
+    return backend
 
 
 __all__ = [

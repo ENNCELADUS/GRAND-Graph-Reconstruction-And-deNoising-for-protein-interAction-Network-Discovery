@@ -6,6 +6,7 @@ import logging
 
 import pytest
 import src.pipeline.bootstrap as pipeline_bootstrap
+from src.pipeline.config import PipelineConfig
 from src.pipeline.runtime import ddp_find_unused_parameters
 from src.pipeline.stages.evaluate import _metrics_from_config
 from src.pipeline.stages.train import _training_validation_metrics
@@ -16,6 +17,7 @@ def _base_config() -> ConfigDict:
     return {
         "run_config": {"stages": ["train", "evaluate"]},
         "device_config": {"device": "cpu", "ddp_enabled": False},
+        "model_config": {"model": "v3"},
         "training_config": {},
     }
 
@@ -92,6 +94,22 @@ def test_ddp_find_unused_parameters_enables_shot_adaptation_by_default() -> None
     }
 
     assert ddp_find_unused_parameters(config) is True
+
+
+def test_pipeline_config_defaults_device_backend_to_ddp() -> None:
+    config = PipelineConfig.from_dict(_base_config())
+
+    assert config.device.backend == "ddp"
+
+
+def test_pipeline_config_rejects_unknown_device_backend() -> None:
+    config = _base_config()
+    device_cfg = config["device_config"]
+    assert isinstance(device_cfg, dict)
+    device_cfg["backend"] = "fsdp"
+
+    with pytest.raises(ValueError, match="device_config.backend"):
+        PipelineConfig.from_dict(config)
 
 
 def test_metrics_from_config_preserves_case_and_order() -> None:

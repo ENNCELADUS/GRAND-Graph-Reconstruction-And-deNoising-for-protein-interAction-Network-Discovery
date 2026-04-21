@@ -199,13 +199,11 @@ def _predict_topology_labels(
     device: torch.device,
     total_records: int,
     decision_threshold: float,
-    use_amp: bool,
     accelerator: AcceleratorLike,
 ) -> list[int]:
     """Predict probabilities and thresholded labels for all topology pairs."""
     gathered_indices: list[int] = []
     gathered_predictions: list[int] = []
-    del use_amp
     with torch.inference_mode():
         for batch in data_loader:
             prepared_batch = move_batch_to_device(batch=batch, device=device)
@@ -402,18 +400,14 @@ def _shard_test_graph_nodes_for_rank(
     """
     if not distributed_context.is_distributed:
         return {
-            int(node_size): list(node_lists)
-            for node_size, node_lists in test_graph_nodes.items()
+            int(node_size): list(node_lists) for node_size, node_lists in test_graph_nodes.items()
         }
 
     ordered_node_sizes = sorted((int(node_size) for node_size in test_graph_nodes), reverse=True)
     local_node_sizes = ordered_node_sizes[
         distributed_context.rank :: distributed_context.world_size
     ]
-    return {
-        node_size: list(test_graph_nodes[node_size])
-        for node_size in sorted(local_node_sizes)
-    }
+    return {node_size: list(test_graph_nodes[node_size]) for node_size in sorted(local_node_sizes)}
 
 
 def _evaluate_predicted_graph_sharded(
@@ -535,7 +529,6 @@ def run_topology_evaluation_stage(
         device=device,
         total_records=len(records),
         decision_threshold=decision_threshold,
-        use_amp=use_amp,
         accelerator=runtime.accelerator,
     )
 
