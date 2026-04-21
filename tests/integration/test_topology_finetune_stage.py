@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 import json
 import os
 import pickle
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import nullcontext
 from csv import DictReader
 from pathlib import Path
 from typing import cast
@@ -1591,12 +1591,12 @@ def test_fit_epoch_accumulates_gradients_before_optimizer_step(
     )
 
     assert accelerator.backward_calls == 3
-    assert accelerator.accumulate_calls == 3
-    assert accelerator.accumulate_steps_seen == [2, 2, 1]
-    assert accelerator.no_sync_calls == 0
+    assert accelerator.accumulate_calls == 0
+    assert accelerator.accumulate_steps_seen == []
+    assert accelerator.no_sync_calls == 1
     assert accelerator.gradient_accumulation_steps == 1
     assert optimizer.step_calls == 2
-    assert optimizer.zero_grad_calls == 2
+    assert optimizer.zero_grad_calls == 3
 
 
 def test_fit_epoch_flushes_remainder_window_without_leaking_final_gradient(
@@ -1623,9 +1623,7 @@ def test_fit_epoch_flushes_remainder_window_without_leaking_final_gradient(
     def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
         return EdgeCoverEpochPlan(
             subgraphs=tuple(task_values),
-            assigned_positive_edges=tuple(
-                frozenset({nodes}) for nodes in task_values
-            ),
+            assigned_positive_edges=tuple(frozenset({nodes}) for nodes in task_values),
             total_positive_edges=len(task_values),
             covered_positive_edges=len(task_values),
             positive_edge_coverage_ratio=1.0,
@@ -1691,7 +1689,7 @@ def test_fit_epoch_flushes_remainder_window_without_leaking_final_gradient(
 
     assert optimizer.step_gradients == [2.0, 4.5]
     assert optimizer.step_calls == 2
-    assert optimizer.zero_grad_calls == 2
+    assert optimizer.zero_grad_calls == 3
     assert model.weight.grad is None
 
 
@@ -1791,9 +1789,9 @@ def test_fit_epoch_batches_multiple_subgraphs_into_one_forward(
     )
 
     assert observed_forward_batch_sizes == [2, 2]
-    assert accelerator.accumulate_calls == 2
-    assert accelerator.accumulate_steps_seen == [2, 2]
-    assert accelerator.no_sync_calls == 0
+    assert accelerator.accumulate_calls == 0
+    assert accelerator.accumulate_steps_seen == []
+    assert accelerator.no_sync_calls == 1
     assert accelerator.gradient_accumulation_steps == 1
 
 
@@ -1821,9 +1819,7 @@ def test_fit_epoch_grouped_accumulation_scales_by_subgraph_count(
     def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
         return EdgeCoverEpochPlan(
             subgraphs=tuple(task_values),
-            assigned_positive_edges=tuple(
-                frozenset({nodes}) for nodes in task_values
-            ),
+            assigned_positive_edges=tuple(frozenset({nodes}) for nodes in task_values),
             total_positive_edges=len(task_values),
             covered_positive_edges=len(task_values),
             positive_edge_coverage_ratio=1.0,
@@ -1839,8 +1835,7 @@ def test_fit_epoch_grouped_accumulation_scales_by_subgraph_count(
         assert isinstance(model, _ScalarLogitModel)
         return tuple(
             topology_finetune_stage.SupervisedForwardResult(
-                logits=model.weight
-                * torch.tensor([task_values[task.nodes]], dtype=torch.float32),
+                logits=model.weight * torch.tensor([task_values[task.nodes]], dtype=torch.float32),
                 bce_labels=torch.ones(1, dtype=torch.float32),
                 bce_mask=torch.ones(1, dtype=torch.float32),
             )
@@ -1892,7 +1887,7 @@ def test_fit_epoch_grouped_accumulation_scales_by_subgraph_count(
 
     assert optimizer.step_gradients == [2.5]
     assert optimizer.step_calls == 1
-    assert optimizer.zero_grad_calls == 1
+    assert optimizer.zero_grad_calls == 2
     assert model.weight.grad is None
 
 
@@ -1996,12 +1991,12 @@ def test_fit_epoch_accumulates_grouped_partial_window_with_dynamic_window_size(
         distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
     )
 
-    assert accelerator.accumulate_calls == 3
-    assert accelerator.accumulate_steps_seen == [2, 2, 1]
-    assert accelerator.no_sync_calls == 0
+    assert accelerator.accumulate_calls == 0
+    assert accelerator.accumulate_steps_seen == []
+    assert accelerator.no_sync_calls == 1
     assert accelerator.gradient_accumulation_steps == 1
     assert optimizer.step_calls == 2
-    assert optimizer.zero_grad_calls == 2
+    assert optimizer.zero_grad_calls == 3
 
 
 def test_fit_epoch_skips_topology_work_during_warmup_single_forward(

@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -588,6 +589,19 @@ def _reset_accelerator_accumulation_state(accelerator: AcceleratorLike) -> None:
     accelerator.sync_gradients = True
     if hasattr(accelerator, "step"):
         accelerator.step = 0
+
+
+def _manual_accumulation_context(
+    *,
+    accelerator: AcceleratorLike,
+    model: nn.Module,
+    sync_gradients: bool,
+) -> AbstractContextManager[object]:
+    """Return the sync context for one manually managed accumulation step."""
+    accelerator.sync_gradients = sync_gradients
+    if sync_gradients:
+        return nullcontext()
+    return accelerator.no_sync(model)
 
 
 def _resolve_subgraphs_per_forward(finetune_cfg: ConfigDict) -> int:
@@ -1822,6 +1836,8 @@ def _fit_epoch(
     )
     _reset_accelerator_accumulation_state(accelerator)
     try:
+        if local_tasks:
+            optimizer.zero_grad(set_to_none=True)
         if subgraphs_per_forward == 1:
             for task_index, task in enumerate(local_tasks):
                 step_start = time.perf_counter()
@@ -1833,8 +1849,12 @@ def _fit_epoch(
                     len(local_tasks),
                 )
                 current_window_size = current_window_end - current_window_start
-                accelerator.gradient_accumulation_steps = current_window_size
-                with accelerator.accumulate(model):
+                is_window_boundary = task_index + 1 == current_window_end
+                with _manual_accumulation_context(
+                    accelerator=accelerator,
+                    model=model,
+                    sync_gradients=is_window_boundary,
+                ):
                     with accelerator.autocast():
                         supervised_result: SupervisedForwardResult | None = None
                         if skip_topology_during_warmup or task.assigned_negative_edges:
@@ -1937,8 +1957,8 @@ def _fit_epoch(
                             )
                         backward_loss = total_loss * 0.0 if task.is_padding else total_loss
 
-                    accelerator.backward(backward_loss)
-                    if accelerator.sync_gradients:
+                    accelerator.backward(backward_loss / float(current_window_size))
+                    if is_window_boundary:
                         optimizer.step()
                         optimizer.zero_grad(set_to_none=True)
                 train_forward_backward_seconds += time.perf_counter() - step_start
@@ -1960,18 +1980,17 @@ def _fit_epoch(
         else:
             for window_start in range(0, len(local_tasks), gradient_accumulation_steps):
                 window_end = min(window_start + gradient_accumulation_steps, len(local_tasks))
-                groups_in_window = max(
-                    1,
-                    (
-                        window_end - window_start + subgraphs_per_forward - 1
-                    ) // subgraphs_per_forward,
-                )
-                accelerator.gradient_accumulation_steps = groups_in_window
+                current_window_size = window_end - window_start
                 for group_start in range(window_start, window_end, subgraphs_per_forward):
                     step_start = time.perf_counter()
                     group_end = min(group_start + subgraphs_per_forward, window_end)
                     group_tasks = local_tasks[group_start:group_end]
-                    with accelerator.accumulate(model):
+                    is_window_boundary = group_end == window_end
+                    with _manual_accumulation_context(
+                        accelerator=accelerator,
+                        model=model,
+                        sync_gradients=is_window_boundary,
+                    ):
                         with accelerator.autocast():
                             needs_separate_bce_forward = skip_topology_during_warmup or any(
                                 task.assigned_negative_edges for task in group_tasks
@@ -2072,12 +2091,8 @@ def _fit_epoch(
                                     )
                                     normalized_topology_losses = normalize_topology_loss_terms(
                                         raw_terms={
-                                            "graph_similarity": topology_losses[
-                                                "graph_similarity"
-                                            ],
-                                            "relative_density": topology_losses[
-                                                "relative_density"
-                                            ],
+                                            "graph_similarity": topology_losses["graph_similarity"],
+                                            "relative_density": topology_losses["relative_density"],
                                             "degree_mmd": topology_losses["degree_mmd"],
                                             "clustering_mmd": topology_losses["clustering_mmd"],
                                         },
@@ -2107,8 +2122,8 @@ def _fit_epoch(
                                 group_loss = group_loss + task_loss
                                 group_updates.append((task, bce_loss, topology_losses, total_loss))
 
-                        accelerator.backward(group_loss)
-                        if accelerator.sync_gradients:
+                        accelerator.backward(group_loss / float(current_window_size))
+                        if is_window_boundary:
                             optimizer.step()
                             optimizer.zero_grad(set_to_none=True)
                     train_forward_backward_seconds += time.perf_counter() - step_start
