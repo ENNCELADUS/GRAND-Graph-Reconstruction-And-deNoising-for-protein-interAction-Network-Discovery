@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import os
 import pickle
@@ -401,6 +402,56 @@ class _CountingOptimizer:
         if self._should_apply is not None and not self._should_apply():
             return
         self.step_calls += 1
+
+
+class _AccelerateSemanticsAccelerator(_RecordingAccelerator):
+    """Test double that mirrors Accelerate's accumulation behavior."""
+
+    def backward(self, loss: torch.Tensor) -> None:
+        self.backward_calls += 1
+        scaled_loss = loss / float(max(1, self.gradient_accumulation_steps))
+        scaled_loss.backward()
+
+    def accumulate(self, *models: torch.nn.Module) -> object:
+        del models
+        self.accumulate_calls += 1
+        self.step += 1
+        steps = max(1, int(self.gradient_accumulation_steps))
+        self.accumulate_steps_seen.append(steps)
+        self.sync_gradients = self.step % steps == 0
+        return nullcontext()
+
+
+class _ScalarLogitModel(torch.nn.Module):
+    """Minimal model carrying a single trainable scalar for gradient assertions."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+
+
+class _GradientCaptureOptimizer:
+    """Optimizer stub that records the gradient applied at each step."""
+
+    def __init__(self, parameter: torch.nn.Parameter) -> None:
+        self._parameter = parameter
+        self.step_calls = 0
+        self.zero_grad_calls = 0
+        self.step_gradients: list[float] = []
+
+    def zero_grad(self, set_to_none: bool = False) -> None:
+        self.zero_grad_calls += 1
+        if set_to_none:
+            self._parameter.grad = None
+            return
+        if self._parameter.grad is not None:
+            self._parameter.grad.zero_()
+
+    def step(self) -> None:
+        gradient = self._parameter.grad
+        assert gradient is not None
+        self.step_calls += 1
+        self.step_gradients.append(float(gradient.detach().item()))
 
 
 def test_load_supervision_graphs_excludes_val_edges_and_keeps_all_train_nodes(
@@ -1548,6 +1599,102 @@ def test_fit_epoch_accumulates_gradients_before_optimizer_step(
     assert optimizer.zero_grad_calls == 2
 
 
+def test_fit_epoch_flushes_remainder_window_without_leaking_final_gradient(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["gradient_accumulation_steps"] = 3
+
+    graph = nx.path_graph(["P1", "P2", "P3", "P4", "P5", "P6"])
+    model = _ScalarLogitModel()
+    optimizer = _GradientCaptureOptimizer(model.weight)
+    accelerator = _AccelerateSemanticsAccelerator()
+    task_values = {
+        ("P1", "P2"): 1.0,
+        ("P2", "P3"): 2.0,
+        ("P3", "P4"): 3.0,
+        ("P4", "P5"): 4.0,
+        ("P5", "P6"): 5.0,
+    }
+
+    def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
+        return EdgeCoverEpochPlan(
+            subgraphs=tuple(task_values),
+            assigned_positive_edges=tuple(
+                frozenset({nodes}) for nodes in task_values
+            ),
+            total_positive_edges=len(task_values),
+            covered_positive_edges=len(task_values),
+            positive_edge_coverage_ratio=1.0,
+            mean_positive_edge_reuse=1.0,
+        )
+
+    def _fake_forward_supervised_task(
+        *,
+        model: torch.nn.Module,
+        task: topology_finetune_stage.LocalSubgraphTask,
+        **_: object,
+    ) -> topology_finetune_stage.SupervisedForwardResult:
+        assert isinstance(model, _ScalarLogitModel)
+        value = torch.tensor([task_values[task.nodes]], dtype=torch.float32)
+        return topology_finetune_stage.SupervisedForwardResult(
+            logits=model.weight * value,
+            bce_labels=torch.ones(1, dtype=torch.float32),
+            bce_mask=torch.ones(1, dtype=torch.float32),
+        )
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "sample_edge_cover_subgraphs",
+        _fake_sample_edge_cover_subgraphs,
+    )
+    monkeypatch.setattr(topology_finetune_stage, "topology_loss_scale", lambda **_: 0.0)
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_forward_supervised_task",
+        _fake_forward_supervised_task,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_masked_bce_loss",
+        lambda *, logits, **_: logits.sum(),
+    )
+
+    topology_finetune_stage._fit_epoch(
+        config=config,
+        model=model,
+        device=torch.device("cpu"),
+        graph=graph,
+        cache_dir=tmp_path,
+        embedding_index={},
+        optimizer=cast(torch.optim.Optimizer, optimizer),
+        epoch_index=0,
+        epoch_seed=11,
+        input_dim=4,
+        max_sequence_length=8,
+        loss_weights=topology_finetune_stage.TopologyLossWeights(
+            alpha=0.0,
+            beta=0.0,
+            gamma=0.0,
+            delta=0.0,
+        ),
+        pair_batch_size=2,
+        use_amp=False,
+        accelerator=accelerator,
+        embedding_repository=cast(EmbeddingRepository, object()),
+        negative_lookup=None,
+        distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+    )
+
+    assert optimizer.step_gradients == [2.0, 4.5]
+    assert optimizer.step_calls == 2
+    assert optimizer.zero_grad_calls == 2
+    assert model.weight.grad is None
+
+
 def test_fit_epoch_batches_multiple_subgraphs_into_one_forward(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1648,6 +1795,105 @@ def test_fit_epoch_batches_multiple_subgraphs_into_one_forward(
     assert accelerator.accumulate_steps_seen == [2, 2]
     assert accelerator.no_sync_calls == 0
     assert accelerator.gradient_accumulation_steps == 1
+
+
+def test_fit_epoch_grouped_accumulation_scales_by_subgraph_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["gradient_accumulation_steps"] = 4
+    topology_cfg["subgraphs_per_forward"] = 2
+
+    graph = nx.path_graph(["P1", "P2", "P3", "P4", "P5"])
+    model = _ScalarLogitModel()
+    optimizer = _GradientCaptureOptimizer(model.weight)
+    accelerator = _AccelerateSemanticsAccelerator()
+    task_values = {
+        ("P1", "P2"): 1.0,
+        ("P2", "P3"): 2.0,
+        ("P3", "P4"): 3.0,
+        ("P4", "P5"): 4.0,
+    }
+
+    def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
+        return EdgeCoverEpochPlan(
+            subgraphs=tuple(task_values),
+            assigned_positive_edges=tuple(
+                frozenset({nodes}) for nodes in task_values
+            ),
+            total_positive_edges=len(task_values),
+            covered_positive_edges=len(task_values),
+            positive_edge_coverage_ratio=1.0,
+            mean_positive_edge_reuse=1.0,
+        )
+
+    def _fake_forward_supervised_group(
+        *,
+        model: torch.nn.Module,
+        tasks: Sequence[topology_finetune_stage.LocalSubgraphTask],
+        **_: object,
+    ) -> tuple[topology_finetune_stage.SupervisedForwardResult, ...]:
+        assert isinstance(model, _ScalarLogitModel)
+        return tuple(
+            topology_finetune_stage.SupervisedForwardResult(
+                logits=model.weight
+                * torch.tensor([task_values[task.nodes]], dtype=torch.float32),
+                bce_labels=torch.ones(1, dtype=torch.float32),
+                bce_mask=torch.ones(1, dtype=torch.float32),
+            )
+            for task in tasks
+        )
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "sample_edge_cover_subgraphs",
+        _fake_sample_edge_cover_subgraphs,
+    )
+    monkeypatch.setattr(topology_finetune_stage, "topology_loss_scale", lambda **_: 0.0)
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_forward_supervised_group",
+        _fake_forward_supervised_group,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_masked_bce_loss",
+        lambda *, logits, **_: logits.sum(),
+    )
+
+    topology_finetune_stage._fit_epoch(
+        config=config,
+        model=model,
+        device=torch.device("cpu"),
+        graph=graph,
+        cache_dir=tmp_path,
+        embedding_index={},
+        optimizer=cast(torch.optim.Optimizer, optimizer),
+        epoch_index=0,
+        epoch_seed=11,
+        input_dim=4,
+        max_sequence_length=8,
+        loss_weights=topology_finetune_stage.TopologyLossWeights(
+            alpha=0.0,
+            beta=0.0,
+            gamma=0.0,
+            delta=0.0,
+        ),
+        pair_batch_size=8,
+        use_amp=False,
+        accelerator=accelerator,
+        embedding_repository=cast(EmbeddingRepository, object()),
+        negative_lookup=None,
+        distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+    )
+
+    assert optimizer.step_gradients == [2.5]
+    assert optimizer.step_calls == 1
+    assert optimizer.zero_grad_calls == 1
+    assert model.weight.grad is None
 
 
 def test_fit_epoch_accumulates_grouped_partial_window_with_dynamic_window_size(
