@@ -88,7 +88,7 @@ training_config:
 
 topology_finetune:
   init_mode: "warm_start"
-  epochs: 12
+  epochs: 20
   supervision_train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi_ratio5_exclusive.txt"
   supervision_valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi_ratio5_exclusive.txt"
   bce_negative_ratio: 5

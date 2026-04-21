@@ -23,8 +23,8 @@ data_config:
     processed_dir: "data/PRING/species_processed_data/human/BFS"
   embeddings:
     source: "esm3"
-    cache_dir: "data/embeddings/esm3_1024"
-  max_sequence_length: 1024
+    cache_dir: "data/embeddings/esm3_768"
+  max_sequence_length: 768
   dataloader:
     train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi.txt"
     valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi.txt"

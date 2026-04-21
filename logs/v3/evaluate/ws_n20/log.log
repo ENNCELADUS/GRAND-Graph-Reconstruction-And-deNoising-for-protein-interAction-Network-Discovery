@@ -1,0 +1,14 @@
+2026-04-19 03:33:13 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-04-19 12:16:44 INFO Stage Start | Checkpoint: models/v3/topology_finetune/ws_n20/best_model.pth | Run Id: ws_n20
+2026-04-19 12:16:44 INFO Checkpoint Loaded | Path: models/v3/topology_finetune/ws_n20/best_model.pth
+2026-04-19 12:19:42 INFO Decision Threshold | Mode: best_f1_on_valid | Value: 0.9682
+2026-04-19 12:25:55 INFO Evaluation Metrics | Accuracy: 0.5748 | AUPRC: 0.5905 | Auroc: 0.6122 | F1: 0.6373 | Mcc: 0.1592 | Precision: 0.5557 | Recall: 0.7471 | Sensitivity: 0.7471 | Specificity: 0.4023 | Split: test
+2026-04-19 12:25:55 INFO CSV Written | Path: logs/v3/evaluate/ws_n20/evaluate.csv
+2026-04-19 12:25:55 INFO Stage Done | Run Id: ws_n20
+2026-04-19 14:04:47 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-04-20 14:32:14 INFO Stage Start | Checkpoint: models/v3/topology_finetune/ws_n20/best_model.pth | Run Id: ws_n20
+2026-04-20 14:32:14 INFO Checkpoint Loaded | Path: models/v3/topology_finetune/ws_n20/best_model.pth
+2026-04-20 14:35:16 INFO Decision Threshold | Mode: best_f1_on_valid | Value: 0.2056
+2026-04-20 14:41:29 INFO Evaluation Metrics | Accuracy: 0.6234 | AUPRC: 0.6987 | Auroc: 0.6806 | F1: 0.6267 | Mcc: 0.2469 | Precision: 0.6214 | Recall: 0.6322 | Sensitivity: 0.6322 | Specificity: 0.6147 | Split: test
+2026-04-20 14:41:29 INFO CSV Written | Path: logs/v3/evaluate/ws_n20/evaluate.csv
+2026-04-20 14:41:29 INFO Stage Done | Run Id: ws_n20
