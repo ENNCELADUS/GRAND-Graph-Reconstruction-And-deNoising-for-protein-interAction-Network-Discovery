@@ -14,7 +14,11 @@ from typing import BinaryIO, Protocol, cast, runtime_checkable
 import torch
 import torch.distributed as dist
 from accelerate import Accelerator
-from accelerate.utils import DataLoaderConfiguration, DistributedDataParallelKwargs
+from accelerate.utils import (
+    DataLoaderConfiguration,
+    DeepSpeedPlugin,
+    DistributedDataParallelKwargs,
+)
 
 from src.adapt import should_run_shot_adaptation
 from src.pipeline.bootstrap import configure_root_logging as _configure_root_logging_impl
@@ -44,6 +48,8 @@ class AcceleratorLike(Protocol):
     local_process_index: int
     num_processes: int
     mixed_precision: str
+    gradient_accumulation_steps: int
+    sync_gradients: bool
 
     def prepare(self, *components: object) -> object:
         """Prepare models, optimizers, schedulers, or loaders."""
@@ -53,6 +59,12 @@ class AcceleratorLike(Protocol):
 
     def backward(self, loss: torch.Tensor) -> None:
         """Backpropagate one loss tensor."""
+
+    def accumulate(self, *models: torch.nn.Module) -> AbstractContextManager[object]:
+        """Return accumulation context manager."""
+
+    def no_sync(self, model: torch.nn.Module) -> AbstractContextManager[object]:
+        """Return gradient-sync suppression context manager."""
 
     def gather_for_metrics(self, value: torch.Tensor) -> torch.Tensor:
         """Gather tensors for metric computation."""
@@ -170,6 +182,7 @@ class PipelineRuntime:
 def build_accelerator(
     *,
     requested_device: str,
+    backend: str,
     ddp_enabled: bool,
     use_mixed_precision: bool,
     find_unused_parameters: bool,
@@ -177,14 +190,23 @@ def build_accelerator(
     """Create the shared Accelerator runtime for the pipeline."""
     del ddp_enabled
     mixed_precision = "fp16" if use_mixed_precision and torch.cuda.is_available() else "no"
+    dataloader_config = DataLoaderConfiguration(non_blocking=True)
+    accelerator_kwargs: dict[str, object] = {
+        "cpu": requested_device.lower() == "cpu",
+        "mixed_precision": mixed_precision,
+        "dataloader_config": dataloader_config,
+    }
+    if backend == "deepspeed":
+        accelerator_kwargs["deepspeed_plugin"] = DeepSpeedPlugin(
+            zero_stage=2,
+        )
+        return Accelerator(**accelerator_kwargs)
+
     ddp_kwargs = DistributedDataParallelKwargs(
         find_unused_parameters=find_unused_parameters,
     )
-    dataloader_config = DataLoaderConfiguration(non_blocking=True)
     return Accelerator(
-        cpu=requested_device.lower() == "cpu",
-        mixed_precision=mixed_precision,
-        dataloader_config=dataloader_config,
+        **accelerator_kwargs,
         kwargs_handlers=[ddp_kwargs],
     )
 
@@ -261,6 +283,7 @@ def build_runtime(
     set_global_seed(config.run.seed)
     accelerator = build_accelerator_fn(
         requested_device=config.device.requested_device,
+        backend=config.device.backend,
         ddp_enabled=config.device.ddp_enabled,
         use_mixed_precision=config.device.use_mixed_precision,
         find_unused_parameters=ddp_find_unused_parameters(config.raw),

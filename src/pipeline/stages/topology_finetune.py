@@ -582,6 +582,14 @@ def _resolve_gradient_accumulation_steps(finetune_cfg: ConfigDict) -> int:
     return steps
 
 
+def _reset_accelerator_accumulation_state(accelerator: AcceleratorLike) -> None:
+    """Restore accelerator accumulation defaults after manual window management."""
+    accelerator.gradient_accumulation_steps = 1
+    accelerator.sync_gradients = True
+    if hasattr(accelerator, "step"):
+        setattr(accelerator, "step", 0)
+
+
 def _resolve_subgraphs_per_forward(finetune_cfg: ConfigDict) -> int:
     """Return the number of subgraphs concatenated into one training forward pass."""
     subgraphs_per_forward = as_int(
@@ -872,6 +880,13 @@ def _cat_padded_pair_embeddings(tensors: Sequence[torch.Tensor]) -> torch.Tensor
     return torch.cat(padded_tensors, dim=0)
 
 
+def _required_chunk_tensor(value: torch.Tensor | None, field_name: str) -> torch.Tensor:
+    """Return one required chunk tensor or raise when chunk assembly is incomplete."""
+    if value is None:
+        raise ValueError(f"Subgraph pair chunk is missing required field '{field_name}'")
+    return value
+
+
 def _batch_subgraph_chunks(
     *,
     chunks: Sequence[SubgraphPairChunk],
@@ -888,10 +903,16 @@ def _batch_subgraph_chunks(
         "label": torch.cat([chunk.label for chunk in chunks], dim=0),
         "pair_index_a": torch.cat([chunk.pair_index_a for chunk in chunks], dim=0),
         "pair_index_b": torch.cat([chunk.pair_index_b for chunk in chunks], dim=0),
-        "bce_label": torch.cat([chunk.bce_label for chunk in chunks], dim=0),
-        "bce_mask": torch.cat([chunk.bce_mask for chunk in chunks], dim=0),
+        "bce_label": torch.cat(
+            [_required_chunk_tensor(chunk.bce_label, "bce_label") for chunk in chunks],
+            dim=0,
+        ),
+        "bce_mask": torch.cat(
+            [_required_chunk_tensor(chunk.bce_mask, "bce_mask") for chunk in chunks],
+            dim=0,
+        ),
     }
-    return move_batch_to_device(batch=batch, device=device)
+    return cast(dict[str, torch.Tensor], move_batch_to_device(batch=batch, device=device))
 
 
 def _forward_subgraph_group(
@@ -947,10 +968,18 @@ def _forward_subgraph_group(
                 nodes=nodes,
                 logits=logits[logit_offset:next_offset],
                 labels=torch.cat([chunk.label for chunk in chunks], dim=0).to(device).float(),
-                bce_labels=torch.cat([chunk.bce_label for chunk in chunks], dim=0)
+                bce_labels=torch.cat(
+                    [_required_chunk_tensor(chunk.bce_label, "bce_label") for chunk in chunks],
+                    dim=0,
+                )
                 .to(device)
                 .float(),
-                bce_mask=torch.cat([chunk.bce_mask for chunk in chunks], dim=0).to(device).float(),
+                bce_mask=torch.cat(
+                    [_required_chunk_tensor(chunk.bce_mask, "bce_mask") for chunk in chunks],
+                    dim=0,
+                )
+                .to(device)
+                .float(),
                 pair_index_a=torch.cat([chunk.pair_index_a for chunk in chunks], dim=0).to(device),
                 pair_index_b=torch.cat([chunk.pair_index_b for chunk in chunks], dim=0).to(device),
             )
@@ -1276,7 +1305,10 @@ def _evaluate_internal_validation_subgraphs(
                 )
                 with accelerator.autocast():
                     logits = _squeeze_binary_logits(
-                        _forward_model(model=model, batch=prepared_batch)["logits"]
+                        _forward_model(
+                            model=model,
+                            batch=cast(Mapping[str, torch.Tensor], prepared_batch),
+                        )["logits"]
                     )
                 probabilities = torch.sigmoid(logits).detach().cpu().tolist()
                 for (global_index, _), probability in zip(
@@ -1788,244 +1820,91 @@ def _fit_epoch(
         if resolved_gradnorm.enabled
         else ()
     )
-    if local_tasks:
-        optimizer.zero_grad(set_to_none=True)
-    if subgraphs_per_forward == 1:
-        for task_index, task in enumerate(local_tasks):
-            step_start = time.perf_counter()
-            with accelerator.autocast():
-                supervised_result: SupervisedForwardResult | None = None
-                if skip_topology_during_warmup or task.assigned_negative_edges:
-                    supervised_result = _forward_supervised_task(
-                        model=model,
-                        task=task,
-                        cache_dir=cache_dir,
-                        embedding_index=embedding_index,
-                        input_dim=input_dim,
-                        max_sequence_length=max_sequence_length,
-                        pair_batch_size=pair_batch_size,
-                        device=device,
-                        embedding_repository=embedding_repository,
-                    )
-                    bce_loss = _masked_bce_loss(
-                        logits=supervised_result.logits,
-                        bce_labels=supervised_result.bce_labels,
-                        bce_mask=supervised_result.bce_mask,
-                        config=config,
-                    )
-                if skip_topology_during_warmup:
-                    if supervised_result is None:
-                        raise RuntimeError("warmup requires supervised BCE forward results")
-                    topology_losses = _zero_topology_losses(reference=bce_loss)
-                    total_loss = bce_loss
-                else:
-                    (
-                        logits,
-                        labels,
-                        all_pair_bce_labels,
-                        all_pair_bce_mask,
-                        pair_index_a,
-                        pair_index_b,
-                    ) = _concat_logits_and_pairs(
-                        model=model,
-                        graph=graph,
-                        nodes=task.nodes,
-                        assigned_positive_edges=task.assigned_positive_edges,
-                        assigned_negative_edges=task.assigned_negative_edges,
-                        cache_dir=cache_dir,
-                        embedding_index=embedding_index,
-                        input_dim=input_dim,
-                        max_sequence_length=max_sequence_length,
-                        pair_batch_size=pair_batch_size,
-                        device=device,
-                        embedding_repository=embedding_repository,
-                    )
-                    if supervised_result is None:
-                        bce_loss = _masked_bce_loss(
-                            logits=logits,
-                            bce_labels=all_pair_bce_labels,
-                            bce_mask=all_pair_bce_mask,
-                            config=config,
-                        )
-                    pred_adjacency, target_adjacency = _subgraph_adjacencies(
-                        num_nodes=len(task.nodes),
-                        logits=logits,
-                        labels=labels,
-                        pair_index_a=pair_index_a,
-                        pair_index_b=pair_index_b,
-                    )
-                    topology_losses = compute_topology_losses(
-                        weights=effective_loss_weights,
-                        pred_adjacency=pred_adjacency,
-                        target_adjacency=target_adjacency,
-                        num_nodes=len(task.nodes),
-                        pair_index_a=pair_index_a,
-                        pair_index_b=pair_index_b,
-                        pred_pair_probabilities=torch.sigmoid(logits),
-                        target_pair_probabilities=labels,
-                    )
-                    normalized_topology_losses = normalize_topology_loss_terms(
-                        raw_terms={
-                            "graph_similarity": topology_losses["graph_similarity"],
-                            "relative_density": topology_losses["relative_density"],
-                            "degree_mmd": topology_losses["degree_mmd"],
-                            "clustering_mmd": topology_losses["clustering_mmd"],
-                        },
-                        state=resolved_adaptive_loss_state,
-                        config=resolved_loss_normalization,
-                    )
-                    topology_objectives = _group_topology_objectives(
-                        topology_losses=normalized_topology_losses,
-                        loss_weights=effective_loss_weights,
-                    )
-                    task_weights = update_gradnorm_task_weights(
-                        task_losses={
-                            "bce": bce_loss,
-                            "density": topology_objectives["density"],
-                            "shape": topology_objectives["shape"],
-                        },
-                        state=resolved_adaptive_loss_state,
-                        reference_parameters=gradnorm_reference_parameters,
-                        config=resolved_gradnorm,
-                    )
-                    total_loss = _task_weighted_total_loss(
-                        bce_loss=bce_loss,
-                        topology_objectives=topology_objectives,
-                        task_weights=task_weights,
-                    )
-                backward_loss = total_loss * 0.0 if task.is_padding else total_loss
-
-            current_window_start = (task_index // gradient_accumulation_steps) * (
-                gradient_accumulation_steps
-            )
-            current_window_size = min(
-                gradient_accumulation_steps,
-                len(local_tasks) - current_window_start,
-            )
-            accelerator.backward(backward_loss / float(current_window_size))
-            is_accumulation_boundary = (task_index + 1) % gradient_accumulation_steps == 0
-            is_last_subgraph = task_index + 1 == len(local_tasks)
-            if is_accumulation_boundary or is_last_subgraph:
-                optimizer.step()
-                if not is_last_subgraph:
-                    optimizer.zero_grad(set_to_none=True)
-            train_forward_backward_seconds += time.perf_counter() - step_start
-            if not task.is_padding:
-                completed_real_subgraphs += 1
-                _update_train_aggregates(
-                    aggregates=aggregates,
-                    bce_loss=bce_loss,
-                    topology_losses=topology_losses,
-                    total_loss=total_loss,
-                )
-                log_epoch_progress(
-                    logger,
-                    epoch=epoch_index + 1,
-                    step=completed_real_subgraphs,
-                    total_steps=total_subgraphs,
-                    loss=aggregates["total"] / float(completed_real_subgraphs),
-                )
-    else:
-        for window_start in range(0, len(local_tasks), gradient_accumulation_steps):
-            window_end = min(window_start + gradient_accumulation_steps, len(local_tasks))
-            current_window_size = window_end - window_start
-            for group_start in range(window_start, window_end, subgraphs_per_forward):
+    _reset_accelerator_accumulation_state(accelerator)
+    try:
+        if subgraphs_per_forward == 1:
+            for task_index, task in enumerate(local_tasks):
                 step_start = time.perf_counter()
-                group_end = min(group_start + subgraphs_per_forward, window_end)
-                group_tasks = local_tasks[group_start:group_end]
-                with accelerator.autocast():
-                    needs_separate_bce_forward = skip_topology_during_warmup or any(
-                        task.assigned_negative_edges for task in group_tasks
-                    )
-                    supervised_results: tuple[SupervisedForwardResult, ...] = ()
-                    if needs_separate_bce_forward:
-                        supervised_results = _forward_supervised_group(
-                            model=model,
-                            tasks=group_tasks,
-                            cache_dir=cache_dir,
-                            embedding_index=embedding_index,
-                            input_dim=input_dim,
-                            max_sequence_length=max_sequence_length,
-                            pair_batch_size=pair_batch_size,
-                            device=device,
-                            embedding_repository=embedding_repository,
-                        )
-                    forward_results: tuple[SubgraphForwardResult, ...] = ()
-                    if not skip_topology_during_warmup:
-                        forward_results = _forward_subgraph_group(
-                            model=model,
-                            graph=graph,
-                            subgraphs=tuple(task.nodes for task in group_tasks),
-                            assigned_positive_edges=tuple(
-                                task.assigned_positive_edges for task in group_tasks
-                            ),
-                            assigned_negative_edges=tuple(
-                                task.assigned_negative_edges for task in group_tasks
-                            ),
-                            cache_dir=cache_dir,
-                            embedding_index=embedding_index,
-                            input_dim=input_dim,
-                            max_sequence_length=max_sequence_length,
-                            pair_batch_size=pair_batch_size,
-                            device=device,
-                            embedding_repository=embedding_repository,
-                        )
-                    group_loss = torch.zeros((), dtype=torch.float32, device=device)
-                    group_updates: list[
-                        tuple[
-                            LocalSubgraphTask,
-                            torch.Tensor,
-                            Mapping[str, torch.Tensor],
-                            torch.Tensor,
-                        ]
-                    ] = []
-                    for result_index, task in enumerate(group_tasks):
-                        supervised_result = (
-                            supervised_results[result_index] if needs_separate_bce_forward else None
-                        )
-                        if skip_topology_during_warmup:
-                            if supervised_result is None:
-                                raise RuntimeError("warmup requires supervised BCE forward results")
+                current_window_start = (task_index // gradient_accumulation_steps) * (
+                    gradient_accumulation_steps
+                )
+                current_window_end = min(
+                    current_window_start + gradient_accumulation_steps,
+                    len(local_tasks),
+                )
+                current_window_size = current_window_end - current_window_start
+                accelerator.gradient_accumulation_steps = current_window_size
+                with accelerator.accumulate(model):
+                    with accelerator.autocast():
+                        supervised_result: SupervisedForwardResult | None = None
+                        if skip_topology_during_warmup or task.assigned_negative_edges:
+                            supervised_result = _forward_supervised_task(
+                                model=model,
+                                task=task,
+                                cache_dir=cache_dir,
+                                embedding_index=embedding_index,
+                                input_dim=input_dim,
+                                max_sequence_length=max_sequence_length,
+                                pair_batch_size=pair_batch_size,
+                                device=device,
+                                embedding_repository=embedding_repository,
+                            )
                             bce_loss = _masked_bce_loss(
                                 logits=supervised_result.logits,
                                 bce_labels=supervised_result.bce_labels,
                                 bce_mask=supervised_result.bce_mask,
                                 config=config,
                             )
+                        if skip_topology_during_warmup:
+                            if supervised_result is None:
+                                raise RuntimeError("warmup requires supervised BCE forward results")
                             topology_losses = _zero_topology_losses(reference=bce_loss)
                             total_loss = bce_loss
                         else:
-                            result = forward_results[result_index]
+                            (
+                                logits,
+                                labels,
+                                all_pair_bce_labels,
+                                all_pair_bce_mask,
+                                pair_index_a,
+                                pair_index_b,
+                            ) = _concat_logits_and_pairs(
+                                model=model,
+                                graph=graph,
+                                nodes=task.nodes,
+                                assigned_positive_edges=task.assigned_positive_edges,
+                                assigned_negative_edges=task.assigned_negative_edges,
+                                cache_dir=cache_dir,
+                                embedding_index=embedding_index,
+                                input_dim=input_dim,
+                                max_sequence_length=max_sequence_length,
+                                pair_batch_size=pair_batch_size,
+                                device=device,
+                                embedding_repository=embedding_repository,
+                            )
                             if supervised_result is None:
                                 bce_loss = _masked_bce_loss(
-                                    logits=result.logits,
-                                    bce_labels=result.bce_labels,
-                                    bce_mask=result.bce_mask,
-                                    config=config,
-                                )
-                            else:
-                                bce_loss = _masked_bce_loss(
-                                    logits=supervised_result.logits,
-                                    bce_labels=supervised_result.bce_labels,
-                                    bce_mask=supervised_result.bce_mask,
+                                    logits=logits,
+                                    bce_labels=all_pair_bce_labels,
+                                    bce_mask=all_pair_bce_mask,
                                     config=config,
                                 )
                             pred_adjacency, target_adjacency = _subgraph_adjacencies(
-                                num_nodes=len(result.nodes),
-                                logits=result.logits,
-                                labels=result.labels,
-                                pair_index_a=result.pair_index_a,
-                                pair_index_b=result.pair_index_b,
+                                num_nodes=len(task.nodes),
+                                logits=logits,
+                                labels=labels,
+                                pair_index_a=pair_index_a,
+                                pair_index_b=pair_index_b,
                             )
                             topology_losses = compute_topology_losses(
                                 weights=effective_loss_weights,
                                 pred_adjacency=pred_adjacency,
                                 target_adjacency=target_adjacency,
-                                num_nodes=len(result.nodes),
-                                pair_index_a=result.pair_index_a,
-                                pair_index_b=result.pair_index_b,
-                                pred_pair_probabilities=torch.sigmoid(result.logits),
-                                target_pair_probabilities=result.labels,
+                                num_nodes=len(task.nodes),
+                                pair_index_a=pair_index_a,
+                                pair_index_b=pair_index_b,
+                                pred_pair_probabilities=torch.sigmoid(logits),
+                                target_pair_probabilities=labels,
                             )
                             normalized_topology_losses = normalize_topology_loss_terms(
                                 raw_terms={
@@ -2056,21 +1935,14 @@ def _fit_epoch(
                                 topology_objectives=topology_objectives,
                                 task_weights=task_weights,
                             )
-                        task_loss = total_loss * 0.0 if task.is_padding else total_loss
-                        group_loss = group_loss + task_loss
-                        group_updates.append((task, bce_loss, topology_losses, total_loss))
+                        backward_loss = total_loss * 0.0 if task.is_padding else total_loss
 
-                accelerator.backward(group_loss / float(current_window_size))
-                is_last_window = window_end == len(local_tasks)
-                is_last_group_in_window = group_end == window_end
-                if is_last_group_in_window:
-                    optimizer.step()
-                    if not is_last_window:
+                    accelerator.backward(backward_loss)
+                    if accelerator.sync_gradients:
+                        optimizer.step()
                         optimizer.zero_grad(set_to_none=True)
                 train_forward_backward_seconds += time.perf_counter() - step_start
-                for task, bce_loss, topology_losses, total_loss in group_updates:
-                    if task.is_padding:
-                        continue
+                if not task.is_padding:
                     completed_real_subgraphs += 1
                     _update_train_aggregates(
                         aggregates=aggregates,
@@ -2085,6 +1957,178 @@ def _fit_epoch(
                         total_steps=total_subgraphs,
                         loss=aggregates["total"] / float(completed_real_subgraphs),
                     )
+        else:
+            for window_start in range(0, len(local_tasks), gradient_accumulation_steps):
+                window_end = min(window_start + gradient_accumulation_steps, len(local_tasks))
+                groups_in_window = max(
+                    1,
+                    (window_end - window_start + subgraphs_per_forward - 1) // subgraphs_per_forward,
+                )
+                accelerator.gradient_accumulation_steps = groups_in_window
+                for group_start in range(window_start, window_end, subgraphs_per_forward):
+                    step_start = time.perf_counter()
+                    group_end = min(group_start + subgraphs_per_forward, window_end)
+                    group_tasks = local_tasks[group_start:group_end]
+                    with accelerator.accumulate(model):
+                        with accelerator.autocast():
+                            needs_separate_bce_forward = skip_topology_during_warmup or any(
+                                task.assigned_negative_edges for task in group_tasks
+                            )
+                            supervised_results: tuple[SupervisedForwardResult, ...] = ()
+                            if needs_separate_bce_forward:
+                                supervised_results = _forward_supervised_group(
+                                    model=model,
+                                    tasks=group_tasks,
+                                    cache_dir=cache_dir,
+                                    embedding_index=embedding_index,
+                                    input_dim=input_dim,
+                                    max_sequence_length=max_sequence_length,
+                                    pair_batch_size=pair_batch_size,
+                                    device=device,
+                                    embedding_repository=embedding_repository,
+                                )
+                            forward_results: tuple[SubgraphForwardResult, ...] = ()
+                            if not skip_topology_during_warmup:
+                                forward_results = _forward_subgraph_group(
+                                    model=model,
+                                    graph=graph,
+                                    subgraphs=tuple(task.nodes for task in group_tasks),
+                                    assigned_positive_edges=tuple(
+                                        task.assigned_positive_edges for task in group_tasks
+                                    ),
+                                    assigned_negative_edges=tuple(
+                                        task.assigned_negative_edges for task in group_tasks
+                                    ),
+                                    cache_dir=cache_dir,
+                                    embedding_index=embedding_index,
+                                    input_dim=input_dim,
+                                    max_sequence_length=max_sequence_length,
+                                    pair_batch_size=pair_batch_size,
+                                    device=device,
+                                    embedding_repository=embedding_repository,
+                                )
+                            group_loss = torch.zeros((), dtype=torch.float32, device=device)
+                            group_updates: list[
+                                tuple[
+                                    LocalSubgraphTask,
+                                    torch.Tensor,
+                                    Mapping[str, torch.Tensor],
+                                    torch.Tensor,
+                                ]
+                            ] = []
+                            for result_index, task in enumerate(group_tasks):
+                                supervised_result = (
+                                    supervised_results[result_index]
+                                    if needs_separate_bce_forward
+                                    else None
+                                )
+                                if skip_topology_during_warmup:
+                                    if supervised_result is None:
+                                        raise RuntimeError(
+                                            "warmup requires supervised BCE forward results"
+                                        )
+                                    bce_loss = _masked_bce_loss(
+                                        logits=supervised_result.logits,
+                                        bce_labels=supervised_result.bce_labels,
+                                        bce_mask=supervised_result.bce_mask,
+                                        config=config,
+                                    )
+                                    topology_losses = _zero_topology_losses(reference=bce_loss)
+                                    total_loss = bce_loss
+                                else:
+                                    result = forward_results[result_index]
+                                    if supervised_result is None:
+                                        bce_loss = _masked_bce_loss(
+                                            logits=result.logits,
+                                            bce_labels=result.bce_labels,
+                                            bce_mask=result.bce_mask,
+                                            config=config,
+                                        )
+                                    else:
+                                        bce_loss = _masked_bce_loss(
+                                            logits=supervised_result.logits,
+                                            bce_labels=supervised_result.bce_labels,
+                                            bce_mask=supervised_result.bce_mask,
+                                            config=config,
+                                        )
+                                    pred_adjacency, target_adjacency = _subgraph_adjacencies(
+                                        num_nodes=len(result.nodes),
+                                        logits=result.logits,
+                                        labels=result.labels,
+                                        pair_index_a=result.pair_index_a,
+                                        pair_index_b=result.pair_index_b,
+                                    )
+                                    topology_losses = compute_topology_losses(
+                                        weights=effective_loss_weights,
+                                        pred_adjacency=pred_adjacency,
+                                        target_adjacency=target_adjacency,
+                                        num_nodes=len(result.nodes),
+                                        pair_index_a=result.pair_index_a,
+                                        pair_index_b=result.pair_index_b,
+                                        pred_pair_probabilities=torch.sigmoid(result.logits),
+                                        target_pair_probabilities=result.labels,
+                                    )
+                                    normalized_topology_losses = normalize_topology_loss_terms(
+                                        raw_terms={
+                                            "graph_similarity": topology_losses[
+                                                "graph_similarity"
+                                            ],
+                                            "relative_density": topology_losses[
+                                                "relative_density"
+                                            ],
+                                            "degree_mmd": topology_losses["degree_mmd"],
+                                            "clustering_mmd": topology_losses["clustering_mmd"],
+                                        },
+                                        state=resolved_adaptive_loss_state,
+                                        config=resolved_loss_normalization,
+                                    )
+                                    topology_objectives = _group_topology_objectives(
+                                        topology_losses=normalized_topology_losses,
+                                        loss_weights=effective_loss_weights,
+                                    )
+                                    task_weights = update_gradnorm_task_weights(
+                                        task_losses={
+                                            "bce": bce_loss,
+                                            "density": topology_objectives["density"],
+                                            "shape": topology_objectives["shape"],
+                                        },
+                                        state=resolved_adaptive_loss_state,
+                                        reference_parameters=gradnorm_reference_parameters,
+                                        config=resolved_gradnorm,
+                                    )
+                                    total_loss = _task_weighted_total_loss(
+                                        bce_loss=bce_loss,
+                                        topology_objectives=topology_objectives,
+                                        task_weights=task_weights,
+                                    )
+                                task_loss = total_loss * 0.0 if task.is_padding else total_loss
+                                group_loss = group_loss + task_loss
+                                group_updates.append((task, bce_loss, topology_losses, total_loss))
+
+                        accelerator.backward(group_loss)
+                        if accelerator.sync_gradients:
+                            optimizer.step()
+                            optimizer.zero_grad(set_to_none=True)
+                    train_forward_backward_seconds += time.perf_counter() - step_start
+                    for task, bce_loss, topology_loss_values, total_loss in group_updates:
+                        if task.is_padding:
+                            continue
+                        completed_real_subgraphs += 1
+                        _update_train_aggregates(
+                            aggregates=aggregates,
+                            bce_loss=bce_loss,
+                            topology_losses=topology_loss_values,
+                            total_loss=total_loss,
+                        )
+                        log_epoch_progress(
+                            logger,
+                            epoch=epoch_index + 1,
+                            step=completed_real_subgraphs,
+                            total_steps=total_subgraphs,
+                            loss=aggregates["total"] / float(completed_real_subgraphs),
+                        )
+    finally:
+        _reset_accelerator_accumulation_state(accelerator)
 
     aggregates["edge_cover_sampling_s"] = edge_cover_sampling_seconds
     aggregates["train_forward_backward_s"] = train_forward_backward_seconds
