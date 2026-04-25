@@ -1,5 +1,5 @@
 """Evaluation exports."""
 
-from src.evaluate.base import Evaluator
+from src.evaluate.base import DEFAULT_DECISION_THRESHOLD, Evaluator
 
-__all__ = ["Evaluator"]
+__all__ = ["DEFAULT_DECISION_THRESHOLD", "Evaluator"]

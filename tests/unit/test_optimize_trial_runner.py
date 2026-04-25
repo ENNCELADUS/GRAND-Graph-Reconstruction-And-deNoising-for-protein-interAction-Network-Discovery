@@ -136,7 +136,7 @@ def test_run_best_full_pipeline_preserves_topology_stage_when_requested() -> Non
         },
         "training_config": {"scheduler": {"max_lr": 1.0e-4}},
         "topology_evaluate": {
-            "decision_threshold": {"mode": "best_f1_on_valid"},
+            "decision_threshold": {"mode": "fixed", "value": 0.5},
             "report_baselines": "src/topology/baselines/pring_human_table2.json",
         },
     }

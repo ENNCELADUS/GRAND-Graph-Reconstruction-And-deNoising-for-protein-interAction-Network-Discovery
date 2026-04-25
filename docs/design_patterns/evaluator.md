@@ -2,6 +2,8 @@
 
 The **Evaluator** module (`src/evaluate/base.py`) is responsible for assessing model performance. It provides a consistent interface for computing metrics during both training validation and final testing.
 
+Binary PPI predictions use the PRING benchmark setting: probabilities greater than or equal to `0.5` are classified as interacting pairs, and probabilities below `0.5` are classified as non-interacting pairs. Training validation, final evaluation, and topology reconstruction all use this same threshold.
+
 ## Core Responsibilities
 
 **Does:**
@@ -9,7 +11,7 @@ The **Evaluator** module (`src/evaluate/base.py`) is responsible for assessing m
 *   **Centralized Loss Reporting**: Computes loss with `training_config.loss` via `LossConfig` so train/val/test loss paths share the same objective configuration.
 *   **Inference Pass**: Runs a single pass over a data loader to collect logits/probabilities and labels. Uses `accelerator.autocast()` for mixed precision and `accelerator.gather_for_metrics()` for distributed metric gathering.
 *   **Stateless Reporting**: Returns a simple dictionary of results (e.g., `{"val_loss": 0.5, "val_auroc": 0.85}`).
-*   **Decision Threshold Selection**: `select_best_f1_threshold()` finds the optimal threshold on a validation set when configured with `best_f1_on_valid` mode.
+*   **Fixed Decision Threshold**: Uses the PRING benchmark convention of probability threshold `0.5` for binary PPI decisions.
 
 **Does NOT:**
 *   **State Management**: It does *not* change the model's training mode. The stage orchestrator is responsible for setting `model.eval()` and `torch.no_grad()`.
@@ -26,7 +28,7 @@ The Evaluator requires a real `AcceleratorLike` instance — there is no optiona
 
 ## Configuration Schema
 
-Metrics are defined in the `evaluate` section of the YAML config.
+Metrics are defined in the `evaluate` section of the YAML config. `decision_threshold` is fixed at `0.5`; validation-selected thresholds are intentionally unsupported so PRING runs use the same operating point across validation, test, and topology reconstruction.
 
 ```yaml
 evaluate:
@@ -42,8 +44,8 @@ evaluate:
     "mcc",
   ]
   decision_threshold:
-    mode: best_f1_on_valid   # or "fixed"
-    value: 0.5               # used when mode is "fixed"
+    mode: fixed
+    value: 0.5
 ```
 
 ## Usage Pattern
@@ -67,7 +69,7 @@ append_csv_row(...)
 
 When `run_config.stages` contains `"evaluate"`, the stage:
 1.  Loads the checkpoint via `runtime.load_checkpoint()`.
-2.  Resolves the decision threshold (fixed or `best_f1_on_valid`).
+2.  Resolves the fixed PRING decision threshold (`0.5`).
 3.  Instantiates the Evaluator with the runtime's accelerator.
 4.  Runs the evaluation pass on the test set.
 5.  Writes the result to `logs/{model}/evaluate/{run_id}/evaluate.csv`.

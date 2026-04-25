@@ -140,20 +140,6 @@ class SequenceAwareModel(nn.Module):
         return {"logits": logits.unsqueeze(-1)}
 
 
-class GradModeProbeModel(nn.Module):
-    """Probe model that records gradient mode during evaluator forwards."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.grad_enabled_states: list[bool] = []
-
-    def forward(self, x: torch.Tensor, label: torch.Tensor) -> dict[str, torch.Tensor]:
-        del label
-        self.grad_enabled_states.append(torch.is_grad_enabled())
-        logits = x.sum(dim=1, keepdim=True)
-        return {"logits": logits}
-
-
 def test_trainer_runs_single_epoch() -> None:
     model = TinyModel()
     loader = DataLoader(TinyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
@@ -525,12 +511,11 @@ def test_compute_metrics_characterization_binary_metric_values() -> None:
     assert metrics["mcc"] == pytest.approx(0.0)
 
 
-def test_compute_metrics_respects_custom_decision_threshold() -> None:
+def test_compute_metrics_uses_fixed_pring_decision_threshold() -> None:
     evaluator = Evaluator(
         metrics=["accuracy", "precision", "recall", "f1"],
         loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
         accelerator=NoOpAccelerator(),
-        decision_threshold=0.3,
     )
     labels = torch.tensor([0, 0, 1, 1], dtype=torch.long)
     probabilities = torch.tensor([0.1, 0.4, 0.45, 0.8], dtype=torch.float32)
@@ -538,35 +523,20 @@ def test_compute_metrics_respects_custom_decision_threshold() -> None:
     metrics = evaluator._compute_metrics(labels=labels, probabilities=probabilities)
 
     assert metrics["accuracy"] == pytest.approx(0.75)
-    assert metrics["precision"] == pytest.approx(2.0 / 3.0)
-    assert metrics["recall"] == pytest.approx(1.0)
-    assert metrics["f1"] == pytest.approx(0.8)
+    assert metrics["precision"] == pytest.approx(1.0)
+    assert metrics["recall"] == pytest.approx(0.5)
+    assert metrics["f1"] == pytest.approx(2.0 / 3.0)
 
 
-def test_best_f1_threshold_prefers_validation_optimum() -> None:
-    labels = torch.tensor([0, 0, 1, 1], dtype=torch.long)
-    probabilities = torch.tensor([0.1, 0.4, 0.45, 0.8], dtype=torch.float32)
-
-    threshold = Evaluator.best_f1_threshold(labels=labels, probabilities=probabilities)
-
-    assert threshold == pytest.approx(0.45)
-
-
-def test_select_best_f1_threshold_disables_grad_tracking() -> None:
-    model = GradModeProbeModel()
-    loader = DataLoader(TinyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
-    evaluator = Evaluator(
-        metrics=["f1"],
-        loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
-        accelerator=NoOpAccelerator(),
-    )
-
-    threshold = evaluator.select_best_f1_threshold(
-        model=model,
-        data_loader=loader,
-        device=torch.device("cpu"),
-    )
-
-    assert 0.0 <= threshold <= 1.0
-    assert model.grad_enabled_states
-    assert model.grad_enabled_states == [False, False]
+def test_evaluator_rejects_non_pring_decision_threshold() -> None:
+    with pytest.raises(ValueError, match="decision_threshold must be 0.5"):
+        Evaluator(
+            metrics=["accuracy"],
+            loss_config=LossConfig(
+                loss_type="bce_with_logits",
+                pos_weight=1.0,
+                label_smoothing=0.0,
+            ),
+            accelerator=NoOpAccelerator(),
+            decision_threshold=0.3,
+        )

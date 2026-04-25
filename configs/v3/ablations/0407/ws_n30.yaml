@@ -1,12 +1,12 @@
 run_config:
-  stages: ["topology_finetune", "evaluate", "topology_evaluate"]
+  stages: ["evaluate", "topology_evaluate"]
   seed: 47
   train_run_id: 20260308_002906
   topology_finetune_run_id: "ws_n30"
   adapt_run_id: null
-  eval_run_id: "ws_n30"
-  topology_eval_run_id: "ws_n30"
-  load_checkpoint_path: "models/v3/train/20260308_002906/best_model.pth"
+  eval_run_id: "ws_n30_0.5"
+  topology_eval_run_id: "ws_n30_0.5"
+  load_checkpoint_path: "models/v3/topology_finetune/ws_n30/best_model.pth"
   save_best_only: true
 
 device_config:
@@ -121,7 +121,8 @@ topology_finetune:
 
 evaluate:
   decision_threshold:
-    mode: "best_f1_on_valid"
+    mode: "fixed"
+    value: 0.5
   metrics:
     - "auroc"
     - "auprc"
@@ -136,6 +137,7 @@ evaluate:
 topology_evaluate:
   inference_batch_size: 128
   decision_threshold:
-    mode: "best_f1_on_valid"
+    mode: "fixed"
+    value: 0.5
   save_pair_predictions: true
   report_baselines: "src/topology/baselines/pring_human_table2.json"

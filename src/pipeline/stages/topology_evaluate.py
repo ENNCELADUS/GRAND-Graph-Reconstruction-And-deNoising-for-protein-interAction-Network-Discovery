@@ -14,7 +14,7 @@ import torch.distributed as _dist
 from torch.utils.data import DataLoader, Dataset
 
 from src.embed import ensure_embeddings_ready
-from src.evaluate import Evaluator
+from src.evaluate import DEFAULT_DECISION_THRESHOLD
 from src.pipeline.loops import (
     forward_model,
     gather_indexed_predictions,
@@ -22,7 +22,6 @@ from src.pipeline.loops import (
 )
 from src.pipeline.runtime import AcceleratorLike, DistributedContext, PipelineRuntime
 from src.pipeline.stages.evaluate import _resolve_decision_threshold
-from src.pipeline.stages.train import _build_loss_config
 from src.topology import (
     evaluate_predicted_graph,
     load_human_table2_baselines,
@@ -465,12 +464,6 @@ def run_topology_evaluation_stage(
     device = runtime.device
     topology_cfg = _topology_config(config)
     evaluate_cfg = get_section(config, "evaluate")
-    training_cfg = get_section(config, "training_config")
-    device_cfg = get_section(config, "device_config")
-    use_amp = device.type == "cuda" and as_bool(
-        device_cfg.get("use_mixed_precision", False),
-        "device_config.use_mixed_precision",
-    )
     checkpoint_path_resolved = Path(checkpoint_path)
     model_name, _ = extract_model_kwargs(config)
     run_id = runtime.stage_run_id("topology_evaluate")
@@ -485,22 +478,11 @@ def run_topology_evaluation_stage(
     threshold_cfg: ConfigDict = {
         "decision_threshold": topology_cfg.get(
             "decision_threshold",
-            evaluate_cfg.get("decision_threshold", 0.5),
+            evaluate_cfg.get("decision_threshold", DEFAULT_DECISION_THRESHOLD),
         )
     }
-    threshold_probe = Evaluator(
-        metrics=["f1"],
-        loss_config=_build_loss_config(training_cfg),
-        use_amp=use_amp,
-        accelerator=runtime.accelerator,
-        gather_for_metrics=runtime.accelerator.use_distributed,
-    )
     decision_threshold, threshold_mode = _resolve_decision_threshold(
         eval_cfg=threshold_cfg,
-        evaluator=threshold_probe,
-        model=model,
-        dataloaders=dataloaders,
-        device=device,
     )
     if runtime.is_main_process:
         log_stage_event(logger, "decision_threshold", mode=threshold_mode, value=decision_threshold)

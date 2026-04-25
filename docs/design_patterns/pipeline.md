@@ -101,7 +101,7 @@ Runs SHOT domain adaptation when `training_config.domain_adaptation.enabled=true
 Assesses final model performance on the test set.
 
 1.  Loads the best available checkpoint (from adapt, topology_finetune, or train).
-2.  Resolves the decision threshold (fixed or `best_f1_on_valid`).
+2.  Resolves the fixed PRING decision threshold (`0.5`).
 3.  Computes all configured metrics via `Evaluator`.
 4.  Writes `evaluate.csv`.
 

@@ -12,7 +12,6 @@ from sklearn.metrics import (
     confusion_matrix,
     f1_score,
     matthews_corrcoef,
-    precision_recall_curve,
     precision_score,
     recall_score,
     roc_auc_score,
@@ -28,6 +27,7 @@ from src.utils.losses import binary_classification_loss
 BatchValue = object
 BatchInput = Mapping[str, BatchValue]
 BatchDict = dict[str, BatchValue]
+DEFAULT_DECISION_THRESHOLD = 0.5
 
 
 def _safe_float(value: float) -> float:
@@ -58,7 +58,7 @@ class Evaluator:
         loss_config: LossConfig,
         *,
         accelerator: AcceleratorLike,
-        decision_threshold: float = 0.5,
+        decision_threshold: float = DEFAULT_DECISION_THRESHOLD,
         use_amp: bool = False,
         gather_for_metrics: bool = False,
     ) -> None:
@@ -73,8 +73,8 @@ class Evaluator:
     def _validate_decision_threshold(decision_threshold: float) -> float:
         """Validate and normalize decision threshold."""
         threshold = float(decision_threshold)
-        if threshold < 0.0 or threshold > 1.0:
-            raise ValueError("decision_threshold must be in [0, 1]")
+        if threshold != DEFAULT_DECISION_THRESHOLD:
+            raise ValueError("decision_threshold must be 0.5")
         return threshold
 
     @staticmethod
@@ -252,56 +252,6 @@ class Evaluator:
             torch.cat(all_probs, dim=0),
             float(torch.cat(all_losses, dim=0).mean().item()),
         )
-
-    @staticmethod
-    def best_f1_threshold(labels: torch.Tensor, probabilities: torch.Tensor) -> float:
-        """Return the validation threshold that maximizes F1."""
-        if torch.unique(labels).numel() < 2:
-            return 0.5
-
-        label_array = labels.cpu().numpy()
-        prob_array = probabilities.cpu().numpy()
-        precision, recall, thresholds = precision_recall_curve(label_array, prob_array)
-        if len(thresholds) == 0:
-            return 0.5
-
-        best_threshold = 0.5
-        best_score = -1.0
-        best_distance_to_midpoint = float("inf")
-        for precision_value, recall_value, threshold in zip(
-            precision[:-1],
-            recall[:-1],
-            thresholds,
-            strict=False,
-        ):
-            denominator = precision_value + recall_value
-            f1_value = (
-                0.0 if denominator <= 0.0 else (2.0 * precision_value * recall_value) / denominator
-            )
-            threshold_value = float(threshold)
-            distance_to_midpoint = abs(threshold_value - 0.5)
-            if f1_value > best_score or (
-                math.isclose(f1_value, best_score)
-                and distance_to_midpoint < best_distance_to_midpoint
-            ):
-                best_score = float(f1_value)
-                best_threshold = threshold_value
-                best_distance_to_midpoint = distance_to_midpoint
-        return best_threshold
-
-    def select_best_f1_threshold(
-        self,
-        model: nn.Module,
-        data_loader: DataLoader[Mapping[str, object]],
-        device: torch.device,
-    ) -> float:
-        """Select decision threshold on a validation loader by F1."""
-        labels, probabilities, _ = self._collect_probabilities_and_labels(
-            model=model,
-            data_loader=data_loader,
-            device=device,
-        )
-        return self.best_f1_threshold(labels=labels, probabilities=probabilities)
 
     def collect_probabilities_and_labels(
         self,

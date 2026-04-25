@@ -11,7 +11,7 @@ from typing import Literal, cast
 import torch
 from torch import nn
 
-from src.evaluate import Evaluator
+from src.evaluate import DEFAULT_DECISION_THRESHOLD, Evaluator
 from src.model import V3, V3_1, V4, V5
 from src.pipeline.runtime import AcceleratorLike, PipelineRuntime
 from src.train.base import Trainer
@@ -303,6 +303,7 @@ def run_training_stage(
     evaluator = Evaluator(
         metrics=evaluator_metrics,
         loss_config=loss_config,
+        decision_threshold=DEFAULT_DECISION_THRESHOLD,
         use_amp=use_amp,
         accelerator=runtime.accelerator,
         gather_for_metrics=runtime.accelerator.use_distributed,

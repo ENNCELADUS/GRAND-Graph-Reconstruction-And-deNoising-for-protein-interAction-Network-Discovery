@@ -316,7 +316,7 @@ def test_pipeline_runtime_logs_once_to_console_for_multi_stage_runs(
     assert captured.err.count("Pipeline Runtime") == 1
 
 
-def test_evaluation_uses_best_f1_threshold_from_validation_and_logs_it(
+def test_evaluation_uses_fixed_pring_threshold_and_logs_it(
     tmp_path: Path,
 ) -> None:
     previous_cwd = Path.cwd()
@@ -328,7 +328,7 @@ def test_evaluation_uses_best_f1_threshold_from_validation_and_logs_it(
         run_cfg["load_checkpoint_path"] = "artifacts/input_checkpoint.pth"
         evaluate_cfg = config["evaluate"]
         assert isinstance(evaluate_cfg, dict)
-        evaluate_cfg["decision_threshold"] = {"mode": "best_f1_on_valid"}
+        evaluate_cfg["decision_threshold"] = {"mode": "fixed", "value": 0.5}
 
         dataloaders = _fake_dataloaders()
         model = _TinyModel()
@@ -356,7 +356,8 @@ def test_evaluation_uses_best_f1_threshold_from_validation_and_logs_it(
 
     log_text = eval_log.read_text(encoding="utf-8")
     assert "Decision Threshold" in log_text
-    assert "best_f1_on_valid" in log_text
+    assert "fixed" in log_text
+    assert "0.5000" in log_text
 
     csv_lines = eval_csv.read_text(encoding="utf-8").splitlines()
     assert len(csv_lines) == 2
@@ -372,11 +373,6 @@ def test_evaluation_worker_rank_runs_metrics_but_skips_artifact_writes(
     class _WorkerEvaluator:
         def __init__(self, *args: object, **kwargs: object) -> None:
             del args, kwargs
-
-        def select_best_f1_threshold(self, **kwargs: object) -> float:
-            del kwargs
-            observed_calls.append("threshold")
-            return 0.5
 
         def evaluate(self, **kwargs: object) -> dict[str, float]:
             del kwargs
@@ -400,7 +396,7 @@ def test_evaluation_worker_rank_runs_metrics_but_skips_artifact_writes(
         config = _base_config(stages=["evaluate"])
         evaluate_cfg = config["evaluate"]
         assert isinstance(evaluate_cfg, dict)
-        evaluate_cfg["decision_threshold"] = {"mode": "best_f1_on_valid"}
+        evaluate_cfg["decision_threshold"] = {"mode": "fixed", "value": 0.5}
 
         model = _TinyModel()
         checkpoint_path = tmp_path / "artifacts" / "worker_eval_checkpoint.pth"
@@ -433,7 +429,7 @@ def test_evaluation_worker_rank_runs_metrics_but_skips_artifact_writes(
 
     eval_dir = tmp_path / "logs" / "v3" / "evaluate" / "worker_eval_case"
     assert metrics["accuracy"] == 1.0
-    assert observed_calls == ["threshold", "evaluate"]
+    assert observed_calls == ["evaluate"]
     assert eval_dir.exists()
     assert not (eval_dir / "evaluate.csv").exists()
     assert not (eval_dir / "log.log").exists()
@@ -449,10 +445,6 @@ def test_run_evaluation_stage_propagates_mixed_precision_setting(
         def __init__(self, *args: object, use_amp: bool = False, **kwargs: object) -> None:
             del args, kwargs
             observed_use_amp.append(use_amp)
-
-        def select_best_f1_threshold(self, **kwargs: object) -> float:
-            del kwargs
-            return 0.5
 
         def evaluate(self, **kwargs: object) -> dict[str, float]:
             del kwargs
@@ -476,7 +468,7 @@ def test_run_evaluation_stage_propagates_mixed_precision_setting(
         device_cfg = cast(ConfigDict, config["device_config"])
         device_cfg["use_mixed_precision"] = True
         evaluate_cfg = cast(ConfigDict, config["evaluate"])
-        evaluate_cfg["decision_threshold"] = {"mode": "best_f1_on_valid"}
+        evaluate_cfg["decision_threshold"] = {"mode": "fixed", "value": 0.5}
 
         model = _TinyModel()
         checkpoint_path = tmp_path / "artifacts" / "amp_eval_checkpoint.pth"
@@ -500,4 +492,4 @@ def test_run_evaluation_stage_propagates_mixed_precision_setting(
     finally:
         os.chdir(previous_cwd)
 
-    assert observed_use_amp == [True, True]
+    assert observed_use_amp == [True]

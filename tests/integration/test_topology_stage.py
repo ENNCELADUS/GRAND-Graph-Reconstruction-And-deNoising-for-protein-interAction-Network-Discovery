@@ -203,10 +203,10 @@ def _build_topology_config(tmp_path: Path) -> ConfigDict:
         },
         "evaluate": {
             "metrics": ["auprc", "auroc"],
-            "decision_threshold": {"mode": "best_f1_on_valid"},
+            "decision_threshold": {"mode": "fixed", "value": 0.5},
         },
         "topology_evaluate": {
-            "decision_threshold": {"mode": "best_f1_on_valid"},
+            "decision_threshold": {"mode": "fixed", "value": 0.5},
             "save_pair_predictions": True,
             "report_baselines": str(baselines_path),
             "inference_batch_size": 2,
@@ -245,7 +245,8 @@ def test_run_topology_evaluation_stage_writes_expected_artifacts(tmp_path: Path)
 
     log_text = (log_dir / "log.log").read_text(encoding="utf-8")
     assert "Decision Threshold" in log_text
-    assert "best_f1_on_valid" in log_text
+    assert "fixed" in log_text
+    assert "0.5000" in log_text
 
 
 def _fake_sharded_topology_result(node_sizes: tuple[int, ...]) -> dict[str, object]:

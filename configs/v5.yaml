@@ -113,7 +113,8 @@ training_config:
 
 evaluate:
   decision_threshold:
-    mode: "best_f1_on_valid"
+    mode: "fixed"
+    value: 0.5
   metrics:
     - "auroc"
     - "auprc"

@@ -189,12 +189,12 @@ def _tiny_topology_config(tmp_path: Path) -> ConfigDict:
             "domain_adaptation": {"enabled": False, "method": "none", "target_split": "test"},
         },
         "evaluate": {
-            "decision_threshold": {"mode": "best_f1_on_valid"},
+            "decision_threshold": {"mode": "fixed", "value": 0.5},
             "metrics": ["auprc", "auroc", "accuracy", "f1", "precision", "recall"],
         },
         "topology_evaluate": {
             "inference_batch_size": 2,
-            "decision_threshold": {"mode": "best_f1_on_valid"},
+            "decision_threshold": {"mode": "fixed", "value": 0.5},
             "save_pair_predictions": True,
             "report_baselines": str(
                 REPO_ROOT / "src" / "topology" / "baselines" / "pring_human_table2.json"

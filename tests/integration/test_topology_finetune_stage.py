@@ -553,21 +553,19 @@ def test_build_internal_validation_node_sets_uses_graph_size_fallback_when_under
     assert all(nodes == ("P1", "P2", "P3") for nodes in node_sets[3])
 
 
-def test_resolve_internal_validation_threshold_uses_validation_selected_mode(
+def test_resolve_internal_validation_threshold_uses_fixed_pring_threshold(
     tmp_path: Path,
 ) -> None:
     config = _build_finetune_config(tmp_path)
     topology_cfg = config["topology_finetune"]
     assert isinstance(topology_cfg, dict)
-    topology_cfg["decision_threshold"] = {"mode": "best_f1_on_valid"}
+    topology_cfg["decision_threshold"] = {"mode": "fixed", "value": 0.5}
     threshold, mode = _resolve_internal_validation_threshold(
         config=config,
-        labels=torch.tensor([0, 1, 1, 0], dtype=torch.long),
-        probabilities=torch.tensor([0.1, 0.9, 0.8, 0.2], dtype=torch.float32),
     )
 
-    assert threshold == pytest.approx(0.8)
-    assert mode == "best_f1_on_valid"
+    assert threshold == pytest.approx(0.5)
+    assert mode == "fixed"
 
 
 def test_parse_loss_weight_schedule_reads_warmup_ramp_and_schedule(
@@ -990,14 +988,14 @@ def test_evaluate_internal_validation_subgraphs_shards_rank_local_work_and_merge
     assert processed_subgraph_indices == {0, 2}
 
 
-def test_run_topology_finetuning_stage_reuses_single_validation_pass_for_threshold(
+def test_run_topology_finetuning_stage_uses_fixed_threshold_after_validation_pass(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config = _build_finetune_config(tmp_path)
     topology_cfg = config["topology_finetune"]
     assert isinstance(topology_cfg, dict)
-    topology_cfg["decision_threshold"] = {"mode": "best_f1_on_valid"}
+    topology_cfg["decision_threshold"] = {"mode": "fixed", "value": 0.5}
     topology_cfg["epochs"] = 1
     model = build_model(config)
     checkpoint_path = Path(str(config["run_config"]["load_checkpoint_path"]))  # type: ignore[index]
@@ -1016,11 +1014,7 @@ def test_run_topology_finetuning_stage_reuses_single_validation_pass_for_thresho
         observed_collect_calls.append(1)
         return original_collect(self, model, data_loader, device)
 
-    def _unexpected_threshold_call(*args: object, **kwargs: object) -> float:
-        raise AssertionError("threshold selection should reuse collected validation outputs")
-
     monkeypatch.setattr(Evaluator, "collect_probabilities_and_labels", _record_collect)
-    monkeypatch.setattr(Evaluator, "select_best_f1_threshold", _unexpected_threshold_call)
 
     previous_cwd = Path.cwd()
     try:

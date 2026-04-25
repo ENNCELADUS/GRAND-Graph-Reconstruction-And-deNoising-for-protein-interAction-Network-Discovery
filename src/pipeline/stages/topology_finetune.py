@@ -20,7 +20,7 @@ from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader
 
 from src.embed import ensure_embeddings_ready
-from src.evaluate import Evaluator
+from src.evaluate import DEFAULT_DECISION_THRESHOLD, Evaluator
 from src.pipeline.loops import move_batch_to_device, reduce_scalar_mapping
 from src.pipeline.runtime import AcceleratorLike, DistributedContext, PipelineRuntime
 from src.pipeline.stages.train import _build_loss_config
@@ -705,10 +705,8 @@ def _resolve_embedding_cache_max_bytes(finetune_cfg: ConfigDict) -> int:
 def _resolve_internal_validation_threshold(
     *,
     config: ConfigDict,
-    labels: torch.Tensor,
-    probabilities: torch.Tensor,
 ) -> tuple[float, str]:
-    """Resolve the hard threshold used for internal topology validation."""
+    """Resolve the fixed hard threshold used for internal topology validation."""
     finetune_cfg = _topology_finetune_config(config)
     evaluate_cfg = config.get("evaluate", {})
     if not isinstance(evaluate_cfg, dict):
@@ -716,24 +714,26 @@ def _resolve_internal_validation_threshold(
 
     raw_threshold = finetune_cfg.get(
         "decision_threshold",
-        cast(ConfigDict, evaluate_cfg).get("decision_threshold", 0.5),
+        cast(ConfigDict, evaluate_cfg).get("decision_threshold", DEFAULT_DECISION_THRESHOLD),
     )
     if isinstance(raw_threshold, dict):
         mode = as_str(
             raw_threshold.get("mode", "fixed"),
             "topology_finetune.decision_threshold.mode",
         ).lower()
-        if mode == "fixed":
-            return (
-                as_float(raw_threshold.get("value", 0.5), "topology_finetune.decision_threshold"),
-                "fixed",
-            )
-        if mode == "best_f1_on_valid":
-            return (Evaluator.best_f1_threshold(labels=labels, probabilities=probabilities), mode)
-        raise ValueError(
-            "topology_finetune.decision_threshold.mode must be 'fixed' or 'best_f1_on_valid'"
+        if mode != "fixed":
+            raise ValueError("topology_finetune.decision_threshold.mode must be 'fixed'")
+        threshold = as_float(
+            raw_threshold.get("value", DEFAULT_DECISION_THRESHOLD),
+            "topology_finetune.decision_threshold",
         )
-    return (as_float(raw_threshold, "topology_finetune.decision_threshold"), "fixed")
+        if threshold != DEFAULT_DECISION_THRESHOLD:
+            raise ValueError("topology_finetune.decision_threshold must be 0.5")
+        return (threshold, "fixed")
+    threshold = as_float(raw_threshold, "topology_finetune.decision_threshold")
+    if threshold != DEFAULT_DECISION_THRESHOLD:
+        raise ValueError("topology_finetune.decision_threshold must be 0.5")
+    return (threshold, "fixed")
 
 
 def _move_chunk_to_device(
@@ -2352,8 +2352,6 @@ def _evaluate_validation_epoch(
     threshold_start = time.perf_counter()
     decision_threshold, _ = _resolve_internal_validation_threshold(
         config=config,
-        labels=labels,
-        probabilities=probabilities,
     )
     threshold_resolution_seconds = time.perf_counter() - threshold_start
     should_run_internal_validation = _should_run_internal_validation(

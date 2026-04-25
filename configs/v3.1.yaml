@@ -114,7 +114,8 @@ topology_finetune:
 
 evaluate:
   decision_threshold:
-    mode: "best_f1_on_valid"
+    mode: "fixed"
+    value: 0.5
   metrics:
     - "auroc"
     - "auprc"
@@ -129,6 +130,7 @@ evaluate:
 topology_evaluate:
   inference_batch_size: 32
   decision_threshold:
-    mode: "best_f1_on_valid"
+    mode: "fixed"
+    value: 0.5
   save_pair_predictions: true
   report_baselines: "src/topology/baselines/pring_human_table2.json"

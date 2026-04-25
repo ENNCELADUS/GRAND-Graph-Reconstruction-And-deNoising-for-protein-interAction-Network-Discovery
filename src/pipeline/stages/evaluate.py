@@ -7,7 +7,7 @@ from pathlib import Path
 
 import torch
 
-from src.evaluate import Evaluator
+from src.evaluate import DEFAULT_DECISION_THRESHOLD, Evaluator
 from src.pipeline.runtime import PipelineRuntime
 from src.pipeline.stages.train import _build_loss_config
 from src.utils.config import (
@@ -45,35 +45,31 @@ def _metrics_from_config(eval_cfg: ConfigDict) -> list[str]:
 def _resolve_decision_threshold(
     *,
     eval_cfg: ConfigDict,
-    evaluator: Evaluator,
-    model: torch.nn.Module,
-    dataloaders: dict[str, torch.utils.data.DataLoader[dict[str, object]]],
-    device: torch.device,
 ) -> tuple[float, str]:
-    """Resolve fixed or validation-selected decision threshold."""
-    raw_threshold = eval_cfg.get("decision_threshold", 0.5)
+    """Resolve the PRING-aligned fixed decision threshold."""
+    raw_threshold = eval_cfg.get("decision_threshold", DEFAULT_DECISION_THRESHOLD)
     field_name = "evaluate.decision_threshold"
     if isinstance(raw_threshold, bool):
         raise ValueError(f"{field_name} must be a number or mapping")
     if isinstance(raw_threshold, (int, float, str)):
-        return as_float(raw_threshold, field_name), "fixed"
+        threshold = as_float(raw_threshold, field_name)
+        if threshold != DEFAULT_DECISION_THRESHOLD:
+            raise ValueError(f"{field_name} must be fixed at 0.5")
+        return threshold, "fixed"
     if not isinstance(raw_threshold, dict):
         raise ValueError(f"{field_name} must be a number or mapping")
 
     threshold_cfg = raw_threshold
     mode = as_str(threshold_cfg.get("mode", "fixed"), f"{field_name}.mode").lower()
-    if mode == "fixed":
-        return as_float(threshold_cfg.get("value", 0.5), f"{field_name}.value"), mode
-    if mode == "best_f1_on_valid":
-        return (
-            evaluator.select_best_f1_threshold(
-                model=model,
-                data_loader=dataloaders["valid"],
-                device=device,
-            ),
-            mode,
-        )
-    raise ValueError("evaluate.decision_threshold.mode must be 'fixed' or 'best_f1_on_valid'")
+    if mode != "fixed":
+        raise ValueError("evaluate.decision_threshold.mode must be 'fixed'")
+    threshold = as_float(
+        threshold_cfg.get("value", DEFAULT_DECISION_THRESHOLD),
+        f"{field_name}.value",
+    )
+    if threshold != DEFAULT_DECISION_THRESHOLD:
+        raise ValueError(f"{field_name}.value must be 0.5")
+    return threshold, mode
 
 
 def run_evaluation_stage(
@@ -112,19 +108,8 @@ def run_evaluation_stage(
     configured_metrics = _metrics_from_config(eval_cfg)
     metrics_to_compute = sorted(set(configured_metrics + EVAL_CSV_COLUMNS[1:]))
     loss_config = _build_loss_config(training_cfg)
-    threshold_probe = Evaluator(
-        metrics=metrics_to_compute,
-        loss_config=loss_config,
-        use_amp=use_amp,
-        accelerator=runtime.accelerator,
-        gather_for_metrics=runtime.accelerator.use_distributed,
-    )
     decision_threshold, threshold_mode = _resolve_decision_threshold(
         eval_cfg=eval_cfg,
-        evaluator=threshold_probe,
-        model=model,
-        dataloaders=dataloaders,
-        device=device,
     )
     evaluator = Evaluator(
         metrics=metrics_to_compute,
