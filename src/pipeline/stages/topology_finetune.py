@@ -1055,6 +1055,18 @@ def _detach_loss_mapping(losses: Mapping[str, torch.Tensor]) -> dict[str, torch.
     return {name: loss.detach() for name, loss in losses.items()}
 
 
+def _unwrap_model_for_detached_forward(
+    *,
+    model: nn.Module,
+    accelerator: AcceleratorLike,
+) -> nn.Module:
+    """Return the module to use for no-grad chunk collection."""
+    unwrap_model = getattr(accelerator, "unwrap_model", None)
+    if callable(unwrap_model):
+        return cast(nn.Module, unwrap_model(model))
+    return model
+
+
 def _cat_padded_pair_embeddings(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
     """Concatenate padded pair embedding tensors with a shared sequence length."""
     if not tensors:
@@ -1494,8 +1506,12 @@ def _backward_chunked_subgraph_task(
     if gradnorm.enabled:
         raise ValueError("topology_finetune.chunked_backward does not support gradnorm.enabled")
 
-    pair_buffer = _collect_subgraph_pair_forward_buffer(
+    detached_forward_model = _unwrap_model_for_detached_forward(
         model=model,
+        accelerator=accelerator,
+    )
+    pair_buffer = _collect_subgraph_pair_forward_buffer(
+        model=detached_forward_model,
         graph=graph,
         nodes=task.nodes,
         assigned_positive_edges=task.assigned_positive_edges,
@@ -1514,7 +1530,7 @@ def _backward_chunked_subgraph_task(
 
     if task.assigned_negative_edges:
         supervised_buffer = _collect_supervised_pair_forward_buffer(
-            model=model,
+            model=detached_forward_model,
             task=task,
             cache_dir=cache_dir,
             embedding_index=embedding_index,
