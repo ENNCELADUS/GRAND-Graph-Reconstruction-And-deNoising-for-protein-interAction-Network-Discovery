@@ -1913,6 +1913,99 @@ def test_chunked_backward_detached_pass_bypasses_ddp_reducer_state(
     assert accelerator.backward_calls == 2
 
 
+def test_chunked_backward_replays_pair_chunks_with_same_rng_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["chunked_backward"] = True
+    topology_cfg["compute_clustering_mmd"] = False
+
+    class _StochasticPairModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
+            self.random_factors: list[tuple[bool, float]] = []
+
+        def forward(
+            self,
+            emb_a: torch.Tensor,
+            emb_b: torch.Tensor,
+            len_a: torch.Tensor,
+            len_b: torch.Tensor,
+            **_: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            del emb_b, len_a, len_b
+            random_factor = torch.rand((), dtype=emb_a.dtype, device=emb_a.device)
+            self.random_factors.append((torch.is_grad_enabled(), float(random_factor.detach())))
+            logits = emb_a.mean(dim=(1, 2)) * self.weight * random_factor
+            return {"logits": logits}
+
+    def _fake_iter_subgraph_pair_chunks(**kwargs: object) -> Sequence[SubgraphPairChunk]:
+        nodes = tuple(cast(Sequence[str], kwargs["nodes"]))
+        return (
+            SubgraphPairChunk(
+                nodes=nodes,
+                emb_a=torch.ones((2, 1, 4), dtype=torch.float32),
+                emb_b=torch.ones((2, 1, 4), dtype=torch.float32),
+                len_a=torch.ones(2, dtype=torch.long),
+                len_b=torch.ones(2, dtype=torch.long),
+                label=torch.tensor([1.0, 0.0], dtype=torch.float32),
+                pair_index_a=torch.tensor([0, 0], dtype=torch.long),
+                pair_index_b=torch.tensor([1, 2], dtype=torch.long),
+                bce_label=torch.tensor([1.0, 0.0], dtype=torch.float32),
+                bce_mask=torch.tensor([1.0, 1.0], dtype=torch.float32),
+            ),
+        )
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "iter_subgraph_pair_chunks",
+        _fake_iter_subgraph_pair_chunks,
+    )
+
+    model = _StochasticPairModel().train()
+    torch.manual_seed(123)
+
+    topology_finetune_stage._backward_chunked_subgraph_task(
+        config=config,
+        model=model,
+        graph=nx.Graph([("P1", "P2"), ("P2", "P3")]),
+        task=topology_finetune_stage.LocalSubgraphTask(
+            nodes=("P1", "P2", "P3"),
+            assigned_positive_edges=frozenset({("P1", "P2")}),
+            assigned_negative_edges=frozenset(),
+        ),
+        cache_dir=tmp_path,
+        embedding_index={},
+        input_dim=4,
+        max_sequence_length=8,
+        pair_batch_size=2,
+        device=torch.device("cpu"),
+        embedding_repository=cast(EmbeddingRepository, object()),
+        loss_weights=topology_finetune_stage.TopologyLossWeights(
+            alpha=0.2,
+            beta=0.3,
+            gamma=0.4,
+            delta=0.0,
+        ),
+        loss_normalization=topology_finetune_stage.TopologyLossNormalizationConfig(),
+        gradnorm=topology_finetune_stage.TopologyGradNormConfig(),
+        adaptive_loss_state=topology_finetune_stage.TopologyAdaptiveLossState(),
+        gradnorm_reference_parameters=(),
+        current_window_size=1,
+        accelerator=_RecordingAccelerator(),
+    )
+
+    no_grad_factors = [factor for grad_enabled, factor in model.random_factors if not grad_enabled]
+    grad_factors = [factor for grad_enabled, factor in model.random_factors if grad_enabled]
+    assert no_grad_factors
+    assert grad_factors
+    assert grad_factors[0] == pytest.approx(no_grad_factors[0])
+
+
 def test_fit_epoch_flushes_remainder_window_without_leaking_final_gradient(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

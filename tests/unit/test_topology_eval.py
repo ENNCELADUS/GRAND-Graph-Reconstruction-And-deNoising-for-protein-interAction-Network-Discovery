@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import networkx as nx
@@ -74,6 +75,24 @@ def test_compute_normalized_mmd_ratio_matches_pring_formula() -> None:
     normalized = compute_normalized_mmd_ratio(pred_samples, gt_samples)
 
     assert normalized == pytest.approx(numerator / denominator)
+
+
+def test_compute_normalized_mmd_ratio_uses_finite_epsilon_floor() -> None:
+    pred_samples = [
+        np.array([0.0, 1.0]),
+        np.array([0.0, 1.0]),
+    ]
+    gt_samples = [
+        np.array([1.0, 0.0]),
+        np.array([1.0, 0.0]),
+        np.array([1.0, 0.0]),
+        np.array([1.0, 0.0]),
+    ]
+
+    normalized = compute_normalized_mmd_ratio(pred_samples, gt_samples)
+
+    assert math.isfinite(normalized)
+    assert normalized > 0.0
 
 
 def test_evaluate_graph_samples_reports_normalized_degree_mmd() -> None:
