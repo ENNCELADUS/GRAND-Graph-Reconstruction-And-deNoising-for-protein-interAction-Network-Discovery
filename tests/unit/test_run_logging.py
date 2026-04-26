@@ -96,14 +96,14 @@ def test_ddp_find_unused_parameters_enables_shot_adaptation_by_default() -> None
     assert ddp_find_unused_parameters(config) is True
 
 
-def test_ddp_find_unused_parameters_enables_topology_chunked_backward_by_default() -> None:
+def test_ddp_find_unused_parameters_keeps_topology_chunked_backward_default_false() -> None:
     config = _base_config()
     run_cfg = config["run_config"]
     assert isinstance(run_cfg, dict)
     run_cfg["stages"] = ["topology_finetune", "evaluate", "topology_evaluate"]
     config["topology_finetune"] = {"chunked_backward": True}
 
-    assert ddp_find_unused_parameters(config) is True
+    assert ddp_find_unused_parameters(config) is False
 
 
 def test_pipeline_config_defaults_device_backend_to_ddp() -> None:
