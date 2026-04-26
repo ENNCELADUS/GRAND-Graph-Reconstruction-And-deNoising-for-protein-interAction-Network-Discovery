@@ -2006,6 +2006,145 @@ def test_chunked_backward_replays_pair_chunks_with_same_rng_state(
     assert grad_factors[0] == pytest.approx(no_grad_factors[0])
 
 
+def test_chunked_backward_sync_boundary_uses_single_ddp_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["chunked_backward"] = True
+    topology_cfg["compute_clustering_mmd"] = False
+
+    class _SyncRecordingAccelerator(_RecordingAccelerator):
+        def __init__(self) -> None:
+            super().__init__()
+            self._in_no_sync = False
+            self.backward_sync_flags: list[bool] = []
+
+        def backward(self, loss: torch.Tensor) -> None:
+            self.backward_calls += 1
+            self.backward_sync_flags.append(not self._in_no_sync)
+            loss.backward()
+
+        def no_sync(self, model: torch.nn.Module) -> object:
+            del model
+            self.no_sync_calls += 1
+            accelerator = self
+
+            class _NoSyncContext:
+                def __enter__(self) -> object:
+                    accelerator._in_no_sync = True
+                    return self
+
+                def __exit__(
+                    self,
+                    exc_type: object,
+                    exc_value: object,
+                    traceback: object,
+                ) -> None:
+                    del exc_type, exc_value, traceback
+                    accelerator._in_no_sync = False
+
+            return _NoSyncContext()
+
+    class _PairModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(0.25, dtype=torch.float32))
+
+        def forward(
+            self,
+            emb_a: torch.Tensor,
+            emb_b: torch.Tensor,
+            len_a: torch.Tensor,
+            len_b: torch.Tensor,
+            **_: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            del len_a, len_b
+            logits = (emb_a + emb_b).mean(dim=(1, 2)) * self.weight
+            return {"logits": logits}
+
+    def _fake_iter_subgraph_pair_chunks(**kwargs: object) -> Sequence[SubgraphPairChunk]:
+        nodes = tuple(cast(Sequence[str], kwargs["nodes"]))
+        return (
+            SubgraphPairChunk(
+                nodes=nodes,
+                emb_a=torch.ones((1, 1, 4), dtype=torch.float32),
+                emb_b=torch.ones((1, 1, 4), dtype=torch.float32),
+                len_a=torch.ones(1, dtype=torch.long),
+                len_b=torch.ones(1, dtype=torch.long),
+                label=torch.ones(1, dtype=torch.float32),
+                pair_index_a=torch.zeros(1, dtype=torch.long),
+                pair_index_b=torch.ones(1, dtype=torch.long),
+                bce_label=torch.ones(1, dtype=torch.float32),
+                bce_mask=torch.ones(1, dtype=torch.float32),
+            ),
+        )
+
+    def _fake_iter_supervised_pair_chunks(**_: object) -> Sequence[SubgraphPairChunk]:
+        return (
+            SubgraphPairChunk(
+                nodes=("P1", "P2", "P3"),
+                emb_a=torch.ones((1, 1, 4), dtype=torch.float32),
+                emb_b=torch.ones((1, 1, 4), dtype=torch.float32),
+                len_a=torch.ones(1, dtype=torch.long),
+                len_b=torch.ones(1, dtype=torch.long),
+                label=torch.ones(1, dtype=torch.float32),
+                pair_index_a=torch.zeros(1, dtype=torch.long),
+                pair_index_b=torch.ones(1, dtype=torch.long),
+                bce_label=torch.ones(1, dtype=torch.float32),
+                bce_mask=torch.ones(1, dtype=torch.float32),
+            ),
+        )
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "iter_subgraph_pair_chunks",
+        _fake_iter_subgraph_pair_chunks,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "iter_supervised_pair_chunks",
+        _fake_iter_supervised_pair_chunks,
+    )
+
+    accelerator = _SyncRecordingAccelerator()
+    accelerator.sync_gradients = True
+    topology_finetune_stage._backward_chunked_subgraph_task(
+        config=config,
+        model=_PairModel().train(),
+        graph=nx.Graph([("P1", "P2"), ("P2", "P3")]),
+        task=topology_finetune_stage.LocalSubgraphTask(
+            nodes=("P1", "P2", "P3"),
+            assigned_positive_edges=frozenset({("P1", "P2")}),
+            assigned_negative_edges=frozenset({("P1", "P3")}),
+        ),
+        cache_dir=tmp_path,
+        embedding_index={},
+        input_dim=4,
+        max_sequence_length=8,
+        pair_batch_size=2,
+        device=torch.device("cpu"),
+        embedding_repository=cast(EmbeddingRepository, object()),
+        loss_weights=topology_finetune_stage.TopologyLossWeights(
+            alpha=0.2,
+            beta=0.3,
+            gamma=0.4,
+            delta=0.0,
+        ),
+        loss_normalization=topology_finetune_stage.TopologyLossNormalizationConfig(),
+        gradnorm=topology_finetune_stage.TopologyGradNormConfig(),
+        adaptive_loss_state=topology_finetune_stage.TopologyAdaptiveLossState(),
+        gradnorm_reference_parameters=(),
+        current_window_size=1,
+        accelerator=accelerator,
+    )
+
+    assert accelerator.no_sync_calls == 1
+    assert accelerator.backward_sync_flags == [False, False, True]
+
+
 def test_fit_epoch_flushes_remainder_window_without_leaking_final_gradient(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
