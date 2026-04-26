@@ -1535,6 +1535,46 @@ def _backward_supervised_pair_chunks_from_gradients(
         raise ValueError("Replayed supervised-pair chunks do not match first-pass logits")
 
 
+def _backward_chunked_replay_sync_marker(
+    *,
+    model: nn.Module,
+    graph: nx.Graph,
+    nodes: Sequence[str],
+    assigned_positive_edges: frozenset[tuple[str, str]],
+    assigned_negative_edges: frozenset[tuple[str, str]],
+    cache_dir: Path,
+    embedding_index: Mapping[str, str],
+    input_dim: int,
+    max_sequence_length: int,
+    pair_batch_size: int,
+    device: torch.device,
+    embedding_repository: EmbeddingRepository,
+    accelerator: AcceleratorLike,
+) -> None:
+    """Run one zero-loss backward to synchronize DDP after no-sync chunk replay."""
+    rng_state = _capture_torch_rng_state(device)
+    try:
+        for chunk in iter_subgraph_pair_chunks(
+            graph=graph,
+            nodes=nodes,
+            assigned_positive_edges=assigned_positive_edges,
+            assigned_negative_edges=assigned_negative_edges,
+            cache_dir=cache_dir,
+            embedding_index=embedding_index,
+            input_dim=input_dim,
+            max_sequence_length=max_sequence_length,
+            pair_batch_size=pair_batch_size,
+            embedding_repository=embedding_repository,
+        ):
+            batch = _move_chunk_to_device(chunk=chunk, device=device)
+            logits = _squeeze_binary_logits(_forward_model(model=model, batch=batch)["logits"])
+            accelerator.backward(logits.sum() * 0.0)
+            return
+    finally:
+        _restore_torch_rng_state(rng_state)
+    raise ValueError("Chunked backward sync marker requires at least one pair chunk")
+
+
 def _backward_chunked_subgraph_task(
     *,
     config: ConfigDict,
@@ -1653,10 +1693,32 @@ def _backward_chunked_subgraph_task(
         supervised_proxy_logits=supervised_proxy_logits,
     )
     loss_scale = 0.0 if task.is_padding else 1.0 / float(current_window_size)
-    if supervised_buffer is not None and supervised_gradients is not None:
-        _backward_supervised_pair_chunks_from_gradients(
+    sync_replay_gradients = bool(accelerator.sync_gradients)
+    replay_sync_context = accelerator.no_sync(model) if sync_replay_gradients else nullcontext()
+    with replay_sync_context:
+        if supervised_buffer is not None and supervised_gradients is not None:
+            _backward_supervised_pair_chunks_from_gradients(
+                model=model,
+                task=task,
+                cache_dir=cache_dir,
+                embedding_index=embedding_index,
+                input_dim=input_dim,
+                max_sequence_length=max_sequence_length,
+                pair_batch_size=pair_batch_size,
+                device=device,
+                embedding_repository=embedding_repository,
+                logit_gradients=supervised_gradients,
+                chunk_sizes=supervised_buffer.chunk_sizes,
+                rng_states=supervised_buffer.rng_states,
+                loss_scale=loss_scale,
+                accelerator=accelerator,
+            )
+        _backward_subgraph_pair_chunks_from_gradients(
             model=model,
-            task=task,
+            graph=graph,
+            nodes=task.nodes,
+            assigned_positive_edges=task.assigned_positive_edges,
+            assigned_negative_edges=task.assigned_negative_edges,
             cache_dir=cache_dir,
             embedding_index=embedding_index,
             input_dim=input_dim,
@@ -1664,31 +1726,28 @@ def _backward_chunked_subgraph_task(
             pair_batch_size=pair_batch_size,
             device=device,
             embedding_repository=embedding_repository,
-            logit_gradients=supervised_gradients,
-            chunk_sizes=supervised_buffer.chunk_sizes,
-            rng_states=supervised_buffer.rng_states,
+            logit_gradients=pair_gradients,
+            chunk_sizes=pair_buffer.chunk_sizes,
+            rng_states=pair_buffer.rng_states,
             loss_scale=loss_scale,
             accelerator=accelerator,
         )
-    _backward_subgraph_pair_chunks_from_gradients(
-        model=model,
-        graph=graph,
-        nodes=task.nodes,
-        assigned_positive_edges=task.assigned_positive_edges,
-        assigned_negative_edges=task.assigned_negative_edges,
-        cache_dir=cache_dir,
-        embedding_index=embedding_index,
-        input_dim=input_dim,
-        max_sequence_length=max_sequence_length,
-        pair_batch_size=pair_batch_size,
-        device=device,
-        embedding_repository=embedding_repository,
-        logit_gradients=pair_gradients,
-        chunk_sizes=pair_buffer.chunk_sizes,
-        rng_states=pair_buffer.rng_states,
-        loss_scale=loss_scale,
-        accelerator=accelerator,
-    )
+    if sync_replay_gradients:
+        _backward_chunked_replay_sync_marker(
+            model=model,
+            graph=graph,
+            nodes=task.nodes,
+            assigned_positive_edges=task.assigned_positive_edges,
+            assigned_negative_edges=task.assigned_negative_edges,
+            cache_dir=cache_dir,
+            embedding_index=embedding_index,
+            input_dim=input_dim,
+            max_sequence_length=max_sequence_length,
+            pair_batch_size=pair_batch_size,
+            device=device,
+            embedding_repository=embedding_repository,
+            accelerator=accelerator,
+        )
     return ChunkedBackwardTaskResult(
         bce_loss=bce_loss.detach(),
         topology_losses=_detach_loss_mapping(topology_losses),

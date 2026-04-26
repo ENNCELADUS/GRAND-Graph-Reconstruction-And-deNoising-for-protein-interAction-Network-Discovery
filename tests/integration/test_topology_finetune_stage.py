@@ -1775,8 +1775,8 @@ def test_fit_epoch_chunked_backward_replays_pair_chunks_without_concat(
         distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
     )
 
-    assert forward_grad_modes == [False, False, True, True]
-    assert accelerator.backward_calls == 2
+    assert forward_grad_modes == [False, False, True, True, True]
+    assert accelerator.backward_calls == 3
     assert optimizer.step_calls == 1
     assert train_stats["planned_subgraphs"] == pytest.approx(1.0)
     assert train_stats["all_subgraph_pairs"] == pytest.approx(3.0)
@@ -1910,7 +1910,7 @@ def test_chunked_backward_detached_pass_bypasses_ddp_reducer_state(
 
     assert not wrapped_model.unreduced_no_grad_forward_seen
     assert result.total_loss.item() > 0.0
-    assert accelerator.backward_calls == 2
+    assert accelerator.backward_calls == 3
 
 
 def test_chunked_backward_replays_pair_chunks_with_same_rng_state(
