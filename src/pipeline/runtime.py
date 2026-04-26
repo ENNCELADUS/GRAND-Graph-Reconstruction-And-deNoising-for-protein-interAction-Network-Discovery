@@ -254,14 +254,6 @@ def ddp_find_unused_parameters(raw_config: dict[str, object]) -> bool:
     from src.pipeline.engine import selected_stages
 
     configured_stages = selected_stages(run_cfg)
-    if "topology_finetune" in configured_stages:
-        topology_finetune_cfg = get_section(config, "topology_finetune")
-        if as_bool(
-            topology_finetune_cfg.get("chunked_backward", False),
-            "topology_finetune.chunked_backward",
-        ):
-            return True
-
     training_cfg = get_section(config, "training_config")
     adaptation_cfg = training_cfg.get("domain_adaptation")
     has_explicit_adaptation_cfg = isinstance(adaptation_cfg, dict)
