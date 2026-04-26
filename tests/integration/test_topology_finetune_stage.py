@@ -1656,6 +1656,132 @@ def test_fit_epoch_accumulates_gradients_before_optimizer_step(
     assert optimizer.zero_grad_calls == 3
 
 
+def test_fit_epoch_chunked_backward_replays_pair_chunks_without_concat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_finetune_config(tmp_path)
+    topology_cfg = config["topology_finetune"]
+    assert isinstance(topology_cfg, dict)
+    topology_cfg["chunked_backward"] = True
+    topology_cfg["compute_clustering_mmd"] = False
+    topology_cfg["gradient_accumulation_steps"] = 1
+
+    graph = nx.Graph()
+    graph.add_edges_from([("P1", "P2"), ("P2", "P3")])
+    accelerator = NoOpAccelerator()
+    optimizer = _CountingOptimizer()
+    forward_grad_modes: list[bool] = []
+
+    def _fake_sample_edge_cover_subgraphs(**_: object) -> EdgeCoverEpochPlan:
+        return EdgeCoverEpochPlan(
+            subgraphs=(("P1", "P2", "P3"),),
+            assigned_positive_edges=(frozenset({("P1", "P2")}),),
+            assigned_negative_edges=(frozenset(),),
+            total_positive_edges=2,
+            covered_positive_edges=1,
+            positive_edge_coverage_ratio=0.5,
+            mean_positive_edge_reuse=1.0,
+        )
+
+    def _fake_iter_subgraph_pair_chunks(**kwargs: object) -> Sequence[SubgraphPairChunk]:
+        nodes = tuple(cast(Sequence[str], kwargs["nodes"]))
+        return (
+            SubgraphPairChunk(
+                nodes=nodes,
+                emb_a=torch.ones((2, 1, 4), dtype=torch.float32),
+                emb_b=torch.ones((2, 1, 4), dtype=torch.float32),
+                len_a=torch.ones(2, dtype=torch.long),
+                len_b=torch.ones(2, dtype=torch.long),
+                label=torch.tensor([1.0, 0.0], dtype=torch.float32),
+                pair_index_a=torch.tensor([0, 0], dtype=torch.long),
+                pair_index_b=torch.tensor([1, 2], dtype=torch.long),
+                bce_label=torch.tensor([1.0, 0.0], dtype=torch.float32),
+                bce_mask=torch.tensor([1.0, 0.0], dtype=torch.float32),
+            ),
+            SubgraphPairChunk(
+                nodes=nodes,
+                emb_a=torch.ones((1, 1, 4), dtype=torch.float32),
+                emb_b=torch.ones((1, 1, 4), dtype=torch.float32),
+                len_a=torch.ones(1, dtype=torch.long),
+                len_b=torch.ones(1, dtype=torch.long),
+                label=torch.ones(1, dtype=torch.float32),
+                pair_index_a=torch.ones(1, dtype=torch.long),
+                pair_index_b=torch.full((1,), 2, dtype=torch.long),
+                bce_label=torch.zeros(1, dtype=torch.float32),
+                bce_mask=torch.zeros(1, dtype=torch.float32),
+            ),
+        )
+
+    def _fake_forward_model(
+        *,
+        model: torch.nn.Module,
+        batch: Mapping[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        del model
+        forward_grad_modes.append(torch.is_grad_enabled())
+        batch_size = int(batch["label"].numel())
+        logits = torch.full(
+            (batch_size,),
+            0.25,
+            dtype=torch.float32,
+            requires_grad=torch.is_grad_enabled(),
+        )
+        return {"logits": logits}
+
+    def _unexpected_concat_logits_and_pairs(**_: object) -> tuple[torch.Tensor, ...]:
+        raise AssertionError("chunked backward must not concatenate all pair logits")
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "sample_edge_cover_subgraphs",
+        _fake_sample_edge_cover_subgraphs,
+    )
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "iter_subgraph_pair_chunks",
+        _fake_iter_subgraph_pair_chunks,
+    )
+    monkeypatch.setattr(topology_finetune_stage, "_forward_model", _fake_forward_model)
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_concat_logits_and_pairs",
+        _unexpected_concat_logits_and_pairs,
+    )
+
+    train_stats = topology_finetune_stage._fit_epoch(
+        config=config,
+        model=torch.nn.Linear(1, 1),
+        device=torch.device("cpu"),
+        graph=graph,
+        cache_dir=tmp_path,
+        embedding_index={},
+        optimizer=cast(torch.optim.Optimizer, optimizer),
+        epoch_index=0,
+        epoch_seed=11,
+        input_dim=4,
+        max_sequence_length=8,
+        loss_weights=topology_finetune_stage.TopologyLossWeights(
+            alpha=0.2,
+            beta=0.3,
+            gamma=0.4,
+            delta=0.0,
+        ),
+        pair_batch_size=2,
+        use_amp=False,
+        accelerator=accelerator,
+        embedding_repository=cast(EmbeddingRepository, object()),
+        negative_lookup=None,
+        distributed_context=DistributedContext(ddp_enabled=False, is_distributed=False),
+    )
+
+    assert forward_grad_modes == [False, False, True, True]
+    assert accelerator.backward_calls == 2
+    assert optimizer.step_calls == 1
+    assert train_stats["planned_subgraphs"] == pytest.approx(1.0)
+    assert train_stats["all_subgraph_pairs"] == pytest.approx(3.0)
+
+
 def test_fit_epoch_flushes_remainder_window_without_leaking_final_gradient(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2815,3 +2941,33 @@ def test_0426_large_n_ablation_configs_disable_finetune_clustering_mmd() -> None
         assert topology_cfg["subgraphs_per_forward"] == 1
         assert topology_eval_cfg["inference_batch_size"] == 128
         assert "compute_clustering_mmd" not in topology_eval_cfg
+
+
+def test_0426_chunked_backward_configs_cover_large_and_range_n() -> None:
+    for filename in ("ws_n80.yaml", "ws_n100.yaml"):
+        config = load_config(Path("configs/v3/ablations/0426") / filename)
+        topology_cfg = config["topology_finetune"]
+        assert isinstance(topology_cfg, dict)
+        assert topology_cfg["chunked_backward"] is True
+        assert topology_cfg["compute_clustering_mmd"] is False
+
+    expected_ranges = {
+        "ws_range_n20_60.yaml": [20, 60],
+        "ws_range_n40_80.yaml": [40, 80],
+        "ws_range_n20_100.yaml": [20, 100],
+    }
+    for filename, node_range in expected_ranges.items():
+        config = load_config(Path("configs/v3/ablations/0426") / filename)
+        run_cfg = config["run_config"]
+        topology_cfg = config["topology_finetune"]
+        assert isinstance(run_cfg, dict)
+        assert isinstance(topology_cfg, dict)
+
+        run_id = filename.removesuffix(".yaml")
+        assert run_cfg["topology_finetune_run_id"] == run_id
+        assert run_cfg["eval_run_id"] == run_id
+        assert run_cfg["topology_eval_run_id"] == run_id
+        assert topology_cfg["subgraph_node_range"] == node_range
+        assert topology_cfg["chunked_backward"] is True
+        assert topology_cfg["compute_clustering_mmd"] is False
+        assert topology_cfg["internal_validation_compute_clustering_mmd"] is False
