@@ -648,6 +648,48 @@ def test_validation_topology_loss_can_skip_clustering_mmd() -> None:
     assert loss == pytest.approx(expected)
 
 
+def test_internal_validation_can_skip_clustering_mmd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, bool] = {}
+
+    def _record_graph_sample_evaluation(**kwargs: object) -> dict[str, object]:
+        captured["include_clustering_stats"] = bool(kwargs["include_clustering_stats"])
+        return {
+            "summary": {
+                "graph_sim": 1.0,
+                "relative_density": 1.0,
+                "deg_dist_mmd": 0.0,
+                "cc_mmd": 0.0,
+            }
+        }
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "evaluate_graph_samples",
+        _record_graph_sample_evaluation,
+    )
+
+    summary = _evaluate_internal_validation_subgraphs(
+        model=torch.nn.Identity(),
+        validation_plan=topology_finetune_stage.InternalValidationPlan(
+            buckets=(),
+            protein_ids=frozenset(),
+            total_subgraphs=0,
+            total_pairs=0,
+        ),
+        embedding_repository=object(),  # type: ignore[arg-type]
+        inference_batch_size=1,
+        threshold=0.5,
+        device=torch.device("cpu"),
+        accelerator=NoOpAccelerator(),
+        compute_clustering_mmd=False,
+    )
+
+    assert captured["include_clustering_stats"] is False
+    assert summary["cc_mmd"] == pytest.approx(0.0)
+
+
 def test_resolve_monitor_value_prefers_weighted_total_for_val_loss() -> None:
     monitor_value = _resolve_monitor_value(
         monitor_metric="val_loss",
@@ -2533,6 +2575,8 @@ def test_evaluate_validation_epoch_skips_internal_topology_validation_during_war
         pair_batch_size=2,
         internal_validation_inference_batch_size=2,
         internal_validation_compute_spectral_stats=False,
+        compute_clustering_mmd=True,
+        internal_validation_compute_clustering_mmd=True,
         epochs=1,
         run_seed=11,
         use_amp=False,

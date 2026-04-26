@@ -142,6 +142,8 @@ class TopologyFinetuneStageContext:
     pair_batch_size: int
     internal_validation_inference_batch_size: int
     internal_validation_compute_spectral_stats: bool
+    compute_clustering_mmd: bool
+    internal_validation_compute_clustering_mmd: bool
     epochs: int
     run_seed: int
     use_amp: bool
@@ -669,6 +671,23 @@ def _resolve_internal_validation_compute_spectral_stats(finetune_cfg: ConfigDict
     )
 
 
+def _resolve_compute_clustering_mmd(finetune_cfg: ConfigDict) -> bool:
+    """Return whether topology fine-tuning should compute the O(n^3) clustering loss."""
+    return as_bool(
+        finetune_cfg.get("compute_clustering_mmd", True),
+        "topology_finetune.compute_clustering_mmd",
+    )
+
+
+def _resolve_internal_validation_compute_clustering_mmd(finetune_cfg: ConfigDict) -> bool:
+    """Return whether internal validation should compute clustering-coefficient MMD."""
+    default_value = finetune_cfg.get("compute_clustering_mmd", True)
+    return as_bool(
+        finetune_cfg.get("internal_validation_compute_clustering_mmd", default_value),
+        "topology_finetune.internal_validation_compute_clustering_mmd",
+    )
+
+
 def _resolve_internal_validation_inference_batch_size(finetune_cfg: ConfigDict) -> int:
     """Return the batch size used for internal validation inference only."""
     batch_size = as_int(
@@ -1100,6 +1119,49 @@ def _subgraph_adjacencies(
     return pred_adjacency, target_adjacency
 
 
+def _compute_train_topology_losses(
+    *,
+    weights: TopologyLossWeights,
+    num_nodes: int,
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    pair_index_a: torch.Tensor,
+    pair_index_b: torch.Tensor,
+    include_clustering_mmd: bool,
+) -> dict[str, torch.Tensor]:
+    """Compute train topology losses, avoiding dense adjacency when clustering is disabled."""
+    pred_pair_probabilities = torch.sigmoid(logits)
+    if not include_clustering_mmd:
+        return compute_topology_losses(
+            weights=weights,
+            num_nodes=num_nodes,
+            pair_index_a=pair_index_a,
+            pair_index_b=pair_index_b,
+            pred_pair_probabilities=pred_pair_probabilities,
+            target_pair_probabilities=labels,
+            include_clustering_mmd=False,
+        )
+
+    pred_adjacency, target_adjacency = _subgraph_adjacencies(
+        num_nodes=num_nodes,
+        logits=logits,
+        labels=labels,
+        pair_index_a=pair_index_a,
+        pair_index_b=pair_index_b,
+    )
+    return compute_topology_losses(
+        weights=weights,
+        pred_adjacency=pred_adjacency,
+        target_adjacency=target_adjacency,
+        num_nodes=num_nodes,
+        pair_index_a=pair_index_a,
+        pair_index_b=pair_index_b,
+        pred_pair_probabilities=pred_pair_probabilities,
+        target_pair_probabilities=labels,
+        include_clustering_mmd=True,
+    )
+
+
 def _build_optimizer(config: ConfigDict, model: nn.Module) -> Optimizer:
     """Build the fine-tuning optimizer."""
     finetune_cfg = _topology_finetune_config(config)
@@ -1292,6 +1354,7 @@ def _evaluate_internal_validation_subgraphs(
     device: torch.device,
     accelerator: AcceleratorLike,
     compute_spectral_stats: bool = False,
+    compute_clustering_mmd: bool = True,
 ) -> dict[str, float]:
     """Compute internal subgraph topology metrics on fixed validation samples."""
     pred_graphs_by_size: dict[int, list[nx.Graph]] = {}
@@ -1362,6 +1425,7 @@ def _evaluate_internal_validation_subgraphs(
         pred_graphs_by_size=pred_graphs_by_size,
         gt_graphs_by_size=target_graphs_by_size,
         include_spectral_stats=compute_spectral_stats,
+        include_clustering_stats=compute_clustering_mmd,
     )
     summary = cast(Mapping[str, float], result["summary"])
     return {
@@ -1711,12 +1775,13 @@ def _validation_topology_loss(
     *,
     loss_weights: TopologyLossWeights,
     internal_val_topology_stats: Mapping[str, float],
+    include_clustering_mmd: bool = True,
 ) -> float:
     """Return the weighted hard-metric topology penalty used in validation monitoring."""
     graph_similarity_loss = 1.0 - float(internal_val_topology_stats["graph_sim"])
     relative_density_loss = (float(internal_val_topology_stats["relative_density"]) - 1.0) ** 2
     degree_mmd = float(internal_val_topology_stats["deg_dist_mmd"])
-    clustering_mmd = float(internal_val_topology_stats["cc_mmd"])
+    clustering_mmd = float(internal_val_topology_stats["cc_mmd"]) if include_clustering_mmd else 0.0
     return (
         loss_weights.alpha * graph_similarity_loss
         + loss_weights.beta * relative_density_loss
@@ -1763,6 +1828,7 @@ def _fit_epoch(
     negative_ratio = _resolve_bce_negative_ratio(finetune_cfg)
     gradient_accumulation_steps = _resolve_gradient_accumulation_steps(finetune_cfg)
     subgraphs_per_forward = _resolve_subgraphs_per_forward(finetune_cfg)
+    compute_clustering_mmd = _resolve_compute_clustering_mmd(finetune_cfg)
     edge_chunk_size = _resolve_edge_chunk_size(
         finetune_cfg=finetune_cfg,
         max_nodes=max_nodes,
@@ -1909,22 +1975,14 @@ def _fit_epoch(
                                     bce_mask=all_pair_bce_mask,
                                     config=config,
                                 )
-                            pred_adjacency, target_adjacency = _subgraph_adjacencies(
+                            topology_losses = _compute_train_topology_losses(
+                                weights=effective_loss_weights,
                                 num_nodes=len(task.nodes),
                                 logits=logits,
                                 labels=labels,
                                 pair_index_a=pair_index_a,
                                 pair_index_b=pair_index_b,
-                            )
-                            topology_losses = compute_topology_losses(
-                                weights=effective_loss_weights,
-                                pred_adjacency=pred_adjacency,
-                                target_adjacency=target_adjacency,
-                                num_nodes=len(task.nodes),
-                                pair_index_a=pair_index_a,
-                                pair_index_b=pair_index_b,
-                                pred_pair_probabilities=torch.sigmoid(logits),
-                                target_pair_probabilities=labels,
+                                include_clustering_mmd=compute_clustering_mmd,
                             )
                             normalized_topology_losses = normalize_topology_loss_terms(
                                 raw_terms={
@@ -2072,22 +2130,14 @@ def _fit_epoch(
                                             bce_mask=supervised_result.bce_mask,
                                             config=config,
                                         )
-                                    pred_adjacency, target_adjacency = _subgraph_adjacencies(
+                                    topology_losses = _compute_train_topology_losses(
+                                        weights=effective_loss_weights,
                                         num_nodes=len(result.nodes),
                                         logits=result.logits,
                                         labels=result.labels,
                                         pair_index_a=result.pair_index_a,
                                         pair_index_b=result.pair_index_b,
-                                    )
-                                    topology_losses = compute_topology_losses(
-                                        weights=effective_loss_weights,
-                                        pred_adjacency=pred_adjacency,
-                                        target_adjacency=target_adjacency,
-                                        num_nodes=len(result.nodes),
-                                        pair_index_a=result.pair_index_a,
-                                        pair_index_b=result.pair_index_b,
-                                        pred_pair_probabilities=torch.sigmoid(result.logits),
-                                        target_pair_probabilities=result.labels,
+                                        include_clustering_mmd=compute_clustering_mmd,
                                     )
                                     normalized_topology_losses = normalize_topology_loss_terms(
                                         raw_terms={
@@ -2219,6 +2269,10 @@ def _prepare_topology_finetune_stage_context(
     internal_validation_compute_spectral_stats = (
         _resolve_internal_validation_compute_spectral_stats(finetune_cfg)
     )
+    compute_clustering_mmd = _resolve_compute_clustering_mmd(finetune_cfg)
+    internal_validation_compute_clustering_mmd = (
+        _resolve_internal_validation_compute_clustering_mmd(finetune_cfg)
+    )
     epochs = as_int(
         finetune_cfg.get("epochs", training_cfg.get("epochs", 1)),
         "topology_finetune.epochs",
@@ -2297,6 +2351,8 @@ def _prepare_topology_finetune_stage_context(
         pair_batch_size=pair_batch_size,
         internal_validation_inference_batch_size=internal_validation_inference_batch_size,
         internal_validation_compute_spectral_stats=internal_validation_compute_spectral_stats,
+        compute_clustering_mmd=compute_clustering_mmd,
+        internal_validation_compute_clustering_mmd=internal_validation_compute_clustering_mmd,
         epochs=epochs,
         run_seed=run_seed,
         use_amp=use_amp,
@@ -2371,6 +2427,7 @@ def _evaluate_validation_epoch(
             device=device,
             accelerator=context.evaluator.accelerator,
             compute_spectral_stats=context.internal_validation_compute_spectral_stats,
+            compute_clustering_mmd=context.internal_validation_compute_clustering_mmd,
         )
         internal_validation_seconds = time.perf_counter() - internal_validation_start
     else:
@@ -2380,6 +2437,7 @@ def _evaluate_validation_epoch(
     val_topology_loss = _validation_topology_loss(
         loss_weights=loss_weights,
         internal_val_topology_stats=internal_val_topology_stats,
+        include_clustering_mmd=context.internal_validation_compute_clustering_mmd,
     )
     return ValidationEpochResult(
         decision_threshold=decision_threshold,

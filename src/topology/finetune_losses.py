@@ -359,6 +359,7 @@ def compute_topology_losses(
     pair_index_b: torch.Tensor | None = None,
     pred_pair_probabilities: torch.Tensor | None = None,
     target_pair_probabilities: torch.Tensor | None = None,
+    include_clustering_mmd: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Return weighted graph-topology loss terms and their total."""
     use_pairwise_path = all(
@@ -416,33 +417,36 @@ def compute_topology_losses(
             weights=weights,
         )
 
-    if pred_adjacency is None:
-        assert num_nodes is not None
-        assert pair_index_a is not None
-        assert pair_index_b is not None
-        assert pred_pair_probabilities is not None
-        pred_adjacency = build_symmetric_adjacency(
-            num_nodes=num_nodes,
-            pair_index_a=pair_index_a,
-            pair_index_b=pair_index_b,
-            pair_probabilities=pred_pair_probabilities,
+    if include_clustering_mmd:
+        if pred_adjacency is None:
+            assert num_nodes is not None
+            assert pair_index_a is not None
+            assert pair_index_b is not None
+            assert pred_pair_probabilities is not None
+            pred_adjacency = build_symmetric_adjacency(
+                num_nodes=num_nodes,
+                pair_index_a=pair_index_a,
+                pair_index_b=pair_index_b,
+                pair_probabilities=pred_pair_probabilities,
+            )
+        if target_adjacency is None:
+            assert num_nodes is not None
+            assert pair_index_a is not None
+            assert pair_index_b is not None
+            assert target_pair_probabilities is not None
+            target_adjacency = build_symmetric_adjacency(
+                num_nodes=num_nodes,
+                pair_index_a=pair_index_a,
+                pair_index_b=pair_index_b,
+                pair_probabilities=target_pair_probabilities,
+            )
+        clustering_mmd = _clustering_distribution_mmd(
+            pred_adjacency=pred_adjacency,
+            target_adjacency=target_adjacency,
+            weights=weights,
         )
-    if target_adjacency is None:
-        assert num_nodes is not None
-        assert pair_index_a is not None
-        assert pair_index_b is not None
-        assert target_pair_probabilities is not None
-        target_adjacency = build_symmetric_adjacency(
-            num_nodes=num_nodes,
-            pair_index_a=pair_index_a,
-            pair_index_b=pair_index_b,
-            pair_probabilities=target_pair_probabilities,
-        )
-    clustering_mmd = _clustering_distribution_mmd(
-        pred_adjacency=pred_adjacency,
-        target_adjacency=target_adjacency,
-        weights=weights,
-    )
+    else:
+        clustering_mmd = graph_similarity.new_zeros(())
     total_topology = (
         weights.alpha * graph_similarity
         + weights.beta * relative_density

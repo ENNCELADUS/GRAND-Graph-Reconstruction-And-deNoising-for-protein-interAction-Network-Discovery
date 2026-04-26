@@ -814,9 +814,7 @@ def test_compute_topology_losses_can_skip_clustering_mmd(monkeypatch: pytest.Mon
     )
 
     expected_total = (
-        0.5 * losses["graph_similarity"]
-        + losses["relative_density"]
-        + 0.3 * losses["degree_mmd"]
+        0.5 * losses["graph_similarity"] + losses["relative_density"] + 0.3 * losses["degree_mmd"]
     )
     assert losses["clustering_mmd"].item() == pytest.approx(0.0)
     assert losses["total_topology"].item() == pytest.approx(expected_total.item())

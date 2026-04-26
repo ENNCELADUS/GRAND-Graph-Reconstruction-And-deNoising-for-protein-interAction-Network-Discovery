@@ -208,6 +208,7 @@ def evaluate_graph_samples(
     pred_graphs_by_size: Mapping[int, list[nx.Graph]],
     gt_graphs_by_size: Mapping[int, list[nx.Graph]],
     include_spectral_stats: bool = True,
+    include_clustering_stats: bool = True,
 ) -> dict[str, Any]:
     """Evaluate predicted and ground-truth graph samples grouped by node size."""
     if set(pred_graphs_by_size) != set(gt_graphs_by_size):
@@ -258,7 +259,7 @@ def evaluate_graph_samples(
             pred_graph = normalized_pred_graph
 
         deg_dist_mmd = compute_mmd(pred_deg_dist, gt_deg_dist)
-        cc_mmd = clustering_stats(gt_graphs, pred_graphs)
+        cc_mmd = clustering_stats(gt_graphs, pred_graphs) if include_clustering_stats else 0.0
 
         graph_level_results["graph_sim"][node_size] = graph_sim_values
         graph_level_results["relative_density"][node_size] = density_values
