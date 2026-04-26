@@ -16,8 +16,8 @@ from src.pipeline.stages.topology_evaluate import (
     write_topology_predictions,
 )
 from src.topology.metrics import (
-    compute_mmd,
     compute_graph_similarity,
+    compute_mmd,
     compute_normalized_mmd_ratio,
     compute_relative_density,
     degree_distribution,

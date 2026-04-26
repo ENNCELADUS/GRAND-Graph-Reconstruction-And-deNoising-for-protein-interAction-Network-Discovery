@@ -13,6 +13,7 @@ from scipy.linalg import eigvalsh
 
 MetricDict = dict[str, dict[int, list[float] | float]]
 KernelFn = Callable[[np.ndarray, np.ndarray], float]
+EPSILON = 1.0e-12
 
 
 def reconstruct_graph(ppis: Iterable[tuple[str, str]]) -> nx.Graph:
@@ -116,6 +117,44 @@ def compute_mmd(
     )
 
 
+def _split_reference_samples(
+    samples: list[np.ndarray],
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Return deterministic disjoint reference samples for paper-style normalization."""
+    return samples[::2], samples[1::2]
+
+
+def compute_normalized_mmd_ratio(
+    pred_samples: list[np.ndarray],
+    gt_samples: list[np.ndarray],
+    *,
+    kernel: KernelFn = gaussian_tv,
+    is_hist: bool = True,
+) -> float:
+    """Compute PRING paper-style normalized MMD ratio.
+
+    PRING reports ``MMD(pred, test) / MMD(test, test)`` for degree,
+    clustering-coefficient, and spectral metrics. With finite sampled graphs,
+    the reference denominator is estimated from a deterministic even/odd split
+    of the ground-truth sample bucket.
+    """
+    numerator = compute_mmd(pred_samples, gt_samples, kernel=kernel, is_hist=is_hist)
+    if len(gt_samples) < 2:
+        return numerator
+    reference_left, reference_right = _split_reference_samples(gt_samples)
+    if not reference_left or not reference_right:
+        return numerator
+    denominator = compute_mmd(
+        reference_left,
+        reference_right,
+        kernel=kernel,
+        is_hist=is_hist,
+    )
+    if denominator <= EPSILON:
+        return 0.0 if numerator <= EPSILON else float("inf")
+    return float(numerator / denominator)
+
+
 def degree_distribution(pred_graph: nx.Graph, gt_graph: nx.Graph) -> tuple[np.ndarray, np.ndarray]:
     """Return degree histograms for a predicted and ground-truth subgraph."""
     pred_histogram = np.array(nx.degree_histogram(pred_graph))
@@ -139,7 +178,7 @@ def clustering_worker(graph: nx.Graph) -> np.ndarray:
 
 
 def clustering_stats(graph_ref_list: list[nx.Graph], graph_pred_list: list[nx.Graph]) -> float:
-    """Compute clustering-coefficient MMD."""
+    """Compute paper-normalized clustering-coefficient MMD."""
     sample_ref: list[np.ndarray] = []
     sample_pred: list[np.ndarray] = []
     pred_graphs_non_empty = [graph for graph in graph_pred_list if graph.number_of_nodes() != 0]
@@ -149,7 +188,7 @@ def clustering_stats(graph_ref_list: list[nx.Graph], graph_pred_list: list[nx.Gr
     with concurrent.futures.ThreadPoolExecutor() as executor:
         for histogram in executor.map(clustering_worker, pred_graphs_non_empty):
             sample_pred.append(histogram)
-    return compute_mmd(sample_ref, sample_pred, kernel=gaussian_tv)
+    return compute_normalized_mmd_ratio(sample_pred, sample_ref, kernel=gaussian_tv)
 
 
 def spectral_worker(graph: nx.Graph, n_eigvals: int = -1) -> np.ndarray:
@@ -171,7 +210,7 @@ def spectral_stats(
     *,
     n_eigvals: int = -1,
 ) -> float:
-    """Compute Laplacian-eigenvalue MMD."""
+    """Compute paper-normalized Laplacian-eigenvalue MMD."""
     sample_ref: list[np.ndarray] = []
     sample_pred: list[np.ndarray] = []
     kernel = partial(spectral_worker, n_eigvals=n_eigvals)
@@ -181,7 +220,7 @@ def spectral_stats(
     with concurrent.futures.ThreadPoolExecutor() as executor:
         for histogram in executor.map(kernel, graph_pred_list):
             sample_pred.append(histogram)
-    return compute_mmd(sample_ref, sample_pred, kernel=gaussian_tv)
+    return compute_normalized_mmd_ratio(sample_pred, sample_ref, kernel=gaussian_tv)
 
 
 def _summary_metric_value(
@@ -258,7 +297,7 @@ def evaluate_graph_samples(
             gt_deg_dist.append(deg_gt)
             pred_graph = normalized_pred_graph
 
-        deg_dist_mmd = compute_mmd(pred_deg_dist, gt_deg_dist)
+        deg_dist_mmd = compute_normalized_mmd_ratio(pred_deg_dist, gt_deg_dist)
         cc_mmd = clustering_stats(gt_graphs, pred_graphs) if include_clustering_stats else 0.0
 
         graph_level_results["graph_sim"][node_size] = graph_sim_values

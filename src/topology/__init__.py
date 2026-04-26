@@ -25,6 +25,7 @@ from src.topology.finetune_losses import (
 )
 from src.topology.metrics import (
     compute_graph_similarity,
+    compute_normalized_mmd_ratio,
     compute_relative_density,
     evaluate_graph_samples,
     evaluate_predicted_graph,
@@ -49,6 +50,7 @@ __all__ = [
     "build_symmetric_adjacency",
     "build_human_table2_rows",
     "compute_graph_similarity",
+    "compute_normalized_mmd_ratio",
     "compute_relative_density",
     "compute_topology_losses",
     "evaluate_graph_samples",
