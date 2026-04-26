@@ -210,6 +210,7 @@ class SubgraphPairForwardBuffer:
     pair_index_a: torch.Tensor
     pair_index_b: torch.Tensor
     chunk_sizes: tuple[int, ...]
+    rng_states: tuple[TorchRngState, ...]
 
 
 @dataclass(frozen=True)
@@ -220,6 +221,16 @@ class SupervisedPairForwardBuffer:
     bce_labels: torch.Tensor
     bce_mask: torch.Tensor
     chunk_sizes: tuple[int, ...]
+    rng_states: tuple[TorchRngState, ...]
+
+
+@dataclass(frozen=True)
+class TorchRngState:
+    """Torch RNG state needed to replay stochastic train-mode forwards."""
+
+    cpu: torch.Tensor
+    cuda: torch.Tensor | None = None
+    cuda_device: torch.device | None = None
 
 
 @dataclass(frozen=True)
@@ -939,6 +950,24 @@ def _concat_logits_and_pairs(
     )
 
 
+def _capture_torch_rng_state(device: torch.device) -> TorchRngState:
+    """Capture CPU and active CUDA RNG state before a stochastic forward pass."""
+    if device.type == "cuda" and torch.cuda.is_available():
+        return TorchRngState(
+            cpu=torch.get_rng_state(),
+            cuda=torch.cuda.get_rng_state(device),
+            cuda_device=device,
+        )
+    return TorchRngState(cpu=torch.get_rng_state())
+
+
+def _restore_torch_rng_state(rng_state: TorchRngState) -> None:
+    """Restore a previously captured Torch RNG state."""
+    torch.set_rng_state(rng_state.cpu)
+    if rng_state.cuda is not None and rng_state.cuda_device is not None:
+        torch.cuda.set_rng_state(rng_state.cuda, rng_state.cuda_device)
+
+
 def _collect_subgraph_pair_forward_buffer(
     *,
     model: nn.Module,
@@ -962,10 +991,10 @@ def _collect_subgraph_pair_forward_buffer(
     pair_index_a_list: list[torch.Tensor] = []
     pair_index_b_list: list[torch.Tensor] = []
     chunk_sizes: list[int] = []
+    rng_states: list[TorchRngState] = []
 
     with torch.no_grad():
-        for _, batch, logits in _iter_subgraph_forward_passes(
-            model=model,
+        for chunk in iter_subgraph_pair_chunks(
             graph=graph,
             nodes=nodes,
             assigned_positive_edges=assigned_positive_edges,
@@ -975,9 +1004,11 @@ def _collect_subgraph_pair_forward_buffer(
             input_dim=input_dim,
             max_sequence_length=max_sequence_length,
             pair_batch_size=pair_batch_size,
-            device=device,
             embedding_repository=embedding_repository,
         ):
+            batch = _move_chunk_to_device(chunk=chunk, device=device)
+            rng_state = _capture_torch_rng_state(device)
+            logits = _squeeze_binary_logits(_forward_model(model=model, batch=batch)["logits"])
             detached_logits = logits.detach()
             logits_list.append(detached_logits)
             labels_list.append(batch["label"].detach().float())
@@ -986,6 +1017,7 @@ def _collect_subgraph_pair_forward_buffer(
             pair_index_a_list.append(batch["pair_index_a"].detach())
             pair_index_b_list.append(batch["pair_index_b"].detach())
             chunk_sizes.append(int(detached_logits.numel()))
+            rng_states.append(rng_state)
 
     return SubgraphPairForwardBuffer(
         logits=torch.cat(logits_list, dim=0),
@@ -995,6 +1027,7 @@ def _collect_subgraph_pair_forward_buffer(
         pair_index_a=torch.cat(pair_index_a_list, dim=0),
         pair_index_b=torch.cat(pair_index_b_list, dim=0),
         chunk_sizes=tuple(chunk_sizes),
+        rng_states=tuple(rng_states),
     )
 
 
@@ -1015,6 +1048,7 @@ def _collect_supervised_pair_forward_buffer(
     labels_list: list[torch.Tensor] = []
     mask_list: list[torch.Tensor] = []
     chunk_sizes: list[int] = []
+    rng_states: list[TorchRngState] = []
 
     with torch.no_grad():
         for chunk in iter_supervised_pair_chunks(
@@ -1028,12 +1062,14 @@ def _collect_supervised_pair_forward_buffer(
             embedding_repository=embedding_repository,
         ):
             batch = _move_chunk_to_device(chunk=chunk, device=device)
+            rng_state = _capture_torch_rng_state(device)
             logits = _squeeze_binary_logits(_forward_model(model=model, batch=batch)["logits"])
             detached_logits = logits.detach()
             logits_list.append(detached_logits)
             labels_list.append(batch["bce_label"].detach().float())
             mask_list.append(batch["bce_mask"].detach().float())
             chunk_sizes.append(int(detached_logits.numel()))
+            rng_states.append(rng_state)
 
     if not logits_list:
         return SupervisedPairForwardBuffer(
@@ -1041,12 +1077,14 @@ def _collect_supervised_pair_forward_buffer(
             bce_labels=torch.zeros(0, dtype=torch.float32, device=device),
             bce_mask=torch.zeros(0, dtype=torch.float32, device=device),
             chunk_sizes=(),
+            rng_states=(),
         )
     return SupervisedPairForwardBuffer(
         logits=torch.cat(logits_list, dim=0),
         bce_labels=torch.cat(labels_list, dim=0),
         bce_mask=torch.cat(mask_list, dim=0),
         chunk_sizes=tuple(chunk_sizes),
+        rng_states=tuple(rng_states),
     )
 
 
@@ -1392,14 +1430,14 @@ def _backward_subgraph_pair_chunks_from_gradients(
     embedding_repository: EmbeddingRepository,
     logit_gradients: torch.Tensor,
     chunk_sizes: Sequence[int],
+    rng_states: Sequence[TorchRngState],
     loss_scale: float,
     accelerator: AcceleratorLike,
 ) -> None:
     """Replay all-pair chunks and backpropagate precomputed logit gradients."""
     offset = 0
     chunk_index = 0
-    for _, _, logits in _iter_subgraph_forward_passes(
-        model=model,
+    for chunk in iter_subgraph_pair_chunks(
         graph=graph,
         nodes=nodes,
         assigned_positive_edges=assigned_positive_edges,
@@ -1409,9 +1447,13 @@ def _backward_subgraph_pair_chunks_from_gradients(
         input_dim=input_dim,
         max_sequence_length=max_sequence_length,
         pair_batch_size=pair_batch_size,
-        device=device,
         embedding_repository=embedding_repository,
     ):
+        if chunk_index >= len(rng_states):
+            raise ValueError("Replayed subgraph-pair chunk count exceeds first-pass RNG states")
+        _restore_torch_rng_state(rng_states[chunk_index])
+        batch = _move_chunk_to_device(chunk=chunk, device=device)
+        logits = _squeeze_binary_logits(_forward_model(model=model, batch=batch)["logits"])
         chunk_size = int(logits.numel())
         _validate_replayed_chunk_size(
             observed_size=chunk_size,
@@ -1427,7 +1469,11 @@ def _backward_subgraph_pair_chunks_from_gradients(
         accelerator.backward(chunk_loss * loss_scale)
         offset += chunk_size
         chunk_index += 1
-    if offset != int(logit_gradients.numel()) or chunk_index != len(chunk_sizes):
+    if (
+        offset != int(logit_gradients.numel())
+        or chunk_index != len(chunk_sizes)
+        or chunk_index != len(rng_states)
+    ):
         raise ValueError("Replayed subgraph-pair chunks do not match first-pass logits")
 
 
@@ -1444,6 +1490,7 @@ def _backward_supervised_pair_chunks_from_gradients(
     embedding_repository: EmbeddingRepository,
     logit_gradients: torch.Tensor,
     chunk_sizes: Sequence[int],
+    rng_states: Sequence[TorchRngState],
     loss_scale: float,
     accelerator: AcceleratorLike,
 ) -> None:
@@ -1460,6 +1507,9 @@ def _backward_supervised_pair_chunks_from_gradients(
         pair_batch_size=pair_batch_size,
         embedding_repository=embedding_repository,
     ):
+        if chunk_index >= len(rng_states):
+            raise ValueError("Replayed supervised-pair chunk count exceeds first-pass RNG states")
+        _restore_torch_rng_state(rng_states[chunk_index])
         batch = _move_chunk_to_device(chunk=chunk, device=device)
         logits = _squeeze_binary_logits(_forward_model(model=model, batch=batch)["logits"])
         chunk_size = int(logits.numel())
@@ -1477,7 +1527,11 @@ def _backward_supervised_pair_chunks_from_gradients(
         accelerator.backward(chunk_loss * loss_scale)
         offset += chunk_size
         chunk_index += 1
-    if offset != int(logit_gradients.numel()) or chunk_index != len(chunk_sizes):
+    if (
+        offset != int(logit_gradients.numel())
+        or chunk_index != len(chunk_sizes)
+        or chunk_index != len(rng_states)
+    ):
         raise ValueError("Replayed supervised-pair chunks do not match first-pass logits")
 
 
@@ -1612,6 +1666,7 @@ def _backward_chunked_subgraph_task(
             embedding_repository=embedding_repository,
             logit_gradients=supervised_gradients,
             chunk_sizes=supervised_buffer.chunk_sizes,
+            rng_states=supervised_buffer.rng_states,
             loss_scale=loss_scale,
             accelerator=accelerator,
         )
@@ -1630,6 +1685,7 @@ def _backward_chunked_subgraph_task(
         embedding_repository=embedding_repository,
         logit_gradients=pair_gradients,
         chunk_sizes=pair_buffer.chunk_sizes,
+        rng_states=pair_buffer.rng_states,
         loss_scale=loss_scale,
         accelerator=accelerator,
     )

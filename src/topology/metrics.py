@@ -150,9 +150,7 @@ def compute_normalized_mmd_ratio(
         kernel=kernel,
         is_hist=is_hist,
     )
-    if denominator <= EPSILON:
-        return 0.0 if numerator <= EPSILON else float("inf")
-    return float(numerator / denominator)
+    return float(numerator / max(denominator, EPSILON))
 
 
 def degree_distribution(pred_graph: nx.Graph, gt_graph: nx.Graph) -> tuple[np.ndarray, np.ndarray]:
