@@ -787,6 +787,41 @@ def test_compute_topology_losses_returns_weighted_total() -> None:
     assert losses["total_topology"].item() == pytest.approx(expected_total.item())
 
 
+def test_compute_topology_losses_can_skip_clustering_mmd(monkeypatch: pytest.MonkeyPatch) -> None:
+    pair_index_a = torch.tensor([0, 0, 1], dtype=torch.long)
+    pair_index_b = torch.tensor([1, 2, 2], dtype=torch.long)
+    pred_pair_probabilities = torch.tensor([0.9, 0.1, 0.8], dtype=torch.float32)
+    target_pair_probabilities = torch.tensor([1.0, 0.0, 1.0], dtype=torch.float32)
+    weights = TopologyLossWeights(alpha=0.5, beta=1.0, gamma=0.3, delta=0.2)
+
+    def _unexpected_clustering_mmd(**_: object) -> torch.Tensor:
+        raise AssertionError("clustering MMD should be skipped for topology finetune")
+
+    monkeypatch.setattr(
+        finetune_losses_module,
+        "_clustering_distribution_mmd",
+        _unexpected_clustering_mmd,
+    )
+
+    losses = compute_topology_losses(
+        weights=weights,
+        num_nodes=3,
+        pair_index_a=pair_index_a,
+        pair_index_b=pair_index_b,
+        pred_pair_probabilities=pred_pair_probabilities,
+        target_pair_probabilities=target_pair_probabilities,
+        include_clustering_mmd=False,
+    )
+
+    expected_total = (
+        0.5 * losses["graph_similarity"]
+        + losses["relative_density"]
+        + 0.3 * losses["degree_mmd"]
+    )
+    assert losses["clustering_mmd"].item() == pytest.approx(0.0)
+    assert losses["total_topology"].item() == pytest.approx(expected_total.item())
+
+
 def test_compute_topology_losses_pairwise_path_matches_dense_path() -> None:
     pair_index_a = torch.tensor([0, 0, 1], dtype=torch.long)
     pair_index_b = torch.tensor([1, 2, 2], dtype=torch.long)

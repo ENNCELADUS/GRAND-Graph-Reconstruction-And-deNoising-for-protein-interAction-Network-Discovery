@@ -627,6 +627,27 @@ def test_validation_topology_loss_matches_weighted_hard_metric_penalties() -> No
     assert loss == pytest.approx(expected)
 
 
+def test_validation_topology_loss_can_skip_clustering_mmd() -> None:
+    loss = topology_finetune_stage._validation_topology_loss(
+        loss_weights=topology_finetune_stage.TopologyLossWeights(
+            alpha=0.5,
+            beta=1.0,
+            gamma=0.3,
+            delta=0.2,
+        ),
+        internal_val_topology_stats={
+            "graph_sim": 0.8,
+            "relative_density": 1.1,
+            "deg_dist_mmd": 0.4,
+            "cc_mmd": 999.0,
+        },
+        include_clustering_mmd=False,
+    )
+
+    expected = 0.5 * (1.0 - 0.8) + (1.1 - 1.0) ** 2 + 0.3 * 0.4
+    assert loss == pytest.approx(expected)
+
+
 def test_resolve_monitor_value_prefers_weighted_total_for_val_loss() -> None:
     monitor_value = _resolve_monitor_value(
         monitor_metric="val_loss",
@@ -2720,3 +2741,33 @@ def test_0407_ablation_configs_use_warm_start_val_loss_recipe() -> None:
         topology_eval_cfg = config["topology_evaluate"]
         assert isinstance(topology_eval_cfg, dict)
         assert topology_eval_cfg["inference_batch_size"] == 128
+
+
+def test_0426_large_n_ablation_configs_disable_finetune_clustering_mmd() -> None:
+    expected_node_sizes = {
+        "ws_n60.yaml": 60,
+        "ws_n80.yaml": 80,
+        "ws_n100.yaml": 100,
+    }
+
+    for filename, node_size in expected_node_sizes.items():
+        config_path = Path("configs/v3/ablations/0426") / filename
+        config = load_config(config_path)
+        run_cfg = config["run_config"]
+        topology_cfg = config["topology_finetune"]
+        topology_eval_cfg = config["topology_evaluate"]
+        assert isinstance(run_cfg, dict)
+        assert isinstance(topology_cfg, dict)
+        assert isinstance(topology_eval_cfg, dict)
+
+        run_id = f"ws_n{node_size}"
+        assert run_cfg["topology_finetune_run_id"] == run_id
+        assert run_cfg["eval_run_id"] == run_id
+        assert run_cfg["topology_eval_run_id"] == run_id
+        assert topology_cfg["subgraph_node_range"] == [node_size, node_size]
+        assert topology_cfg["compute_clustering_mmd"] is False
+        assert topology_cfg["internal_validation_compute_clustering_mmd"] is False
+        assert topology_cfg["pair_batch_size"] == 32
+        assert topology_cfg["subgraphs_per_forward"] == 1
+        assert topology_eval_cfg["inference_batch_size"] == 128
+        assert "compute_clustering_mmd" not in topology_eval_cfg
