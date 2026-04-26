@@ -1,0 +1,7 @@
+2026-04-26 13:06:23 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-04-26 13:06:23 INFO Stage Start | Checkpoint: models/v3/train/20260308_002906/best_model.pth | Run Id: 20260426_130529
+2026-04-26 13:07:00 INFO Checkpoint Loaded | Path: models/v3/train/20260308_002906/best_model.pth
+2026-04-26 13:07:00 INFO Decision Threshold | Mode: fixed | Value: 0.5000
+2026-04-26 13:49:41 INFO Evaluation Metrics | Accuracy: 0.6013 | AUPRC: 0.6905 | Auroc: 0.6761 | F1: 0.4457 | Mcc: 0.2449 | Precision: 0.7312 | Recall: 0.3206 | Sensitivity: 0.3206 | Specificity: 0.8821 | Split: test
+2026-04-26 13:49:41 INFO CSV Written | Path: logs/v3/evaluate/20260426_130529/evaluate.csv
+2026-04-26 13:49:41 INFO Stage Done | Run Id: 20260426_130529
