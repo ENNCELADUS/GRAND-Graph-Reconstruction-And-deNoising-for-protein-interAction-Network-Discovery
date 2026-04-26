@@ -200,6 +200,38 @@ class SupervisedForwardResult:
 
 
 @dataclass(frozen=True)
+class SubgraphPairForwardBuffer:
+    """Detached all-pair forward outputs for one subgraph chunked-backward pass."""
+
+    logits: torch.Tensor
+    labels: torch.Tensor
+    bce_labels: torch.Tensor
+    bce_mask: torch.Tensor
+    pair_index_a: torch.Tensor
+    pair_index_b: torch.Tensor
+    chunk_sizes: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class SupervisedPairForwardBuffer:
+    """Detached supervised-pair forward outputs for chunked BCE replay."""
+
+    logits: torch.Tensor
+    bce_labels: torch.Tensor
+    bce_mask: torch.Tensor
+    chunk_sizes: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ChunkedBackwardTaskResult:
+    """Detached per-task losses after chunked replay has already backpropagated."""
+
+    bce_loss: torch.Tensor
+    topology_losses: dict[str, torch.Tensor]
+    total_loss: torch.Tensor
+
+
+@dataclass(frozen=True)
 class LocalSubgraphTask:
     """Rank-local train task, including DDP padding participation."""
 
@@ -688,6 +720,14 @@ def _resolve_internal_validation_compute_clustering_mmd(finetune_cfg: ConfigDict
     )
 
 
+def _resolve_chunked_backward(finetune_cfg: ConfigDict) -> bool:
+    """Return whether train subgraph losses should replay chunks for backward."""
+    return as_bool(
+        finetune_cfg.get("chunked_backward", False),
+        "topology_finetune.chunked_backward",
+    )
+
+
 def _resolve_internal_validation_inference_batch_size(finetune_cfg: ConfigDict) -> int:
     """Return the batch size used for internal validation inference only."""
     batch_size = as_int(
@@ -897,6 +937,122 @@ def _concat_logits_and_pairs(
         torch.cat(pair_index_a_list, dim=0),
         torch.cat(pair_index_b_list, dim=0),
     )
+
+
+def _collect_subgraph_pair_forward_buffer(
+    *,
+    model: nn.Module,
+    graph: nx.Graph,
+    nodes: Sequence[str],
+    assigned_positive_edges: frozenset[tuple[str, str]],
+    assigned_negative_edges: frozenset[tuple[str, str]],
+    cache_dir: Path,
+    embedding_index: Mapping[str, str],
+    input_dim: int,
+    max_sequence_length: int,
+    pair_batch_size: int,
+    device: torch.device,
+    embedding_repository: EmbeddingRepository,
+) -> SubgraphPairForwardBuffer:
+    """Collect detached first-pass all-pair logits without retaining model activations."""
+    logits_list: list[torch.Tensor] = []
+    labels_list: list[torch.Tensor] = []
+    bce_labels_list: list[torch.Tensor] = []
+    bce_mask_list: list[torch.Tensor] = []
+    pair_index_a_list: list[torch.Tensor] = []
+    pair_index_b_list: list[torch.Tensor] = []
+    chunk_sizes: list[int] = []
+
+    with torch.no_grad():
+        for _, batch, logits in _iter_subgraph_forward_passes(
+            model=model,
+            graph=graph,
+            nodes=nodes,
+            assigned_positive_edges=assigned_positive_edges,
+            assigned_negative_edges=assigned_negative_edges,
+            cache_dir=cache_dir,
+            embedding_index=embedding_index,
+            input_dim=input_dim,
+            max_sequence_length=max_sequence_length,
+            pair_batch_size=pair_batch_size,
+            device=device,
+            embedding_repository=embedding_repository,
+        ):
+            detached_logits = logits.detach()
+            logits_list.append(detached_logits)
+            labels_list.append(batch["label"].detach().float())
+            bce_labels_list.append(batch["bce_label"].detach().float())
+            bce_mask_list.append(batch["bce_mask"].detach().float())
+            pair_index_a_list.append(batch["pair_index_a"].detach())
+            pair_index_b_list.append(batch["pair_index_b"].detach())
+            chunk_sizes.append(int(detached_logits.numel()))
+
+    return SubgraphPairForwardBuffer(
+        logits=torch.cat(logits_list, dim=0),
+        labels=torch.cat(labels_list, dim=0),
+        bce_labels=torch.cat(bce_labels_list, dim=0),
+        bce_mask=torch.cat(bce_mask_list, dim=0),
+        pair_index_a=torch.cat(pair_index_a_list, dim=0),
+        pair_index_b=torch.cat(pair_index_b_list, dim=0),
+        chunk_sizes=tuple(chunk_sizes),
+    )
+
+
+def _collect_supervised_pair_forward_buffer(
+    *,
+    model: nn.Module,
+    task: LocalSubgraphTask,
+    cache_dir: Path,
+    embedding_index: Mapping[str, str],
+    input_dim: int,
+    max_sequence_length: int,
+    pair_batch_size: int,
+    device: torch.device,
+    embedding_repository: EmbeddingRepository,
+) -> SupervisedPairForwardBuffer:
+    """Collect detached first-pass supervised BCE logits for chunked replay."""
+    logits_list: list[torch.Tensor] = []
+    labels_list: list[torch.Tensor] = []
+    mask_list: list[torch.Tensor] = []
+    chunk_sizes: list[int] = []
+
+    with torch.no_grad():
+        for chunk in iter_supervised_pair_chunks(
+            positive_edges=task.assigned_positive_edges,
+            negative_edges=task.assigned_negative_edges,
+            cache_dir=cache_dir,
+            embedding_index=embedding_index,
+            input_dim=input_dim,
+            max_sequence_length=max_sequence_length,
+            pair_batch_size=pair_batch_size,
+            embedding_repository=embedding_repository,
+        ):
+            batch = _move_chunk_to_device(chunk=chunk, device=device)
+            logits = _squeeze_binary_logits(_forward_model(model=model, batch=batch)["logits"])
+            detached_logits = logits.detach()
+            logits_list.append(detached_logits)
+            labels_list.append(batch["bce_label"].detach().float())
+            mask_list.append(batch["bce_mask"].detach().float())
+            chunk_sizes.append(int(detached_logits.numel()))
+
+    if not logits_list:
+        return SupervisedPairForwardBuffer(
+            logits=torch.zeros(0, dtype=torch.float32, device=device),
+            bce_labels=torch.zeros(0, dtype=torch.float32, device=device),
+            bce_mask=torch.zeros(0, dtype=torch.float32, device=device),
+            chunk_sizes=(),
+        )
+    return SupervisedPairForwardBuffer(
+        logits=torch.cat(logits_list, dim=0),
+        bce_labels=torch.cat(labels_list, dim=0),
+        bce_mask=torch.cat(mask_list, dim=0),
+        chunk_sizes=tuple(chunk_sizes),
+    )
+
+
+def _detach_loss_mapping(losses: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Detach a topology-loss mapping while preserving tensor devices and dtypes."""
+    return {name: loss.detach() for name, loss in losses.items()}
 
 
 def _cat_padded_pair_embeddings(tensors: Sequence[torch.Tensor]) -> torch.Tensor:
@@ -1159,6 +1315,312 @@ def _compute_train_topology_losses(
         pred_pair_probabilities=pred_pair_probabilities,
         target_pair_probabilities=labels,
         include_clustering_mmd=True,
+    )
+
+
+def _proxy_gradients(
+    *,
+    proxy_loss: torch.Tensor,
+    proxy_logits: torch.Tensor,
+    supervised_proxy_logits: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Return gradients of a lightweight proxy loss with respect to detached logits."""
+    grad_inputs: tuple[torch.Tensor, ...]
+    if supervised_proxy_logits is None:
+        grad_inputs = (proxy_logits,)
+    else:
+        grad_inputs = (proxy_logits, supervised_proxy_logits)
+    gradients = torch.autograd.grad(
+        proxy_loss,
+        grad_inputs,
+        allow_unused=True,
+    )
+    pair_grad = gradients[0]
+    if pair_grad is None:
+        pair_grad = torch.zeros_like(proxy_logits)
+    if supervised_proxy_logits is None:
+        return pair_grad.detach(), None
+    supervised_grad = gradients[1]
+    if supervised_grad is None:
+        supervised_grad = torch.zeros_like(supervised_proxy_logits)
+    return pair_grad.detach(), supervised_grad.detach()
+
+
+def _validate_replayed_chunk_size(
+    *,
+    observed_size: int,
+    expected_sizes: Sequence[int],
+    chunk_index: int,
+    label: str,
+) -> None:
+    """Raise when a replayed chunk no longer matches the first pass."""
+    if chunk_index >= len(expected_sizes):
+        raise ValueError(f"Replayed {label} chunk count exceeds first-pass chunk count")
+    expected_size = int(expected_sizes[chunk_index])
+    if observed_size != expected_size:
+        raise ValueError(
+            f"Replayed {label} chunk {chunk_index} size changed: "
+            f"expected {expected_size}, got {observed_size}"
+        )
+
+
+def _backward_subgraph_pair_chunks_from_gradients(
+    *,
+    model: nn.Module,
+    graph: nx.Graph,
+    nodes: Sequence[str],
+    assigned_positive_edges: frozenset[tuple[str, str]],
+    assigned_negative_edges: frozenset[tuple[str, str]],
+    cache_dir: Path,
+    embedding_index: Mapping[str, str],
+    input_dim: int,
+    max_sequence_length: int,
+    pair_batch_size: int,
+    device: torch.device,
+    embedding_repository: EmbeddingRepository,
+    logit_gradients: torch.Tensor,
+    chunk_sizes: Sequence[int],
+    loss_scale: float,
+    accelerator: AcceleratorLike,
+) -> None:
+    """Replay all-pair chunks and backpropagate precomputed logit gradients."""
+    offset = 0
+    chunk_index = 0
+    for _, _, logits in _iter_subgraph_forward_passes(
+        model=model,
+        graph=graph,
+        nodes=nodes,
+        assigned_positive_edges=assigned_positive_edges,
+        assigned_negative_edges=assigned_negative_edges,
+        cache_dir=cache_dir,
+        embedding_index=embedding_index,
+        input_dim=input_dim,
+        max_sequence_length=max_sequence_length,
+        pair_batch_size=pair_batch_size,
+        device=device,
+        embedding_repository=embedding_repository,
+    ):
+        chunk_size = int(logits.numel())
+        _validate_replayed_chunk_size(
+            observed_size=chunk_size,
+            expected_sizes=chunk_sizes,
+            chunk_index=chunk_index,
+            label="subgraph-pair",
+        )
+        grad_slice = logit_gradients[offset : offset + chunk_size].to(
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        chunk_loss = torch.sum(logits.reshape(-1) * grad_slice.reshape(-1).detach())
+        accelerator.backward(chunk_loss * loss_scale)
+        offset += chunk_size
+        chunk_index += 1
+    if offset != int(logit_gradients.numel()) or chunk_index != len(chunk_sizes):
+        raise ValueError("Replayed subgraph-pair chunks do not match first-pass logits")
+
+
+def _backward_supervised_pair_chunks_from_gradients(
+    *,
+    model: nn.Module,
+    task: LocalSubgraphTask,
+    cache_dir: Path,
+    embedding_index: Mapping[str, str],
+    input_dim: int,
+    max_sequence_length: int,
+    pair_batch_size: int,
+    device: torch.device,
+    embedding_repository: EmbeddingRepository,
+    logit_gradients: torch.Tensor,
+    chunk_sizes: Sequence[int],
+    loss_scale: float,
+    accelerator: AcceleratorLike,
+) -> None:
+    """Replay supervised BCE chunks and backpropagate precomputed logit gradients."""
+    offset = 0
+    chunk_index = 0
+    for chunk in iter_supervised_pair_chunks(
+        positive_edges=task.assigned_positive_edges,
+        negative_edges=task.assigned_negative_edges,
+        cache_dir=cache_dir,
+        embedding_index=embedding_index,
+        input_dim=input_dim,
+        max_sequence_length=max_sequence_length,
+        pair_batch_size=pair_batch_size,
+        embedding_repository=embedding_repository,
+    ):
+        batch = _move_chunk_to_device(chunk=chunk, device=device)
+        logits = _squeeze_binary_logits(_forward_model(model=model, batch=batch)["logits"])
+        chunk_size = int(logits.numel())
+        _validate_replayed_chunk_size(
+            observed_size=chunk_size,
+            expected_sizes=chunk_sizes,
+            chunk_index=chunk_index,
+            label="supervised-pair",
+        )
+        grad_slice = logit_gradients[offset : offset + chunk_size].to(
+            device=logits.device,
+            dtype=logits.dtype,
+        )
+        chunk_loss = torch.sum(logits.reshape(-1) * grad_slice.reshape(-1).detach())
+        accelerator.backward(chunk_loss * loss_scale)
+        offset += chunk_size
+        chunk_index += 1
+    if offset != int(logit_gradients.numel()) or chunk_index != len(chunk_sizes):
+        raise ValueError("Replayed supervised-pair chunks do not match first-pass logits")
+
+
+def _backward_chunked_subgraph_task(
+    *,
+    config: ConfigDict,
+    model: nn.Module,
+    graph: nx.Graph,
+    task: LocalSubgraphTask,
+    cache_dir: Path,
+    embedding_index: Mapping[str, str],
+    input_dim: int,
+    max_sequence_length: int,
+    pair_batch_size: int,
+    device: torch.device,
+    embedding_repository: EmbeddingRepository,
+    loss_weights: TopologyLossWeights,
+    loss_normalization: TopologyLossNormalizationConfig,
+    gradnorm: TopologyGradNormConfig,
+    adaptive_loss_state: TopologyAdaptiveLossState,
+    gradnorm_reference_parameters: Sequence[nn.Parameter],
+    current_window_size: int,
+    accelerator: AcceleratorLike,
+) -> ChunkedBackwardTaskResult:
+    """Run two-pass chunked backward for one subgraph without retaining all activations."""
+    if gradnorm.enabled:
+        raise ValueError("topology_finetune.chunked_backward does not support gradnorm.enabled")
+
+    pair_buffer = _collect_subgraph_pair_forward_buffer(
+        model=model,
+        graph=graph,
+        nodes=task.nodes,
+        assigned_positive_edges=task.assigned_positive_edges,
+        assigned_negative_edges=task.assigned_negative_edges,
+        cache_dir=cache_dir,
+        embedding_index=embedding_index,
+        input_dim=input_dim,
+        max_sequence_length=max_sequence_length,
+        pair_batch_size=pair_batch_size,
+        device=device,
+        embedding_repository=embedding_repository,
+    )
+    proxy_logits = pair_buffer.logits.detach().requires_grad_(True)
+    supervised_buffer: SupervisedPairForwardBuffer | None = None
+    supervised_proxy_logits: torch.Tensor | None = None
+
+    if task.assigned_negative_edges:
+        supervised_buffer = _collect_supervised_pair_forward_buffer(
+            model=model,
+            task=task,
+            cache_dir=cache_dir,
+            embedding_index=embedding_index,
+            input_dim=input_dim,
+            max_sequence_length=max_sequence_length,
+            pair_batch_size=pair_batch_size,
+            device=device,
+            embedding_repository=embedding_repository,
+        )
+        supervised_proxy_logits = supervised_buffer.logits.detach().requires_grad_(True)
+        bce_loss = _masked_bce_loss(
+            logits=supervised_proxy_logits,
+            bce_labels=supervised_buffer.bce_labels,
+            bce_mask=supervised_buffer.bce_mask,
+            config=config,
+        )
+    else:
+        bce_loss = _masked_bce_loss(
+            logits=proxy_logits,
+            bce_labels=pair_buffer.bce_labels,
+            bce_mask=pair_buffer.bce_mask,
+            config=config,
+        )
+
+    topology_losses = compute_topology_losses(
+        weights=loss_weights,
+        num_nodes=len(task.nodes),
+        pair_index_a=pair_buffer.pair_index_a,
+        pair_index_b=pair_buffer.pair_index_b,
+        pred_pair_probabilities=torch.sigmoid(proxy_logits),
+        target_pair_probabilities=pair_buffer.labels,
+        include_clustering_mmd=False,
+    )
+    normalized_topology_losses = normalize_topology_loss_terms(
+        raw_terms={
+            "graph_similarity": topology_losses["graph_similarity"],
+            "relative_density": topology_losses["relative_density"],
+            "degree_mmd": topology_losses["degree_mmd"],
+            "clustering_mmd": topology_losses["clustering_mmd"],
+        },
+        state=adaptive_loss_state,
+        config=loss_normalization,
+    )
+    topology_objectives = _group_topology_objectives(
+        topology_losses=normalized_topology_losses,
+        loss_weights=loss_weights,
+    )
+    task_weights = update_gradnorm_task_weights(
+        task_losses={
+            "bce": bce_loss,
+            "density": topology_objectives["density"],
+            "shape": topology_objectives["shape"],
+        },
+        state=adaptive_loss_state,
+        reference_parameters=gradnorm_reference_parameters,
+        config=gradnorm,
+    )
+    total_loss = _task_weighted_total_loss(
+        bce_loss=bce_loss,
+        topology_objectives=topology_objectives,
+        task_weights=task_weights,
+    )
+    pair_gradients, supervised_gradients = _proxy_gradients(
+        proxy_loss=total_loss,
+        proxy_logits=proxy_logits,
+        supervised_proxy_logits=supervised_proxy_logits,
+    )
+    loss_scale = 0.0 if task.is_padding else 1.0 / float(current_window_size)
+    if supervised_buffer is not None and supervised_gradients is not None:
+        _backward_supervised_pair_chunks_from_gradients(
+            model=model,
+            task=task,
+            cache_dir=cache_dir,
+            embedding_index=embedding_index,
+            input_dim=input_dim,
+            max_sequence_length=max_sequence_length,
+            pair_batch_size=pair_batch_size,
+            device=device,
+            embedding_repository=embedding_repository,
+            logit_gradients=supervised_gradients,
+            chunk_sizes=supervised_buffer.chunk_sizes,
+            loss_scale=loss_scale,
+            accelerator=accelerator,
+        )
+    _backward_subgraph_pair_chunks_from_gradients(
+        model=model,
+        graph=graph,
+        nodes=task.nodes,
+        assigned_positive_edges=task.assigned_positive_edges,
+        assigned_negative_edges=task.assigned_negative_edges,
+        cache_dir=cache_dir,
+        embedding_index=embedding_index,
+        input_dim=input_dim,
+        max_sequence_length=max_sequence_length,
+        pair_batch_size=pair_batch_size,
+        device=device,
+        embedding_repository=embedding_repository,
+        logit_gradients=pair_gradients,
+        chunk_sizes=pair_buffer.chunk_sizes,
+        loss_scale=loss_scale,
+        accelerator=accelerator,
+    )
+    return ChunkedBackwardTaskResult(
+        bce_loss=bce_loss.detach(),
+        topology_losses=_detach_loss_mapping(topology_losses),
+        total_loss=total_loss.detach(),
     )
 
 
@@ -1829,6 +2291,7 @@ def _fit_epoch(
     gradient_accumulation_steps = _resolve_gradient_accumulation_steps(finetune_cfg)
     subgraphs_per_forward = _resolve_subgraphs_per_forward(finetune_cfg)
     compute_clustering_mmd = _resolve_compute_clustering_mmd(finetune_cfg)
+    chunked_backward = _resolve_chunked_backward(finetune_cfg)
     edge_chunk_size = _resolve_edge_chunk_size(
         finetune_cfg=finetune_cfg,
         max_nodes=max_nodes,
@@ -1878,6 +2341,12 @@ def _fit_epoch(
     resolved_loss_normalization = loss_normalization or TopologyLossNormalizationConfig()
     resolved_gradnorm = gradnorm or TopologyGradNormConfig()
     resolved_adaptive_loss_state = adaptive_loss_state or TopologyAdaptiveLossState()
+    if chunked_backward and subgraphs_per_forward != 1:
+        raise ValueError("topology_finetune.chunked_backward requires subgraphs_per_forward=1")
+    if chunked_backward and compute_clustering_mmd:
+        raise ValueError("topology_finetune.chunked_backward requires compute_clustering_mmd=false")
+    if chunked_backward and resolved_gradnorm.enabled:
+        raise ValueError("topology_finetune.chunked_backward does not support gradnorm.enabled")
     current_topology_loss_scale = topology_loss_scale(
         epoch=epoch_index,
         schedule=resolved_loss_weight_schedule,
@@ -1923,7 +2392,10 @@ def _fit_epoch(
                 ):
                     with accelerator.autocast():
                         supervised_result: SupervisedForwardResult | None = None
-                        if skip_topology_during_warmup or task.assigned_negative_edges:
+                        already_backpropagated = False
+                        if skip_topology_during_warmup or (
+                            task.assigned_negative_edges and not chunked_backward
+                        ):
                             supervised_result = _forward_supervised_task(
                                 model=model,
                                 task=task,
@@ -1946,6 +2418,31 @@ def _fit_epoch(
                                 raise RuntimeError("warmup requires supervised BCE forward results")
                             topology_losses = _zero_topology_losses(reference=bce_loss)
                             total_loss = bce_loss
+                        elif chunked_backward:
+                            chunked_result = _backward_chunked_subgraph_task(
+                                config=config,
+                                model=model,
+                                graph=graph,
+                                task=task,
+                                cache_dir=cache_dir,
+                                embedding_index=embedding_index,
+                                input_dim=input_dim,
+                                max_sequence_length=max_sequence_length,
+                                pair_batch_size=pair_batch_size,
+                                device=device,
+                                embedding_repository=embedding_repository,
+                                loss_weights=effective_loss_weights,
+                                loss_normalization=resolved_loss_normalization,
+                                gradnorm=resolved_gradnorm,
+                                adaptive_loss_state=resolved_adaptive_loss_state,
+                                gradnorm_reference_parameters=gradnorm_reference_parameters,
+                                current_window_size=current_window_size,
+                                accelerator=accelerator,
+                            )
+                            bce_loss = chunked_result.bce_loss
+                            topology_losses = chunked_result.topology_losses
+                            total_loss = chunked_result.total_loss
+                            already_backpropagated = True
                         else:
                             (
                                 logits,
@@ -2015,7 +2512,8 @@ def _fit_epoch(
                             )
                         backward_loss = total_loss * 0.0 if task.is_padding else total_loss
 
-                    accelerator.backward(backward_loss / float(current_window_size))
+                    if not already_backpropagated:
+                        accelerator.backward(backward_loss / float(current_window_size))
                     if is_window_boundary:
                         optimizer.step()
                         optimizer.zero_grad(set_to_none=True)

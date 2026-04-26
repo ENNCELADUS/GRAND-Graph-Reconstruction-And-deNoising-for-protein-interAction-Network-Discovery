@@ -98,6 +98,7 @@ topology_finetune:
   strategy: "mixed"
   pair_batch_size: 32
   internal_validation_inference_batch_size: 128
+  chunked_backward: true
   compute_clustering_mmd: false
   internal_validation_compute_clustering_mmd: false
   decision_threshold:

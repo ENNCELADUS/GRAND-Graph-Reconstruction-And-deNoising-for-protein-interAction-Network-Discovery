@@ -2,10 +2,10 @@ run_config:
   stages: ["topology_finetune", "evaluate", "topology_evaluate"]
   seed: 47
   train_run_id: 20260308_002906
-  topology_finetune_run_id: "ws_n80"
+  topology_finetune_run_id: "ws_range_n20_100"
   adapt_run_id: null
-  eval_run_id: "ws_n80"
-  topology_eval_run_id: "ws_n80"
+  eval_run_id: "ws_range_n20_100"
+  topology_eval_run_id: "ws_range_n20_100"
   load_checkpoint_path: "models/v3/train/20260308_002906/best_model.pth"
   save_best_only: true
 
@@ -92,7 +92,7 @@ topology_finetune:
   supervision_train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi_ratio5_exclusive.txt"
   supervision_valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi_ratio5_exclusive.txt"
   bce_negative_ratio: 5
-  subgraph_node_range: [80, 80]
+  subgraph_node_range: [20, 100]
   gradient_accumulation_steps: 8
   subgraphs_per_forward: 1
   strategy: "mixed"
