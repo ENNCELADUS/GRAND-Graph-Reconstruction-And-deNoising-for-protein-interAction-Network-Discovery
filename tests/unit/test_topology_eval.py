@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import networkx as nx
+import numpy as np
 import pytest
 import torch
 from src.pipeline.runtime import DistributedContext
@@ -15,8 +16,11 @@ from src.pipeline.stages.topology_evaluate import (
     write_topology_predictions,
 )
 from src.topology.metrics import (
+    compute_mmd,
     compute_graph_similarity,
+    compute_normalized_mmd_ratio,
     compute_relative_density,
+    degree_distribution,
     evaluate_graph_samples,
     evaluate_predicted_graph,
 )
@@ -48,6 +52,63 @@ def test_compute_relative_density_matches_official_formula() -> None:
     relative_density = compute_relative_density(pred_graph=pred_graph, gt_graph=gt_graph)
 
     assert relative_density == pytest.approx(0.5)
+
+
+def test_compute_normalized_mmd_ratio_matches_pring_formula() -> None:
+    pred_samples = [
+        np.array([1.0, 0.0]),
+        np.array([1.0, 0.0]),
+        np.array([1.0, 0.0]),
+        np.array([1.0, 0.0]),
+    ]
+    gt_samples = [
+        np.array([1.0, 0.0]),
+        np.array([0.0, 1.0]),
+        np.array([1.0, 0.0]),
+        np.array([0.0, 1.0]),
+    ]
+
+    numerator = compute_mmd(pred_samples, gt_samples)
+    denominator = compute_mmd(gt_samples[::2], gt_samples[1::2])
+
+    normalized = compute_normalized_mmd_ratio(pred_samples, gt_samples)
+
+    assert normalized == pytest.approx(numerator / denominator)
+
+
+def test_evaluate_graph_samples_reports_normalized_degree_mmd() -> None:
+    gt_graphs = {
+        3: [
+            nx.path_graph(["A", "B", "C"]),
+            nx.Graph([("A", "B"), ("A", "C")]),
+            nx.Graph([("A", "B"), ("B", "C")]),
+            nx.Graph([("A", "B"), ("A", "C"), ("B", "C")]),
+        ],
+    }
+    pred_graphs = {
+        3: [
+            nx.Graph([("A", "B")]),
+            nx.Graph([("A", "B")]),
+            nx.Graph([("A", "B")]),
+            nx.Graph([("A", "B")]),
+        ],
+    }
+    pred_degree_hists: list[np.ndarray] = []
+    gt_degree_hists: list[np.ndarray] = []
+    for pred_graph, gt_graph in zip(pred_graphs[3], gt_graphs[3], strict=True):
+        pred_hist, gt_hist = degree_distribution(pred_graph, gt_graph)
+        pred_degree_hists.append(pred_hist)
+        gt_degree_hists.append(gt_hist)
+
+    result = evaluate_graph_samples(
+        pred_graphs_by_size=pred_graphs,
+        gt_graphs_by_size=gt_graphs,
+        include_spectral_stats=False,
+    )
+
+    assert result["per_node_size"][3]["deg_dist_mmd"] == pytest.approx(
+        compute_normalized_mmd_ratio(pred_degree_hists, gt_degree_hists)
+    )
 
 
 def test_evaluate_predicted_graph_returns_official_summary_shape() -> None:
