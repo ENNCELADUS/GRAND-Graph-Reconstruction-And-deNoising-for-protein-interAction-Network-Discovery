@@ -26,9 +26,53 @@ from src.model.v3 import (
     _to_mapping,
 )
 
+POOLING_BASE_COMPONENTS = ("esm_cls", "mean", "attn", "max")
+POOLING_GATED_COMPONENT = "gated"
+DEFAULT_RICH_POOLING_COMPONENTS = (*POOLING_BASE_COMPONENTS, POOLING_GATED_COMPONENT)
+
+
+def _parse_rich_pooling_components(value: object) -> tuple[str, ...]:
+    """Parse enabled rich-pooling components in canonical order."""
+    if value is None:
+        return DEFAULT_RICH_POOLING_COMPONENTS
+    if not isinstance(value, list) or not value:
+        raise ValueError("model_config.rich_pooling.components must be a non-empty list")
+
+    raw_components: set[str] = set()
+    valid_components = set(DEFAULT_RICH_POOLING_COMPONENTS)
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ValueError("model_config.rich_pooling.components must contain strings")
+        component = item.strip().lower()
+        if component not in valid_components:
+            raise ValueError(
+                "model_config.rich_pooling.components contains unsupported component: "
+                f"{component}"
+            )
+        if component in raw_components:
+            raise ValueError(
+                f"model_config.rich_pooling.components contains duplicate: {component}"
+            )
+        raw_components.add(component)
+
+    base_components = tuple(
+        component for component in POOLING_BASE_COMPONENTS if component in raw_components
+    )
+    if not base_components:
+        raise ValueError("model_config.rich_pooling.components must enable a base component")
+    if POOLING_GATED_COMPONENT in raw_components and not base_components:
+        raise ValueError("model_config.rich_pooling.components cannot enable gated alone")
+
+    components = list(base_components)
+    if POOLING_GATED_COMPONENT in raw_components:
+        components.append(POOLING_GATED_COMPONENT)
+    return tuple(components)
+
+
 # ---------------------------------------------------------------------------
 # Cross-attention layer (identical to V3 — shared weights, bidirectional)
 # ---------------------------------------------------------------------------
+
 
 class CrossAttentionLayer(nn.Module):
     """Shared-weight bidirectional cross-attention with FFN and CLS pooling."""
@@ -124,22 +168,57 @@ class CrossAttentionLayer(nn.Module):
 
 
 class RichPooling(nn.Module):
-    """CLS + mean + attention + max pooling with learned gated fusion.
+    """Configurable ESM-CLS and residue pooling with optional gated fusion.
 
-    Combines four complementary pooling signals via a soft gate, then
-    projects the concatenated 5-way representation back to ``d_model``.
+    ``esm_cls`` uses the first ESM3 special-token embedding. Residue pooling
+    components use positions between the first BOS token and final EOS token.
     """
 
-    def __init__(self, d_model: int, dropout: float) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        dropout: float,
+        components: tuple[str, ...] = DEFAULT_RICH_POOLING_COMPONENTS,
+    ) -> None:
         super().__init__()
+        self.components = _parse_rich_pooling_components(list(components))
+        self.base_components = tuple(
+            component for component in POOLING_BASE_COMPONENTS if component in self.components
+        )
+        self.use_gated = POOLING_GATED_COMPONENT in self.components
         self.attn_scorer = nn.Linear(d_model, 1)
-        self.pool_gate = nn.Linear(d_model * 4, 4)
+        self.pool_gate = (
+            nn.Linear(d_model * len(self.base_components), len(self.base_components))
+            if self.use_gated
+            else None
+        )
+        projection_components = len(self.base_components) + int(self.use_gated)
         self.proj = nn.Sequential(
-            nn.LayerNorm(d_model * 5),
-            nn.Linear(d_model * 5, d_model),
+            nn.LayerNorm(d_model * projection_components),
+            nn.Linear(d_model * projection_components, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
         )
+
+    def _residue_mask(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
+        """Return a mask for non-special residue tokens."""
+        batch_size, sequence_length, _ = x.shape
+        if padding_mask is not None:
+            valid_mask = ~padding_mask
+        else:
+            valid_mask = torch.ones(
+                batch_size,
+                sequence_length,
+                dtype=torch.bool,
+                device=x.device,
+            )
+
+        positions = torch.arange(sequence_length, device=x.device).unsqueeze(0)
+        valid_lengths = valid_mask.sum(dim=1, keepdim=True)
+        residue_mask = valid_mask & (positions > 0) & (positions < valid_lengths - 1)
+        if bool((residue_mask.sum(dim=1) == 0).any()):
+            raise ValueError("RichPooling requires at least one residue token between BOS and EOS")
+        return residue_mask
 
     def forward(self, x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
         """Pool token sequence to a single ``d_model`` vector.
@@ -151,37 +230,41 @@ class RichPooling(nn.Module):
         Returns:
             Pooled vector ``(batch, d_model)``.
         """
-        # Float mask: 1 for real tokens, 0 for padding
-        if padding_mask is not None:
-            float_mask = (~padding_mask).float()
-        else:
-            float_mask = x.new_ones(x.size(0), x.size(1))
+        pooled_by_component: dict[str, torch.Tensor] = {}
+        if "esm_cls" in self.base_components:
+            pooled_by_component["esm_cls"] = x[:, 0]
 
-        # CLS: first token
-        cls_vec = x[:, 0]
+        if any(component in self.base_components for component in ("mean", "attn", "max")):
+            residue_mask = self._residue_mask(x=x, padding_mask=padding_mask)
+            residue_float_mask = residue_mask.float()
+            residue_3d = residue_float_mask.unsqueeze(-1)
 
-        # Mean pool (mask-aware)
-        mask_3d = float_mask.unsqueeze(-1)
-        mean_vec = (x * mask_3d).sum(dim=1) / mask_3d.sum(dim=1).clamp_min(1.0)
+            if "mean" in self.base_components:
+                pooled_by_component["mean"] = (x * residue_3d).sum(dim=1) / residue_3d.sum(
+                    dim=1
+                ).clamp_min(1.0)
 
-        # Attention pool (learned scalar score per token)
-        scores = self.attn_scorer(x).squeeze(-1)
-        if padding_mask is not None:
-            scores = scores.masked_fill(padding_mask, torch.finfo(scores.dtype).min)
-        attn_weights = torch.softmax(scores, dim=1).unsqueeze(-1)
-        attn_vec = (x * attn_weights).sum(dim=1)
+            if "attn" in self.base_components:
+                scores = self.attn_scorer(x).squeeze(-1)
+                scores = scores.masked_fill(~residue_mask, torch.finfo(scores.dtype).min)
+                attn_weights = torch.softmax(scores, dim=1).unsqueeze(-1)
+                pooled_by_component["attn"] = (x * attn_weights).sum(dim=1)
 
-        # Max pool (mask-aware)
-        masked_x = x.masked_fill(float_mask.unsqueeze(-1) == 0, torch.finfo(x.dtype).min)
-        max_vec = masked_x.max(dim=1).values
+            if "max" in self.base_components:
+                masked_x = x.masked_fill(~residue_mask.unsqueeze(-1), torch.finfo(x.dtype).min)
+                pooled_by_component["max"] = masked_x.max(dim=1).values
 
-        # Gated fusion
-        gate_input = torch.cat([cls_vec, mean_vec, attn_vec, max_vec], dim=1)
-        gate_weights = torch.softmax(self.pool_gate(gate_input), dim=1).unsqueeze(-1)
-        pooled_stack = torch.stack([cls_vec, mean_vec, attn_vec, max_vec], dim=1)
-        gated_vec = (pooled_stack * gate_weights).sum(dim=1)
+        base_vectors = [pooled_by_component[component] for component in self.base_components]
+        output_vectors = list(base_vectors)
+        if self.use_gated:
+            if self.pool_gate is None:
+                raise RuntimeError("pool_gate must be initialized when gated pooling is enabled")
+            gate_input = torch.cat(base_vectors, dim=1)
+            gate_weights = torch.softmax(self.pool_gate(gate_input), dim=1).unsqueeze(-1)
+            pooled_stack = torch.stack(base_vectors, dim=1)
+            output_vectors.append((pooled_stack * gate_weights).sum(dim=1))
 
-        combined = torch.cat([cls_vec, mean_vec, attn_vec, max_vec, gated_vec], dim=1)
+        combined = torch.cat(output_vectors, dim=1)
         return cast(torch.Tensor, self.proj(combined))
 
 
@@ -193,7 +276,14 @@ class RichPooling(nn.Module):
 class InteractionCrossAttention(nn.Module):
     """Stacked cross-attention encoder with rich CLS + gated pooling."""
 
-    def __init__(self, d_model: int, n_heads: int, n_layers: int, dropout: float) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        n_layers: int,
+        dropout: float,
+        pooling_components: tuple[str, ...] = DEFAULT_RICH_POOLING_COMPONENTS,
+    ) -> None:
         super().__init__()
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
@@ -201,8 +291,9 @@ class InteractionCrossAttention(nn.Module):
             CrossAttentionLayer(d_model=d_model, n_heads=n_heads, dropout=dropout)
             for _ in range(n_layers)
         )
-        self.pool_a = RichPooling(d_model=d_model, dropout=dropout)
-        self.pool_b = RichPooling(d_model=d_model, dropout=dropout)
+        shared_pool = RichPooling(d_model=d_model, dropout=dropout, components=pooling_components)
+        self.pool_a = shared_pool
+        self.pool_b = shared_pool
         # Fuse CLS + pooled_a + pooled_b → d_model
         self.fusion = nn.Sequential(
             nn.LayerNorm(d_model * 3),
@@ -317,6 +408,15 @@ class V3_1(nn.Module):
         self.stochastic_depth = _to_float(
             reg_cfg.get("stochastic_depth", 0.0), "model_config.regularization.stochastic_depth"
         )
+        rich_pooling_cfg_raw = model_config.get("rich_pooling", {})
+        if rich_pooling_cfg_raw is None:
+            rich_pooling_cfg_raw = {}
+        if not isinstance(rich_pooling_cfg_raw, dict):
+            raise ValueError("model_config.rich_pooling must be a mapping")
+        rich_pooling_cfg = _to_mapping(rich_pooling_cfg_raw, "model_config.rich_pooling")
+        self.rich_pooling_components = _parse_rich_pooling_components(
+            rich_pooling_cfg.get("components")
+        )
 
         self.encoder = SiameseEncoder(
             input_dim=self.input_dim,
@@ -332,6 +432,7 @@ class V3_1(nn.Module):
             n_heads=self.n_heads,
             n_layers=self.cross_attn_layers,
             dropout=self.cross_attention_dropout,
+            pooling_components=self.rich_pooling_components,
         )
         self.output_head = MLPHead(
             input_dim=self.d_model,

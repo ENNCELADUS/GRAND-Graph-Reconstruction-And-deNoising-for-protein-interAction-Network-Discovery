@@ -308,6 +308,97 @@ def test_run_optimization_writes_trials_and_best_params(
     assert rows[2]["run_id"] == "20260320_110811_t0002"
 
 
+def test_run_optimization_rechecks_top_trials_and_uses_rechecked_best(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _base_config()
+    optimization_cfg = cast(ConfigDict, config["optimization"])
+    optimization_cfg["recheck"] = {
+        "enabled": True,
+        "top_k": 2,
+        "seeds": [13, 47, 101],
+        "std_penalty": 0.5,
+    }
+    observed: dict[str, object] = {}
+
+    def _pipeline_with_recheck_shift(cfg: ConfigDict) -> None:
+        run_cfg = cast(ConfigDict, cfg["run_config"])
+        run_id = str(run_cfg.get("train_run_id", "missing"))
+        model_cfg = cast(ConfigDict, cfg["model_config"])
+        d_model = int(model_cfg["d_model"])
+        if run_id.endswith("_best_train"):
+            observed["final_d_model"] = d_model
+
+        training_cfg = cast(ConfigDict, cfg["training_config"])
+        optimizer_cfg = cast(ConfigDict, training_cfg["optimizer"])
+        lr = float(optimizer_cfg.get("lr", 1.0e-4))
+        if "_recheck_" in run_id:
+            score = 0.9 if d_model == 192 else 0.1
+        else:
+            score = d_model / 1000.0 + (1.0e-3 - lr)
+
+        model_name = str(model_cfg.get("model", "v5"))
+        log_dir = Path("logs") / model_name / "train" / run_id
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with (log_dir / "training_step.csv").open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=[
+                    "Epoch",
+                    "Epoch Time",
+                    "Train Loss",
+                    "Val Loss",
+                    "Val auprc",
+                    "Learning Rate",
+                ],
+            )
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "Epoch": 1,
+                    "Epoch Time": 1.0,
+                    "Train Loss": 0.5,
+                    "Val Loss": 0.4,
+                    "Val auprc": score,
+                    "Learning Rate": lr,
+                }
+            )
+        model_dir = Path("models") / model_name / "train" / run_id
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "best_model.pth").write_text("fake", encoding="utf-8")
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        optimize_run,
+        "generate_run_id",
+        lambda existing_value=None: "20260320_110811",
+    )
+    monkeypatch.setattr(
+        optuna_backend_module,
+        "_import_optuna",
+        lambda: _FakeOptunaModule(),
+    )
+    monkeypatch.setattr(optimize_run, "PIPELINE_EXECUTE_FN", _pipeline_with_recheck_shift)
+
+    optimize_run.run_optimization(
+        config=config,
+        backend_override=None,
+        skip_final_full_pipeline=False,
+    )
+
+    output_dir = tmp_path / "artifacts" / "hpo" / "unit_opt"
+    assert (output_dir / "recheck_summary.csv").exists()
+    assert (output_dir / "recheck_trials.csv").exists()
+    assert (output_dir / "rechecked_best_params.yaml").exists()
+    assert observed["final_d_model"] == 192
+
+    with (output_dir / "recheck_trials.csv").open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert len(rows) == 6
+    assert {int(row["seed"]) for row in rows} == {13, 47, 101}
+
+
 def test_should_run_optimization_requires_train_stage() -> None:
     config = _base_config()
     run_cfg = cast(ConfigDict, config["run_config"])

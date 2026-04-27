@@ -6,8 +6,10 @@ import argparse
 import csv
 import json
 import logging
+import math
 import os
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -22,13 +24,18 @@ from src.optimize.distributed import (
     build_optimization_channel,
     run_distributed_worker_loop,
 )
-from src.optimize.search_space import extend_with_nas_lite, parse_search_space
-from src.optimize.trial_runner import run_best_full_pipeline
+from src.optimize.search_space import SearchParameter, extend_with_nas_lite, parse_search_space
+from src.optimize.trial_runner import (
+    RecheckSeedResult,
+    execute_recheck_seed,
+    run_best_full_pipeline,
+)
 from src.pipeline.engine import execute_pipeline
 from src.pipeline.runtime import DistributedContext
 from src.utils.config import (
     ConfigDict,
     as_bool,
+    as_float,
     as_int,
     as_str,
     as_str_list,
@@ -40,6 +47,32 @@ from src.utils.logging import generate_run_id
 LOGGER = logging.getLogger(__name__)
 PipelineExecuteFn = Callable[[ConfigDict], None]
 PIPELINE_EXECUTE_FN: PipelineExecuteFn = cast(PipelineExecuteFn, execute_pipeline)
+
+
+@dataclass(frozen=True)
+class RecheckCandidateSummary:
+    """Aggregated post-HPO recheck result for one Optuna candidate."""
+
+    trial_number: int
+    original_value: float
+    mean_value: float
+    std_value: float
+    score: float
+    params: dict[str, object]
+    seed_results: tuple[RecheckSeedResult, ...]
+
+
+@dataclass(frozen=True)
+class RecheckResult:
+    """Post-HPO top-k multi-seed recheck result."""
+
+    top_k: int
+    seeds: tuple[int, ...]
+    std_penalty: float
+    direction: str
+    best_trial_number: int
+    best_params: dict[str, object]
+    summaries: tuple[RecheckCandidateSummary, ...]
 
 
 def parse_args() -> argparse.Namespace:
@@ -120,18 +153,31 @@ def run_optimization(
             distributed_channel=distributed_channel,
         )
         _write_optuna_artifacts(output_dir=output_dir, result=result)
+        best_values = dict(result.best_params)
+        recheck_result = _run_configured_recheck(
+            base_config=config,
+            optimization_cfg=optimization_cfg,
+            search_space=search_space,
+            optuna_result=result,
+            run_id_prefix=run_id_prefix,
+            execution_cfg=execution_cfg,
+            distributed_channel=distributed_channel,
+        )
+        if recheck_result is not None:
+            _write_recheck_artifacts(output_dir=output_dir, result=recheck_result)
+            best_values = dict(recheck_result.best_params)
         if not skip_final_full_pipeline:
             if distributed_channel is not None:
                 distributed_channel.send(
                     OptimizationCommand(
                         kind="run_best_pipeline",
-                        best_values=dict(result.best_params),
+                        best_values=best_values,
                     )
                 )
             best_pipeline_run_id = run_best_full_pipeline(
                 base_config=config,
                 search_space=search_space,
-                best_values=result.best_params,
+                best_values=best_values,
                 run_id_prefix=run_id_prefix,
                 run_pipeline_fn=PIPELINE_EXECUTE_FN,
                 ddp_per_trial=distributed_context.is_distributed,
@@ -305,6 +351,270 @@ def _write_optuna_artifacts(*, output_dir: Path, result: OptunaResult) -> None:
             "best_params": result.best_params,
         },
     )
+
+
+def _run_configured_recheck(
+    *,
+    base_config: ConfigDict,
+    optimization_cfg: ConfigDict,
+    search_space: list[SearchParameter],
+    optuna_result: OptunaResult,
+    run_id_prefix: str,
+    execution_cfg: ConfigDict,
+    distributed_channel: OptimizationChannel | None,
+) -> RecheckResult | None:
+    """Run optional post-HPO top-k multi-seed recheck."""
+    recheck_raw = optimization_cfg.get("recheck")
+    if recheck_raw is None:
+        return None
+    recheck_cfg = _as_config_dict(recheck_raw, "optimization.recheck")
+    if not as_bool(recheck_cfg.get("enabled", False), "optimization.recheck.enabled"):
+        return None
+
+    top_k = as_int(recheck_cfg.get("top_k", 5), "optimization.recheck.top_k")
+    if top_k <= 0:
+        raise ValueError("optimization.recheck.top_k must be > 0")
+    seeds = _parse_seed_list(recheck_cfg.get("seeds", [13, 47, 101]))
+    std_penalty = as_float(
+        recheck_cfg.get("std_penalty", 0.5),
+        "optimization.recheck.std_penalty",
+    )
+    if std_penalty < 0.0:
+        raise ValueError("optimization.recheck.std_penalty must be >= 0")
+
+    top_trials = _select_top_completed_trials(
+        trial_records=list(optuna_result.trial_records),
+        direction=optuna_result.direction,
+        top_k=top_k,
+    )
+    summaries: list[RecheckCandidateSummary] = []
+    for trial_record in top_trials:
+        seed_results: list[RecheckSeedResult] = []
+        for seed in seeds:
+            if distributed_channel is not None:
+                distributed_channel.send(
+                    OptimizationCommand(
+                        kind="run_recheck_trial",
+                        trial_number=trial_record.number,
+                        seed=seed,
+                        sampled_values=dict(trial_record.params),
+                    )
+                )
+            seed_result = execute_recheck_seed(
+                base_config=base_config,
+                search_space=search_space,
+                sampled_values=trial_record.params,
+                run_id_prefix=run_id_prefix,
+                trial_number=trial_record.number,
+                seed=seed,
+                objective_metric=optuna_result.objective_metric,
+                direction=optuna_result.direction,
+                execution_cfg=execution_cfg,
+                run_pipeline_fn=PIPELINE_EXECUTE_FN,
+            )
+            seed_results.append(seed_result)
+            if distributed_channel is not None:
+                distributed_channel.barrier()
+
+        values = [item.objective_value for item in seed_results]
+        mean_value = _mean(values)
+        std_value = _population_std(values, mean_value)
+        score = _recheck_score(
+            mean_value=mean_value,
+            std_value=std_value,
+            std_penalty=std_penalty,
+            direction=optuna_result.direction,
+        )
+        if trial_record.value is None:
+            raise ValueError("Completed trial unexpectedly has no objective value")
+        summaries.append(
+            RecheckCandidateSummary(
+                trial_number=trial_record.number,
+                original_value=trial_record.value,
+                mean_value=mean_value,
+                std_value=std_value,
+                score=score,
+                params=dict(trial_record.params),
+                seed_results=tuple(seed_results),
+            )
+        )
+
+    ranked = sorted(
+        summaries,
+        key=lambda item: item.score,
+        reverse=optuna_result.direction == "maximize",
+    )
+    best_summary = ranked[0]
+    return RecheckResult(
+        top_k=top_k,
+        seeds=tuple(seeds),
+        std_penalty=std_penalty,
+        direction=optuna_result.direction,
+        best_trial_number=best_summary.trial_number,
+        best_params=dict(best_summary.params),
+        summaries=tuple(ranked),
+    )
+
+
+def _select_top_completed_trials(
+    *,
+    trial_records: list[TrialRecord],
+    direction: str,
+    top_k: int,
+) -> list[TrialRecord]:
+    """Return top complete Optuna trials by original objective value."""
+    complete_trials = [
+        record
+        for record in trial_records
+        if record.state == "COMPLETE" and record.value is not None
+    ]
+    if not complete_trials:
+        raise ValueError("optimization.recheck requires at least one COMPLETE Optuna trial")
+    return sorted(
+        complete_trials,
+        key=lambda record: cast(float, record.value),
+        reverse=direction == "maximize",
+    )[:top_k]
+
+
+def _parse_seed_list(raw_seeds: object) -> tuple[int, ...]:
+    """Parse ``optimization.recheck.seeds``."""
+    if not isinstance(raw_seeds, list) or not raw_seeds:
+        raise ValueError("optimization.recheck.seeds must be a non-empty list")
+    seeds: list[int] = []
+    for index, raw_seed in enumerate(raw_seeds):
+        seed = as_int(raw_seed, f"optimization.recheck.seeds[{index}]")
+        seeds.append(seed)
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("optimization.recheck.seeds must not contain duplicates")
+    return tuple(seeds)
+
+
+def _mean(values: list[float]) -> float:
+    """Return arithmetic mean for non-empty values."""
+    if not values:
+        raise ValueError("Cannot compute mean of empty values")
+    return sum(values) / len(values)
+
+
+def _population_std(values: list[float], mean_value: float) -> float:
+    """Return population standard deviation for observed recheck seeds."""
+    if not values:
+        raise ValueError("Cannot compute standard deviation of empty values")
+    variance = sum((value - mean_value) ** 2 for value in values) / len(values)
+    return math.sqrt(variance)
+
+
+def _recheck_score(
+    *,
+    mean_value: float,
+    std_value: float,
+    std_penalty: float,
+    direction: str,
+) -> float:
+    """Return stability-aware recheck score."""
+    if direction == "maximize":
+        return mean_value - std_penalty * std_value
+    if direction == "minimize":
+        return mean_value + std_penalty * std_value
+    raise ValueError("optimization.direction must be 'maximize' or 'minimize'")
+
+
+def _write_recheck_artifacts(*, output_dir: Path, result: RecheckResult) -> None:
+    """Persist post-HPO recheck outputs."""
+    _write_recheck_summary_csv(
+        output_path=output_dir / "recheck_summary.csv",
+        summaries=list(result.summaries),
+    )
+    _write_recheck_seed_csv(
+        output_path=output_dir / "recheck_trials.csv",
+        summaries=list(result.summaries),
+    )
+    _write_yaml(
+        output_path=output_dir / "rechecked_best_params.yaml",
+        payload={
+            "selection": "top_k_multi_seed_recheck",
+            "top_k": result.top_k,
+            "seeds": list(result.seeds),
+            "std_penalty": result.std_penalty,
+            "direction": result.direction,
+            "best_trial_number": result.best_trial_number,
+            "best_params": result.best_params,
+        },
+    )
+
+
+def _write_recheck_summary_csv(
+    *,
+    output_path: Path,
+    summaries: list[RecheckCandidateSummary],
+) -> None:
+    """Write candidate-level recheck summaries."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "rank",
+        "trial_number",
+        "original_value",
+        "mean_value",
+        "std_value",
+        "score",
+        "params_json",
+    ]
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for rank, summary in enumerate(summaries, start=1):
+            writer.writerow(
+                {
+                    "rank": rank,
+                    "trial_number": summary.trial_number,
+                    "original_value": f"{summary.original_value:.8f}",
+                    "mean_value": f"{summary.mean_value:.8f}",
+                    "std_value": f"{summary.std_value:.8f}",
+                    "score": f"{summary.score:.8f}",
+                    "params_json": json.dumps(summary.params, ensure_ascii=True, sort_keys=True),
+                }
+            )
+
+
+def _write_recheck_seed_csv(
+    *,
+    output_path: Path,
+    summaries: list[RecheckCandidateSummary],
+) -> None:
+    """Write seed-level recheck results."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = [
+        "trial_number",
+        "seed",
+        "run_id",
+        "value",
+        "metric_column",
+        "train_csv_path",
+        "checkpoint_path",
+        "params_json",
+    ]
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for summary in summaries:
+            for seed_result in summary.seed_results:
+                writer.writerow(
+                    {
+                        "trial_number": seed_result.trial_number,
+                        "seed": seed_result.seed,
+                        "run_id": seed_result.run_id,
+                        "value": f"{seed_result.objective_value:.8f}",
+                        "metric_column": seed_result.metric_column,
+                        "train_csv_path": str(seed_result.train_csv_path),
+                        "checkpoint_path": str(seed_result.checkpoint_path),
+                        "params_json": json.dumps(
+                            seed_result.params,
+                            ensure_ascii=True,
+                            sort_keys=True,
+                        ),
+                    }
+                )
 
 
 def _write_trials_csv(*, output_path: Path, trial_records: list[TrialRecord]) -> None:

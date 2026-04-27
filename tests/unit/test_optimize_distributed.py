@@ -25,12 +25,24 @@ def test_worker_loop_executes_trial_and_best_pipeline_commands() -> None:
     from src.optimize.distributed import OptimizationCommand, run_distributed_worker_loop
 
     observed_trials: list[tuple[int, dict[str, object]]] = []
+    observed_rechecks: list[tuple[int, int, dict[str, object]]] = []
     observed_best: list[dict[str, object]] = []
 
     def fake_execute_trial(**kwargs: object) -> object:
         observed_trials.append(
             (
                 int(kwargs["trial_number"]),
+                dict(kwargs["sampled_values"]),
+            )
+        )
+        assert kwargs["run_id_prefix"] == "20260320_110811"
+        return None
+
+    def fake_execute_recheck_seed(**kwargs: object) -> object:
+        observed_rechecks.append(
+            (
+                int(kwargs["trial_number"]),
+                int(kwargs["seed"]),
                 dict(kwargs["sampled_values"]),
             )
         )
@@ -47,6 +59,12 @@ def test_worker_loop_executes_trial_and_best_pipeline_commands() -> None:
             OptimizationCommand(
                 kind="run_trial",
                 trial_number=2,
+                sampled_values={"scheduler_max_lr": 1.0e-4},
+            ),
+            OptimizationCommand(
+                kind="run_recheck_trial",
+                trial_number=2,
+                seed=47,
                 sampled_values={"scheduler_max_lr": 1.0e-4},
             ),
             OptimizationCommand(
@@ -76,12 +94,14 @@ def test_worker_loop_executes_trial_and_best_pipeline_commands() -> None:
         run_pipeline_fn=lambda cfg: None,
         channel=channel,
         execute_trial_fn=fake_execute_trial,
+        execute_recheck_seed_fn=fake_execute_recheck_seed,
         run_best_full_pipeline_fn=fake_run_best_full_pipeline,
     )
 
     assert observed_trials == [(2, {"scheduler_max_lr": 1.0e-4})]
+    assert observed_rechecks == [(2, 47, {"scheduler_max_lr": 1.0e-4})]
     assert observed_best == [{"scheduler_max_lr": 8.0e-5}]
-    assert channel.barrier_calls == 2
+    assert channel.barrier_calls == 3
 
 
 def test_torch_distributed_channel_send_receive_and_barrier(

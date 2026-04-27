@@ -1,0 +1,204 @@
+run_config:
+  stages: ["train", "evaluate", "topology_finetune", "topology_evaluate"]
+  seed: 47
+  train_run_id: null
+  topology_finetune_run_id: null
+  adapt_run_id: null
+  eval_run_id: null
+  topology_eval_run_id: null
+  load_checkpoint_path: null
+  save_best_only: true
+
+device_config:
+  device: "cuda"
+  ddp_enabled: true
+  use_mixed_precision: true
+
+data_config:
+  benchmark:
+    name: "PRING"
+    root_dir: "data/PRING"
+    species: "human"
+    split_strategy: "BFS"
+    processed_dir: "data/PRING/species_processed_data/human/BFS"
+  embeddings:
+    source: "esm3"
+    cache_dir: "data/embeddings/esm3_1024"
+  max_sequence_length: 1024
+  dataloader:
+    train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi.txt"
+    valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi.txt"
+    test_dataset: "data/PRING/species_processed_data/human/BFS/human_test_ppi.txt"
+    num_workers: 4
+    pin_memory: true
+    drop_last: true
+    sampling:
+      strategy: "ohem"
+      warmup_epochs: 5
+      pool_multiplier: 4
+      cap_protein: 4
+
+model_config:
+  model: "v3.1"
+  input_dim: 1536
+  d_model: 512
+  encoder_layers: 3
+  cross_attn_layers: 3
+  n_heads: 8
+  mlp_head:
+    hidden_dims: [512, 256, 128]
+    dropout: 0.20
+    activation: "gelu"
+    norm: "layernorm"
+  regularization:
+    dropout: 0.10
+    token_dropout: 0.10
+    cross_attention_dropout: 0.10
+    stochastic_depth: 0.10
+  rich_pooling:
+    components: ["esm_cls", "mean", "attn", "max", "gated"]
+
+training_config:
+  epochs: 50
+  batch_size: 32
+  early_stopping_patience: 10
+  monitor_metric: "auprc"
+  logging:
+    validation_metrics: ["auprc", "auroc", "f1", "accuracy"]
+  optimizer:
+    type: "adamw"
+    lr: 0.0001
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+    weight_decay: 0.05
+  scheduler:
+    type: "onecycle"
+    max_lr: 0.0001
+    pct_start: 0.10
+    div_factor: 25
+    final_div_factor: 10000
+    anneal_strategy: "cos"
+  loss:
+    type: "bce_with_logits"
+    pos_weight: 1.0
+    label_smoothing: 0.05
+  strategy:
+    type: "none"
+  domain_adaptation:
+    enabled: false
+
+topology_finetune:
+  init_mode: "warm_start"
+  epochs: 30
+  supervision_train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi_ratio5_exclusive.txt"
+  supervision_valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi_ratio5_exclusive.txt"
+  bce_negative_ratio: 5
+  subgraph_node_range: [30, 60]
+  gradient_accumulation_steps: 8
+  subgraphs_per_forward: 2
+  strategy: "mixed"
+  pair_batch_size: 32
+  decision_threshold: 0.5
+  monitor_metric: "internal_val_graph_sim"
+  early_stopping_patience: 5
+  optimizer:
+    lr: 3.0e-6
+    weight_decay: 3.0e-3
+  losses:
+    alpha: 0.25
+    beta: 0.20
+    gamma: 0.10
+    delta: 0.10
+    histogram_sigma: 1.5
+    degree_bins: 32
+    clustering_bins: 48
+
+evaluate:
+  decision_threshold:
+    mode: "fixed"
+    value: 0.5
+  metrics:
+    - "auroc"
+    - "auprc"
+    - "accuracy"
+    - "sensitivity"
+    - "specificity"
+    - "precision"
+    - "recall"
+    - "f1"
+    - "mcc"
+
+topology_evaluate:
+  inference_batch_size: 32
+  decision_threshold:
+    mode: "fixed"
+    value: 0.5
+  save_pair_predictions: true
+  report_baselines: "src/topology/baselines/pring_human_table2.json"
+
+optimization:
+  enabled: true
+  backend: "optuna"
+  study_name: "v3_1_train_hpo"
+  run_id_prefix: null
+  objective_metric: "val_auprc"
+  direction: "maximize"
+  budget:
+    n_trials: 24
+    timeout_minutes: 720
+  execution:
+    trial_stages: ["train"]
+    ddp_per_trial: true
+    catch_oom_as_pruned: true
+  storage:
+    type: "sqlite"
+    url: "sqlite:///artifacts/hpo/v3_1_train_hpo.db"
+  sampler:
+    name: "TPESampler"
+    seed: 47
+  pruner:
+    name: "MedianPruner"
+    n_startup_trials: 4
+    n_warmup_steps: 3
+  recheck:
+    enabled: true
+    top_k: 5
+    seeds: [13, 47, 101]
+    std_penalty: 0.5
+  search_space:
+    - name: "scheduler_max_lr"
+      path: "training_config.scheduler.max_lr"
+      type: "float"
+      low: 6.0e-5
+      high: 1.8e-4
+      log: true
+    - name: "weight_decay"
+      path: "training_config.optimizer.weight_decay"
+      type: "float"
+      low: 1.0e-2
+      high: 8.0e-2
+      log: true
+    - name: "pos_weight"
+      path: "training_config.loss.pos_weight"
+      type: "categorical"
+      choices: [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0]
+    - name: "label_smoothing"
+      path: "training_config.loss.label_smoothing"
+      type: "categorical"
+      choices: [0.0, 0.0025, 0.005, 0.01, 0.02, 0.05]
+    - name: "ohem_warmup_epochs"
+      path: "data_config.dataloader.sampling.warmup_epochs"
+      type: "int"
+      low: 3
+      high: 8
+    - name: "ohem_pool_multiplier"
+      path: "data_config.dataloader.sampling.pool_multiplier"
+      type: "int"
+      low: 2
+      high: 8
+    - name: "ohem_cap_protein"
+      path: "data_config.dataloader.sampling.cap_protein"
+      type: "int"
+      low: 2
+      high: 6

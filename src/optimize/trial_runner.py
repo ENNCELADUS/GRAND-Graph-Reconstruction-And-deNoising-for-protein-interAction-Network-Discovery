@@ -37,6 +37,20 @@ class TrialExecutionResult:
     checkpoint_path: Path
 
 
+@dataclass(frozen=True)
+class RecheckSeedResult:
+    """One seed-level recheck result for a candidate Optuna trial."""
+
+    trial_number: int
+    seed: int
+    run_id: str
+    objective_value: float
+    metric_column: str
+    train_csv_path: Path
+    checkpoint_path: Path
+    params: dict[str, object]
+
+
 def execute_trial(
     *,
     base_config: ConfigDict,
@@ -108,6 +122,60 @@ def execute_trial(
     )
 
 
+def execute_recheck_seed(
+    *,
+    base_config: ConfigDict,
+    search_space: list[SearchParameter],
+    sampled_values: Mapping[str, object],
+    run_id_prefix: str,
+    trial_number: int,
+    seed: int,
+    objective_metric: str,
+    direction: Direction,
+    execution_cfg: Mapping[str, object],
+    run_pipeline_fn: RunPipelineFn,
+) -> RecheckSeedResult:
+    """Re-run one candidate trial with one seed for post-HPO stability checking."""
+    trial_config = apply_search_parameters(
+        base_config=base_config,
+        sampled_values=sampled_values,
+        search_space=search_space,
+    )
+    run_id = build_recheck_run_id(
+        run_id_prefix=run_id_prefix,
+        trial_number=trial_number,
+        seed=seed,
+    )
+    run_cfg = get_section(trial_config, "run_config")
+    run_cfg["seed"] = seed
+    _patch_trial_runtime_config(
+        config=trial_config,
+        execution_cfg=execution_cfg,
+        run_id=run_id,
+    )
+
+    run_pipeline_fn(trial_config)
+
+    model_name, _ = extract_model_kwargs(trial_config)
+    train_csv_path = Path("logs") / model_name / "train" / run_id / "training_step.csv"
+    objective_history, metric_column = read_objective_history(
+        csv_path=train_csv_path,
+        objective_metric=objective_metric,
+    )
+    objective_value = pick_objective_value(history=objective_history, direction=direction)
+    checkpoint_path = Path("models") / model_name / "train" / run_id / "best_model.pth"
+    return RecheckSeedResult(
+        trial_number=trial_number,
+        seed=seed,
+        run_id=run_id,
+        objective_value=objective_value,
+        metric_column=metric_column,
+        train_csv_path=train_csv_path,
+        checkpoint_path=checkpoint_path,
+        params=dict(sampled_values),
+    )
+
+
 def run_best_full_pipeline(
     *,
     base_config: ConfigDict,
@@ -155,6 +223,11 @@ def run_best_full_pipeline(
 def build_trial_run_id(*, run_id_prefix: str, trial_number: int) -> str:
     """Build deterministic trial run ID."""
     return f"{run_id_prefix}_t{trial_number:04d}"
+
+
+def build_recheck_run_id(*, run_id_prefix: str, trial_number: int, seed: int) -> str:
+    """Build deterministic post-HPO recheck run ID."""
+    return f"{run_id_prefix}_recheck_t{trial_number:04d}_s{seed}"
 
 
 def read_objective_history(*, csv_path: Path, objective_metric: str) -> tuple[list[float], str]:
@@ -309,9 +382,12 @@ def _run_id_for_stage(run_cfg: ConfigDict, stage: str) -> str:
 
 __all__ = [
     "Direction",
+    "RecheckSeedResult",
     "RunPipelineFn",
     "TrialExecutionResult",
+    "build_recheck_run_id",
     "build_trial_run_id",
+    "execute_recheck_seed",
     "execute_trial",
     "objective_metric_to_csv_header",
     "pick_objective_value",

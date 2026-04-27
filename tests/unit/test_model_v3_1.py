@@ -77,8 +77,8 @@ def test_v3_1_instantiation() -> None:
     assert isinstance(model, torch.nn.Module)
 
 
-def test_v3_1_has_rich_pooling_submodule() -> None:
-    """InteractionCrossAttention inside V3_1 must expose pool_a and pool_b."""
+def test_v3_1_uses_shared_rich_pooling_submodule() -> None:
+    """InteractionCrossAttention must share rich-pooling parameters for A/B."""
     from src.model.v3_1 import V3_1
 
     cfg = _base_config()["model_config"]
@@ -87,6 +87,7 @@ def test_v3_1_has_rich_pooling_submodule() -> None:
     model = V3_1(**cfg)
     assert hasattr(model.cross_attention, "pool_a"), "cross_attention must have pool_a"
     assert hasattr(model.cross_attention, "pool_b"), "cross_attention must have pool_b"
+    assert model.cross_attention.pool_a is model.cross_attention.pool_b
     assert hasattr(model.cross_attention, "fusion"), "cross_attention must have fusion"
 
 
@@ -188,6 +189,94 @@ def test_rich_pooling_respects_padding_mask() -> None:
     )
 
 
+def test_rich_pooling_component_ablation_combinations_forward() -> None:
+    """Configured rich-pooling component ablations must keep forward shape stable."""
+    from src.model.v3_1 import V3_1
+
+    component_sets = [
+        ["esm_cls", "mean", "attn", "max", "gated"],
+        ["mean", "attn", "max", "gated"],
+        ["esm_cls", "attn", "max", "gated"],
+        ["esm_cls", "mean", "max", "gated"],
+        ["esm_cls", "mean", "attn", "gated"],
+        ["esm_cls", "mean", "attn", "max"],
+    ]
+
+    for components in component_sets:
+        cfg = _base_config()["model_config"]
+        assert isinstance(cfg, dict)
+        cfg.pop("model")
+        cfg["rich_pooling"] = {"components": components}
+        model = V3_1(**cfg)
+        model.eval()
+        with torch.no_grad():
+            out = model(_make_batch(seq_len_a=6, seq_len_b=7))
+        assert out["logits"].shape == (2, 1)
+
+
+def test_rich_pooling_residue_components_ignore_bos_and_eos() -> None:
+    """Residue-only components must exclude ESM BOS and EOS special tokens."""
+    from src.model.v3_1 import RichPooling
+
+    torch.manual_seed(7)
+    pool = RichPooling(d_model=8, dropout=0.0, components=("mean", "attn", "max"))
+    pool.eval()
+
+    x = torch.randn(2, 6, 8)
+    changed_specials = x.clone()
+    changed_specials[:, 0] = changed_specials[:, 0] + 100.0
+    changed_specials[:, 5] = changed_specials[:, 5] - 100.0
+    mask = torch.tensor(
+        [
+            [False, False, False, False, False, False],
+            [False, False, False, False, True, True],
+        ]
+    )
+    changed_specials[1, 3] = changed_specials[1, 3] - 100.0
+
+    with torch.no_grad():
+        out = pool(x, padding_mask=mask)
+        changed = pool(changed_specials, padding_mask=mask)
+
+    assert torch.allclose(out, changed)
+
+
+def test_rich_pooling_cls_component_uses_bos_token() -> None:
+    """The esm_cls component must depend on the first ESM special token."""
+    from src.model.v3_1 import RichPooling
+
+    torch.manual_seed(11)
+    pool = RichPooling(d_model=8, dropout=0.0, components=("esm_cls",))
+    pool.eval()
+
+    x = torch.randn(2, 5, 8)
+    changed_bos = x.clone()
+    changed_bos[:, 0] = changed_bos[:, 0] + 100.0
+
+    with torch.no_grad():
+        out = pool(x, padding_mask=None)
+        changed = pool(changed_bos, padding_mask=None)
+
+    assert not torch.allclose(out, changed)
+
+
+def test_rich_pooling_rejects_invalid_components() -> None:
+    """Invalid or degenerate rich-pooling component configs must fail fast."""
+    from src.model.v3_1 import RichPooling
+
+    invalid_configs = [
+        ("gated",),
+        ("mean", "mean"),
+        ("unknown",),
+    ]
+    for components in invalid_configs:
+        try:
+            RichPooling(d_model=8, dropout=0.0, components=components)
+        except ValueError:
+            continue
+        raise AssertionError(f"Expected ValueError for components={components!r}")
+
+
 # ---------------------------------------------------------------------------
 # Padding / variable-length sequences
 # ---------------------------------------------------------------------------
@@ -208,7 +297,7 @@ def test_v3_1_forward_variable_lengths() -> None:
         "emb_a": torch.randn(2, 5, 8),
         "emb_b": torch.randn(2, 6, 8),
         "len_a": torch.tensor([5, 3]),
-        "len_b": torch.tensor([6, 2]),
+        "len_b": torch.tensor([6, 3]),
     }
     with torch.no_grad():
         out = model(batch)

@@ -3185,11 +3185,75 @@ def test_prepare_topology_supervision_from_config_generates_missing_ratio_superv
 
 
 def test_v3_configs_omit_validation_mode() -> None:
-    for config_path in (Path("configs/v3.yaml"), Path("configs/v3.1.yaml")):
+    for config_path in (Path("configs/v3.yaml"), Path("configs/v3-1/v3.1.yaml")):
         config = load_config(config_path)
         topology_cfg = config["topology_finetune"]
         assert isinstance(topology_cfg, dict)
         assert "validation_mode" not in topology_cfg
+
+
+def test_v3_1_config_uses_ohem_and_fixed_pooling_hpo_space() -> None:
+    config = load_config("configs/v3-1/v3.1.yaml")
+    data_cfg = config["data_config"]
+    model_cfg = config["model_config"]
+    optimization_cfg = config["optimization"]
+    assert isinstance(data_cfg, dict)
+    assert isinstance(model_cfg, dict)
+    assert isinstance(optimization_cfg, dict)
+
+    dataloader_cfg = data_cfg["dataloader"]
+    assert isinstance(dataloader_cfg, dict)
+    sampling_cfg = dataloader_cfg["sampling"]
+    assert isinstance(sampling_cfg, dict)
+    assert sampling_cfg["strategy"] == "ohem"
+
+    rich_pooling_cfg = model_cfg["rich_pooling"]
+    assert isinstance(rich_pooling_cfg, dict)
+    assert rich_pooling_cfg["components"] == ["esm_cls", "mean", "attn", "max", "gated"]
+
+    search_space = optimization_cfg["search_space"]
+    assert isinstance(search_space, list)
+    names = {entry["name"] for entry in search_space if isinstance(entry, dict)}
+    assert "sampling_strategy" not in names
+    assert {"ohem_warmup_epochs", "ohem_pool_multiplier", "ohem_cap_protein"} <= names
+
+
+def test_v3_1_0428_rich_pooling_ablation_configs() -> None:
+    expected_components = {
+        "full.yaml": ["esm_cls", "mean", "attn", "max", "gated"],
+        "no_cls.yaml": ["mean", "attn", "max", "gated"],
+        "no_mean.yaml": ["esm_cls", "attn", "max", "gated"],
+        "no_attn.yaml": ["esm_cls", "mean", "max", "gated"],
+        "no_max.yaml": ["esm_cls", "mean", "attn", "gated"],
+        "no_gated.yaml": ["esm_cls", "mean", "attn", "max"],
+    }
+
+    config_dir = Path("configs/v3-1/0428")
+    assert {path.name for path in config_dir.glob("*.yaml")} == set(expected_components)
+    for filename, components in expected_components.items():
+        config = load_config(config_dir / filename)
+        run_cfg = config["run_config"]
+        data_cfg = config["data_config"]
+        model_cfg = config["model_config"]
+        assert isinstance(run_cfg, dict)
+        assert isinstance(data_cfg, dict)
+        assert isinstance(model_cfg, dict)
+
+        run_id = filename.removesuffix(".yaml")
+        assert run_cfg["stages"] == ["train", "evaluate"]
+        assert run_cfg["train_run_id"] == run_id
+        assert run_cfg["eval_run_id"] == run_id
+        assert "optimization" not in config
+
+        dataloader_cfg = data_cfg["dataloader"]
+        assert isinstance(dataloader_cfg, dict)
+        sampling_cfg = dataloader_cfg["sampling"]
+        assert isinstance(sampling_cfg, dict)
+        assert sampling_cfg["strategy"] == "ohem"
+
+        rich_pooling_cfg = model_cfg["rich_pooling"]
+        assert isinstance(rich_pooling_cfg, dict)
+        assert rich_pooling_cfg["components"] == components
 
 
 def test_v3_topology_finetune_uses_fixed_threshold_scheduler_and_patience() -> None:
@@ -3234,6 +3298,12 @@ def test_v3_topology_finetune_uses_fixed_threshold_scheduler_and_patience() -> N
 
 
 def test_0407_ablation_configs_use_warm_start_val_loss_recipe() -> None:
+    expected_epochs = {
+        "ws_n20.yaml": 12,
+        "ws_n30.yaml": 12,
+        "ws_n40.yaml": 20,
+        "ws_n50.yaml": 20,
+    }
     for config_path in sorted(Path("configs/v3/ablations/0407").glob("ws_n*.yaml")):
         config = load_config(config_path)
         topology_cfg = config["topology_finetune"]
@@ -3242,7 +3312,7 @@ def test_0407_ablation_configs_use_warm_start_val_loss_recipe() -> None:
         decision_threshold = topology_cfg["decision_threshold"]
         assert isinstance(decision_threshold, dict)
         assert topology_cfg["init_mode"] == "warm_start"
-        assert topology_cfg["epochs"] == 12
+        assert topology_cfg["epochs"] == expected_epochs[config_path.name]
         assert topology_cfg["pair_batch_size"] == 32
         assert topology_cfg["internal_validation_inference_batch_size"] == 128
         assert decision_threshold == {"mode": "fixed", "value": 0.5}
@@ -3257,7 +3327,7 @@ def test_0407_ablation_configs_use_warm_start_val_loss_recipe() -> None:
         assert isinstance(loss_weight_schedule, dict)
         assert loss_weight_schedule == {
             "warmup_epochs": 0,
-            "ramp_epochs": 1,
+            "ramp_epochs": 0,
             "schedule": "linear",
         }
 

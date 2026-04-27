@@ -9,8 +9,10 @@ from typing import Protocol
 from src.optimize.search_space import SearchParameter
 from src.optimize.trial_runner import (
     Direction,
+    RecheckSeedResult,
     RunPipelineFn,
     TrialExecutionResult,
+    execute_recheck_seed,
     execute_trial,
     run_best_full_pipeline,
 )
@@ -18,6 +20,7 @@ from src.pipeline.runtime import DistributedContext, dist, distributed_barrier
 from src.utils.config import ConfigDict
 
 ExecuteTrialFn = Callable[..., TrialExecutionResult | None]
+ExecuteRecheckSeedFn = Callable[..., RecheckSeedResult | None]
 RunBestPipelineFn = Callable[..., str]
 
 
@@ -27,6 +30,7 @@ class OptimizationCommand:
 
     kind: str
     trial_number: int | None = None
+    seed: int | None = None
     sampled_values: dict[str, object] = field(default_factory=dict)
     best_values: dict[str, object] = field(default_factory=dict)
 
@@ -81,6 +85,7 @@ def run_distributed_worker_loop(
     run_pipeline_fn: RunPipelineFn,
     channel: OptimizationChannel,
     execute_trial_fn: ExecuteTrialFn = execute_trial,
+    execute_recheck_seed_fn: ExecuteRecheckSeedFn = execute_recheck_seed,
     run_best_full_pipeline_fn: RunBestPipelineFn = run_best_full_pipeline,
 ) -> None:
     """Run worker-rank loop for distributed HPO coordination."""
@@ -97,6 +102,25 @@ def run_distributed_worker_loop(
                 sampled_values=command.sampled_values,
                 run_id_prefix=run_id_prefix,
                 trial_number=command.trial_number,
+                objective_metric=objective_metric,
+                direction=direction,
+                execution_cfg=execution_cfg,
+                run_pipeline_fn=run_pipeline_fn,
+            )
+            channel.barrier()
+            continue
+        if command.kind == "run_recheck_trial":
+            if command.trial_number is None:
+                raise ValueError("run_recheck_trial command requires trial_number")
+            if command.seed is None:
+                raise ValueError("run_recheck_trial command requires seed")
+            execute_recheck_seed_fn(
+                base_config=base_config,
+                search_space=search_space,
+                sampled_values=command.sampled_values,
+                run_id_prefix=run_id_prefix,
+                trial_number=command.trial_number,
+                seed=command.seed,
                 objective_metric=objective_metric,
                 direction=direction,
                 execution_cfg=execution_cfg,
