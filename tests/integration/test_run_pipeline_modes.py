@@ -504,6 +504,33 @@ def test_execute_pipeline_evaluate_only(
     assert patched_pipeline.topology_evaluation == []
 
 
+def test_execute_pipeline_skips_model_dirs_for_evaluation_stages(
+    base_config: ConfigDict,
+    patched_pipeline: PipelineCalls,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    run_cfg = base_config["run_config"]
+    assert isinstance(run_cfg, dict)
+    run_cfg["stages"] = ["evaluate", "topology_evaluate"]
+    run_cfg["load_checkpoint_path"] = "artifacts/eval_input_model.pth"
+
+    run_module.execute_pipeline(base_config)
+
+    assert patched_pipeline.training == []
+    assert patched_pipeline.evaluation == [(Path("artifacts/eval_input_model.pth"), "eval_run")]
+    assert patched_pipeline.topology_evaluation == [
+        (Path("artifacts/eval_input_model.pth"), "topology_eval_run")
+    ]
+    assert (tmp_path / "logs" / "v3" / "evaluate" / "eval_run").exists()
+    assert (tmp_path / "logs" / "v3" / "topology_evaluate" / "topology_eval_run").exists()
+    assert not (tmp_path / "models" / "v3" / "evaluate" / "eval_run").exists()
+    assert not (
+        tmp_path / "models" / "v3" / "topology_evaluate" / "topology_eval_run"
+    ).exists()
+
+
 def test_execute_pipeline_all_stages_with_shot(
     base_config: ConfigDict,
     patched_pipeline: PipelineCalls,

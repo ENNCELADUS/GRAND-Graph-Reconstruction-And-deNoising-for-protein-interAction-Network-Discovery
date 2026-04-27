@@ -30,7 +30,7 @@ uv run python -m src.run --config configs/v3/v3.yaml
 # To run only selected stages, edit `run_config.stages` in YAML, e.g.:
 # stages: ["train"] or stages: ["evaluate"].
 # If stages includes evaluate and domain_adaptation.enabled=true, SHOT runs before evaluation.
-# Checkpoints are stored in models/v3/<stage>/<RUN_ID>/.
+# Checkpoints are stored in models/v3/<stage>/<RUN_ID>/ for checkpoint-writing stages.
 ```
 
 ## Documentation

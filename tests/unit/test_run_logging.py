@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import pytest
 import src.pipeline.bootstrap as pipeline_bootstrap
@@ -11,6 +12,7 @@ from src.pipeline.runtime import ddp_find_unused_parameters
 from src.pipeline.stages.evaluate import _metrics_from_config
 from src.pipeline.stages.train import _training_validation_metrics
 from src.utils.config import ConfigDict
+from src.utils.logging import prepare_stage_directories
 
 
 def _base_config() -> ConfigDict:
@@ -57,6 +59,25 @@ def test_configure_root_logging_non_main_rank(monkeypatch: pytest.MonkeyPatch) -
 
     assert observed["level"] == logging.CRITICAL
     assert observed["force"] is True
+
+
+def test_prepare_stage_directories_can_skip_model_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    log_dir, model_dir = prepare_stage_directories(
+        "v3",
+        "evaluate",
+        "eval_case",
+        create_model_dir=False,
+    )
+
+    assert log_dir == Path("logs") / "v3" / "evaluate" / "eval_case"
+    assert model_dir == Path("models") / "v3" / "evaluate" / "eval_case"
+    assert log_dir.exists()
+    assert not model_dir.exists()
 
 
 def test_ddp_find_unused_parameters_uses_strategy_default() -> None:

@@ -35,6 +35,7 @@ _STAGE_RUN_ID_KEYS: tuple[tuple[str, str], ...] = (
     ("evaluate", "eval_run_id"),
     ("topology_evaluate", "topology_eval_run_id"),
 )
+_NON_CHECKPOINT_STAGES = {"evaluate", "topology_evaluate"}
 
 
 @runtime_checkable
@@ -342,6 +343,7 @@ def stage_paths(runtime: PipelineRuntime, stage: str, run_id: str) -> StagePaths
         model_name=runtime.config.model_name,
         stage=stage,
         run_id=run_id,
+        create_model_dir=stage not in _NON_CHECKPOINT_STAGES,
     )
     return StagePaths(log_dir=log_dir, model_dir=model_dir)
 

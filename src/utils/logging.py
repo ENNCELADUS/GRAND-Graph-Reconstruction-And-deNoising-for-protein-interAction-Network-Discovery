@@ -197,13 +197,20 @@ def _format_label(token: str) -> str:
     return " ".join(formatted_words)
 
 
-def prepare_stage_directories(model_name: str, stage: str, run_id: str) -> tuple[Path, Path]:
+def prepare_stage_directories(
+    model_name: str,
+    stage: str,
+    run_id: str,
+    *,
+    create_model_dir: bool = True,
+) -> tuple[Path, Path]:
     """Create and return log/model directories for a stage.
 
     Args:
         model_name: Model name (e.g. ``v3``).
         stage: Stage name (train/evaluate).
         run_id: Unique stage run ID.
+        create_model_dir: Whether to create the stage model directory.
 
     Returns:
         Tuple of ``(log_dir, model_dir)``.
@@ -211,7 +218,8 @@ def prepare_stage_directories(model_name: str, stage: str, run_id: str) -> tuple
     log_dir = Path("logs") / model_name / stage / run_id
     model_dir = Path("models") / model_name / stage / run_id
     log_dir.mkdir(parents=True, exist_ok=True)
-    model_dir.mkdir(parents=True, exist_ok=True)
+    if create_model_dir:
+        model_dir.mkdir(parents=True, exist_ok=True)
     return log_dir, model_dir
 
 

@@ -11,7 +11,7 @@ This document details the logging strategy and artifact structure for GRAND. It 
 
 ## Directory Layout
 
-All artifacts are stored under the `logs/` directory, organized by model architecture, stage, and run ID.
+Stage logs and metrics are stored under the `logs/` directory, organized by model architecture, stage, and run ID. Checkpoints are stored separately under `models/` only for stages that write model weights.
 
 ### Logging and Checkpoints
 
@@ -20,6 +20,7 @@ All artifacts are stored under the `logs/` directory, organized by model archite
 *   **Adaptation**: `logs/{model}/adapt/<run_id>/`
 *   **Evaluation**: `logs/{model}/evaluate/<run_id>/`
 *   **Topology Evaluation**: `logs/{model}/topology_evaluate/<run_id>/`
+*   **Checkpoints**: `models/{model}/{stage}/<run_id>/best_model.pth` for `train`, `topology_finetune`, and `adapt` only.
 
 **Note**: The `<run_id>` is either provided in the config or automatically generated (timestamped) by the runtime. In distributed mode, run IDs are broadcast from rank 0 to ensure consistency.
 
@@ -72,9 +73,10 @@ All artifacts are stored under the `logs/` directory, organized by model archite
     *   `topology_evaluate.csv`: Summary metrics row.
 
 ### 6. `best_model.pth`
-*   **Location**: `logs/{model}/{stage}/<run_id>/best_model.pth` (for `train` and `topology_finetune` stages).
+*   **Location**: `models/{model}/{stage}/<run_id>/best_model.pth` (for `train`, `topology_finetune`, and `adapt` stages).
 *   **Role**: The saved state dictionary of the model achieving the best performance on the monitored metric.
 *   **Checkpoint I/O**: All checkpoint operations go through `PipelineRuntime.save_checkpoint()` and `load_checkpoint()`, which handle accelerator unwrapping, `wait_for_everyone()` barriers, and main-process-only writes.
+*   **Evaluation stages**: `evaluate` and `topology_evaluate` load checkpoints but do not create checkpoint directories because they do not save model weights.
 
 ## Checkpoint Policy
 

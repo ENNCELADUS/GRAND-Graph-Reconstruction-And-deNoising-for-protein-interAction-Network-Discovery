@@ -67,7 +67,7 @@ Before any stage runs, the engine performs:
 *   **Runtime Construction**: `build_runtime()` creates the Accelerator, resolves the device, builds the `DistributedContext`, and generates run IDs for each stage. Run IDs are broadcast from rank 0 in distributed mode.
 *   **Data Loading**: Instantiates data loaders using `src/utils/data_io.build_dataloaders()`.
 *   **Model Initialization**: Selects and instantiates the model from `src/model/` based on `model_config`.
-*   **Stage Logging Bootstrap**: Creates stage loggers and artifact directories so setup events are persisted in `log.log`.
+*   **Stage Logging Bootstrap**: Creates stage loggers and log artifact directories so setup events are persisted in `log.log`. Model checkpoint directories are created only for stages that save checkpoints.
 
 ### 2. Train Stage
 
@@ -116,6 +116,8 @@ Runs PRING-style graph reconstruction and computes topology metrics (graph simil
 
 ## Artifact Contracts
 
+* `logs/{model}/{stage}/{run_id}/` is created for every selected stage.
+* `models/{model}/{stage}/{run_id}/` is created only for checkpoint-writing stages: `train`, `topology_finetune`, and `adapt`.
 * `training_step.csv` strict header order:
   * `Epoch,Epoch Time,Train Loss,Val Loss,Val <metric>...,Learning Rate`
   * `Val <metric>` columns follow `training_config.logging.validation_metrics` order.
