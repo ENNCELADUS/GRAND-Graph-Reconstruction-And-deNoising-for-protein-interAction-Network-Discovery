@@ -186,7 +186,7 @@ class RichPooling(nn.Module):
             component for component in POOLING_BASE_COMPONENTS if component in self.components
         )
         self.use_gated = POOLING_GATED_COMPONENT in self.components
-        self.attn_scorer = nn.Linear(d_model, 1)
+        self.attn_scorer = nn.Linear(d_model, 1) if "attn" in self.base_components else None
         self.pool_gate = (
             nn.Linear(d_model * len(self.base_components), len(self.base_components))
             if self.use_gated
@@ -245,6 +245,10 @@ class RichPooling(nn.Module):
                 ).clamp_min(1.0)
 
             if "attn" in self.base_components:
+                if self.attn_scorer is None:
+                    raise RuntimeError(
+                        "attn_scorer must be initialized when attention pooling is enabled"
+                    )
                 scores = self.attn_scorer(x).squeeze(-1)
                 scores = scores.masked_fill(~residue_mask, torch.finfo(scores.dtype).min)
                 attn_weights = torch.softmax(scores, dim=1).unsqueeze(-1)

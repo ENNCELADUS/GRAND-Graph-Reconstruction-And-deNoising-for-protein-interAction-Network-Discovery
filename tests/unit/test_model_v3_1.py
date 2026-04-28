@@ -228,7 +228,9 @@ def test_rich_pooling_no_attention_ablation_has_no_unused_trainable_parameters()
     output.sum().backward()
 
     unused_parameters = [
-        name for name, parameter in model.named_parameters() if parameter.requires_grad and parameter.grad is None
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
     ]
     assert unused_parameters == []
 
