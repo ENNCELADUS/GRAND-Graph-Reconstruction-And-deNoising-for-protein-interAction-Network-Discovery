@@ -214,6 +214,25 @@ def test_rich_pooling_component_ablation_combinations_forward() -> None:
         assert out["logits"].shape == (2, 1)
 
 
+def test_rich_pooling_no_attention_ablation_has_no_unused_trainable_parameters() -> None:
+    """No-attention rich pooling must not leave trainable parameters unused."""
+    from src.model.v3_1 import V3_1
+
+    cfg = _base_config()["model_config"]
+    assert isinstance(cfg, dict)
+    cfg.pop("model")
+    cfg["rich_pooling"] = {"components": ["esm_cls", "mean", "max", "gated"]}
+    model = V3_1(**cfg)
+
+    output = model(_make_batch(seq_len_a=6, seq_len_b=7))["logits"]
+    output.sum().backward()
+
+    unused_parameters = [
+        name for name, parameter in model.named_parameters() if parameter.requires_grad and parameter.grad is None
+    ]
+    assert unused_parameters == []
+
+
 def test_rich_pooling_residue_components_ignore_bos_and_eos() -> None:
     """Residue-only components must exclude ESM BOS and EOS special tokens."""
     from src.model.v3_1 import RichPooling
