@@ -170,14 +170,16 @@ def format_stage_event(event: str, **fields: object) -> str:
     if not fields:
         return event_label
     formatted_fields = " | ".join(
-        f"{_format_label(key)}: {_format_field_value(fields[key])}" for key in sorted(fields)
+        f"{_format_label(key)}: {_format_field_value(key, fields[key])}" for key in sorted(fields)
     )
     return f"{event_label} | {formatted_fields}"
 
 
-def _format_field_value(value: object) -> str:
+def _format_field_value(key: str, value: object) -> str:
     """Format event field values in a stable human-readable form."""
     if isinstance(value, float):
+        if key.lower() in {"lr", "learning_rate"}:
+            return f"{value:.6g}"
         return f"{value:.4f}"
     return str(value)
 
