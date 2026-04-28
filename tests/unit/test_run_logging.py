@@ -12,7 +12,7 @@ from src.pipeline.runtime import ddp_find_unused_parameters
 from src.pipeline.stages.evaluate import _metrics_from_config
 from src.pipeline.stages.train import _training_validation_metrics
 from src.utils.config import ConfigDict
-from src.utils.logging import prepare_stage_directories
+from src.utils.logging import format_stage_event, prepare_stage_directories
 
 
 def _base_config() -> ConfigDict:
@@ -78,6 +78,14 @@ def test_prepare_stage_directories_can_skip_model_dir(
     assert model_dir == Path("models") / "v3" / "evaluate" / "eval_case"
     assert log_dir.exists()
     assert not model_dir.exists()
+
+
+def test_format_stage_event_preserves_small_learning_rate() -> None:
+    message = format_stage_event("epoch_progress", lr=5e-5, loss=0.927643)
+
+    assert "LR: 0.0000" not in message
+    assert "LR: 5e-05" in message
+    assert "Loss: 0.9276" in message
 
 
 def test_ddp_find_unused_parameters_uses_strategy_default() -> None:
