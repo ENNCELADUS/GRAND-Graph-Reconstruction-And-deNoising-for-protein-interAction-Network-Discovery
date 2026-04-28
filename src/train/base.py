@@ -119,35 +119,31 @@ class Trainer:
             prepared = self.accelerator.prepare(
                 self.model,
                 self.optimizer,
-                train_loader,
             )
-            self.model, self.optimizer, prepared_loader = cast(
-                tuple[nn.Module, Optimizer, DataLoader[Mapping[str, object]]],
+            self.model, self.optimizer = cast(
+                tuple[nn.Module, Optimizer],
                 prepared,
             )
         else:
             prepared = self.accelerator.prepare(
                 self.model,
                 self.optimizer,
-                train_loader,
                 self.scheduler,
             )
             (
                 self.model,
                 self.optimizer,
-                prepared_loader,
                 self.scheduler,
             ) = cast(
                 tuple[
                     nn.Module,
                     Optimizer,
-                    DataLoader[Mapping[str, object]],
                     LRScheduler,
                 ],
                 prepared,
             )
         self._train_components_prepared = True
-        return prepared_loader
+        return train_loader
 
     @staticmethod
     def _required_batch_tensor(
@@ -369,7 +365,8 @@ class Trainer:
         self.model.train()
         running_loss = 0.0
         batch_count = 0
-        total_steps = max(1, len(train_loader))
+        configured_steps = len(train_loader)
+        total_steps = max(1, configured_steps)
 
         for batch in train_loader:
             batch_count += 1
@@ -416,9 +413,20 @@ class Trainer:
                 lr=current_lr,
             )
 
-        average_loss = running_loss / max(1, batch_count)
+        if batch_count == 0:
+            raise RuntimeError(
+                "Training epoch "
+                f"{epoch_index + 1} produced zero batches (len(train_loader)={configured_steps}). "
+                "Check dataloader sharding and batch sampler configuration."
+            )
+        average_loss = running_loss / batch_count
         current_lr = float(self.optimizer.param_groups[0]["lr"])
-        return {"loss": average_loss, "lr": current_lr}
+        return {
+            "loss": average_loss,
+            "loss_sum": running_loss,
+            "batch_count": float(batch_count),
+            "lr": current_lr,
+        }
 
 
 __all__ = [

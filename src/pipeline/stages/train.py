@@ -13,6 +13,7 @@ from torch import nn
 
 from src.evaluate import DEFAULT_DECISION_THRESHOLD, Evaluator
 from src.model import V3, V3_1, V4, V5
+from src.pipeline.loops import reduce_scalar_mapping
 from src.pipeline.runtime import AcceleratorLike, PipelineRuntime
 from src.train.base import Trainer
 from src.train.config import LossConfig, OptimizerConfig, SchedulerConfig
@@ -353,6 +354,10 @@ def run_training_stage(
             train_sampler.set_epoch(epoch)
         strategy.on_epoch_begin(trainer, epoch)
         train_stats = trainer.train_one_epoch(train_loader, epoch_index=epoch)
+        reduced_train_stats = _reduce_train_stats(
+            runtime=runtime,
+            train_stats=train_stats,
+        )
         stage_model.eval()
         with torch.no_grad():
             val_stats = evaluator.evaluate(
@@ -368,9 +373,9 @@ def run_training_stage(
         row: dict[str, float | int | str] = {
             "Epoch": epoch + 1,
             "Epoch Time": epoch_seconds,
-            "Train Loss": train_stats["loss"],
+            "Train Loss": reduced_train_stats["loss"],
             "Val Loss": float(val_stats.get("val_loss", 0.0)),
-            "Learning Rate": train_stats["lr"],
+            "Learning Rate": reduced_train_stats["lr"],
         }
         for metric in validation_metrics:
             row[f"Val {metric}"] = float(val_stats.get(f"val_{metric}", 0.0))
@@ -414,7 +419,7 @@ def run_training_stage(
                 "epoch_done",
                 epoch=epoch + 1,
                 time=epoch_seconds,
-                train_loss=train_stats["loss"],
+                train_loss=reduced_train_stats["loss"],
                 val_loss=float(val_stats.get("val_loss", 0.0)),
                 **val_metric_fields,
             )
@@ -453,3 +458,31 @@ def _sync_flag(runtime: PipelineRuntime, flag: bool) -> bool:
     flag_tensor = torch.tensor([1 if flag else 0], device=runtime.device, dtype=torch.int64)
     reduced = runtime.accelerator.reduce(flag_tensor, reduction="sum")
     return bool(int(reduced.item()) > 0)
+
+
+def _reduce_train_stats(
+    *,
+    runtime: PipelineRuntime,
+    train_stats: dict[str, float],
+) -> dict[str, float]:
+    """Reduce train loss sufficient statistics across distributed ranks."""
+    if not runtime.is_distributed:
+        return train_stats
+    reduced = reduce_scalar_mapping(
+        runtime.accelerator,
+        {
+            "loss_sum": train_stats["loss_sum"],
+            "batch_count": train_stats["batch_count"],
+        },
+        device=runtime.device,
+        reduction="sum",
+    )
+    batch_count = reduced["batch_count"]
+    if batch_count <= 0.0:
+        raise RuntimeError("Distributed training produced zero batches across all ranks")
+    return {
+        **train_stats,
+        "loss": reduced["loss_sum"] / batch_count,
+        "loss_sum": reduced["loss_sum"],
+        "batch_count": batch_count,
+    }

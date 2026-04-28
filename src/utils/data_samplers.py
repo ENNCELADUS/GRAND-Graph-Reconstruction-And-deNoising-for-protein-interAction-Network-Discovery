@@ -198,7 +198,7 @@ class StagedOHEMBatchSampler:
         if not self.neg_indices:
             raise ValueError("StagedOHEMBatchSampler requires at least one negative sample")
 
-        self.batch_size = int(batch_size)
+        self.target_batch_size = int(batch_size)
         self.warmup_pos_neg_ratio = float(warmup_pos_neg_ratio)
         self.warmup_epochs = int(warmup_epochs)
         self.pool_multiplier = int(pool_multiplier)
@@ -211,7 +211,8 @@ class StagedOHEMBatchSampler:
 
         self.pos_per_batch = self._compute_pos_per_batch()
         self.neg_per_batch = self._compute_neg_per_batch(self.pos_per_batch)
-        self.mining_batch_size = self.pool_multiplier * self.batch_size
+        self.warmup_batch_size = self.pos_per_batch + self.neg_per_batch
+        self.mining_batch_size = self.pool_multiplier * self.target_batch_size
 
     def set_epoch(self, epoch: int) -> None:
         """Set the current epoch (0-based)."""
@@ -288,7 +289,7 @@ class StagedOHEMBatchSampler:
 
     def _compute_pos_per_batch(self) -> int:
         denom = 1.0 + self.warmup_pos_neg_ratio
-        raw = self.batch_size / denom
+        raw = self.target_batch_size / denom
         return max(1, int(math.floor(raw)))
 
     def _compute_neg_per_batch(self, pos_per_batch: int) -> int:
@@ -304,11 +305,24 @@ class StagedOHEMBatchSampler:
         return max(0, scaled)
 
     def _pool_class_counts(self) -> tuple[int, int]:
-        pos_fraction = len(self.pos_indices) / float(len(self.labels))
+        local_count = len(self.pos_indices) + len(self.neg_indices)
+        if local_count == 0:
+            return 0, 0
+        pos_fraction = len(self.pos_indices) / float(local_count)
         pos_in_pool = int(round(self.mining_batch_size * pos_fraction))
         pos_in_pool = max(0, min(pos_in_pool, len(self.pos_indices)))
         neg_in_pool = self.mining_batch_size - pos_in_pool
         neg_in_pool = max(0, min(neg_in_pool, len(self.neg_indices)))
+        if self.mining_batch_size >= 2:
+            if len(self.pos_indices) > 0 and pos_in_pool == 0:
+                pos_in_pool = 1
+            if len(self.neg_indices) > 0 and neg_in_pool == 0:
+                neg_in_pool = 1
+        if pos_in_pool + neg_in_pool > self.mining_batch_size:
+            if pos_in_pool >= neg_in_pool and pos_in_pool > 1:
+                pos_in_pool -= pos_in_pool + neg_in_pool - self.mining_batch_size
+            elif neg_in_pool > 1:
+                neg_in_pool -= pos_in_pool + neg_in_pool - self.mining_batch_size
         if pos_in_pool + neg_in_pool == 0:
             return 0, 0
         if pos_in_pool + neg_in_pool < self.mining_batch_size:

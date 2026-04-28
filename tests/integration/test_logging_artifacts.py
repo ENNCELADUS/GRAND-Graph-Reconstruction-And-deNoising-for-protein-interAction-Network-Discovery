@@ -10,10 +10,11 @@ from typing import cast
 import pytest
 import src.pipeline.engine as run_module
 import src.pipeline.stages.evaluate as stage_evaluate_module
+import src.pipeline.stages.train as stage_train_module
 import torch
 from src.pipeline.runtime import DistributedContext
 from src.utils.config import ConfigDict
-from tests.runtime_helpers import build_stage_runtime
+from tests.runtime_helpers import NoOpAccelerator, build_stage_runtime
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -227,6 +228,42 @@ def test_non_main_process_does_not_write_stage_artifacts(tmp_path: Path) -> None
     assert not (log_dir / "log.log").exists()
     assert not (log_dir / "training_step.csv").exists()
     assert not best_checkpoint.exists()
+
+
+def test_reduce_train_stats_uses_loss_sufficient_statistics() -> None:
+    class _SummingAccelerator(NoOpAccelerator):
+        def reduce(self, value: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+            assert reduction == "sum"
+            self.reduce_calls += 1
+            return torch.tensor([6.0, 3.0], dtype=value.dtype, device=value.device)
+
+    distributed_context = DistributedContext(
+        ddp_enabled=True,
+        is_distributed=True,
+        rank=0,
+        local_rank=0,
+        world_size=2,
+    )
+    runtime = build_stage_runtime(
+        _base_config(stages=["train"]),
+        distributed=distributed_context,
+        accelerator=_SummingAccelerator(distributed=distributed_context),
+    )
+
+    reduced = stage_train_module._reduce_train_stats(
+        runtime=runtime,
+        train_stats={
+            "loss": 1.0,
+            "loss_sum": 2.0,
+            "batch_count": 2.0,
+            "lr": 0.01,
+        },
+    )
+
+    assert reduced["loss"] == pytest.approx(2.0)
+    assert reduced["loss_sum"] == pytest.approx(6.0)
+    assert reduced["batch_count"] == pytest.approx(3.0)
+    assert reduced["lr"] == pytest.approx(0.01)
 
 
 def test_pipeline_runtime_logs_once_to_console_for_multi_stage_runs(

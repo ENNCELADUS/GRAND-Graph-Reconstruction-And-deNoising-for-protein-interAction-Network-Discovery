@@ -47,6 +47,18 @@ class TinyDataset(Dataset[dict[str, torch.Tensor]]):
         return {"x": feature, "label": label}
 
 
+class EmptyDataset(Dataset[dict[str, torch.Tensor]]):
+    """Empty dataset for fail-fast trainer regression coverage."""
+
+    def __len__(self) -> int:
+        """Return dataset size."""
+        return 0
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        """Raise because no samples are available."""
+        raise IndexError(index)
+
+
 def _collate(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
     return {
         "x": torch.stack([item["x"] for item in batch], dim=0),
@@ -157,8 +169,11 @@ def test_trainer_runs_single_epoch() -> None:
     )
     metrics = trainer.train_one_epoch(loader)
     assert "loss" in metrics
+    assert "loss_sum" in metrics
+    assert "batch_count" in metrics
     assert "lr" in metrics
     assert metrics["loss"] >= 0.0
+    assert metrics["batch_count"] == float(len(loader))
 
 
 def test_trainer_uses_accelerator_runtime_for_backward_and_autocast() -> None:
@@ -184,6 +199,56 @@ def test_trainer_uses_accelerator_runtime_for_backward_and_autocast() -> None:
     assert accelerator.prepare_calls >= 1
     assert accelerator.autocast_calls == len(loader)
     assert accelerator.backward_calls == len(loader)
+
+
+def test_prepare_training_components_does_not_prepare_loader() -> None:
+    class RecordingAccelerator(NoOpAccelerator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.prepared_component_counts: list[int] = []
+
+        def prepare(self, *components: object) -> object:
+            self.prepared_component_counts.append(len(components))
+            return super().prepare(*components)
+
+    model = TinyModel()
+    loader = DataLoader(TinyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
+    accelerator = RecordingAccelerator()
+    trainer = Trainer(
+        model=model,
+        device=torch.device("cpu"),
+        accelerator=accelerator,
+        optimizer_config=OptimizerConfig(optimizer_type="adamw", lr=1e-2),
+        scheduler_config=SchedulerConfig(scheduler_type="none"),
+        loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        use_amp=False,
+        total_epochs=1,
+        steps_per_epoch=len(loader),
+    )
+
+    prepared_loader = trainer.prepare_training_components(loader)
+
+    assert prepared_loader is loader
+    assert accelerator.prepared_component_counts == [2]
+
+
+def test_trainer_raises_on_empty_epoch() -> None:
+    model = TinyModel()
+    loader = DataLoader(EmptyDataset(), batch_size=2, shuffle=False, collate_fn=_collate)
+    trainer = Trainer(
+        model=model,
+        device=torch.device("cpu"),
+        optimizer_config=OptimizerConfig(optimizer_type="adamw", lr=1e-2),
+        scheduler_config=SchedulerConfig(scheduler_type="none"),
+        loss_config=LossConfig(loss_type="bce_with_logits", pos_weight=1.0, label_smoothing=0.0),
+        use_amp=False,
+        total_epochs=1,
+        steps_per_epoch=1,
+        accelerator=NoOpAccelerator(),
+    )
+
+    with pytest.raises(RuntimeError, match=r"zero batches .*len\(train_loader\)=0"):
+        trainer.train_one_epoch(loader, epoch_index=0)
 
 
 def test_evaluator_uses_accelerator_runtime_for_autocast_and_metric_gather() -> None:
