@@ -1,0 +1,146 @@
+run_config:
+  stages: ["topology_finetune", "evaluate", "topology_evaluate"]
+  seed: 47
+  train_run_id: 20260308_002906
+  topology_finetune_run_id: "topo_gs_rd"
+  adapt_run_id: null
+  eval_run_id: "topo_gs_rd"
+  topology_eval_run_id: "topo_gs_rd"
+  load_checkpoint_path: "models/v3/train/20260308_002906/best_model.pth"
+  save_best_only: true
+
+device_config:
+  device: "cuda"
+  ddp_enabled: true
+  use_mixed_precision: true
+
+data_config:
+  benchmark:
+    name: "PRING"
+    root_dir: "data/PRING"
+    species: "human"
+    split_strategy: "BFS"
+    processed_dir: "data/PRING/species_processed_data/human/BFS"
+  embeddings:
+    source: "esm3"
+    cache_dir: "data/embeddings/esm3_1024"
+  max_sequence_length: 1024
+  dataloader:
+    train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi.txt"
+    valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi.txt"
+    test_dataset: "data/PRING/species_processed_data/human/BFS/human_test_ppi.txt"
+    num_workers: 4
+    pin_memory: true
+    drop_last: true
+    sampling:
+      strategy: "none"
+      warmup_epochs: 5
+      pool_multiplier: 4
+      cap_protein: 4
+
+model_config:
+  model: "v3"
+  input_dim: 1536
+  d_model: 512
+  encoder_layers: 3
+  cross_attn_layers: 3
+  n_heads: 8
+  mlp_head:
+    hidden_dims: [512, 256, 128]
+    dropout: 0.20
+    activation: "gelu"
+    norm: "layernorm"
+  regularization:
+    dropout: 0.10
+    token_dropout: 0.10
+    cross_attention_dropout: 0.10
+    stochastic_depth: 0.10
+
+training_config:
+  epochs: 50
+  batch_size: 32
+  early_stopping_patience: 10
+  monitor_metric: "auprc"
+  logging:
+    validation_metrics: ["auprc", "auroc", "f1", "accuracy"]
+  optimizer:
+    type: "adamw"
+    lr: 0.0001
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+    weight_decay: 0.05
+  scheduler:
+    type: "onecycle"
+    max_lr: 0.0001
+    pct_start: 0.10
+    div_factor: 25
+    final_div_factor: 10000
+    anneal_strategy: "cos"
+  loss:
+    type: "bce_with_logits"
+    pos_weight: 1.0
+    label_smoothing: 0.05
+  strategy:
+    type: "none"
+  domain_adaptation:
+    enabled: false
+
+topology_finetune:
+  init_mode: "warm_start"
+  epochs: 20
+  supervision_train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi_ratio5_exclusive.txt"
+  supervision_valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi_ratio5_exclusive.txt"
+  bce_negative_ratio: 5
+  subgraph_node_range: [20, 80]
+  gradient_accumulation_steps: 8
+  subgraphs_per_forward: 1
+  strategy: "mixed"
+  pair_batch_size: 32
+  internal_validation_inference_batch_size: 128
+  chunked_backward: true
+  compute_clustering_mmd: false
+  internal_validation_compute_clustering_mmd: false
+  decision_threshold:
+    mode: "fixed"
+    value: 0.5
+  monitor_metric: "val_topology_loss"
+  early_stopping_patience: 4
+  optimizer:
+    lr: 6.0e-6
+    weight_decay: 6.0e-3
+  loss_weight_schedule:
+    warmup_epochs: 0
+    ramp_epochs: 0
+    schedule: "linear"
+  losses:
+    alpha: 0.35   # Graph similarity
+    beta: 0.45    # Relative density
+    gamma: 0.0    # Degree MMD
+    delta: 0.0    # Clustering MMD
+    histogram_sigma: 1.25
+    degree_bins: 48
+    clustering_bins: 64
+
+evaluate:
+  decision_threshold:
+    mode: "fixed"
+    value: 0.5
+  metrics:
+    - "auroc"
+    - "auprc"
+    - "accuracy"
+    - "sensitivity"
+    - "specificity"
+    - "precision"
+    - "recall"
+    - "f1"
+    - "mcc"
+
+topology_evaluate:
+  inference_batch_size: 128
+  decision_threshold:
+    mode: "fixed"
+    value: 0.5
+  save_pair_predictions: true
+  report_baselines: "src/topology/baselines/pring_human_table2.json"

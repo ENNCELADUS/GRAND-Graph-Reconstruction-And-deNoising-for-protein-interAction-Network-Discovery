@@ -589,6 +589,7 @@ def test_parse_loss_weight_schedule_reads_warmup_ramp_and_schedule(
 
 def test_resolve_monitor_mode_uses_min_for_val_loss() -> None:
     assert _resolve_monitor_mode("val_loss") == "min"
+    assert _resolve_monitor_mode("val_topology_loss") == "min"
     assert _resolve_monitor_mode("val_auprc") == "max"
 
 
@@ -648,6 +649,36 @@ def test_validation_topology_loss_can_skip_clustering_mmd() -> None:
     assert loss == pytest.approx(expected)
 
 
+def test_train_topology_losses_skip_dense_adjacency_when_clustering_weight_is_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _unexpected_subgraph_adjacencies(**_: object) -> tuple[torch.Tensor, torch.Tensor]:
+        raise AssertionError("zero-weight clustering MMD should not build dense adjacency")
+
+    monkeypatch.setattr(
+        topology_finetune_stage,
+        "_subgraph_adjacencies",
+        _unexpected_subgraph_adjacencies,
+    )
+
+    losses = topology_finetune_stage._compute_train_topology_losses(
+        weights=topology_finetune_stage.TopologyLossWeights(
+            alpha=0.5,
+            beta=1.0,
+            gamma=0.3,
+            delta=0.0,
+        ),
+        num_nodes=3,
+        logits=torch.tensor([2.0, -2.0, 1.0], dtype=torch.float32),
+        labels=torch.tensor([1.0, 0.0, 1.0], dtype=torch.float32),
+        pair_index_a=torch.tensor([0, 0, 1], dtype=torch.long),
+        pair_index_b=torch.tensor([1, 2, 2], dtype=torch.long),
+        include_clustering_mmd=True,
+    )
+
+    assert losses["clustering_mmd"].item() == pytest.approx(0.0)
+
+
 def test_internal_validation_can_skip_clustering_mmd(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -704,6 +735,36 @@ def test_resolve_monitor_value_prefers_weighted_total_for_val_loss() -> None:
     )
 
     assert monitor_value == pytest.approx(0.77)
+
+
+def test_resolve_monitor_value_reads_val_topology_loss() -> None:
+    monitor_value = _resolve_monitor_value(
+        monitor_metric="val_topology_loss",
+        val_pair_stats={"val_loss": 0.42, "val_auprc": 0.91},
+        internal_val_topology_stats={
+            "graph_sim": 0.2,
+            "relative_density": 1.1,
+            "deg_dist_mmd": 0.3,
+            "cc_mmd": 0.4,
+        },
+        val_topology_loss=0.35,
+    )
+
+    assert monitor_value == pytest.approx(0.35)
+
+
+def test_resolve_monitor_value_requires_val_topology_loss() -> None:
+    with pytest.raises(ValueError, match="requires val_topology_loss"):
+        _resolve_monitor_value(
+            monitor_metric="val_topology_loss",
+            val_pair_stats={"val_loss": 0.42, "val_auprc": 0.91},
+            internal_val_topology_stats={
+                "graph_sim": 0.2,
+                "relative_density": 1.1,
+                "deg_dist_mmd": 0.3,
+                "cc_mmd": 0.4,
+            },
+        )
 
 
 def test_forward_model_uses_activation_checkpointing_during_training(

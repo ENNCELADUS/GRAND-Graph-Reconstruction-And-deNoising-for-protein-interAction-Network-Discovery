@@ -372,29 +372,49 @@ def compute_topology_losses(
             target_pair_probabilities,
         )
     )
+    reference = pred_pair_probabilities if use_pairwise_path else pred_adjacency
+    if reference is None:
+        raise ValueError(
+            "compute_topology_losses requires either adjacency matrices or "
+            "the pairwise topology inputs"
+        )
+    zero_loss = reference.new_zeros(())
+
     if use_pairwise_path:
         assert num_nodes is not None
         assert pair_index_a is not None
         assert pair_index_b is not None
         assert pred_pair_probabilities is not None
         assert target_pair_probabilities is not None
-        graph_similarity = _pairwise_graph_similarity_loss(
-            pred_pair_probabilities=pred_pair_probabilities,
-            target_pair_probabilities=target_pair_probabilities,
+        graph_similarity = (
+            _pairwise_graph_similarity_loss(
+                pred_pair_probabilities=pred_pair_probabilities,
+                target_pair_probabilities=target_pair_probabilities,
+            )
+            if weights.alpha != 0.0
+            else zero_loss
         )
-        relative_density = _pairwise_relative_density_loss(
-            num_nodes=num_nodes,
-            pred_pair_probabilities=pred_pair_probabilities,
-            target_pair_probabilities=target_pair_probabilities,
-            loss_form=weights.rd_loss_form,
+        relative_density = (
+            _pairwise_relative_density_loss(
+                num_nodes=num_nodes,
+                pred_pair_probabilities=pred_pair_probabilities,
+                target_pair_probabilities=target_pair_probabilities,
+                loss_form=weights.rd_loss_form,
+            )
+            if weights.beta != 0.0
+            else zero_loss
         )
-        degree_mmd = _degree_distribution_mmd_from_pairs(
-            num_nodes=num_nodes,
-            pair_index_a=pair_index_a,
-            pair_index_b=pair_index_b,
-            pred_pair_probabilities=pred_pair_probabilities,
-            target_pair_probabilities=target_pair_probabilities,
-            weights=weights,
+        degree_mmd = (
+            _degree_distribution_mmd_from_pairs(
+                num_nodes=num_nodes,
+                pair_index_a=pair_index_a,
+                pair_index_b=pair_index_b,
+                pred_pair_probabilities=pred_pair_probabilities,
+                target_pair_probabilities=target_pair_probabilities,
+                weights=weights,
+            )
+            if weights.gamma != 0.0
+            else zero_loss
         )
     else:
         if pred_adjacency is None or target_adjacency is None:
@@ -402,22 +422,34 @@ def compute_topology_losses(
                 "compute_topology_losses requires either adjacency matrices or "
                 "the pairwise topology inputs"
             )
-        graph_similarity = soft_graph_similarity_loss(
-            pred_adjacency=pred_adjacency,
-            target_adjacency=target_adjacency,
+        graph_similarity = (
+            soft_graph_similarity_loss(
+                pred_adjacency=pred_adjacency,
+                target_adjacency=target_adjacency,
+            )
+            if weights.alpha != 0.0
+            else zero_loss
         )
-        relative_density = soft_relative_density_loss(
-            pred_adjacency=pred_adjacency,
-            target_adjacency=target_adjacency,
-            loss_form=weights.rd_loss_form,
+        relative_density = (
+            soft_relative_density_loss(
+                pred_adjacency=pred_adjacency,
+                target_adjacency=target_adjacency,
+                loss_form=weights.rd_loss_form,
+            )
+            if weights.beta != 0.0
+            else zero_loss
         )
-        degree_mmd = _degree_distribution_mmd(
-            pred_adjacency=pred_adjacency,
-            target_adjacency=target_adjacency,
-            weights=weights,
+        degree_mmd = (
+            _degree_distribution_mmd(
+                pred_adjacency=pred_adjacency,
+                target_adjacency=target_adjacency,
+                weights=weights,
+            )
+            if weights.gamma != 0.0
+            else zero_loss
         )
 
-    if include_clustering_mmd:
+    if include_clustering_mmd and weights.delta != 0.0:
         if pred_adjacency is None:
             assert num_nodes is not None
             assert pair_index_a is not None
@@ -446,7 +478,7 @@ def compute_topology_losses(
             weights=weights,
         )
     else:
-        clustering_mmd = graph_similarity.new_zeros(())
+        clustering_mmd = zero_loss
     total_topology = (
         weights.alpha * graph_similarity
         + weights.beta * relative_density

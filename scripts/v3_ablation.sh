@@ -16,7 +16,7 @@ set -euo pipefail
 
 cd /public/home/wangar2023/grand/
 source ~/.bashrc
-TARGET_PATH="${1:-configs/v3/ablations/0426}"
+TARGET_PATH="${1:-configs/v3/ablations/0427_loss_ablation}"
 
 if [ ! -d ".venv" ]; then
   echo "Missing .venv. Run 'uv sync --group dev --locked' on the login node before sbatch."

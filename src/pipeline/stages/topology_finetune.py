@@ -290,7 +290,7 @@ def _topology_finetune_config(config: ConfigDict) -> ConfigDict:
 
 def _resolve_monitor_mode(monitor_metric: str) -> str:
     """Return the optimization direction for a topology finetune monitor."""
-    if monitor_metric == "val_loss":
+    if monitor_metric in {"val_loss", "val_topology_loss"}:
         return "min"
     return "max"
 
@@ -301,8 +301,12 @@ def _resolve_monitor_value(
     val_pair_stats: Mapping[str, float],
     internal_val_topology_stats: Mapping[str, float],
     val_total_loss: float | None = None,
+    val_topology_loss: float | None = None,
 ) -> float:
     """Resolve the scalar value used for checkpoint selection and early stopping."""
+    if monitor_metric == "val_topology_loss" and val_topology_loss is None:
+        raise ValueError("val_topology_loss monitor requires val_topology_loss")
+
     return float(
         {
             "val_loss": (
@@ -310,6 +314,7 @@ def _resolve_monitor_value(
                 if val_total_loss is not None
                 else float(val_pair_stats.get("val_loss", 0.0))
             ),
+            "val_topology_loss": float(val_topology_loss) if val_topology_loss is not None else 0.0,
             "internal_val_graph_sim": internal_val_topology_stats["graph_sim"],
             "val_graph_sim": internal_val_topology_stats["graph_sim"],
             "internal_val_relative_density": -abs(
@@ -1337,7 +1342,7 @@ def _compute_train_topology_losses(
 ) -> dict[str, torch.Tensor]:
     """Compute train topology losses, avoiding dense adjacency when clustering is disabled."""
     pred_pair_probabilities = torch.sigmoid(logits)
-    if not include_clustering_mmd:
+    if not include_clustering_mmd or weights.delta == 0.0:
         return compute_topology_losses(
             weights=weights,
             num_nodes=num_nodes,
@@ -3338,6 +3343,7 @@ def run_topology_finetuning_stage(
             val_pair_stats=validation_result.val_pair_stats,
             internal_val_topology_stats=validation_result.internal_val_topology_stats,
             val_total_loss=validation_result.val_total_loss,
+            val_topology_loss=validation_result.val_topology_loss,
         )
         should_stop = False
         save_best_checkpoint = False
