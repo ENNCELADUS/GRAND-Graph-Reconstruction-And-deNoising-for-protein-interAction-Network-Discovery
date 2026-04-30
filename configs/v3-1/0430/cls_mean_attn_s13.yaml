@@ -1,0 +1,111 @@
+run_config:
+  stages:
+  - train
+  - evaluate
+  seed: 13
+  train_run_id: cls_mean_attn_s13
+  topology_finetune_run_id: null
+  adapt_run_id: null
+  eval_run_id: cls_mean_attn_s13
+  topology_eval_run_id: null
+  load_checkpoint_path: null
+  save_best_only: true
+device_config:
+  device: cuda
+  ddp_enabled: true
+  use_mixed_precision: true
+data_config:
+  benchmark:
+    name: PRING
+    root_dir: data/PRING
+    species: human
+    split_strategy: BFS
+    processed_dir: data/PRING/species_processed_data/human/BFS
+  embeddings:
+    source: esm3
+    cache_dir: data/embeddings/esm3_1024
+  max_sequence_length: 1024
+  dataloader:
+    train_dataset: data/PRING/species_processed_data/human/BFS/human_train_ppi.txt
+    valid_dataset: data/PRING/species_processed_data/human/BFS/human_val_ppi.txt
+    test_dataset: data/PRING/species_processed_data/human/BFS/human_test_ppi.txt
+    num_workers: 4
+    pin_memory: true
+    drop_last: true
+    sampling:
+      strategy: ohem
+      warmup_epochs: 5
+      pool_multiplier: 4
+      cap_protein: 4
+model_config:
+  model: v3.1
+  input_dim: 1536
+  d_model: 512
+  encoder_layers: 3
+  cross_attn_layers: 3
+  n_heads: 8
+  mlp_head:
+    hidden_dims:
+    - 512
+    - 256
+    - 128
+    dropout: 0.2
+    activation: gelu
+    norm: layernorm
+  regularization:
+    dropout: 0.1
+    token_dropout: 0.1
+    cross_attention_dropout: 0.1
+    stochastic_depth: 0.1
+  rich_pooling:
+    components:
+    - esm_cls
+    - mean
+    - attn
+training_config:
+  epochs: 50
+  batch_size: 32
+  early_stopping_patience: 10
+  monitor_metric: auprc
+  logging:
+    validation_metrics:
+    - auprc
+    - auroc
+    - f1
+    - accuracy
+  optimizer:
+    type: adamw
+    lr: 0.0001
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-08
+    weight_decay: 0.05
+  scheduler:
+    type: onecycle
+    max_lr: 0.0001
+    pct_start: 0.1
+    div_factor: 25
+    final_div_factor: 10000
+    anneal_strategy: cos
+  loss:
+    type: bce_with_logits
+    pos_weight: 1.0
+    label_smoothing: 0.05
+  strategy:
+    type: none
+  domain_adaptation:
+    enabled: false
+evaluate:
+  decision_threshold:
+    mode: fixed
+    value: 0.5
+  metrics:
+  - auroc
+  - auprc
+  - accuracy
+  - sensitivity
+  - specificity
+  - precision
+  - recall
+  - f1
+  - mcc

@@ -3256,6 +3256,53 @@ def test_v3_1_0428_rich_pooling_ablation_configs() -> None:
         assert rich_pooling_cfg["components"] == components
 
 
+def test_v3_1_0430_multiseed_rich_pooling_ablation_configs() -> None:
+    expected_components = {
+        "full": ["esm_cls", "mean", "attn", "max", "gated"],
+        "no_cls": ["mean", "attn", "max", "gated"],
+        "no_max": ["esm_cls", "mean", "attn", "gated"],
+        "no_gated": ["esm_cls", "mean", "attn", "max"],
+        "cls_mean_attn": ["esm_cls", "mean", "attn"],
+        "mean_attn": ["mean", "attn"],
+    }
+    expected_seeds = {13, 47, 101}
+
+    config_dir = Path("configs/v3-1/0430_multiseed")
+    expected_files = {
+        f"{ablation}_s{seed}.yaml"
+        for ablation in expected_components
+        for seed in expected_seeds
+    }
+    assert {path.name for path in config_dir.glob("*.yaml")} == expected_files
+
+    for ablation, components in expected_components.items():
+        for seed in expected_seeds:
+            run_id = f"{ablation}_s{seed}"
+            config = load_config(config_dir / f"{run_id}.yaml")
+            run_cfg = config["run_config"]
+            data_cfg = config["data_config"]
+            model_cfg = config["model_config"]
+            assert isinstance(run_cfg, dict)
+            assert isinstance(data_cfg, dict)
+            assert isinstance(model_cfg, dict)
+
+            assert run_cfg["stages"] == ["train", "evaluate"]
+            assert run_cfg["seed"] == seed
+            assert run_cfg["train_run_id"] == run_id
+            assert run_cfg["eval_run_id"] == run_id
+            assert "optimization" not in config
+
+            dataloader_cfg = data_cfg["dataloader"]
+            assert isinstance(dataloader_cfg, dict)
+            sampling_cfg = dataloader_cfg["sampling"]
+            assert isinstance(sampling_cfg, dict)
+            assert sampling_cfg["strategy"] == "ohem"
+
+            rich_pooling_cfg = model_cfg["rich_pooling"]
+            assert isinstance(rich_pooling_cfg, dict)
+            assert rich_pooling_cfg["components"] == components
+
+
 def test_v3_topology_finetune_uses_fixed_threshold_scheduler_and_patience() -> None:
     config = load_config("configs/v3.yaml")
     topology_cfg = config["topology_finetune"]

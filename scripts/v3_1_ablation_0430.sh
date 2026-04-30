@@ -16,7 +16,7 @@ set -euo pipefail
 
 cd /public/home/wangar2023/grand/
 source ~/.bashrc
-TARGET_PATH="${1:-configs/v3-1/0428}"
+TARGET_PATH="${1:-configs/v3-1/0430}"
 
 if [ ! -d ".venv" ]; then
   echo "Missing .venv. Run 'uv sync --group dev --locked' on the login node before sbatch."
