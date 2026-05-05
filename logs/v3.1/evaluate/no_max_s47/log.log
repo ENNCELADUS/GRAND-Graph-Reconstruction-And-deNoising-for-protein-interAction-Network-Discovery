@@ -1,0 +1,7 @@
+2026-05-03 06:29:42 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 812 | Valid Batches: 762 | World Size: 4
+2026-05-03 10:08:51 INFO Stage Start | Checkpoint: models/v3.1/train/no_max_s47/best_model.pth | Run Id: no_max_s47
+2026-05-03 10:08:51 INFO Checkpoint Loaded | Path: models/v3.1/train/no_max_s47/best_model.pth
+2026-05-03 10:08:51 INFO Decision Threshold | Mode: fixed | Value: 0.5000
+2026-05-03 10:16:33 INFO Evaluation Metrics | Accuracy: 0.6153 | AUPRC: 0.6881 | Auroc: 0.6661 | F1: 0.5922 | Mcc: 0.2321 | Precision: 0.6302 | Recall: 0.5585 | Sensitivity: 0.5585 | Specificity: 0.6721 | Split: test
+2026-05-03 10:16:33 INFO CSV Written | Path: logs/v3.1/evaluate/no_max_s47/evaluate.csv
+2026-05-03 10:16:33 INFO Stage Done | Run Id: no_max_s47

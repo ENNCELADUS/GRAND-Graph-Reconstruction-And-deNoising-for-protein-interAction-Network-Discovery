@@ -1,0 +1,7 @@
+2026-05-02 02:59:57 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 812 | Valid Batches: 762 | World Size: 4
+2026-05-02 05:50:04 INFO Stage Start | Checkpoint: models/v3.1/train/no_cls_s101/best_model.pth | Run Id: no_cls_s101
+2026-05-02 05:50:04 INFO Checkpoint Loaded | Path: models/v3.1/train/no_cls_s101/best_model.pth
+2026-05-02 05:50:04 INFO Decision Threshold | Mode: fixed | Value: 0.5000
+2026-05-02 05:57:47 INFO Evaluation Metrics | Accuracy: 0.6178 | AUPRC: 0.6926 | Auroc: 0.6715 | F1: 0.6050 | Mcc: 0.2361 | Precision: 0.6261 | Recall: 0.5854 | Sensitivity: 0.5854 | Specificity: 0.6502 | Split: test
+2026-05-02 05:57:47 INFO CSV Written | Path: logs/v3.1/evaluate/no_cls_s101/evaluate.csv
+2026-05-02 05:57:47 INFO Stage Done | Run Id: no_cls_s101

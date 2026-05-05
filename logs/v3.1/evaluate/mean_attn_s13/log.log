@@ -1,0 +1,7 @@
+2026-05-01 20:45:36 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 812 | Valid Batches: 762 | World Size: 4
+2026-05-01 23:33:41 INFO Stage Start | Checkpoint: models/v3.1/train/mean_attn_s13/best_model.pth | Run Id: mean_attn_s13
+2026-05-01 23:33:41 INFO Checkpoint Loaded | Path: models/v3.1/train/mean_attn_s13/best_model.pth
+2026-05-01 23:33:41 INFO Decision Threshold | Mode: fixed | Value: 0.5000
+2026-05-01 23:41:24 INFO Evaluation Metrics | Accuracy: 0.6060 | AUPRC: 0.6808 | Auroc: 0.6606 | F1: 0.6060 | Mcc: 0.2120 | Precision: 0.6062 | Recall: 0.6058 | Sensitivity: 0.6058 | Specificity: 0.6062 | Split: test
+2026-05-01 23:41:24 INFO CSV Written | Path: logs/v3.1/evaluate/mean_attn_s13/evaluate.csv
+2026-05-01 23:41:24 INFO Stage Done | Run Id: mean_attn_s13

@@ -1,0 +1,139 @@
+2026-05-01 10:41:24 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 812 | Valid Batches: 762 | World Size: 4
+2026-05-01 10:41:24 INFO Stage Start | Run Id: full_s13
+2026-05-01 10:41:26 INFO Train Config | Epochs: 50 | Monitor: auprc | Patience: 10
+2026-05-01 10:41:26 INFO Epoch Start | Epoch: 1
+2026-05-01 10:41:32 INFO Epoch Progress | Epoch: 1 | Loss: 0.9052 | LR: 4e-06 | Progress: 0% | Step: 1/812
+2026-05-01 10:43:30 INFO Epoch Progress | Epoch: 1 | Loss: 0.7354 | LR: 1.30844e-05 | Progress: 25% | Step: 203/812
+2026-05-01 10:45:27 INFO Epoch Progress | Epoch: 1 | Loss: 0.7231 | LR: 3.704e-05 | Progress: 50% | Step: 406/812
+2026-05-01 10:47:24 INFO Epoch Progress | Epoch: 1 | Loss: 0.7003 | LR: 6.67126e-05 | Progress: 75% | Step: 609/812
+2026-05-01 10:49:21 INFO Epoch Progress | Epoch: 1 | Loss: 0.6631 | LR: 9.07628e-05 | Progress: 100% | Step: 812/812
+2026-05-01 10:53:10 INFO CSV Written | Epoch: 1
+2026-05-01 10:53:15 INFO Best Saved | Epoch: 1 | Monitor: val_auprc | Value: 0.8450
+2026-05-01 10:53:15 INFO Epoch Done | Epoch: 1 | Time: 703.1982 | Train Loss: 0.6646 | Val Accuracy: 0.7616 | Val AUPRC: 0.8450 | Val Auroc: 0.8488 | Val F1: 0.7440 | Val Loss: 0.5154
+2026-05-01 10:53:15 INFO Epoch Start | Epoch: 2
+2026-05-01 10:53:17 INFO Epoch Progress | Epoch: 2 | Loss: 0.6111 | LR: 9.08503e-05 | Progress: 0% | Step: 1/812
+2026-05-01 10:55:14 INFO Epoch Progress | Epoch: 2 | Loss: 0.5107 | LR: 9.99999e-05 | Progress: 25% | Step: 203/812
+2026-05-01 10:57:10 INFO Epoch Progress | Epoch: 2 | Loss: 0.4968 | LR: 9.98791e-05 | Progress: 50% | Step: 406/812
+2026-05-01 10:59:08 INFO Epoch Progress | Epoch: 2 | Loss: 0.4912 | LR: 9.95152e-05 | Progress: 75% | Step: 609/812
+2026-05-01 11:01:05 INFO Epoch Progress | Epoch: 2 | Loss: 0.4822 | LR: 9.89101e-05 | Progress: 100% | Step: 812/812
+2026-05-01 11:04:46 INFO CSV Written | Epoch: 2
+2026-05-01 11:04:46 INFO Best Saved | Epoch: 2 | Monitor: val_auprc | Value: 0.8910
+2026-05-01 11:04:46 INFO Epoch Done | Epoch: 2 | Time: 690.6246 | Train Loss: 0.4800 | Val Accuracy: 0.8143 | Val AUPRC: 0.8910 | Val Auroc: 0.8936 | Val F1: 0.8186 | Val Loss: 0.4484
+2026-05-01 11:04:46 INFO Epoch Start | Epoch: 3
+2026-05-01 11:04:48 INFO Epoch Progress | Epoch: 3 | Loss: 0.3428 | LR: 9.89065e-05 | Progress: 0% | Step: 1/812
+2026-05-01 11:06:46 INFO Epoch Progress | Epoch: 3 | Loss: 0.4418 | LR: 9.80666e-05 | Progress: 25% | Step: 203/812
+2026-05-01 11:08:45 INFO Epoch Progress | Epoch: 3 | Loss: 0.4329 | LR: 9.69949e-05 | Progress: 50% | Step: 406/812
+2026-05-01 11:10:43 INFO Epoch Progress | Epoch: 3 | Loss: 0.4249 | LR: 9.56895e-05 | Progress: 75% | Step: 609/812
+2026-05-01 11:12:41 INFO Epoch Progress | Epoch: 3 | Loss: 0.4242 | LR: 9.41615e-05 | Progress: 100% | Step: 812/812
+2026-05-01 11:16:24 INFO CSV Written | Epoch: 3
+2026-05-01 11:16:24 INFO Best Saved | Epoch: 3 | Monitor: val_auprc | Value: 0.9128
+2026-05-01 11:16:24 INFO Epoch Done | Epoch: 3 | Time: 698.0922 | Train Loss: 0.4232 | Val Accuracy: 0.8310 | Val AUPRC: 0.9128 | Val Auroc: 0.9149 | Val F1: 0.8251 | Val Loss: 0.4203
+2026-05-01 11:16:24 INFO Epoch Start | Epoch: 4
+2026-05-01 11:16:27 INFO Epoch Progress | Epoch: 4 | Loss: 0.2871 | LR: 9.41535e-05 | Progress: 0% | Step: 1/812
+2026-05-01 11:18:23 INFO Epoch Progress | Epoch: 4 | Loss: 0.3912 | LR: 9.24184e-05 | Progress: 25% | Step: 203/812
+2026-05-01 11:20:19 INFO Epoch Progress | Epoch: 4 | Loss: 0.3892 | LR: 9.04686e-05 | Progress: 50% | Step: 406/812
+2026-05-01 11:22:15 INFO Epoch Progress | Epoch: 4 | Loss: 0.3846 | LR: 8.83216e-05 | Progress: 75% | Step: 609/812
+2026-05-01 11:24:12 INFO Epoch Progress | Epoch: 4 | Loss: 0.3866 | LR: 8.59879e-05 | Progress: 100% | Step: 812/812
+2026-05-01 11:27:52 INFO CSV Written | Epoch: 4
+2026-05-01 11:27:52 INFO Best Saved | Epoch: 4 | Monitor: val_auprc | Value: 0.9261
+2026-05-01 11:27:52 INFO Epoch Done | Epoch: 4 | Time: 687.6720 | Train Loss: 0.3862 | Val Accuracy: 0.8496 | Val AUPRC: 0.9261 | Val Auroc: 0.9272 | Val F1: 0.8495 | Val Loss: 0.3922
+2026-05-01 11:27:52 INFO Epoch Start | Epoch: 5
+2026-05-01 11:27:55 INFO Epoch Progress | Epoch: 5 | Loss: 0.4454 | LR: 8.5976e-05 | Progress: 0% | Step: 1/812
+2026-05-01 11:29:52 INFO Epoch Progress | Epoch: 5 | Loss: 0.3573 | LR: 8.3479e-05 | Progress: 25% | Step: 203/812
+2026-05-01 11:31:49 INFO Epoch Progress | Epoch: 5 | Loss: 0.3552 | LR: 8.08069e-05 | Progress: 50% | Step: 406/812
+2026-05-01 11:33:47 INFO Epoch Progress | Epoch: 5 | Loss: 0.3552 | LR: 7.79847e-05 | Progress: 75% | Step: 609/812
+2026-05-01 11:35:44 INFO Epoch Progress | Epoch: 5 | Loss: 0.3561 | LR: 7.50262e-05 | Progress: 100% | Step: 812/812
+2026-05-01 11:39:25 INFO CSV Written | Epoch: 5
+2026-05-01 11:39:26 INFO Best Saved | Epoch: 5 | Monitor: val_auprc | Value: 0.9301
+2026-05-01 11:39:26 INFO Epoch Done | Epoch: 5 | Time: 693.0764 | Train Loss: 0.3559 | Val Accuracy: 0.8563 | Val AUPRC: 0.9301 | Val Auroc: 0.9320 | Val F1: 0.8574 | Val Loss: 0.3906
+2026-05-01 11:39:26 INFO Epoch Start | Epoch: 6
+2026-05-01 11:39:41 INFO Epoch Progress | Epoch: 6 | Loss: 0.9058 | LR: 7.50113e-05 | Progress: 1% | Step: 1/190
+2026-05-01 11:41:15 INFO Epoch Progress | Epoch: 6 | Loss: 0.7075 | LR: 7.43082e-05 | Progress: 25% | Step: 48/190
+2026-05-01 11:42:50 INFO Epoch Progress | Epoch: 6 | Loss: 0.6943 | LR: 7.35837e-05 | Progress: 51% | Step: 96/190
+2026-05-01 11:44:24 INFO Epoch Progress | Epoch: 6 | Loss: 0.6901 | LR: 7.28527e-05 | Progress: 76% | Step: 144/190
+2026-05-01 11:45:52 INFO Epoch Progress | Epoch: 6 | Loss: 0.6871 | LR: 7.21463e-05 | Progress: 100% | Step: 190/190
+2026-05-01 11:49:38 INFO CSV Written | Epoch: 6
+2026-05-01 11:49:38 INFO Best Saved | Epoch: 6 | Monitor: val_auprc | Value: 0.9372
+2026-05-01 11:49:38 INFO Epoch Done | Epoch: 6 | Time: 612.0228 | Train Loss: 0.6851 | Val Accuracy: 0.8654 | Val AUPRC: 0.9372 | Val Auroc: 0.9382 | Val F1: 0.8665 | Val Loss: 0.4833
+2026-05-01 11:49:38 INFO Epoch Start | Epoch: 7
+2026-05-01 11:49:48 INFO Epoch Progress | Epoch: 7 | Loss: 0.6685 | LR: 7.21309e-05 | Progress: 1% | Step: 1/190
+2026-05-01 11:51:20 INFO Epoch Progress | Epoch: 7 | Loss: 0.6781 | LR: 7.14034e-05 | Progress: 25% | Step: 48/190
+2026-05-01 11:52:55 INFO Epoch Progress | Epoch: 7 | Loss: 0.6694 | LR: 7.06546e-05 | Progress: 51% | Step: 96/190
+2026-05-01 11:54:30 INFO Epoch Progress | Epoch: 7 | Loss: 0.6686 | LR: 6.99001e-05 | Progress: 76% | Step: 144/190
+2026-05-01 11:55:59 INFO Epoch Progress | Epoch: 7 | Loss: 0.6623 | LR: 6.9172e-05 | Progress: 100% | Step: 190/190
+2026-05-01 11:59:47 INFO CSV Written | Epoch: 7
+2026-05-01 11:59:47 INFO Epoch Done | Epoch: 7 | Time: 609.0300 | Train Loss: 0.6586 | Val Accuracy: 0.8633 | Val AUPRC: 0.9367 | Val Auroc: 0.9384 | Val F1: 0.8615 | Val Loss: 0.4533
+2026-05-01 11:59:47 INFO Epoch Start | Epoch: 8
+2026-05-01 11:59:55 INFO Epoch Progress | Epoch: 8 | Loss: 0.6820 | LR: 6.91561e-05 | Progress: 1% | Step: 1/190
+2026-05-01 12:01:29 INFO Epoch Progress | Epoch: 8 | Loss: 0.6164 | LR: 6.84072e-05 | Progress: 25% | Step: 48/190
+2026-05-01 12:03:03 INFO Epoch Progress | Epoch: 8 | Loss: 0.6337 | LR: 6.76373e-05 | Progress: 51% | Step: 96/190
+2026-05-01 12:04:36 INFO Epoch Progress | Epoch: 8 | Loss: 0.6411 | LR: 6.68626e-05 | Progress: 76% | Step: 144/190
+2026-05-01 12:06:05 INFO Epoch Progress | Epoch: 8 | Loss: 0.6464 | LR: 6.61159e-05 | Progress: 100% | Step: 190/190
+2026-05-01 12:09:56 INFO CSV Written | Epoch: 8
+2026-05-01 12:09:56 INFO Epoch Done | Epoch: 8 | Time: 608.9569 | Train Loss: 0.6426 | Val Accuracy: 0.8668 | Val AUPRC: 0.9355 | Val Auroc: 0.9383 | Val F1: 0.8666 | Val Loss: 0.4608
+2026-05-01 12:09:56 INFO Epoch Start | Epoch: 9
+2026-05-01 12:10:06 INFO Epoch Progress | Epoch: 9 | Loss: 0.7037 | LR: 6.60996e-05 | Progress: 1% | Step: 1/190
+2026-05-01 12:11:39 INFO Epoch Progress | Epoch: 9 | Loss: 0.6241 | LR: 6.53487e-05 | Progress: 25% | Step: 48/190
+2026-05-01 12:13:13 INFO Epoch Progress | Epoch: 9 | Loss: 0.6333 | LR: 6.45612e-05 | Progress: 51% | Step: 96/190
+2026-05-01 12:14:48 INFO Epoch Progress | Epoch: 9 | Loss: 0.6380 | LR: 6.37696e-05 | Progress: 76% | Step: 144/190
+2026-05-01 12:16:16 INFO Epoch Progress | Epoch: 9 | Loss: 0.6363 | LR: 6.30075e-05 | Progress: 100% | Step: 190/190
+2026-05-01 12:20:03 INFO CSV Written | Epoch: 9
+2026-05-01 12:20:03 INFO Epoch Done | Epoch: 9 | Time: 606.6860 | Train Loss: 0.6283 | Val Accuracy: 0.8619 | Val AUPRC: 0.9350 | Val Auroc: 0.9362 | Val F1: 0.8589 | Val Loss: 0.4431
+2026-05-01 12:20:03 INFO Epoch Start | Epoch: 10
+2026-05-01 12:20:13 INFO Epoch Progress | Epoch: 10 | Loss: 0.5786 | LR: 6.29909e-05 | Progress: 1% | Step: 1/190
+2026-05-01 12:21:45 INFO Epoch Progress | Epoch: 10 | Loss: 0.6114 | LR: 6.22088e-05 | Progress: 25% | Step: 48/190
+2026-05-01 12:23:19 INFO Epoch Progress | Epoch: 10 | Loss: 0.6242 | LR: 6.14068e-05 | Progress: 51% | Step: 96/190
+2026-05-01 12:24:54 INFO Epoch Progress | Epoch: 10 | Loss: 0.6192 | LR: 6.06017e-05 | Progress: 76% | Step: 144/190
+2026-05-01 12:26:24 INFO Epoch Progress | Epoch: 10 | Loss: 0.6186 | LR: 5.98274e-05 | Progress: 100% | Step: 190/190
+2026-05-01 12:30:10 INFO CSV Written | Epoch: 10
+2026-05-01 12:30:10 INFO Epoch Done | Epoch: 10 | Time: 607.7863 | Train Loss: 0.6112 | Val Accuracy: 0.8634 | Val AUPRC: 0.9344 | Val Auroc: 0.9368 | Val F1: 0.8616 | Val Loss: 0.4410
+2026-05-01 12:30:10 INFO Epoch Start | Epoch: 11
+2026-05-01 12:30:21 INFO Epoch Progress | Epoch: 11 | Loss: 0.6234 | LR: 5.98105e-05 | Progress: 1% | Step: 1/190
+2026-05-01 12:31:53 INFO Epoch Progress | Epoch: 11 | Loss: 0.5917 | LR: 5.90168e-05 | Progress: 25% | Step: 48/190
+2026-05-01 12:33:28 INFO Epoch Progress | Epoch: 11 | Loss: 0.5956 | LR: 5.82038e-05 | Progress: 51% | Step: 96/190
+2026-05-01 12:35:02 INFO Epoch Progress | Epoch: 11 | Loss: 0.5983 | LR: 5.73885e-05 | Progress: 76% | Step: 144/190
+2026-05-01 12:36:31 INFO Epoch Progress | Epoch: 11 | Loss: 0.6001 | LR: 5.66053e-05 | Progress: 100% | Step: 190/190
+2026-05-01 12:40:17 INFO CSV Written | Epoch: 11
+2026-05-01 12:40:17 INFO Epoch Done | Epoch: 11 | Time: 606.5735 | Train Loss: 0.5933 | Val Accuracy: 0.8680 | Val AUPRC: 0.9347 | Val Auroc: 0.9384 | Val F1: 0.8661 | Val Loss: 0.4205
+2026-05-01 12:40:17 INFO Epoch Start | Epoch: 12
+2026-05-01 12:40:27 INFO Epoch Progress | Epoch: 12 | Loss: 0.4585 | LR: 5.65883e-05 | Progress: 1% | Step: 1/190
+2026-05-01 12:41:59 INFO Epoch Progress | Epoch: 12 | Loss: 0.5477 | LR: 5.57863e-05 | Progress: 25% | Step: 48/190
+2026-05-01 12:43:34 INFO Epoch Progress | Epoch: 12 | Loss: 0.5614 | LR: 5.49657e-05 | Progress: 51% | Step: 96/190
+2026-05-01 12:45:08 INFO Epoch Progress | Epoch: 12 | Loss: 0.5680 | LR: 5.41438e-05 | Progress: 76% | Step: 144/190
+2026-05-01 12:46:37 INFO Epoch Progress | Epoch: 12 | Loss: 0.5735 | LR: 5.33551e-05 | Progress: 100% | Step: 190/190
+2026-05-01 12:50:20 INFO CSV Written | Epoch: 12
+2026-05-01 12:50:20 INFO Epoch Done | Epoch: 12 | Time: 603.3146 | Train Loss: 0.5656 | Val Accuracy: 0.8643 | Val AUPRC: 0.9333 | Val Auroc: 0.9360 | Val F1: 0.8635 | Val Loss: 0.4142
+2026-05-01 12:50:20 INFO Epoch Start | Epoch: 13
+2026-05-01 12:50:29 INFO Epoch Progress | Epoch: 13 | Loss: 0.5146 | LR: 5.33379e-05 | Progress: 1% | Step: 1/190
+2026-05-01 12:52:02 INFO Epoch Progress | Epoch: 13 | Loss: 0.5264 | LR: 5.25311e-05 | Progress: 25% | Step: 48/190
+2026-05-01 12:53:37 INFO Epoch Progress | Epoch: 13 | Loss: 0.5439 | LR: 5.17065e-05 | Progress: 51% | Step: 96/190
+2026-05-01 12:55:12 INFO Epoch Progress | Epoch: 13 | Loss: 0.5488 | LR: 5.08814e-05 | Progress: 76% | Step: 144/190
+2026-05-01 12:56:40 INFO Epoch Progress | Epoch: 13 | Loss: 0.5481 | LR: 5.00905e-05 | Progress: 100% | Step: 190/190
+2026-05-01 13:00:25 INFO CSV Written | Epoch: 13
+2026-05-01 13:00:25 INFO Epoch Done | Epoch: 13 | Time: 604.4891 | Train Loss: 0.5423 | Val Accuracy: 0.8699 | Val AUPRC: 0.9339 | Val Auroc: 0.9379 | Val F1: 0.8698 | Val Loss: 0.3991
+2026-05-01 13:00:25 INFO Epoch Start | Epoch: 14
+2026-05-01 13:00:33 INFO Epoch Progress | Epoch: 14 | Loss: 0.6448 | LR: 5.00733e-05 | Progress: 1% | Step: 1/190
+2026-05-01 13:02:06 INFO Epoch Progress | Epoch: 14 | Loss: 0.5208 | LR: 4.92651e-05 | Progress: 25% | Step: 48/190
+2026-05-01 13:03:41 INFO Epoch Progress | Epoch: 14 | Loss: 0.5234 | LR: 4.844e-05 | Progress: 51% | Step: 96/190
+2026-05-01 13:05:16 INFO Epoch Progress | Epoch: 14 | Loss: 0.5222 | LR: 4.76153e-05 | Progress: 76% | Step: 144/190
+2026-05-01 13:06:44 INFO Epoch Progress | Epoch: 14 | Loss: 0.5241 | LR: 4.68255e-05 | Progress: 100% | Step: 190/190
+2026-05-01 13:10:30 INFO CSV Written | Epoch: 14
+2026-05-01 13:10:30 INFO Epoch Done | Epoch: 14 | Time: 604.6347 | Train Loss: 0.5168 | Val Accuracy: 0.8718 | Val AUPRC: 0.9332 | Val Auroc: 0.9375 | Val F1: 0.8735 | Val Loss: 0.3943
+2026-05-01 13:10:30 INFO Epoch Start | Epoch: 15
+2026-05-01 13:10:40 INFO Epoch Progress | Epoch: 15 | Loss: 0.5090 | LR: 4.68083e-05 | Progress: 1% | Step: 1/190
+2026-05-01 13:12:13 INFO Epoch Progress | Epoch: 15 | Loss: 0.5024 | LR: 4.60023e-05 | Progress: 25% | Step: 48/190
+2026-05-01 13:13:47 INFO Epoch Progress | Epoch: 15 | Loss: 0.4921 | LR: 4.51801e-05 | Progress: 51% | Step: 96/190
+2026-05-01 13:15:22 INFO Epoch Progress | Epoch: 15 | Loss: 0.4999 | LR: 4.43593e-05 | Progress: 76% | Step: 144/190
+2026-05-01 13:16:51 INFO Epoch Progress | Epoch: 15 | Loss: 0.5009 | LR: 4.35741e-05 | Progress: 100% | Step: 190/190
+2026-05-01 13:20:41 INFO CSV Written | Epoch: 15
+2026-05-01 13:20:41 INFO Epoch Done | Epoch: 15 | Time: 611.5762 | Train Loss: 0.4900 | Val Accuracy: 0.8676 | Val AUPRC: 0.9333 | Val Auroc: 0.9361 | Val F1: 0.8675 | Val Loss: 0.3912
+2026-05-01 13:20:41 INFO Epoch Start | Epoch: 16
+2026-05-01 13:20:50 INFO Epoch Progress | Epoch: 16 | Loss: 0.4020 | LR: 4.3557e-05 | Progress: 1% | Step: 1/190
+2026-05-01 13:22:22 INFO Epoch Progress | Epoch: 16 | Loss: 0.4645 | LR: 4.27565e-05 | Progress: 25% | Step: 48/190
+2026-05-01 13:23:56 INFO Epoch Progress | Epoch: 16 | Loss: 0.4710 | LR: 4.19408e-05 | Progress: 51% | Step: 96/190
+2026-05-01 13:25:31 INFO Epoch Progress | Epoch: 16 | Loss: 0.4723 | LR: 4.11274e-05 | Progress: 76% | Step: 144/190
+2026-05-01 13:27:00 INFO Epoch Progress | Epoch: 16 | Loss: 0.4787 | LR: 4.03501e-05 | Progress: 100% | Step: 190/190
+2026-05-01 13:30:43 INFO CSV Written | Epoch: 16
+2026-05-01 13:30:43 INFO Epoch Done | Epoch: 16 | Time: 601.7084 | Train Loss: 0.4691 | Val Accuracy: 0.8685 | Val AUPRC: 0.9331 | Val Auroc: 0.9369 | Val F1: 0.8697 | Val Loss: 0.3905
+2026-05-01 13:30:43 INFO Early Stop | Epoch: 16
+2026-05-01 13:30:43 INFO Stage Done | Run Id: full_s13
