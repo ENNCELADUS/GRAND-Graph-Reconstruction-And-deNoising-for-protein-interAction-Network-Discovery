@@ -3328,7 +3328,7 @@ def test_v3_1_0430_multiseed_rich_pooling_ablation_configs() -> None:
     }
     expected_seeds = {13, 47, 101}
 
-    config_dir = Path("configs/v3-1/0430_multiseed")
+    config_dir = Path("configs/v3-1/0430")
     expected_files = {
         f"{ablation}_s{seed}.yaml"
         for ablation in expected_components
@@ -3362,6 +3362,64 @@ def test_v3_1_0430_multiseed_rich_pooling_ablation_configs() -> None:
             rich_pooling_cfg = model_cfg["rich_pooling"]
             assert isinstance(rich_pooling_cfg, dict)
             assert rich_pooling_cfg["components"] == components
+
+
+def test_v3_1_0506_no_cls_baseline_archive() -> None:
+    """Current best no-CLS v3.1 architecture must be archived for comparison."""
+    config_dir = Path("configs/v3-1/baselines/0506_no_cls")
+    expected_files = {"README.md", "no_cls_s13.yaml", "no_cls_s47.yaml", "no_cls_s101.yaml"}
+
+    assert {path.name for path in config_dir.iterdir()} == expected_files
+    readme = (config_dir / "README.md").read_text(encoding="utf-8")
+    assert "AUROC: 0.668268" in readme
+    assert "AUPRC: 0.689207" in readme
+    assert "MCC: 0.232008" in readme
+
+    for seed in (13, 47, 101):
+        run_id = f"no_cls_s{seed}"
+        archived = load_config(config_dir / f"{run_id}.yaml")
+        source = load_config(Path("configs/v3-1/0430") / f"{run_id}.yaml")
+        assert archived == source
+
+
+def test_v3_1_0506_pair_readout_ablation_configs() -> None:
+    """New v3.1 ablations must keep no-CLS baseline settings except readout mode."""
+    expected_modes = {
+        "pair_context_gated": "pair_context_gated",
+        "contact_sketch": "contact_sketch_fusion",
+    }
+    expected_seeds = {13, 47, 101}
+    config_dir = Path("configs/v3-1/0506")
+    expected_files = {
+        f"{ablation}_s{seed}.yaml"
+        for ablation in expected_modes
+        for seed in expected_seeds
+    }
+
+    assert {path.name for path in config_dir.glob("*.yaml")} == expected_files
+    for ablation, mode in expected_modes.items():
+        for seed in expected_seeds:
+            run_id = f"{ablation}_s{seed}"
+            config = load_config(config_dir / f"{run_id}.yaml")
+            run_cfg = config["run_config"]
+            model_cfg = config["model_config"]
+            assert isinstance(run_cfg, dict)
+            assert isinstance(model_cfg, dict)
+
+            assert run_cfg["stages"] == ["train", "evaluate"]
+            assert run_cfg["seed"] == seed
+            assert run_cfg["train_run_id"] == run_id
+            assert run_cfg["eval_run_id"] == run_id
+            assert "optimization" not in config
+            assert model_cfg["model"] == "v3.1"
+            assert model_cfg["rich_pooling"]["components"] == ["mean", "attn", "max", "gated"]
+            assert model_cfg["pair_readout"]["mode"] == mode
+            if mode == "contact_sketch_fusion":
+                assert model_cfg["pair_readout"]["contact_tokens"] == 64
+                assert model_cfg["pair_readout"]["pair_dim"] == 32
+                assert model_cfg["pair_readout"]["cnn_dim"] == 64
+                assert model_cfg["pair_readout"]["cnn_blocks"] == 2
+                assert model_cfg["pair_readout"]["cnn_dropout"] == 0.1
 
 
 def test_v3_topology_finetune_uses_fixed_threshold_scheduler_and_patience() -> None:

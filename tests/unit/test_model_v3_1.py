@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 from src.pipeline.stages.train import build_model
 
@@ -89,6 +90,33 @@ def test_v3_1_uses_shared_rich_pooling_submodule() -> None:
     assert hasattr(model.cross_attention, "pool_b"), "cross_attention must have pool_b"
     assert model.cross_attention.pool_a is model.cross_attention.pool_b
     assert hasattr(model.cross_attention, "fusion"), "cross_attention must have fusion"
+
+
+def test_v3_1_default_pair_readout_is_rich_pooling() -> None:
+    """V3_1 must keep the existing rich-pooling readout by default."""
+    from src.model.v3_1 import V3_1
+
+    cfg = _base_config()["model_config"]
+    assert isinstance(cfg, dict)
+    cfg.pop("model")
+    model = V3_1(**cfg)
+
+    assert model.pair_readout_mode == "rich_pooling"
+    assert hasattr(model.cross_attention, "pool_a")
+    assert hasattr(model.cross_attention, "pool_b")
+
+
+def test_v3_1_rejects_invalid_pair_readout_mode() -> None:
+    """Unsupported pair-readout modes must fail fast."""
+    from src.model.v3_1 import V3_1
+
+    cfg = _base_config()["model_config"]
+    assert isinstance(cfg, dict)
+    cfg.pop("model")
+    cfg["pair_readout"] = {"mode": "unknown"}
+
+    with pytest.raises(ValueError, match="model_config.pair_readout.mode"):
+        V3_1(**cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +242,82 @@ def test_rich_pooling_component_ablation_combinations_forward() -> None:
         assert out["logits"].shape == (2, 1)
 
 
+def test_pair_context_gated_readout_forward_logits_shape() -> None:
+    """Pair-context gated readout must preserve the classifier output shape."""
+    from src.model.v3_1 import V3_1
+
+    cfg = _base_config()["model_config"]
+    assert isinstance(cfg, dict)
+    cfg.pop("model")
+    cfg["rich_pooling"] = {"components": ["mean", "attn", "max", "gated"]}
+    cfg["pair_readout"] = {"mode": "pair_context_gated"}
+    model = V3_1(**cfg)
+    model.eval()
+
+    with torch.no_grad():
+        out = model(_make_batch(seq_len_a=7, seq_len_b=8))
+
+    assert out["logits"].shape == (2, 1)
+
+
+def test_contact_sketch_fusion_readout_forward_logits_shape() -> None:
+    """Contact-sketch fusion readout must preserve the classifier output shape."""
+    from src.model.v3_1 import V3_1
+
+    cfg = _base_config()["model_config"]
+    assert isinstance(cfg, dict)
+    cfg.pop("model")
+    cfg["rich_pooling"] = {"components": ["mean", "attn", "max", "gated"]}
+    cfg["pair_readout"] = {
+        "mode": "contact_sketch_fusion",
+        "contact_tokens": 4,
+        "pair_dim": 4,
+        "cnn_dim": 4,
+        "cnn_blocks": 1,
+        "cnn_dropout": 0.0,
+    }
+    model = V3_1(**cfg)
+    model.eval()
+
+    with torch.no_grad():
+        out = model(_make_batch(seq_len_a=7, seq_len_b=8))
+
+    assert out["logits"].shape == (2, 1)
+
+
+def test_new_pair_readouts_have_no_unused_trainable_parameters() -> None:
+    """New pair-readout ablations must not leave trainable modules disconnected."""
+    from src.model.v3_1 import V3_1
+
+    pair_readout_configs = [
+        {"mode": "pair_context_gated"},
+        {
+            "mode": "contact_sketch_fusion",
+            "contact_tokens": 4,
+            "pair_dim": 4,
+            "cnn_dim": 4,
+            "cnn_blocks": 1,
+            "cnn_dropout": 0.0,
+        },
+    ]
+    for pair_readout in pair_readout_configs:
+        cfg = _base_config()["model_config"]
+        assert isinstance(cfg, dict)
+        cfg.pop("model")
+        cfg["rich_pooling"] = {"components": ["mean", "attn", "max", "gated"]}
+        cfg["pair_readout"] = pair_readout
+        model = V3_1(**cfg)
+        output = model(_make_batch(seq_len_a=7, seq_len_b=8))["logits"]
+        output.sum().backward()
+
+        unused_parameters = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.requires_grad and parameter.grad is None
+        ]
+        assert unused_parameters == []
+
+
 def test_rich_pooling_no_attention_ablation_has_no_unused_trainable_parameters() -> None:
     """No-attention rich pooling must not leave trainable parameters unused."""
     from src.model.v3_1 import V3_1
@@ -279,6 +383,30 @@ def test_rich_pooling_cls_component_uses_bos_token() -> None:
         changed = pool(changed_bos, padding_mask=None)
 
     assert not torch.allclose(out, changed)
+
+
+def test_contact_token_compressor_ignores_special_and_padding_tokens() -> None:
+    """Contact-sketch compression must use only residue positions."""
+    from src.model.v3_1_readouts import ContactTokenCompressor
+
+    torch.manual_seed(13)
+    compressor = ContactTokenCompressor(num_tokens=3)
+    x = torch.randn(2, 6, 8)
+    changed = x.clone()
+    changed[:, 0] = changed[:, 0] + 100.0
+    changed[:, 5] = changed[:, 5] - 100.0
+    mask = torch.tensor(
+        [
+            [False, False, False, False, False, False],
+            [False, False, False, False, True, True],
+        ]
+    )
+    changed[1, 3] = changed[1, 3] + 100.0
+
+    out = compressor(x, mask)
+    changed_out = compressor(changed, mask)
+
+    assert torch.allclose(out, changed_out)
 
 
 def test_rich_pooling_rejects_invalid_components() -> None:

@@ -25,10 +25,12 @@ from src.model.v3 import (
     _to_int,
     _to_mapping,
 )
+from src.model.v3_1_readouts import ContactSketchFusionReadout, PairContextGatedReadout
 
 POOLING_BASE_COMPONENTS = ("esm_cls", "mean", "attn", "max")
 POOLING_GATED_COMPONENT = "gated"
 DEFAULT_RICH_POOLING_COMPONENTS = (*POOLING_BASE_COMPONENTS, POOLING_GATED_COMPONENT)
+PAIR_READOUT_MODES = ("rich_pooling", "pair_context_gated", "contact_sketch_fusion")
 
 
 def _parse_rich_pooling_components(value: object) -> tuple[str, ...]:
@@ -278,7 +280,7 @@ class RichPooling(nn.Module):
 
 
 class InteractionCrossAttention(nn.Module):
-    """Stacked cross-attention encoder with rich CLS + gated pooling."""
+    """Stacked cross-attention encoder with configurable pair readout."""
 
     def __init__(
         self,
@@ -287,24 +289,65 @@ class InteractionCrossAttention(nn.Module):
         n_layers: int,
         dropout: float,
         pooling_components: tuple[str, ...] = DEFAULT_RICH_POOLING_COMPONENTS,
+        pair_readout_mode: str = "rich_pooling",
+        contact_tokens: int = 64,
+        pair_dim: int = 32,
+        cnn_dim: int = 64,
+        cnn_blocks: int = 2,
+        cnn_dropout: float = 0.1,
     ) -> None:
         super().__init__()
+        if pair_readout_mode not in PAIR_READOUT_MODES:
+            raise ValueError(
+                "model_config.pair_readout.mode must be one of: "
+                f"{', '.join(PAIR_READOUT_MODES)}"
+            )
+        self.pair_readout_mode = pair_readout_mode
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
         self.layers = nn.ModuleList(
             CrossAttentionLayer(d_model=d_model, n_heads=n_heads, dropout=dropout)
             for _ in range(n_layers)
         )
-        shared_pool = RichPooling(d_model=d_model, dropout=dropout, components=pooling_components)
-        self.pool_a = shared_pool
-        self.pool_b = shared_pool
-        # Fuse CLS + pooled_a + pooled_b → d_model
-        self.fusion = nn.Sequential(
-            nn.LayerNorm(d_model * 3),
-            nn.Linear(d_model * 3, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
+        if pair_readout_mode in {"rich_pooling", "contact_sketch_fusion"}:
+            shared_pool = RichPooling(
+                d_model=d_model, dropout=dropout, components=pooling_components
+            )
+            self.pool_a = shared_pool
+            self.pool_b = shared_pool
+            self.fusion = nn.Sequential(
+                nn.LayerNorm(d_model * 3),
+                nn.Linear(d_model * 3, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            )
+        if pair_readout_mode == "pair_context_gated":
+            self.pair_context_readout = PairContextGatedReadout(d_model=d_model, dropout=dropout)
+        if pair_readout_mode == "contact_sketch_fusion":
+            self.contact_sketch_readout = ContactSketchFusionReadout(
+                d_model=d_model,
+                contact_tokens=contact_tokens,
+                pair_dim=pair_dim,
+                cnn_dim=cnn_dim,
+                cnn_blocks=cnn_blocks,
+                cnn_dropout=cnn_dropout,
+                dropout=dropout,
+            )
+
+    def _rich_pooling_readout(
+        self,
+        h_a: torch.Tensor,
+        h_b: torch.Tensor,
+        cls_vec: torch.Tensor,
+        mask_a: torch.Tensor | None,
+        mask_b: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if not hasattr(self, "pool_a") or not hasattr(self, "pool_b"):
+            raise RuntimeError("rich pooling readout modules are not initialized")
+        pooled_a = self.pool_a(h_a, mask_a)
+        pooled_b = self.pool_b(h_b, mask_b)
+        fused = torch.cat([cls_vec, pooled_a, pooled_b], dim=1)
+        return cast(torch.Tensor, self.fusion(fused))
 
     def forward(
         self,
@@ -339,12 +382,20 @@ class InteractionCrossAttention(nn.Module):
         for layer in self.layers:
             h_a, h_b, cls_token = layer(h_a, h_b, cls_token, mask_a, mask_b)
 
-        pooled_a = self.pool_a(h_a, mask_a)
-        pooled_b = self.pool_b(h_b, mask_b)
         cls_vec = cls_token.squeeze(1)
+        if self.pair_readout_mode == "pair_context_gated":
+            return cast(
+                torch.Tensor,
+                self.pair_context_readout(h_a, h_b, cls_vec, mask_a, mask_b),
+            )
 
-        fused = torch.cat([cls_vec, pooled_a, pooled_b], dim=1)
-        return cast(torch.Tensor, self.fusion(fused))
+        base_repr = self._rich_pooling_readout(h_a, h_b, cls_vec, mask_a, mask_b)
+        if self.pair_readout_mode == "contact_sketch_fusion":
+            return cast(
+                torch.Tensor,
+                self.contact_sketch_readout(base_repr, h_a, h_b, mask_a, mask_b),
+            )
+        return base_repr
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +472,38 @@ class V3_1(nn.Module):
         self.rich_pooling_components = _parse_rich_pooling_components(
             rich_pooling_cfg.get("components")
         )
+        pair_readout_cfg_raw = model_config.get("pair_readout", {})
+        if pair_readout_cfg_raw is None:
+            pair_readout_cfg_raw = {}
+        if not isinstance(pair_readout_cfg_raw, dict):
+            raise ValueError("model_config.pair_readout must be a mapping")
+        pair_readout_cfg = _to_mapping(pair_readout_cfg_raw, "model_config.pair_readout")
+        self.pair_readout_mode = str(pair_readout_cfg.get("mode", "rich_pooling")).lower()
+        if self.pair_readout_mode not in PAIR_READOUT_MODES:
+            raise ValueError(
+                "model_config.pair_readout.mode must be one of: "
+                f"{', '.join(PAIR_READOUT_MODES)}"
+            )
+        contact_tokens = _to_int(
+            pair_readout_cfg.get("contact_tokens", 64),
+            "model_config.pair_readout.contact_tokens",
+        )
+        pair_dim = _to_int(
+            pair_readout_cfg.get("pair_dim", 32),
+            "model_config.pair_readout.pair_dim",
+        )
+        cnn_dim = _to_int(
+            pair_readout_cfg.get("cnn_dim", 64),
+            "model_config.pair_readout.cnn_dim",
+        )
+        cnn_blocks = _to_int(
+            pair_readout_cfg.get("cnn_blocks", 2),
+            "model_config.pair_readout.cnn_blocks",
+        )
+        cnn_dropout = _to_float(
+            pair_readout_cfg.get("cnn_dropout", 0.1),
+            "model_config.pair_readout.cnn_dropout",
+        )
 
         self.encoder = SiameseEncoder(
             input_dim=self.input_dim,
@@ -437,6 +520,12 @@ class V3_1(nn.Module):
             n_layers=self.cross_attn_layers,
             dropout=self.cross_attention_dropout,
             pooling_components=self.rich_pooling_components,
+            pair_readout_mode=self.pair_readout_mode,
+            contact_tokens=contact_tokens,
+            pair_dim=pair_dim,
+            cnn_dim=cnn_dim,
+            cnn_blocks=cnn_blocks,
+            cnn_dropout=cnn_dropout,
         )
         self.output_head = MLPHead(
             input_dim=self.d_model,
