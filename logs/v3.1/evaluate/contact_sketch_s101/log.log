@@ -1,0 +1,7 @@
+2026-05-07 15:50:57 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 812 | Valid Batches: 762 | World Size: 4
+2026-05-07 18:29:11 INFO Stage Start | Checkpoint: models/v3.1/train/contact_sketch_s101/best_model.pth | Run Id: contact_sketch_s101
+2026-05-07 18:29:11 INFO Checkpoint Loaded | Path: models/v3.1/train/contact_sketch_s101/best_model.pth
+2026-05-07 18:29:11 INFO Decision Threshold | Mode: fixed | Value: 0.5000
+2026-05-07 18:35:54 INFO Evaluation Metrics | Accuracy: 0.6088 | AUPRC: 0.6830 | Auroc: 0.6573 | F1: 0.5967 | Mcc: 0.2180 | Precision: 0.6159 | Recall: 0.5786 | Sensitivity: 0.5786 | Specificity: 0.6390 | Split: test
+2026-05-07 18:35:54 INFO CSV Written | Path: logs/v3.1/evaluate/contact_sketch_s101/evaluate.csv
+2026-05-07 18:35:54 INFO Stage Done | Run Id: contact_sketch_s101

@@ -1,0 +1,10 @@
+2026-04-26 17:34:26 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-04-26 18:09:59 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-04-26 21:32:28 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-04-26 23:04:59 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-04-28 02:50:20 INFO Stage Start | Checkpoint: models/v3/topology_finetune/ws_n100/best_model.pth | Run Id: ws_n100
+2026-04-28 02:50:20 INFO Checkpoint Loaded | Path: models/v3/topology_finetune/ws_n100/best_model.pth
+2026-04-28 02:50:20 INFO Decision Threshold | Mode: fixed | Value: 0.5000
+2026-04-28 02:56:54 INFO Evaluation Metrics | Accuracy: 0.5840 | AUPRC: 0.6977 | Auroc: 0.6779 | F1: 0.3385 | Mcc: 0.2511 | Precision: 0.8266 | Recall: 0.2128 | Sensitivity: 0.2128 | Specificity: 0.9553 | Split: test
+2026-04-28 02:56:54 INFO CSV Written | Path: logs/v3/evaluate/ws_n100/evaluate.csv
+2026-04-28 02:56:54 INFO Stage Done | Run Id: ws_n100

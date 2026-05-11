@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH -J V3-Ablation-Subgraph-Size
-#SBATCH -p hexm_l40
+#SBATCH -p hexm
 #SBATCH -A hexm
 #SBATCH -N 1
 #SBATCH -t 4-00:00:00
 #SBATCH --mem=300G
 #SBATCH --cpus-per-task=32
-#SBATCH --gres=gpu:NVIDIAL40:4
+#SBATCH --gres=gpu:NVIDIAA40:4
 #SBATCH --output=logs/v3/slurm_%j.out
 #SBATCH --error=logs/v3/slurm_%j.err
 #SBATCH --mail-type=ALL
@@ -16,7 +16,7 @@ set -euo pipefail
 
 cd /public/home/wangar2023/grand/
 source ~/.bashrc
-TARGET_PATH="${1:-configs/v3/ablations/0427_loss_ablation}"
+TARGET_PATH="${1:-configs/v3/ablations/0426}"
 
 if [ ! -d ".venv" ]; then
   echo "Missing .venv. Run 'uv sync --group dev --locked' on the login node before sbatch."
