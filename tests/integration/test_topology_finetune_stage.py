@@ -28,6 +28,7 @@ from src.pipeline.stages.topology_finetune import (
     _resolve_monitor_mode,
     _resolve_monitor_value,
     _resolve_sampling_node_bounds,
+    _resolve_sampling_node_sizes,
     run_topology_finetuning_stage,
 )
 from src.pipeline.stages.train import build_model
@@ -493,6 +494,26 @@ def test_resolve_sampling_node_bounds_uses_subgraph_node_range() -> None:
 
     assert min_nodes == 30
     assert max_nodes == 60
+
+
+def test_resolve_sampling_node_sizes_expands_range_by_ten() -> None:
+    node_sizes = _resolve_sampling_node_sizes(
+        {
+            "subgraph_node_range": [20, 100],
+        }
+    )
+
+    assert node_sizes == (20, 30, 40, 50, 60, 70, 80, 90, 100)
+
+
+def test_resolve_sampling_node_sizes_appends_non_aligned_upper_bound() -> None:
+    node_sizes = _resolve_sampling_node_sizes(
+        {
+            "subgraph_node_range": [20, 95],
+        }
+    )
+
+    assert node_sizes == (20, 30, 40, 50, 60, 70, 80, 90, 95)
 
 
 def test_resolve_sampling_node_bounds_rejects_legacy_min_max_config() -> None:
@@ -3551,11 +3572,11 @@ def test_0426_chunked_backward_configs_cover_large_and_range_n() -> None:
         assert topology_cfg["compute_clustering_mmd"] is False
 
     expected_ranges = {
-        "ws_range_n20_60.yaml": [20, 60],
-        "ws_range_n40_80.yaml": [40, 80],
-        "ws_range_n20_100.yaml": [20, 100],
+        "ws_range_n20_60.yaml": ([20, 60], (20, 30, 40, 50, 60)),
+        "ws_range_n40_80.yaml": ([40, 80], (40, 50, 60, 70, 80)),
+        "ws_range_n20_100.yaml": ([20, 100], (20, 30, 40, 50, 60, 70, 80, 90, 100)),
     }
-    for filename, node_range in expected_ranges.items():
+    for filename, (node_range, node_sizes) in expected_ranges.items():
         config = load_config(Path("configs/v3/ablations/0426") / filename)
         run_cfg = config["run_config"]
         topology_cfg = config["topology_finetune"]
@@ -3567,6 +3588,7 @@ def test_0426_chunked_backward_configs_cover_large_and_range_n() -> None:
         assert run_cfg["eval_run_id"] == run_id
         assert run_cfg["topology_eval_run_id"] == run_id
         assert topology_cfg["subgraph_node_range"] == node_range
+        assert _resolve_sampling_node_sizes(topology_cfg) == node_sizes
         assert topology_cfg["chunked_backward"] is True
         assert topology_cfg["compute_clustering_mmd"] is False
         assert topology_cfg["internal_validation_compute_clustering_mmd"] is False

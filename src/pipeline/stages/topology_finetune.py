@@ -556,6 +556,9 @@ def _parse_gradnorm_config(finetune_cfg: ConfigDict) -> TopologyGradNormConfig:
     )
 
 
+SUBGRAPH_NODE_RANGE_STEP = 10
+
+
 def _resolve_sampling_node_bounds(finetune_cfg: ConfigDict) -> tuple[int, int]:
     """Resolve subgraph node limits for topology fine-tuning."""
     raw_range = finetune_cfg.get("subgraph_node_range")
@@ -580,6 +583,17 @@ def _resolve_sampling_node_bounds(finetune_cfg: ConfigDict) -> tuple[int, int]:
             "topology_finetune.subgraph_node_range[1]"
         )
     return min_nodes, max_nodes
+
+
+def _resolve_sampling_node_sizes(finetune_cfg: ConfigDict) -> tuple[int, ...]:
+    """Resolve discrete training subgraph node sizes from the configured range."""
+    min_nodes, max_nodes = _resolve_sampling_node_bounds(finetune_cfg)
+    if min_nodes == max_nodes:
+        return (min_nodes,)
+    node_sizes = list(range(min_nodes, max_nodes + 1, SUBGRAPH_NODE_RANGE_STEP))
+    if node_sizes[-1] != max_nodes:
+        node_sizes.append(max_nodes)
+    return tuple(node_sizes)
 
 
 def _resolve_init_mode(finetune_cfg: ConfigDict) -> str:
@@ -607,12 +621,11 @@ def _resolve_bce_negative_ratio(finetune_cfg: ConfigDict) -> int:
 def _resolve_edge_chunk_size(
     *,
     finetune_cfg: ConfigDict,
-    max_nodes: int,
 ) -> int | None:
     """Return the positive-edge chunk size for one topology epoch plan."""
     raw_edge_chunk_size = finetune_cfg.get("edge_chunk_size")
     if raw_edge_chunk_size is None:
-        return max(1, (max_nodes * (max_nodes - 1)) // 4)
+        return None
     edge_chunk_size = as_int(
         raw_edge_chunk_size,
         "topology_finetune.edge_chunk_size",
@@ -2417,7 +2430,9 @@ def _fit_epoch(
     """Run one fine-tuning epoch over sampled train subgraphs."""
     del use_amp
     finetune_cfg = _topology_finetune_config(config)
-    min_nodes, max_nodes = _resolve_sampling_node_bounds(finetune_cfg)
+    node_sizes = _resolve_sampling_node_sizes(finetune_cfg)
+    min_nodes = min(node_sizes)
+    max_nodes = max(node_sizes)
     subgraphs_per_epoch = as_int(
         finetune_cfg.get("subgraphs_per_epoch", 0),
         "topology_finetune.subgraphs_per_epoch",
@@ -2428,10 +2443,7 @@ def _fit_epoch(
     subgraphs_per_forward = _resolve_subgraphs_per_forward(finetune_cfg)
     compute_clustering_mmd = _resolve_compute_clustering_mmd(finetune_cfg)
     chunked_backward = _resolve_chunked_backward(finetune_cfg)
-    edge_chunk_size = _resolve_edge_chunk_size(
-        finetune_cfg=finetune_cfg,
-        max_nodes=max_nodes,
-    )
+    edge_chunk_size = _resolve_edge_chunk_size(finetune_cfg=finetune_cfg)
     sampling_start = time.perf_counter()
     epoch_plan = sample_edge_cover_subgraphs(
         graph=graph,
@@ -2441,6 +2453,7 @@ def _fit_epoch(
         strategy=strategy,
         seed=epoch_seed,
         edge_chunk_size=edge_chunk_size,
+        node_sizes=node_sizes if len(node_sizes) > 1 else None,
         negative_lookup=negative_lookup,
         negative_ratio=negative_ratio,
     )

@@ -158,6 +158,52 @@ def test_sample_edge_cover_subgraphs_splits_sparse_chunks_by_max_nodes() -> None
     assert all(len(assigned_edges) <= 885 for assigned_edges in plan.assigned_positive_edges)
 
 
+def test_sample_edge_cover_subgraphs_balances_explicit_node_sizes() -> None:
+    graph = nx.Graph()
+    graph.add_edges_from((f"A{i}", f"B{i}") for i in range(120))
+
+    plan = sample_edge_cover_subgraphs(
+        graph=graph,
+        num_subgraphs=0,
+        min_nodes=20,
+        max_nodes=40,
+        strategy="BFS",
+        seed=13,
+        node_sizes=(20, 30, 40),
+    )
+
+    sampled_sizes = [len(node_ids) for node_ids in plan.subgraphs]
+    size_counts = {node_size: sampled_sizes.count(node_size) for node_size in (20, 30, 40)}
+    assert plan.covered_positive_edges == plan.total_positive_edges == 120
+    assert plan.positive_edge_coverage_ratio == pytest.approx(1.0)
+    assert set(sampled_sizes) == {20, 30, 40}
+    assert max(size_counts.values()) - min(size_counts.values()) <= 1
+
+
+def test_sample_edge_cover_subgraphs_fixed_node_size_matches_legacy_path() -> None:
+    graph = nx.path_graph([f"P{i}" for i in range(1, 31)])
+
+    legacy_plan = sample_edge_cover_subgraphs(
+        graph=graph,
+        num_subgraphs=0,
+        min_nodes=10,
+        max_nodes=10,
+        strategy="BFS",
+        seed=13,
+    )
+    fixed_size_plan = sample_edge_cover_subgraphs(
+        graph=graph,
+        num_subgraphs=0,
+        min_nodes=10,
+        max_nodes=10,
+        strategy="BFS",
+        seed=13,
+        node_sizes=(10,),
+    )
+
+    assert fixed_size_plan == legacy_plan
+
+
 def test_sample_edge_cover_subgraphs_assigns_each_positive_edge_exactly_once() -> None:
     graph = nx.Graph()
     graph.add_edges_from(

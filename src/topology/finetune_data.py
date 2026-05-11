@@ -612,6 +612,87 @@ def _partition_edges(
     return tuple(chunks)
 
 
+def _normalize_edge_cover_node_sizes(
+    *,
+    graph: nx.Graph,
+    min_nodes: int,
+    max_nodes: int,
+    node_sizes: Sequence[int] | None,
+) -> tuple[int, ...] | None:
+    """Return explicit edge-cover target sizes, or None for legacy random sizing."""
+    if node_sizes is None:
+        return None
+    if not node_sizes:
+        raise ValueError("node_sizes must not be empty")
+    if min_nodes <= 1:
+        raise ValueError("min_nodes must be greater than 1")
+    if max_nodes < min_nodes:
+        raise ValueError("max_nodes must be >= min_nodes")
+    graph_size = graph.number_of_nodes()
+    if graph_size < min_nodes:
+        raise ValueError(
+            f"Train graph is too small for subgraph sampling: {graph_size} < {min_nodes}"
+        )
+
+    normalized_sizes: list[int] = []
+    for node_size in node_sizes:
+        resolved_size = int(node_size)
+        if resolved_size < min_nodes or resolved_size > max_nodes:
+            raise ValueError("node_sizes must fall within min_nodes and max_nodes")
+        if resolved_size <= 1:
+            raise ValueError("node_sizes must be greater than 1")
+        normalized_sizes.append(min(resolved_size, graph_size))
+    return tuple(dict.fromkeys(normalized_sizes))
+
+
+def _partition_edges_by_node_sizes(
+    *,
+    positive_edges: Sequence[tuple[str, str]],
+    node_sizes: Sequence[int],
+    edge_chunk_size: int | None,
+    num_subgraphs: int,
+) -> tuple[tuple[tuple[tuple[str, str], ...], ...], tuple[int, ...]]:
+    """Partition positive edges into round-robin target-size chunks."""
+    if not node_sizes:
+        raise ValueError("node_sizes must not be empty")
+
+    chunks: list[tuple[tuple[str, str], ...]] = []
+    chunk_node_sizes: list[int] = []
+    edge_index = 0
+    while edge_index < len(positive_edges):
+        target_size = int(node_sizes[len(chunks) % len(node_sizes)])
+        requested_chunk_size = (
+            _default_edge_chunk_size(target_size)
+            if edge_chunk_size is None
+            else int(edge_chunk_size)
+        )
+        resolved_chunk_size = _resolve_epoch_edge_chunk_size(
+            positive_edge_count=len(positive_edges),
+            requested_chunk_size=requested_chunk_size,
+            num_subgraphs=num_subgraphs,
+        )
+        current_chunk: list[tuple[str, str]] = []
+        current_nodes: set[str] = set()
+
+        while edge_index < len(positive_edges):
+            edge = positive_edges[edge_index]
+            edge_nodes = set(edge)
+            would_exceed_edge_budget = len(current_chunk) >= resolved_chunk_size
+            would_exceed_node_budget = len(current_nodes | edge_nodes) > target_size
+            if current_chunk and (would_exceed_edge_budget or would_exceed_node_budget):
+                break
+            current_chunk.append(edge)
+            current_nodes.update(edge_nodes)
+            edge_index += 1
+            if len(current_chunk) >= resolved_chunk_size:
+                break
+
+        chunks.append(tuple(current_chunk))
+        chunk_node_sizes.append(target_size)
+
+    return tuple(chunks), tuple(chunk_node_sizes)
+
+
 def _resolve_epoch_edge_chunk_size(
     *,
     positive_edge_count: int,
@@ -815,6 +896,7 @@ def sample_edge_cover_subgraphs(
     strategy: str,
     seed: int,
     edge_chunk_size: int | None = None,
+    node_sizes: Sequence[int] | None = None,
     negative_lookup: ExplicitNegativePairLookup | None = None,
     negative_ratio: int = 0,
 ) -> EdgeCoverEpochPlan:
@@ -825,18 +907,37 @@ def sample_edge_cover_subgraphs(
         raise ValueError("negative_ratio must be non-negative")
 
     normalized_strategy = _normalize_sampling_strategy(strategy)
+    normalized_node_sizes = _normalize_edge_cover_node_sizes(
+        graph=graph,
+        min_nodes=min_nodes,
+        max_nodes=max_nodes,
+        node_sizes=node_sizes,
+    )
     rng = random.Random(seed)
 
     positive_edges = sorted(_graph_positive_edges(graph))
     if not positive_edges:
-        fallback_subgraphs = sample_training_subgraphs(
-            graph=graph,
-            num_subgraphs=num_subgraphs,
-            min_nodes=min_nodes,
-            max_nodes=max_nodes,
-            strategy=strategy,
-            seed=seed,
-        )
+        if normalized_node_sizes is None or len(normalized_node_sizes) <= 1:
+            fallback_subgraphs = sample_training_subgraphs(
+                graph=graph,
+                num_subgraphs=num_subgraphs,
+                min_nodes=min_nodes,
+                max_nodes=max_nodes,
+                strategy=strategy,
+                seed=seed,
+            )
+        else:
+            fallback_subgraphs = [
+                sample_training_subgraphs(
+                    graph=graph,
+                    num_subgraphs=1,
+                    min_nodes=normalized_node_sizes[index % len(normalized_node_sizes)],
+                    max_nodes=normalized_node_sizes[index % len(normalized_node_sizes)],
+                    strategy=strategy,
+                    seed=seed + index,
+                )[0]
+                for index in range(num_subgraphs)
+            ]
         assigned_negative_edges = _assign_negative_edges_to_subgraphs(
             subgraphs=fallback_subgraphs,
             assigned_positive_edges=[frozenset() for _ in fallback_subgraphs],
@@ -852,34 +953,52 @@ def sample_edge_cover_subgraphs(
 
     shuffled_edges = list(positive_edges)
     rng.shuffle(shuffled_edges)
-    resolved_edge_chunk_size = (
-        _default_edge_chunk_size(max_nodes) if edge_chunk_size is None else int(edge_chunk_size)
-    )
-    resolved_edge_chunk_size = _resolve_epoch_edge_chunk_size(
-        positive_edge_count=len(shuffled_edges),
-        requested_chunk_size=resolved_edge_chunk_size,
-        num_subgraphs=num_subgraphs,
-    )
-    edge_chunks = _partition_edges(
-        positive_edges=shuffled_edges,
-        chunk_size=resolved_edge_chunk_size,
-        max_nodes=max_nodes,
-    )
-    sampled_subgraphs = [
-        _expand_chunk_nodes(
-            graph=graph,
-            edge_chunk=edge_chunk,
-            target_size=_sample_target_size(
-                graph=graph,
-                min_nodes=min_nodes,
-                max_nodes=max_nodes,
-                rng=rng,
-            ),
-            strategy=_choose_sampling_strategy(strategy=normalized_strategy, rng=rng),
-            rng=rng,
+    if normalized_node_sizes is None or len(normalized_node_sizes) <= 1:
+        resolved_edge_chunk_size = (
+            _default_edge_chunk_size(max_nodes) if edge_chunk_size is None else int(edge_chunk_size)
         )
-        for edge_chunk in edge_chunks
-    ]
+        resolved_edge_chunk_size = _resolve_epoch_edge_chunk_size(
+            positive_edge_count=len(shuffled_edges),
+            requested_chunk_size=resolved_edge_chunk_size,
+            num_subgraphs=num_subgraphs,
+        )
+        edge_chunks = _partition_edges(
+            positive_edges=shuffled_edges,
+            chunk_size=resolved_edge_chunk_size,
+            max_nodes=max_nodes,
+        )
+        sampled_subgraphs = [
+            _expand_chunk_nodes(
+                graph=graph,
+                edge_chunk=edge_chunk,
+                target_size=_sample_target_size(
+                    graph=graph,
+                    min_nodes=min_nodes,
+                    max_nodes=max_nodes,
+                    rng=rng,
+                ),
+                strategy=_choose_sampling_strategy(strategy=normalized_strategy, rng=rng),
+                rng=rng,
+            )
+            for edge_chunk in edge_chunks
+        ]
+    else:
+        edge_chunks, chunk_node_sizes = _partition_edges_by_node_sizes(
+            positive_edges=shuffled_edges,
+            node_sizes=normalized_node_sizes,
+            edge_chunk_size=edge_chunk_size,
+            num_subgraphs=num_subgraphs,
+        )
+        sampled_subgraphs = [
+            _expand_chunk_nodes(
+                graph=graph,
+                edge_chunk=edge_chunk,
+                target_size=target_size,
+                strategy=_choose_sampling_strategy(strategy=normalized_strategy, rng=rng),
+                rng=rng,
+            )
+            for edge_chunk, target_size in zip(edge_chunks, chunk_node_sizes, strict=True)
+        ]
     assigned_positive_edges = tuple(frozenset(edge_chunk) for edge_chunk in edge_chunks)
     assigned_negative_edges = _assign_negative_edges_to_subgraphs(
         subgraphs=sampled_subgraphs,
