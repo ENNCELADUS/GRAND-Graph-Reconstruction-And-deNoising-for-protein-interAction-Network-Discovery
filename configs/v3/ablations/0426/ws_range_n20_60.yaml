@@ -93,11 +93,13 @@ topology_finetune:
   supervision_valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi_ratio5_exclusive.txt"
   bce_negative_ratio: 5
   subgraph_node_range: [20, 60]
-  gradient_accumulation_steps: 8
+  gradient_accumulation_steps: 16
   subgraphs_per_forward: 1
   strategy: "mixed"
-  pair_batch_size: 32
+  pair_batch_size: 48
   internal_validation_inference_batch_size: 128
+  internal_validation_node_sizes: [20, 40, 60, 80, 100]
+  internal_validation_samples_per_size: 10
   chunked_backward: true
   compute_clustering_mmd: false
   internal_validation_compute_clustering_mmd: false
@@ -107,7 +109,7 @@ topology_finetune:
   monitor_metric: "val_loss"
   early_stopping_patience: 4
   optimizer:
-    lr: 6.0e-6
+    lr: 1.0e-5
     weight_decay: 6.0e-3
   loss_weight_schedule:
     warmup_epochs: 0

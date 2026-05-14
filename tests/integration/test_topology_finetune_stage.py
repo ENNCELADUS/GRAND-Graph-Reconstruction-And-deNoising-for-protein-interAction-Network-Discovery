@@ -3573,7 +3573,7 @@ def test_0426_chunked_backward_configs_cover_large_and_range_n() -> None:
 
     expected_ranges = {
         "ws_range_n20_60.yaml": ([20, 60], (20, 30, 40, 50, 60)),
-        "ws_range_n40_80.yaml": ([40, 80], (40, 50, 60, 70, 80)),
+        "ws_range_n60_100.yaml": ([60, 100], (60, 70, 80, 90, 100)),
         "ws_range_n20_100.yaml": ([20, 100], (20, 30, 40, 50, 60, 70, 80, 90, 100)),
     }
     for filename, (node_range, node_sizes) in expected_ranges.items():
@@ -3589,6 +3589,8 @@ def test_0426_chunked_backward_configs_cover_large_and_range_n() -> None:
         assert run_cfg["topology_eval_run_id"] == run_id
         assert topology_cfg["subgraph_node_range"] == node_range
         assert _resolve_sampling_node_sizes(topology_cfg) == node_sizes
+        if filename in {"ws_range_n20_60.yaml", "ws_range_n60_100.yaml"}:
+            assert topology_cfg["optimizer"]["lr"] == 1.0e-5
         assert topology_cfg["chunked_backward"] is True
         assert topology_cfg["compute_clustering_mmd"] is False
         assert topology_cfg["internal_validation_compute_clustering_mmd"] is False
