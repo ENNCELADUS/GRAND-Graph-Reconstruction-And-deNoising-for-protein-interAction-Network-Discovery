@@ -52,6 +52,31 @@ def _v5_config() -> dict[str, object]:
     return config
 
 
+def _tuna_config() -> dict[str, object]:
+    return {
+        "model_config": {
+            "model": "tuna",
+            "input_dim": 8,
+            "hid_dim": 64,
+            "n_layers": 1,
+            "n_heads": 8,
+            "ff_dim": 256,
+            "dropout": 0.2,
+            "max_sequence_length": 512,
+            "activation_function": "swish",
+            "exclude_special_tokens": True,
+            "inter_mask_mode": "official_block",
+            "random_seed": 47,
+            "output_head": {"type": "linear"},
+        }
+    }
+
+
+def test_build_model_tuna() -> None:
+    model = build_model(_tuna_config())
+    assert model.__class__.__name__ == "TUNA"
+
+
 def test_build_model_v3() -> None:
     model = build_model(_base_config("v3"))
     assert model.__class__.__name__ == "V3"

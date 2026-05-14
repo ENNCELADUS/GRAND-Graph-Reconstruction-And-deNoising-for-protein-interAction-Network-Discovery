@@ -170,6 +170,13 @@ class Trainer:
     def _forward_model(self, batch: BatchInput) -> dict[str, torch.Tensor]:
         return forward_model(self.model, batch)
 
+    def _call_optional_model_hook(self, hook_name: str, **kwargs: object) -> None:
+        """Call an optional hook on the wrapped model or its DDP module."""
+        hook_owner = getattr(self.model, "module", self.model)
+        hook = getattr(hook_owner, hook_name, None)
+        if callable(hook):
+            hook(**kwargs)
+
     def _select_loss(
         self,
         output: dict[str, torch.Tensor],
@@ -363,6 +370,11 @@ class Trainer:
         """
         train_loader = self.prepare_training_components(train_loader)
         self.model.train()
+        self._call_optional_model_hook(
+            "on_train_epoch_start",
+            epoch_index=epoch_index,
+            total_epochs=self.total_epochs,
+        )
         running_loss = 0.0
         batch_count = 0
         configured_steps = len(train_loader)

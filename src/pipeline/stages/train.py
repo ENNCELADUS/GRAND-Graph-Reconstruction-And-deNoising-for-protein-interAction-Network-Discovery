@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from src.evaluate import DEFAULT_DECISION_THRESHOLD, Evaluator
-from src.model import V3, V3_1, V4, V5
+from src.model import TUNA, V3, V3_1, V4, V5
 from src.pipeline.loops import reduce_scalar_mapping
 from src.pipeline.runtime import AcceleratorLike, PipelineRuntime
 from src.train.base import Trainer
@@ -56,6 +56,11 @@ def _build_v3_1_model(model_kwargs: ConfigDict) -> nn.Module:
     return V3_1(**model_kwargs)
 
 
+def _build_tuna_model(model_kwargs: ConfigDict) -> nn.Module:
+    """Build TUnA-style model instance."""
+    return TUNA(**model_kwargs)
+
+
 def _build_v4_model(model_kwargs: ConfigDict) -> nn.Module:
     """Build V4 model instance."""
     return V4(**model_kwargs)
@@ -67,6 +72,7 @@ def _build_v5_model(model_kwargs: ConfigDict) -> nn.Module:
 
 
 MODEL_FACTORIES: dict[str, ModelFactory] = {
+    "tuna": _build_tuna_model,
     "v3": _build_v3_model,
     "v3.1": _build_v3_1_model,
     "v4": _build_v4_model,

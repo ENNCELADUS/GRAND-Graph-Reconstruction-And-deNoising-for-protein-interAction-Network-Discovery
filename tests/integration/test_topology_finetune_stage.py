@@ -3443,6 +3443,65 @@ def test_v3_1_0506_pair_readout_ablation_configs() -> None:
                 assert model_cfg["pair_readout"]["cnn_dropout"] == 0.1
 
 
+def test_tuna_0514_quick_reproduction_configs() -> None:
+    """TUnA quick-run ablations must use official seed 47 and small head settings."""
+    expected_configs = {
+        "tuna64_linear_official_s47.yaml": ("linear", "official_block"),
+        "tuna64_linear_cross_s47.yaml": ("linear", "cross_chain"),
+        "tuna64_sngp_official_s47.yaml": ("sngp", "official_block"),
+        "tuna64_sngp_cross_s47.yaml": ("sngp", "cross_chain"),
+    }
+    config_dir = Path("configs/tuna/0514")
+    assert {path.name for path in config_dir.glob("*.yaml")} == set(expected_configs)
+
+    for filename, (head_type, inter_mask_mode) in expected_configs.items():
+        run_id = filename.removesuffix(".yaml")
+        config = load_config(config_dir / filename)
+        run_cfg = config["run_config"]
+        data_cfg = config["data_config"]
+        model_cfg = config["model_config"]
+        training_cfg = config["training_config"]
+        assert isinstance(run_cfg, dict)
+        assert isinstance(data_cfg, dict)
+        assert isinstance(model_cfg, dict)
+        assert isinstance(training_cfg, dict)
+
+        assert run_cfg["stages"] == ["train", "evaluate"]
+        assert run_cfg["seed"] == 47
+        assert run_cfg["train_run_id"] == run_id
+        assert run_cfg["eval_run_id"] == run_id
+        assert "optimization" not in config
+        assert data_cfg["max_sequence_length"] == 1024
+
+        dataloader_cfg = data_cfg["dataloader"]
+        assert isinstance(dataloader_cfg, dict)
+        sampling_cfg = dataloader_cfg["sampling"]
+        assert isinstance(sampling_cfg, dict)
+        assert sampling_cfg["strategy"] == "ohem"
+
+        assert model_cfg["model"] == "tuna"
+        assert model_cfg["input_dim"] == 1536
+        assert model_cfg["hid_dim"] == 64
+        assert model_cfg["n_layers"] == 1
+        assert model_cfg["n_heads"] == 8
+        assert model_cfg["ff_dim"] == 256
+        assert model_cfg["dropout"] == 0.2
+        assert model_cfg["max_sequence_length"] == 512
+        assert model_cfg["activation_function"] == "swish"
+        assert model_cfg["exclude_special_tokens"] is True
+        assert model_cfg["inter_mask_mode"] == inter_mask_mode
+        assert model_cfg["random_seed"] == 47
+        output_head = model_cfg["output_head"]
+        assert isinstance(output_head, dict)
+        assert output_head["type"] == head_type
+        if head_type == "sngp":
+            assert output_head["rffs"] == 4096
+            assert output_head["gp_cov_momentum"] == -1.0
+            assert output_head["gp_ridge_penalty"] == 1.0
+
+        assert training_cfg["monitor_metric"] == "auprc"
+
+
 def test_v3_topology_finetune_uses_fixed_threshold_scheduler_and_patience() -> None:
     config = load_config("configs/v3.yaml")
     topology_cfg = config["topology_finetune"]
