@@ -97,13 +97,18 @@ class SelfAttention(nn.Module):
         k = k.view(batch_size, -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
         v = v.view(batch_size, -1, self.n_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        energy = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(float(self.head_dim))
+        q_attention = q.float()
+        k_attention = k.float()
+        v_attention = v.float()
+        energy = torch.matmul(q_attention, k_attention.transpose(-1, -2)) / math.sqrt(
+            float(self.head_dim)
+        )
         if mask is not None:
             energy = energy.masked_fill(~mask, -1.0e4)
         attention = self.dropout(torch.softmax(energy, dim=-1))
-        attended = torch.matmul(attention, v)
+        attended = torch.matmul(attention, v_attention)
         attended = attended.permute(0, 2, 1, 3).contiguous()
-        attended = attended.view(batch_size, -1, self.hid_dim)
+        attended = attended.view(batch_size, -1, self.hid_dim).to(dtype=query.dtype)
         return cast(torch.Tensor, self.fc(attended))
 
 
