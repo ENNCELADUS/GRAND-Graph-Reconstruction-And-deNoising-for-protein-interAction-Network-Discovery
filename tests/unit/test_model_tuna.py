@@ -160,21 +160,22 @@ def test_tuna_eval_crop_is_deterministic_and_limited() -> None:
     assert windows.squeeze(-1).tolist() == [[1.0, 2.0, 3.0]]
 
 
-def test_tuna_mixed_precision_attention_keeps_large_embeddings_finite() -> None:
+def test_tuna_autocast_keeps_large_embeddings_finite() -> None:
     from src.model.tuna import TUNA
 
     torch.manual_seed(0)
-    model = TUNA(**_tuna_model_config(input_dim=8, inter_mask_mode="cross_chain")).half()
+    model = TUNA(**_tuna_model_config(input_dim=8, inter_mask_mode="cross_chain"))
     model.train()
     batch = {
-        "emb_a": torch.randn(2, 7, 8).half() * 1000.0,
-        "emb_b": torch.randn(2, 8, 8).half() * 1000.0,
+        "emb_a": torch.randn(2, 7, 8) * 20000.0,
+        "emb_b": torch.randn(2, 8, 8) * 20000.0,
         "len_a": torch.tensor([7, 7]),
         "len_b": torch.tensor([8, 8]),
         "label": torch.tensor([1.0, 0.0]),
     }
 
-    output = model(batch)
+    with torch.autocast("cpu", dtype=torch.float16):
+        output = model(batch)
 
     assert torch.isfinite(output["logits"]).all()
     assert torch.isfinite(output["loss"])

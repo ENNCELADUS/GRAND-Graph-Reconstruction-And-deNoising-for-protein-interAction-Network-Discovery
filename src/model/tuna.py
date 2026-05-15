@@ -540,24 +540,27 @@ class TUNA(nn.Module):
 
         residue_a, residue_lengths_a = self._residue_windows(emb_a, lengths_a)
         residue_b, residue_lengths_b = self._residue_windows(emb_b, lengths_b)
-        mask_a = self._intra_mask(residue_lengths_a, residue_a.size(1))
-        mask_b = self._intra_mask(residue_lengths_b, residue_b.size(1))
-        encoded_a = self.intra_encoder(residue_a, mask_a)
-        encoded_b = self.intra_encoder(residue_b, mask_b)
-        feature_ab = self._pair_feature(
-            encoded_a=encoded_a,
-            encoded_b=encoded_b,
-            lengths_a=residue_lengths_a,
-            lengths_b=residue_lengths_b,
-        )
-        feature_ba = self._pair_feature(
-            encoded_a=encoded_b,
-            encoded_b=encoded_a,
-            lengths_a=residue_lengths_b,
-            lengths_b=residue_lengths_a,
-        )
-        pair_feature = torch.max(torch.stack([feature_ab, feature_ba], dim=-1), dim=-1).values
-        logits = self._logits_from_feature(pair_feature)
+        with torch.autocast(device_type=device.type, enabled=False):
+            residue_a = residue_a.float()
+            residue_b = residue_b.float()
+            mask_a = self._intra_mask(residue_lengths_a, residue_a.size(1))
+            mask_b = self._intra_mask(residue_lengths_b, residue_b.size(1))
+            encoded_a = self.intra_encoder(residue_a, mask_a)
+            encoded_b = self.intra_encoder(residue_b, mask_b)
+            feature_ab = self._pair_feature(
+                encoded_a=encoded_a,
+                encoded_b=encoded_b,
+                lengths_a=residue_lengths_a,
+                lengths_b=residue_lengths_b,
+            )
+            feature_ba = self._pair_feature(
+                encoded_a=encoded_b,
+                encoded_b=encoded_a,
+                lengths_a=residue_lengths_b,
+                lengths_b=residue_lengths_a,
+            )
+            pair_feature = torch.max(torch.stack([feature_ab, feature_ba], dim=-1), dim=-1).values
+            logits = self._logits_from_feature(pair_feature)
         output: dict[str, torch.Tensor] = {"logits": logits}
         if "label" in merged:
             labels = merged["label"].float()
