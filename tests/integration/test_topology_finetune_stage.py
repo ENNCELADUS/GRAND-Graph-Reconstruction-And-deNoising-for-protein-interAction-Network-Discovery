@@ -3443,6 +3443,61 @@ def test_v3_1_0506_pair_readout_ablation_configs() -> None:
                 assert model_cfg["pair_readout"]["cnn_dropout"] == 0.1
 
 
+def test_v3_1_0517_s47_architecture_ablation_configs() -> None:
+    """New s47 architecture ablations must isolate symmetry, interaction, and size."""
+    expected_architecture = {
+        "pair_context_gated_abba_s47.yaml": ("bidirectional_cross", "abba_max"),
+        "pair_context_gated_abba_no_cross_s47.yaml": ("none", "abba_max"),
+        "pair_context_gated_abba_block_s47.yaml": ("block_self", "abba_max"),
+    }
+    expected_sizes = {
+        "pair_context_gated_sn_d64_s47.yaml": 64,
+        "pair_context_gated_sn_d128_s47.yaml": 128,
+        "pair_context_gated_sn_d256_s47.yaml": 256,
+        "pair_context_gated_sn_d512_s47.yaml": 512,
+        "pair_context_gated_sn_d768_s47.yaml": 768,
+    }
+    config_dir = Path("configs/v3-1/0517")
+    expected_files = set(expected_architecture) | set(expected_sizes)
+    assert {path.name for path in config_dir.glob("*.yaml")} == expected_files
+
+    for filename in sorted(expected_files):
+        run_id = filename.removesuffix(".yaml")
+        config = load_config(config_dir / filename)
+        run_cfg = config["run_config"]
+        model_cfg = config["model_config"]
+        assert isinstance(run_cfg, dict)
+        assert isinstance(model_cfg, dict)
+
+        assert run_cfg["stages"] == ["train", "evaluate"]
+        assert run_cfg["seed"] == 47
+        assert run_cfg["train_run_id"] == run_id
+        assert run_cfg["eval_run_id"] == run_id
+        assert "optimization" not in config
+        assert model_cfg["model"] == "v3.1"
+        assert model_cfg["encoder_layers"] == 3
+        assert model_cfg["cross_attn_layers"] == 3
+        assert model_cfg["n_heads"] == 8
+        assert model_cfg["rich_pooling"]["components"] == ["mean", "attn", "max", "gated"]
+        assert model_cfg["pair_readout"]["mode"] == "pair_context_gated"
+
+        if filename in expected_architecture:
+            interaction_mode, order_aggregation = expected_architecture[filename]
+            assert model_cfg["d_model"] == 512
+            assert model_cfg["interaction"]["mode"] == interaction_mode
+            assert model_cfg["pair_readout"]["order_aggregation"] == order_aggregation
+            assert "spectral_norm" not in model_cfg["pair_readout"]
+            assert "spectral_norm" not in model_cfg["mlp_head"]
+        else:
+            d_model = expected_sizes[filename]
+            assert model_cfg["d_model"] == d_model
+            assert model_cfg["interaction"]["mode"] == "bidirectional_cross"
+            assert model_cfg["pair_readout"]["order_aggregation"] == "single"
+            assert model_cfg["pair_readout"]["spectral_norm"] is True
+            assert model_cfg["mlp_head"]["hidden_dims"] == [d_model, d_model // 2, d_model // 4]
+            assert model_cfg["mlp_head"]["spectral_norm"] is True
+
+
 def test_tuna_0514_quick_reproduction_configs() -> None:
     """TUnA quick-run ablations must use official seed 47 and small head settings."""
     expected_configs = {

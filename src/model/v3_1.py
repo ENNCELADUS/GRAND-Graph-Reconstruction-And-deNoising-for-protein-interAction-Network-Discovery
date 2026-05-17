@@ -15,6 +15,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
+from torch.nn.utils import spectral_norm
 
 # Re-use shared building blocks from v3 directly to avoid duplication.
 from src.model.v3 import (
@@ -31,6 +32,23 @@ POOLING_BASE_COMPONENTS = ("esm_cls", "mean", "attn", "max")
 POOLING_GATED_COMPONENT = "gated"
 DEFAULT_RICH_POOLING_COMPONENTS = (*POOLING_BASE_COMPONENTS, POOLING_GATED_COMPONENT)
 PAIR_READOUT_MODES = ("rich_pooling", "pair_context_gated", "contact_sketch_fusion")
+INTERACTION_MODES = ("bidirectional_cross", "none", "block_self")
+ORDER_AGGREGATION_MODES = ("single", "abba_max")
+
+
+def _to_bool(value: object, field_name: str) -> bool:
+    """Convert a config value to bool."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"{field_name} must be bool-compatible")
 
 
 def _parse_rich_pooling_components(value: object) -> tuple[str, ...]:
@@ -164,6 +182,48 @@ class CrossAttentionLayer(nn.Module):
         return h_a, h_b, cls_token
 
 
+class BlockSelfInteractionLayer(nn.Module):
+    """Self-only A/B interaction layer that avoids cross-chain token mixing."""
+
+    def __init__(self, d_model: int, n_heads: int, dropout: float) -> None:
+        super().__init__()
+        self.norm_attn = nn.LayerNorm(d_model)
+        self.norm_ffn = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=n_heads, dropout=dropout, batch_first=True
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, 4 * d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * d_model, d_model),
+            nn.Dropout(dropout),
+        )
+        self.drop_attn = nn.Dropout(dropout)
+        self.drop_ffn = nn.Dropout(dropout)
+
+    def _self_attend(
+        self,
+        x: torch.Tensor,
+        padding_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        x_norm = self.norm_attn(x)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm, key_padding_mask=padding_mask)
+        x = x + cast(torch.Tensor, self.drop_attn(attn_out))
+        return x + cast(torch.Tensor, self.drop_ffn(self.ffn(self.norm_ffn(x))))
+
+    def forward(
+        self,
+        h_a: torch.Tensor,
+        h_b: torch.Tensor,
+        cls_token: torch.Tensor,
+        mask_a: torch.Tensor | None,
+        mask_b: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Run one self-only layer and keep the pair CLS token unchanged."""
+        return self._self_attend(h_a, mask_a), self._self_attend(h_b, mask_b), cls_token
+
+
 # ---------------------------------------------------------------------------
 # Rich pooling
 # ---------------------------------------------------------------------------
@@ -295,6 +355,8 @@ class InteractionCrossAttention(nn.Module):
         cnn_dim: int = 64,
         cnn_blocks: int = 2,
         cnn_dropout: float = 0.1,
+        interaction_mode: str = "bidirectional_cross",
+        pair_readout_spectral_norm: bool = False,
     ) -> None:
         super().__init__()
         if pair_readout_mode not in PAIR_READOUT_MODES:
@@ -302,13 +364,27 @@ class InteractionCrossAttention(nn.Module):
                 "model_config.pair_readout.mode must be one of: "
                 f"{', '.join(PAIR_READOUT_MODES)}"
             )
+        if interaction_mode not in INTERACTION_MODES:
+            raise ValueError(
+                "model_config.interaction.mode must be one of: "
+                f"{', '.join(INTERACTION_MODES)}"
+            )
         self.pair_readout_mode = pair_readout_mode
+        self.interaction_mode = interaction_mode
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
-        self.layers = nn.ModuleList(
-            CrossAttentionLayer(d_model=d_model, n_heads=n_heads, dropout=dropout)
-            for _ in range(n_layers)
-        )
+        if interaction_mode == "bidirectional_cross":
+            self.layers = nn.ModuleList(
+                CrossAttentionLayer(d_model=d_model, n_heads=n_heads, dropout=dropout)
+                for _ in range(n_layers)
+            )
+        elif interaction_mode == "block_self":
+            self.layers = nn.ModuleList(
+                BlockSelfInteractionLayer(d_model=d_model, n_heads=n_heads, dropout=dropout)
+                for _ in range(n_layers)
+            )
+        else:
+            self.layers = nn.ModuleList()
         if pair_readout_mode in {"rich_pooling", "contact_sketch_fusion"}:
             shared_pool = RichPooling(
                 d_model=d_model, dropout=dropout, components=pooling_components
@@ -322,7 +398,11 @@ class InteractionCrossAttention(nn.Module):
                 nn.Dropout(dropout),
             )
         if pair_readout_mode == "pair_context_gated":
-            self.pair_context_readout = PairContextGatedReadout(d_model=d_model, dropout=dropout)
+            self.pair_context_readout = PairContextGatedReadout(
+                d_model=d_model,
+                dropout=dropout,
+                use_spectral_norm=pair_readout_spectral_norm,
+            )
         if pair_readout_mode == "contact_sketch_fusion":
             self.contact_sketch_readout = ContactSketchFusionReadout(
                 d_model=d_model,
@@ -447,6 +527,10 @@ class V3_1(nn.Module):
         self.mlp_dropout = _to_float(mlp_cfg["dropout"], "model_config.mlp_head.dropout")
         self.mlp_activation = str(mlp_cfg.get("activation", "gelu"))
         self.mlp_norm = str(mlp_cfg.get("norm", "layernorm"))
+        self.mlp_spectral_norm = _to_bool(
+            mlp_cfg.get("spectral_norm", False),
+            "model_config.mlp_head.spectral_norm",
+        )
 
         reg_cfg_raw = model_config.get("regularization")
         if not isinstance(reg_cfg_raw, dict) or "dropout" not in reg_cfg_raw:
@@ -463,6 +547,20 @@ class V3_1(nn.Module):
         self.stochastic_depth = _to_float(
             reg_cfg.get("stochastic_depth", 0.0), "model_config.regularization.stochastic_depth"
         )
+        interaction_cfg_raw = model_config.get("interaction", {})
+        if interaction_cfg_raw is None:
+            interaction_cfg_raw = {}
+        if not isinstance(interaction_cfg_raw, dict):
+            raise ValueError("model_config.interaction must be a mapping")
+        interaction_cfg = _to_mapping(interaction_cfg_raw, "model_config.interaction")
+        self.interaction_mode = str(
+            interaction_cfg.get("mode", "bidirectional_cross")
+        ).lower()
+        if self.interaction_mode not in INTERACTION_MODES:
+            raise ValueError(
+                "model_config.interaction.mode must be one of: "
+                f"{', '.join(INTERACTION_MODES)}"
+            )
         rich_pooling_cfg_raw = model_config.get("rich_pooling", {})
         if rich_pooling_cfg_raw is None:
             rich_pooling_cfg_raw = {}
@@ -484,6 +582,16 @@ class V3_1(nn.Module):
                 "model_config.pair_readout.mode must be one of: "
                 f"{', '.join(PAIR_READOUT_MODES)}"
             )
+        self.order_aggregation = str(pair_readout_cfg.get("order_aggregation", "single")).lower()
+        if self.order_aggregation not in ORDER_AGGREGATION_MODES:
+            raise ValueError(
+                "model_config.pair_readout.order_aggregation must be one of: "
+                f"{', '.join(ORDER_AGGREGATION_MODES)}"
+            )
+        self.pair_readout_spectral_norm = _to_bool(
+            pair_readout_cfg.get("spectral_norm", False),
+            "model_config.pair_readout.spectral_norm",
+        )
         contact_tokens = _to_int(
             pair_readout_cfg.get("contact_tokens", 64),
             "model_config.pair_readout.contact_tokens",
@@ -526,6 +634,8 @@ class V3_1(nn.Module):
             cnn_dim=cnn_dim,
             cnn_blocks=cnn_blocks,
             cnn_dropout=cnn_dropout,
+            interaction_mode=self.interaction_mode,
+            pair_readout_spectral_norm=self.pair_readout_spectral_norm,
         )
         self.output_head = MLPHead(
             input_dim=self.d_model,
@@ -534,6 +644,32 @@ class V3_1(nn.Module):
             dropout=self.mlp_dropout,
             activation=self.mlp_activation,
             norm=self.mlp_norm,
+        )
+        if self.mlp_spectral_norm:
+            self._apply_output_head_spectral_norm()
+
+    def _apply_output_head_spectral_norm(self) -> None:
+        """Apply spectral norm to output-head linear layers."""
+        for module in self.output_head.modules():
+            if isinstance(module, nn.Linear):
+                spectral_norm(module)
+
+    def _pair_representation(
+        self,
+        encoded_a: torch.Tensor,
+        encoded_b: torch.Tensor,
+        lengths_a: torch.Tensor,
+        lengths_b: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return a pair representation with optional AB/BA max aggregation."""
+        feature_ab = self.cross_attention(encoded_a, encoded_b, lengths_a, lengths_b)
+        if self.order_aggregation == "single":
+            return feature_ab
+
+        feature_ba = self.cross_attention(encoded_b, encoded_a, lengths_b, lengths_a)
+        return cast(
+            torch.Tensor,
+            torch.max(torch.stack([feature_ab, feature_ba], dim=-1), dim=-1).values,
         )
 
     def forward(
@@ -581,8 +717,8 @@ class V3_1(nn.Module):
 
         encoded_a = self.encoder(emb_a, lengths_a)
         encoded_b = self.encoder(emb_b, lengths_b)
-        cls_repr = self.cross_attention(encoded_a, encoded_b, lengths_a, lengths_b)
-        logits = self.output_head(cls_repr)
+        pair_repr = self._pair_representation(encoded_a, encoded_b, lengths_a, lengths_b)
+        logits = self.output_head(pair_repr)
 
         output: dict[str, torch.Tensor] = {"logits": logits}
         if "label" in merged:

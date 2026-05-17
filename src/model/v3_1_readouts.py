@@ -7,6 +7,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
 
 
 def residue_mask(x: torch.Tensor, padding_mask: torch.Tensor | None) -> torch.Tensor:
@@ -62,34 +63,40 @@ class ContactTokenCompressor(nn.Module):
         return torch.stack(pooled_rows, dim=0)
 
 
+def _linear(in_features: int, out_features: int, *, use_spectral_norm: bool = False) -> nn.Linear:
+    """Build an optionally spectral-normalized linear layer."""
+    layer = nn.Linear(in_features, out_features)
+    return spectral_norm(layer) if use_spectral_norm else layer
+
+
 class PairContextGatedReadout(nn.Module):
     """Residue-only mean/max/pair-conditioned-attention readout."""
 
-    def __init__(self, d_model: int, dropout: float) -> None:
+    def __init__(self, d_model: int, dropout: float, use_spectral_norm: bool = False) -> None:
         super().__init__()
         self.context_proj = nn.Sequential(
             nn.LayerNorm(d_model * 2),
-            nn.Linear(d_model * 2, d_model),
+            _linear(d_model * 2, d_model, use_spectral_norm=use_spectral_norm),
             nn.GELU(),
             nn.Dropout(dropout),
         )
         self.attn_scorer = nn.Sequential(
             nn.LayerNorm(d_model * 2),
-            nn.Linear(d_model * 2, d_model),
+            _linear(d_model * 2, d_model, use_spectral_norm=use_spectral_norm),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, 1),
+            _linear(d_model, 1, use_spectral_norm=use_spectral_norm),
         )
-        self.branch_gate = nn.Linear(d_model * 12, 3)
+        self.branch_gate = _linear(d_model * 12, 3, use_spectral_norm=use_spectral_norm)
         self.branch_proj = nn.Sequential(
             nn.LayerNorm(d_model * 4),
-            nn.Linear(d_model * 4, d_model),
+            _linear(d_model * 4, d_model, use_spectral_norm=use_spectral_norm),
             nn.GELU(),
             nn.Dropout(dropout),
         )
         self.final_proj = nn.Sequential(
             nn.LayerNorm(d_model * 2),
-            nn.Linear(d_model * 2, d_model),
+            _linear(d_model * 2, d_model, use_spectral_norm=use_spectral_norm),
             nn.GELU(),
             nn.Dropout(dropout),
         )

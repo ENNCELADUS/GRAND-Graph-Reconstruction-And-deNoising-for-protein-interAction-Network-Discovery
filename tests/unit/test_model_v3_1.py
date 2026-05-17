@@ -102,6 +102,10 @@ def test_v3_1_default_pair_readout_is_rich_pooling() -> None:
     model = V3_1(**cfg)
 
     assert model.pair_readout_mode == "rich_pooling"
+    assert model.interaction_mode == "bidirectional_cross"
+    assert model.order_aggregation == "single"
+    assert model.pair_readout_spectral_norm is False
+    assert model.mlp_spectral_norm is False
     assert hasattr(model.cross_attention, "pool_a")
     assert hasattr(model.cross_attention, "pool_b")
 
@@ -116,6 +120,32 @@ def test_v3_1_rejects_invalid_pair_readout_mode() -> None:
     cfg["pair_readout"] = {"mode": "unknown"}
 
     with pytest.raises(ValueError, match="model_config.pair_readout.mode"):
+        V3_1(**cfg)
+
+
+def test_v3_1_rejects_invalid_interaction_mode() -> None:
+    """Unsupported interaction modes must fail fast."""
+    from src.model.v3_1 import V3_1
+
+    cfg = _base_config()["model_config"]
+    assert isinstance(cfg, dict)
+    cfg.pop("model")
+    cfg["interaction"] = {"mode": "unknown"}
+
+    with pytest.raises(ValueError, match="model_config.interaction.mode"):
+        V3_1(**cfg)
+
+
+def test_v3_1_rejects_invalid_order_aggregation() -> None:
+    """Unsupported order aggregation modes must fail fast."""
+    from src.model.v3_1 import V3_1
+
+    cfg = _base_config()["model_config"]
+    assert isinstance(cfg, dict)
+    cfg.pop("model")
+    cfg["pair_readout"] = {"mode": "pair_context_gated", "order_aggregation": "unknown"}
+
+    with pytest.raises(ValueError, match="model_config.pair_readout.order_aggregation"):
         V3_1(**cfg)
 
 
@@ -260,6 +290,54 @@ def test_pair_context_gated_readout_forward_logits_shape() -> None:
     assert out["logits"].shape == (2, 1)
 
 
+@pytest.mark.parametrize("interaction_mode", ["none", "block_self"])
+def test_pair_context_gated_interaction_modes_forward_logits_shape(
+    interaction_mode: str,
+) -> None:
+    """No-cross and block-self interaction modes must keep classifier shape stable."""
+    from src.model.v3_1 import V3_1
+
+    cfg = _base_config()["model_config"]
+    assert isinstance(cfg, dict)
+    cfg.pop("model")
+    cfg["rich_pooling"] = {"components": ["mean", "attn", "max", "gated"]}
+    cfg["pair_readout"] = {"mode": "pair_context_gated"}
+    cfg["interaction"] = {"mode": interaction_mode}
+    model = V3_1(**cfg)
+    model.eval()
+
+    with torch.no_grad():
+        out = model(_make_batch(seq_len_a=7, seq_len_b=8))
+
+    assert out["logits"].shape == (2, 1)
+
+
+def test_pair_context_gated_abba_max_is_swap_invariant_in_eval() -> None:
+    """AB/BA max aggregation must make pair-context logits order invariant."""
+    from src.model.v3_1 import V3_1
+
+    cfg = _base_config()["model_config"]
+    assert isinstance(cfg, dict)
+    cfg.pop("model")
+    cfg["rich_pooling"] = {"components": ["mean", "attn", "max", "gated"]}
+    cfg["pair_readout"] = {"mode": "pair_context_gated", "order_aggregation": "abba_max"}
+    model = V3_1(**cfg)
+    model.eval()
+    batch = _make_batch(batch_size=2, seq_len_a=7, seq_len_b=8)
+    swapped = {
+        "emb_a": batch["emb_b"],
+        "emb_b": batch["emb_a"],
+        "len_a": batch["len_b"],
+        "len_b": batch["len_a"],
+    }
+
+    with torch.no_grad():
+        logits = model(batch)["logits"]
+        swapped_logits = model(swapped)["logits"]
+
+    assert torch.allclose(logits, swapped_logits, atol=1.0e-6)
+
+
 def test_contact_sketch_fusion_readout_forward_logits_shape() -> None:
     """Contact-sketch fusion readout must preserve the classifier output shape."""
     from src.model.v3_1 import V3_1
@@ -316,6 +394,63 @@ def test_new_pair_readouts_have_no_unused_trainable_parameters() -> None:
             if parameter.requires_grad and parameter.grad is None
         ]
         assert unused_parameters == []
+
+
+def test_pair_context_gated_spectral_norm_has_no_unused_trainable_parameters() -> None:
+    """Spectral-normalized readout/head ablation must keep all parameters connected."""
+    from src.model.v3_1 import V3_1
+
+    cfg = _base_config()["model_config"]
+    assert isinstance(cfg, dict)
+    cfg.pop("model")
+    mlp_cfg = cfg["mlp_head"]
+    assert isinstance(mlp_cfg, dict)
+    mlp_cfg["spectral_norm"] = True
+    cfg["rich_pooling"] = {"components": ["mean", "attn", "max", "gated"]}
+    cfg["pair_readout"] = {"mode": "pair_context_gated", "spectral_norm": True}
+    model = V3_1(**cfg)
+    output = model(_make_batch(seq_len_a=7, seq_len_b=8))["logits"]
+    output.sum().backward()
+
+    assert any(
+        hasattr(module, "weight_orig")
+        for module in model.cross_attention.pair_context_readout.modules()
+        if isinstance(module, torch.nn.Linear)
+    )
+    assert any(
+        hasattr(module, "weight_orig")
+        for module in model.output_head.modules()
+        if isinstance(module, torch.nn.Linear)
+    )
+    unused_parameters = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    assert unused_parameters == []
+
+
+@pytest.mark.parametrize("d_model", [64, 128, 256, 512, 768])
+def test_pair_context_gated_size_ablation_builds_via_factory(d_model: int) -> None:
+    """Pair-context gated model-size ablations must build through the factory."""
+    config = _base_config("v3.1")
+    model_cfg = config["model_config"]
+    assert isinstance(model_cfg, dict)
+    model_cfg["d_model"] = d_model
+    model_cfg["n_heads"] = 8
+    model_cfg["mlp_head"] = {
+        "hidden_dims": [d_model, d_model // 2, d_model // 4],
+        "dropout": 0.1,
+        "activation": "gelu",
+        "norm": "layernorm",
+        "spectral_norm": True,
+    }
+    model_cfg["rich_pooling"] = {"components": ["mean", "attn", "max", "gated"]}
+    model_cfg["pair_readout"] = {"mode": "pair_context_gated", "spectral_norm": True}
+
+    model = build_model(config)
+
+    assert model.d_model == d_model
 
 
 def test_rich_pooling_no_attention_ablation_has_no_unused_trainable_parameters() -> None:
