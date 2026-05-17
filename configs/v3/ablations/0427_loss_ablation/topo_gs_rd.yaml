@@ -92,7 +92,7 @@ topology_finetune:
   supervision_train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi_ratio5_exclusive.txt"
   supervision_valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi_ratio5_exclusive.txt"
   bce_negative_ratio: 5
-  subgraph_node_range: [20, 80]
+  subgraph_node_range: [30, 40]
   gradient_accumulation_steps: 8
   subgraphs_per_forward: 1
   strategy: "mixed"

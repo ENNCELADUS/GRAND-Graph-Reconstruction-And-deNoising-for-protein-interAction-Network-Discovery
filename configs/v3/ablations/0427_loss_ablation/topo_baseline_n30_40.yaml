@@ -2,10 +2,10 @@ run_config:
   stages: ["topology_finetune", "evaluate", "topology_evaluate"]
   seed: 47
   train_run_id: 20260308_002906
-  topology_finetune_run_id: "topo_gs_rd_deg"
+  topology_finetune_run_id: "topo_baseline_n30_40"
   adapt_run_id: null
-  eval_run_id: "topo_gs_rd_deg"
-  topology_eval_run_id: "topo_gs_rd_deg"
+  eval_run_id: "topo_baseline_n30_40"
+  topology_eval_run_id: "topo_baseline_n30_40"
   load_checkpoint_path: "models/v3/train/20260308_002906/best_model.pth"
   save_best_only: true
 
@@ -117,7 +117,7 @@ topology_finetune:
     alpha: 0.35   # Graph similarity
     beta: 0.45    # Relative density
     gamma: 0.15   # Degree MMD
-    delta: 0.0    # Clustering MMD
+    delta: 0.15   # Clustering MMD
     histogram_sigma: 1.25
     degree_bins: 48
     clustering_bins: 64
