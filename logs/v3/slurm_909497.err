@@ -1,0 +1,120 @@
+Warning: torch was built against CUDA 12.8, but using toolkit 12.5 at /public/software/CUDA/cuda-12.5.
+Set GRAND_CUDA_VERSION or CUDA_HOME to an exact-match toolkit to avoid DS_SKIP_CUDA_CHECK=1.
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+INFO:src.pipeline.__main__:Loaded config: configs/v3/ablations/0426/ws_range_n20_100.yaml
+WARNING:accelerate.utils.other:[RANK 0] Detected kernel version 3.10.0, which is below the recommended minimum of 5.5.0; this can cause the process to hang. It is recommended to upgrade the kernel to the minimum version or higher.
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+
+2026-05-11 11:52:48 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-05-11 11:52:48 INFO Stage Start | Checkpoint: models/v3/train/20260308_002906/best_model.pth | Init Mode: warm_start | Run Id: ws_range_n20_100
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/deepspeed/runtime/zero/linear.py:47: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  @autocast_custom_fwd
+
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/deepspeed/runtime/zero/linear.py:66: FutureWarning: `torch.cuda.amp.custom_bwd(args...)` is deprecated. Please use `torch.amp.custom_bwd(args..., device_type='cuda')` instead.
+  @autocast_custom_bwd
+
+2026-05-11 11:53:41 INFO Finetune Config | Epochs: 20 | Internal Validation Compute Spectral Stats: False | Internal Validation Inference Batch Size: 128 | Internal Validation Node Sizes: [20, 40, 60, 80, 100, 120, 140, 160, 180, 200] | Internal Validation Pairs: 1529000 | Internal Validation Subgraphs: 200 | Monitor: val_loss | Pair Batch Size: 32
+2026-05-11 11:59:02 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-11 11:59:12 INFO Epoch Progress | Epoch: 1 | Loss: 0.7640 | Progress: 0% | Step: 1/385
+2026-05-11 13:37:10 INFO Epoch Progress | Epoch: 1 | Loss: 1.1477 | Progress: 25% | Step: 97/385
+2026-05-11 15:14:58 INFO Epoch Progress | Epoch: 1 | Loss: 1.1051 | Progress: 50% | Step: 194/385
+2026-05-11 16:46:07 INFO Epoch Progress | Epoch: 1 | Loss: 1.2354 | Progress: 76% | Step: 291/385
+2026-05-11 18:08:27 INFO Epoch Progress | Epoch: 1 | Loss: 1.3784 | Progress: 100% | Step: 385/385
+2026-05-11 19:22:44 INFO Best Saved | Epoch: 1 | Monitor: val_loss | Value: 10.5330
+2026-05-11 19:22:44 INFO Epoch Done | All Subgraph Pairs: 3232080 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0630 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 324.8035 | Epoch: 1 | Internal Val Graph Sim: 0.2169 | Internal Val Topology S: 4238.1457 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 21799.5420 | Planned Subgraphs: 1538 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 22136.4279 | Train Loss: 1.3754 | Val AUPRC: 0.9242 | Val Pair Pass S: 218.8530 | Val Threshold S: 0.0000
+2026-05-11 19:28:18 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-11 19:28:26 INFO Epoch Progress | Epoch: 2 | Loss: 0.6521 | Progress: 0% | Step: 1/385
+2026-05-11 21:06:52 INFO Epoch Progress | Epoch: 2 | Loss: 1.0221 | Progress: 25% | Step: 97/385
+2026-05-11 22:43:37 INFO Epoch Progress | Epoch: 2 | Loss: 0.9720 | Progress: 50% | Step: 194/385
+2026-05-12 00:13:59 INFO Epoch Progress | Epoch: 2 | Loss: 1.0778 | Progress: 76% | Step: 291/385
+2026-05-12 01:36:09 INFO Epoch Progress | Epoch: 2 | Loss: 1.2226 | Progress: 100% | Step: 385/385
+2026-05-12 02:46:46 INFO Best Saved | Epoch: 2 | Monitor: val_loss | Value: 10.2858
+2026-05-12 02:46:46 INFO Epoch Done | All Subgraph Pairs: 3232080 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0630 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 330.3444 | Epoch: 2 | Internal Val Graph Sim: 0.2219 | Internal Val Topology S: 4033.4912 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 21766.4653 | Planned Subgraphs: 1538 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 22050.4237 | Train Loss: 1.2252 | Val AUPRC: 0.9272 | Val Pair Pass S: 203.7484 | Val Threshold S: 0.0000
+2026-05-12 02:52:12 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-12 02:52:19 INFO Epoch Progress | Epoch: 3 | Loss: 0.6969 | Progress: 0% | Step: 1/385
+2026-05-12 04:26:19 INFO Epoch Progress | Epoch: 3 | Loss: 0.8610 | Progress: 25% | Step: 97/385
+2026-05-12 05:59:59 INFO Epoch Progress | Epoch: 3 | Loss: 0.8152 | Progress: 50% | Step: 194/385
+2026-05-12 07:27:48 INFO Epoch Progress | Epoch: 3 | Loss: 0.9588 | Progress: 76% | Step: 291/385
+2026-05-12 08:46:39 INFO Epoch Progress | Epoch: 3 | Loss: 1.1390 | Progress: 100% | Step: 385/385
+2026-05-12 09:55:28 INFO Epoch Done | All Subgraph Pairs: 3232080 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0630 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 317.4860 | Epoch: 3 | Internal Val Graph Sim: 0.2248 | Internal Val Topology S: 3890.3397 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 21766.4390 | Planned Subgraphs: 1538 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 21250.4992 | Train Loss: 1.1253 | Val AUPRC: 0.9307 | Val Pair Pass S: 238.6155 | Val Threshold S: 0.0000
+2026-05-12 10:00:29 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-12 10:00:35 INFO Epoch Progress | Epoch: 4 | Loss: 0.6212 | Progress: 0% | Step: 1/385
+2026-05-12 11:33:50 INFO Epoch Progress | Epoch: 4 | Loss: 0.8070 | Progress: 25% | Step: 97/385
+2026-05-12 13:09:25 INFO Epoch Progress | Epoch: 4 | Loss: 0.7748 | Progress: 50% | Step: 194/385
+2026-05-12 14:38:40 INFO Epoch Progress | Epoch: 4 | Loss: 0.8874 | Progress: 76% | Step: 291/385
+2026-05-12 16:00:54 INFO Epoch Progress | Epoch: 4 | Loss: 1.0795 | Progress: 100% | Step: 385/385
+2026-05-12 17:13:34 INFO Best Saved | Epoch: 4 | Monitor: val_loss | Value: 9.9864
+2026-05-12 17:13:34 INFO Epoch Done | All Subgraph Pairs: 3232080 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0630 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 305.4493 | Epoch: 4 | Internal Val Graph Sim: 0.2255 | Internal Val Topology S: 4128.0480 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 21766.5327 | Planned Subgraphs: 1538 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 21597.3275 | Train Loss: 1.0774 | Val AUPRC: 0.9315 | Val Pair Pass S: 231.0477 | Val Threshold S: 0.0000
+2026-05-12 17:18:55 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-12 17:19:04 INFO Epoch Progress | Epoch: 5 | Loss: 0.4502 | Progress: 0% | Step: 1/385
+2026-05-12 18:54:52 INFO Epoch Progress | Epoch: 5 | Loss: 0.7714 | Progress: 25% | Step: 97/385
+2026-05-12 20:29:53 INFO Epoch Progress | Epoch: 5 | Loss: 0.7446 | Progress: 50% | Step: 194/385
+2026-05-12 21:59:34 INFO Epoch Progress | Epoch: 5 | Loss: 0.8868 | Progress: 76% | Step: 291/385
+2026-05-12 23:20:48 INFO Epoch Progress | Epoch: 5 | Loss: 1.0565 | Progress: 100% | Step: 385/385
+2026-05-13 00:33:31 INFO Best Saved | Epoch: 5 | Monitor: val_loss | Value: 9.1673
+2026-05-13 00:33:31 INFO Epoch Done | All Subgraph Pairs: 3232080 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0630 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 325.9325 | Epoch: 5 | Internal Val Graph Sim: 0.2290 | Internal Val Topology S: 4152.6827 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 21766.3853 | Planned Subgraphs: 1538 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 21684.1652 | Train Loss: 1.0488 | Val AUPRC: 0.9324 | Val Pair Pass S: 210.6161 | Val Threshold S: 0.0000
+2026-05-13 00:38:55 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-13 00:39:02 INFO Epoch Progress | Epoch: 6 | Loss: 0.5206 | Progress: 0% | Step: 1/385
+2026-05-13 02:18:12 INFO Epoch Progress | Epoch: 6 | Loss: 0.7468 | Progress: 25% | Step: 97/385
+2026-05-13 03:57:56 INFO Epoch Progress | Epoch: 6 | Loss: 0.7196 | Progress: 50% | Step: 194/385
+2026-05-13 05:30:28 INFO Epoch Progress | Epoch: 6 | Loss: 0.8728 | Progress: 76% | Step: 291/385
+2026-05-13 06:52:28 INFO Epoch Progress | Epoch: 6 | Loss: 1.0383 | Progress: 100% | Step: 385/385
+2026-05-13 08:05:37 INFO Best Saved | Epoch: 6 | Monitor: val_loss | Value: 8.8174
+2026-05-13 08:05:37 INFO Epoch Done | All Subgraph Pairs: 3237030 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0629 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 321.1830 | Epoch: 6 | Internal Val Graph Sim: 0.2305 | Internal Val Topology S: 4183.8153 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 21799.5820 | Planned Subgraphs: 1539 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 22391.0010 | Train Loss: 1.0375 | Val AUPRC: 0.9333 | Val Pair Pass S: 205.2742 | Val Threshold S: 0.0000
+2026-05-13 08:10:50 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-13 08:10:58 INFO Epoch Progress | Epoch: 7 | Loss: 0.4015 | Progress: 0% | Step: 1/385
+2026-05-13 09:50:15 INFO Epoch Progress | Epoch: 7 | Loss: 0.7215 | Progress: 25% | Step: 97/385
+2026-05-13 11:26:47 INFO Epoch Progress | Epoch: 7 | Loss: 0.6970 | Progress: 50% | Step: 194/385
+2026-05-13 12:56:20 INFO Epoch Progress | Epoch: 7 | Loss: 0.8477 | Progress: 76% | Step: 291/385
+2026-05-13 14:18:41 INFO Epoch Progress | Epoch: 7 | Loss: 1.0169 | Progress: 100% | Step: 385/385
+2026-05-13 15:32:12 INFO Best Saved | Epoch: 7 | Monitor: val_loss | Value: 8.6937
+2026-05-13 15:32:12 INFO Epoch Done | All Subgraph Pairs: 3232080 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0630 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 311.9457 | Epoch: 7 | Internal Val Graph Sim: 0.2304 | Internal Val Topology S: 4200.5129 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 21766.5327 | Planned Subgraphs: 1538 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 22048.6472 | Train Loss: 1.0285 | Val AUPRC: 0.9336 | Val Pair Pass S: 209.3763 | Val Threshold S: 0.0000
+2026-05-13 15:37:16 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-13 15:37:23 INFO Epoch Progress | Epoch: 8 | Loss: 0.3458 | Progress: 0% | Step: 1/385
+2026-05-13 17:17:24 INFO Epoch Progress | Epoch: 8 | Loss: 0.7336 | Progress: 25% | Step: 97/385
+2026-05-13 18:57:06 INFO Epoch Progress | Epoch: 8 | Loss: 0.7030 | Progress: 50% | Step: 194/385
+2026-05-13 20:29:52 INFO Epoch Progress | Epoch: 8 | Loss: 0.8513 | Progress: 76% | Step: 291/385
+2026-05-13 21:52:23 INFO Epoch Progress | Epoch: 8 | Loss: 1.0149 | Progress: 100% | Step: 385/385
+2026-05-13 23:06:02 INFO Epoch Done | All Subgraph Pairs: 3232080 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0630 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 305.2462 | Epoch: 8 | Internal Val Graph Sim: 0.2312 | Internal Val Topology S: 4213.7384 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 21766.5327 | Planned Subgraphs: 1538 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 22481.7350 | Train Loss: 1.0145 | Val AUPRC: 0.9338 | Val Pair Pass S: 205.9024 | Val Threshold S: 0.0000
+2026-05-13 23:11:50 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-13 23:11:58 INFO Epoch Progress | Epoch: 9 | Loss: 0.6008 | Progress: 0% | Step: 1/385
+2026-05-14 00:49:48 INFO Epoch Progress | Epoch: 9 | Loss: 0.7409 | Progress: 25% | Step: 97/385
+2026-05-14 02:26:05 INFO Epoch Progress | Epoch: 9 | Loss: 0.7104 | Progress: 50% | Step: 194/385
+2026-05-14 03:59:59 INFO Epoch Progress | Epoch: 9 | Loss: 0.8575 | Progress: 76% | Step: 291/385
+2026-05-14 05:23:23 INFO Epoch Progress | Epoch: 9 | Loss: 1.0291 | Progress: 100% | Step: 385/385
+2026-05-14 06:36:51 INFO Best Saved | Epoch: 9 | Monitor: val_loss | Value: 8.2247
+2026-05-14 06:36:51 INFO Epoch Done | All Subgraph Pairs: 3232080 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0630 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 342.2016 | Epoch: 9 | Internal Val Graph Sim: 0.2327 | Internal Val Topology S: 4178.7524 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 21766.4951 | Planned Subgraphs: 1538 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 22274.6949 | Train Loss: 1.0174 | Val AUPRC: 0.9343 | Val Pair Pass S: 228.8305 | Val Threshold S: 0.0000
+2026-05-14 06:42:10 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-14 06:42:18 INFO Epoch Progress | Epoch: 10 | Loss: 0.5442 | Progress: 0% | Step: 1/385
+2026-05-14 08:22:08 INFO Epoch Progress | Epoch: 10 | Loss: 0.7187 | Progress: 25% | Step: 97/385
+2026-05-14 10:02:48 INFO Epoch Progress | Epoch: 10 | Loss: 0.6962 | Progress: 50% | Step: 194/385
+2026-05-14 11:35:18 INFO Epoch Progress | Epoch: 10 | Loss: 0.8285 | Progress: 76% | Step: 291/385
+2026-05-14 12:57:50 INFO Epoch Progress | Epoch: 10 | Loss: 0.9819 | Progress: 100% | Step: 385/385
+2026-05-14 14:11:14 INFO Epoch Done | All Subgraph Pairs: 3232080 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0630 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 316.9360 | Epoch: 10 | Internal Val Graph Sim: 0.2334 | Internal Val Topology S: 4187.5006 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 21799.5781 | Planned Subgraphs: 1538 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 22517.6475 | Train Loss: 1.0035 | Val AUPRC: 0.9352 | Val Pair Pass S: 216.2911 | Val Threshold S: 0.0000
+2026-05-14 14:16:32 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-14 14:16:39 INFO Epoch Progress | Epoch: 11 | Loss: 0.4371 | Progress: 0% | Step: 1/385
+2026-05-14 15:55:46 INFO Epoch Progress | Epoch: 11 | Loss: 0.7098 | Progress: 25% | Step: 97/385
+2026-05-14 17:35:05 INFO Epoch Progress | Epoch: 11 | Loss: 0.6942 | Progress: 50% | Step: 194/385
+2026-05-14 19:07:11 INFO Epoch Progress | Epoch: 11 | Loss: 0.8189 | Progress: 76% | Step: 291/385
+2026-05-14 20:30:32 INFO Epoch Progress | Epoch: 11 | Loss: 0.9891 | Progress: 100% | Step: 385/385
+2026-05-14 21:44:37 INFO Best Saved | Epoch: 11 | Monitor: val_loss | Value: 8.1999
+2026-05-14 21:44:37 INFO Epoch Done | All Subgraph Pairs: 3232080 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0630 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 311.4053 | Epoch: 11 | Internal Val Graph Sim: 0.2354 | Internal Val Topology S: 4229.4927 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 21766.4951 | Planned Subgraphs: 1538 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 22422.5790 | Train Loss: 1.0020 | Val AUPRC: 0.9357 | Val Pair Pass S: 214.9896 | Val Threshold S: 0.0000
+2026-05-14 21:49:59 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-14 21:50:06 INFO Epoch Progress | Epoch: 12 | Loss: 0.4592 | Progress: 0% | Step: 1/385
+2026-05-14 23:29:26 INFO Epoch Progress | Epoch: 12 | Loss: 0.6980 | Progress: 25% | Step: 97/385
+2026-05-15 01:08:22 INFO Epoch Progress | Epoch: 12 | Loss: 0.6790 | Progress: 50% | Step: 194/385
+2026-05-15 02:41:12 INFO Epoch Progress | Epoch: 12 | Loss: 0.8169 | Progress: 76% | Step: 291/385
+2026-05-15 04:04:54 INFO Epoch Progress | Epoch: 12 | Loss: 0.9862 | Progress: 100% | Step: 385/385
+2026-05-15 05:18:31 INFO Best Saved | Epoch: 12 | Monitor: val_loss | Value: 8.0840
+2026-05-15 05:18:31 INFO Epoch Done | All Subgraph Pairs: 3237030 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.0629 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 323.0741 | Epoch: 12 | Internal Val Graph Sim: 0.2351 | Internal Val Topology S: 4208.7029 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 21766.5327 | Planned Subgraphs: 1539 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 22470.3617 | Train Loss: 0.9942 | Val AUPRC: 0.9357 | Val Pair Pass S: 208.3512 | Val Threshold S: 0.0000
+2026-05-15 05:24:07 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-15 05:24:13 INFO Epoch Progress | Epoch: 13 | Loss: 0.3675 | Progress: 0% | Step: 1/385
+2026-05-15 07:03:49 INFO Epoch Progress | Epoch: 13 | Loss: 0.7041 | Progress: 25% | Step: 97/385
+2026-05-15 08:42:35 INFO Epoch Progress | Epoch: 13 | Loss: 0.6719 | Progress: 50% | Step: 194/385
+2026-05-15 10:15:35 INFO Epoch Progress | Epoch: 13 | Loss: 0.8143 | Progress: 76% | Step: 291/385
+2026-05-15 11:38:07 INFO Epoch Progress | Epoch: 13 | Loss: 0.9846 | Progress: 100% | Step: 385/385
+slurmstepd: error: *** JOB 909497 ON hexm01 CANCELLED AT 2026-05-15T11:51:56 DUE TO TIME LIMIT ***

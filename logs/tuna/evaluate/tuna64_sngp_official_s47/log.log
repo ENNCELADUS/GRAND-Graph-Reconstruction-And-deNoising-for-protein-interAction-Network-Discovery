@@ -1,0 +1,7 @@
+2026-05-16 01:16:43 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 812 | Valid Batches: 762 | World Size: 4
+2026-05-16 03:23:29 INFO Stage Start | Checkpoint: models/tuna/train/tuna64_sngp_official_s47/best_model.pth | Run Id: tuna64_sngp_official_s47
+2026-05-16 03:23:29 INFO Checkpoint Loaded | Path: models/tuna/train/tuna64_sngp_official_s47/best_model.pth
+2026-05-16 03:23:29 INFO Decision Threshold | Mode: fixed | Value: 0.5000
+2026-05-16 03:31:56 INFO Evaluation Metrics | Accuracy: 0.6101 | AUPRC: 0.6895 | Auroc: 0.6704 | F1: 0.6519 | Mcc: 0.2268 | Precision: 0.5889 | Recall: 0.7300 | Sensitivity: 0.7300 | Specificity: 0.4901 | Split: test
+2026-05-16 03:31:56 INFO CSV Written | Path: logs/tuna/evaluate/tuna64_sngp_official_s47/evaluate.csv
+2026-05-16 03:31:56 INFO Stage Done | Run Id: tuna64_sngp_official_s47
