@@ -1,0 +1,7 @@
+2026-05-18 02:55:42 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 812 | Valid Batches: 762 | World Size: 4
+2026-05-18 06:41:53 INFO Stage Start | Checkpoint: models/v3.1/train/pair_context_gated_sn_d128_s47/best_model.pth | Run Id: pair_context_gated_sn_d128_s47
+2026-05-18 06:41:53 INFO Checkpoint Loaded | Path: models/v3.1/train/pair_context_gated_sn_d128_s47/best_model.pth
+2026-05-18 06:41:53 INFO Decision Threshold | Mode: fixed | Value: 0.5000
+2026-05-18 06:49:47 INFO Evaluation Metrics | Accuracy: 0.6270 | AUPRC: 0.7128 | Auroc: 0.6861 | F1: 0.6099 | Mcc: 0.2549 | Precision: 0.6393 | Recall: 0.5830 | Sensitivity: 0.5830 | Specificity: 0.6709 | Split: test
+2026-05-18 06:49:47 INFO CSV Written | Path: logs/v3.1/evaluate/pair_context_gated_sn_d128_s47/evaluate.csv
+2026-05-18 06:49:47 INFO Stage Done | Run Id: pair_context_gated_sn_d128_s47
