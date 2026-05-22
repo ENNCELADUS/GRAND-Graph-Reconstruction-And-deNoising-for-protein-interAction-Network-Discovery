@@ -11,7 +11,13 @@ from torch import nn
 
 from src.adapt import should_run_shot_adaptation
 from src.pipeline.config import PipelineConfig
-from src.pipeline.runtime import AcceleratorLike, PipelineRuntime, build_accelerator, build_runtime
+from src.pipeline.runtime import (
+    AcceleratorLike,
+    PipelineRuntime,
+    build_accelerator,
+    build_runtime,
+    shutdown_runtime,
+)
 from src.pipeline.stages.adapt import run_shot_adaptation_stage
 from src.pipeline.stages.evaluate import run_evaluation_stage
 from src.pipeline.stages.topology_evaluate import run_topology_evaluation_stage
@@ -138,20 +144,23 @@ def execute_pipeline(
     resolved_build_accelerator = build_accelerator_fn or build_accelerator
     typed_config = PipelineConfig.from_dict(config)
     runtime = build_runtime(typed_config, build_accelerator_fn=resolved_build_accelerator)
-    execute_pipeline_with_runtime(
-        runtime,
-        build_dataloaders_fn=build_dataloaders_fn or build_dataloaders,
-        build_model_fn=build_model_fn or build_model,
-        run_training_stage_fn=run_training_stage_fn or run_training_stage,
-        run_topology_finetuning_stage_fn=(
-            run_topology_finetuning_stage_fn or run_topology_finetuning_stage
-        ),
-        run_adaptation_stage_fn=run_adaptation_stage_fn or run_shot_adaptation_stage,
-        run_evaluation_stage_fn=run_evaluation_stage_fn or run_evaluation_stage,
-        run_topology_evaluation_stage_fn=(
-            run_topology_evaluation_stage_fn or run_topology_evaluation_stage
-        ),
-    )
+    try:
+        execute_pipeline_with_runtime(
+            runtime,
+            build_dataloaders_fn=build_dataloaders_fn or build_dataloaders,
+            build_model_fn=build_model_fn or build_model,
+            run_training_stage_fn=run_training_stage_fn or run_training_stage,
+            run_topology_finetuning_stage_fn=(
+                run_topology_finetuning_stage_fn or run_topology_finetuning_stage
+            ),
+            run_adaptation_stage_fn=run_adaptation_stage_fn or run_shot_adaptation_stage,
+            run_evaluation_stage_fn=run_evaluation_stage_fn or run_evaluation_stage,
+            run_topology_evaluation_stage_fn=(
+                run_topology_evaluation_stage_fn or run_topology_evaluation_stage
+            ),
+        )
+    finally:
+        shutdown_runtime(runtime)
 
 
 def execute_pipeline_with_runtime(

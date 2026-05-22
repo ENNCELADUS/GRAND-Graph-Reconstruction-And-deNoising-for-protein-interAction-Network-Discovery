@@ -216,6 +216,7 @@ def distributed_context_from_accelerator(
     *,
     accelerator: AcceleratorLike,
     ddp_enabled: bool,
+    owns_process_group: bool = False,
 ) -> DistributedContext:
     """Project accelerator process metadata onto the repository context type."""
     return DistributedContext(
@@ -224,7 +225,7 @@ def distributed_context_from_accelerator(
         rank=accelerator.process_index,
         local_rank=accelerator.local_process_index,
         world_size=accelerator.num_processes,
-        owns_process_group=False,
+        owns_process_group=owns_process_group,
     )
 
 
@@ -282,6 +283,7 @@ def build_runtime(
 ) -> PipelineRuntime:
     """Create the accelerator-owned runtime for one pipeline execution."""
     set_global_seed(config.run.seed)
+    process_group_preexisting = dist.is_initialized()
     accelerator = build_accelerator_fn(
         requested_device=config.device.requested_device,
         backend=config.device.backend,
@@ -292,6 +294,9 @@ def build_runtime(
     distributed = distributed_context_from_accelerator(
         accelerator=accelerator,
         ddp_enabled=config.device.ddp_enabled,
+        owns_process_group=(
+            accelerator.use_distributed and not process_group_preexisting and dist.is_initialized()
+        ),
     )
     stage_run_ids = resolve_stage_run_ids(config=config, distributed=distributed)
     return PipelineRuntime(
@@ -394,6 +399,18 @@ def barrier(runtime: PipelineRuntime) -> None:
     runtime.accelerator.wait_for_everyone()
 
 
+def shutdown_runtime(runtime: PipelineRuntime) -> None:
+    """Release distributed resources owned by the pipeline runtime."""
+    if not runtime.distributed.is_distributed or not runtime.distributed.owns_process_group:
+        return
+    end_training = getattr(runtime.accelerator, "end_training", None)
+    if callable(end_training):
+        end_training()
+        return
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
 @contextmanager
 def main_process_first(runtime: PipelineRuntime) -> Iterator[None]:
     """Run a block with main-process priority when supported."""
@@ -462,6 +479,7 @@ __all__ = [
     "load_checkpoint",
     "main_process_first",
     "save_checkpoint",
+    "shutdown_runtime",
     "stage_logger",
     "stage_paths",
 ]

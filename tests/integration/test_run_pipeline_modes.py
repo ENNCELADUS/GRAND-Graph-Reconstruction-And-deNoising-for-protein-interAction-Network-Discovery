@@ -486,6 +486,142 @@ def test_execute_pipeline_distributed_worker_reuses_main_run_ids(
     assert patched_pipeline.training == [("train", "shared_train_run")]
 
 
+def test_execute_pipeline_ends_accelerator_owned_distributed_group(
+    base_config: ConfigDict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_cfg = base_config["run_config"]
+    assert isinstance(run_cfg, dict)
+    run_cfg["stages"] = ["train"]
+    run_cfg["train_run_id"] = None
+
+    device_cfg = base_config["device_config"]
+    assert isinstance(device_cfg, dict)
+    device_cfg["ddp_enabled"] = True
+
+    initialized = False
+    cleanup_calls: list[str] = []
+
+    class _DistributedAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = True
+        process_index = 0
+        local_process_index = 0
+        num_processes = 2
+        mixed_precision = "no"
+
+        def end_training(self) -> None:
+            cleanup_calls.append("end_training")
+
+    def fake_build_accelerator(**kwargs: object) -> _DistributedAccelerator:
+        nonlocal initialized
+        del kwargs
+        initialized = True
+        return _DistributedAccelerator()
+
+    def fake_build_dataloaders(
+        *args: object,
+        **kwargs: object,
+    ) -> dict[str, DataLoader[dict[str, torch.Tensor]]]:
+        del args, kwargs
+        loader = DataLoader(_EmptyDataset(), batch_size=1)
+        return {"train": loader, "valid": loader, "test": loader}
+
+    def fake_run_training_stage(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        return Path("artifacts/train_best_model.pth")
+
+    monkeypatch.setattr(
+        pipeline_runtime.dist,
+        "is_initialized",
+        lambda: initialized,
+    )
+    monkeypatch.setattr(
+        pipeline_runtime.torch.distributed,
+        "is_initialized",
+        lambda: initialized,
+    )
+    monkeypatch.setattr(
+        pipeline_runtime.torch.distributed,
+        "broadcast_object_list",
+        lambda payload, src: None,
+    )
+    monkeypatch.setattr(run_module, "build_accelerator", fake_build_accelerator, raising=False)
+    monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
+    monkeypatch.setattr(run_module, "build_model", lambda config: _DummyModel())
+    monkeypatch.setattr(run_module, "run_training_stage", fake_run_training_stage)
+
+    run_module.execute_pipeline(base_config)
+
+    assert cleanup_calls == ["end_training"]
+
+
+def test_execute_pipeline_preserves_preexisting_distributed_group(
+    base_config: ConfigDict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_cfg = base_config["run_config"]
+    assert isinstance(run_cfg, dict)
+    run_cfg["stages"] = ["train"]
+    run_cfg["train_run_id"] = None
+
+    device_cfg = base_config["device_config"]
+    assert isinstance(device_cfg, dict)
+    device_cfg["ddp_enabled"] = True
+
+    cleanup_calls: list[str] = []
+
+    class _DistributedAccelerator:
+        device = torch.device("cpu")
+        is_main_process = True
+        use_distributed = True
+        process_index = 0
+        local_process_index = 0
+        num_processes = 2
+        mixed_precision = "no"
+
+        def end_training(self) -> None:
+            cleanup_calls.append("end_training")
+
+    def fake_build_dataloaders(
+        *args: object,
+        **kwargs: object,
+    ) -> dict[str, DataLoader[dict[str, torch.Tensor]]]:
+        del args, kwargs
+        loader = DataLoader(_EmptyDataset(), batch_size=1)
+        return {"train": loader, "valid": loader, "test": loader}
+
+    def fake_run_training_stage(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        return Path("artifacts/train_best_model.pth")
+
+    monkeypatch.setattr(pipeline_runtime.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        pipeline_runtime.torch.distributed,
+        "is_initialized",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        pipeline_runtime.torch.distributed,
+        "broadcast_object_list",
+        lambda payload, src: None,
+    )
+    monkeypatch.setattr(
+        run_module,
+        "build_accelerator",
+        lambda **kwargs: _DistributedAccelerator(),
+        raising=False,
+    )
+    monkeypatch.setattr(run_module, "build_dataloaders", fake_build_dataloaders)
+    monkeypatch.setattr(run_module, "build_model", lambda config: _DummyModel())
+    monkeypatch.setattr(run_module, "run_training_stage", fake_run_training_stage)
+
+    run_module.execute_pipeline(base_config)
+
+    assert cleanup_calls == []
+
+
 def test_execute_pipeline_evaluate_only(
     base_config: ConfigDict,
     patched_pipeline: PipelineCalls,
@@ -526,9 +662,7 @@ def test_execute_pipeline_skips_model_dirs_for_evaluation_stages(
     assert (tmp_path / "logs" / "v3" / "evaluate" / "eval_run").exists()
     assert (tmp_path / "logs" / "v3" / "topology_evaluate" / "topology_eval_run").exists()
     assert not (tmp_path / "models" / "v3" / "evaluate" / "eval_run").exists()
-    assert not (
-        tmp_path / "models" / "v3" / "topology_evaluate" / "topology_eval_run"
-    ).exists()
+    assert not (tmp_path / "models" / "v3" / "topology_evaluate" / "topology_eval_run").exists()
 
 
 def test_execute_pipeline_all_stages_with_shot(
