@@ -3538,6 +3538,58 @@ def test_v3_1_0522_d256_no_spectral_norm_configs() -> None:
         assert model_cfg["interaction"]["mode"] == interaction_mode
 
 
+def test_v3_1_0523_abba_followup_configs() -> None:
+    """Follow-up ablations must isolate d512 stability and abba-block spectral norm."""
+    expected_configs = {
+        "pair_context_gated_abba_block_s13.yaml": (13, 512, "block_self", False),
+        "pair_context_gated_abba_block_s101.yaml": (101, 512, "block_self", False),
+        "pair_context_gated_abba_no_cross_s13.yaml": (13, 512, "none", False),
+        "pair_context_gated_abba_no_cross_s101.yaml": (101, 512, "none", False),
+        "pair_context_gated_abba_block_sn_d256_s13.yaml": (13, 256, "block_self", True),
+        "pair_context_gated_abba_block_sn_d256_s47.yaml": (47, 256, "block_self", True),
+        "pair_context_gated_abba_block_sn_d256_s101.yaml": (101, 256, "block_self", True),
+        "pair_context_gated_abba_block_sn_d512_s47.yaml": (47, 512, "block_self", True),
+    }
+    config_dir = Path("configs/v3-1/0523")
+    assert {path.name for path in config_dir.glob("*.yaml")} == set(expected_configs)
+
+    for filename, (seed, d_model, interaction_mode, use_spectral_norm) in sorted(
+        expected_configs.items()
+    ):
+        run_id = filename.removesuffix(".yaml")
+        config = load_config(config_dir / filename)
+        run_cfg = config["run_config"]
+        model_cfg = config["model_config"]
+        assert isinstance(run_cfg, dict)
+        assert isinstance(model_cfg, dict)
+
+        assert run_cfg["stages"] == ["train", "evaluate"]
+        assert run_cfg["seed"] == seed
+        assert run_cfg["train_run_id"] == run_id
+        assert run_cfg["eval_run_id"] == run_id
+        assert "optimization" not in config
+        assert model_cfg["model"] == "v3.1"
+        assert model_cfg["d_model"] == d_model
+        assert model_cfg["encoder_layers"] == 3
+        assert model_cfg["cross_attn_layers"] == 3
+        assert model_cfg["n_heads"] == 8
+        assert model_cfg["mlp_head"]["hidden_dims"] == [
+            d_model,
+            d_model // 2,
+            d_model // 4,
+        ]
+        assert model_cfg["rich_pooling"]["components"] == ["mean", "attn", "max", "gated"]
+        assert model_cfg["pair_readout"]["mode"] == "pair_context_gated"
+        assert model_cfg["pair_readout"]["order_aggregation"] == "abba_max"
+        assert model_cfg["interaction"]["mode"] == interaction_mode
+        if use_spectral_norm:
+            assert model_cfg["mlp_head"]["spectral_norm"] is True
+            assert model_cfg["pair_readout"]["spectral_norm"] is True
+        else:
+            assert "spectral_norm" not in model_cfg["mlp_head"]
+            assert "spectral_norm" not in model_cfg["pair_readout"]
+
+
 def test_tuna_0514_quick_reproduction_configs() -> None:
     """TUnA quick-run ablations must use official seed 47 and small head settings."""
     expected_configs = {
