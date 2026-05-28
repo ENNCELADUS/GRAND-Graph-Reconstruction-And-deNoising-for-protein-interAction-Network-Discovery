@@ -42,7 +42,7 @@ from src.utils.config import (
     get_section,
     load_config,
 )
-from src.utils.logging import generate_run_id
+from src.utils.logging import format_float_result, generate_run_id
 
 LOGGER = logging.getLogger(__name__)
 PipelineExecuteFn = Callable[[ConfigDict], None]
@@ -568,10 +568,10 @@ def _write_recheck_summary_csv(
                 {
                     "rank": rank,
                     "trial_number": summary.trial_number,
-                    "original_value": f"{summary.original_value:.8f}",
-                    "mean_value": f"{summary.mean_value:.8f}",
-                    "std_value": f"{summary.std_value:.8f}",
-                    "score": f"{summary.score:.8f}",
+                    "original_value": format_float_result(summary.original_value),
+                    "mean_value": format_float_result(summary.mean_value),
+                    "std_value": format_float_result(summary.std_value),
+                    "score": format_float_result(summary.score),
                     "params_json": json.dumps(summary.params, ensure_ascii=True, sort_keys=True),
                 }
             )
@@ -604,7 +604,7 @@ def _write_recheck_seed_csv(
                         "trial_number": seed_result.trial_number,
                         "seed": seed_result.seed,
                         "run_id": seed_result.run_id,
-                        "value": f"{seed_result.objective_value:.8f}",
+                        "value": format_float_result(seed_result.objective_value),
                         "metric_column": seed_result.metric_column,
                         "train_csv_path": str(seed_result.train_csv_path),
                         "checkpoint_path": str(seed_result.checkpoint_path),
@@ -629,7 +629,7 @@ def _write_trials_csv(*, output_path: Path, trial_records: list[TrialRecord]) ->
                 {
                     "trial_number": record.number,
                     "state": record.state,
-                    "value": "" if record.value is None else f"{record.value:.8f}",
+                    "value": "" if record.value is None else format_float_result(record.value),
                     "run_id": "" if record.run_id is None else record.run_id,
                     "params_json": json.dumps(record.params, ensure_ascii=True, sort_keys=True),
                 }

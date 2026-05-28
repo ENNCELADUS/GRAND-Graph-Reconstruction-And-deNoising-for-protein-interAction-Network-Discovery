@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import logging
 import math
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 
@@ -178,10 +179,31 @@ def format_stage_event(event: str, **fields: object) -> str:
 def _format_field_value(key: str, value: object) -> str:
     """Format event field values in a stable human-readable form."""
     if isinstance(value, float):
-        if key.lower() in {"lr", "learning_rate"}:
+        if _is_learning_rate_key(key):
             return f"{value:.6g}"
-        return f"{value:.4f}"
+        return format_float_result(value)
     return str(value)
+
+
+def format_float_result(value: float) -> str:
+    """Format displayed floating-point results with project-wide precision."""
+    return f"{value:.3f}"
+
+
+def format_result_payload(payload: object) -> object:
+    """Round floating-point values inside JSON-like result payloads."""
+    if isinstance(payload, float):
+        return round(payload, 3) if math.isfinite(payload) else payload
+    if isinstance(payload, Mapping):
+        return {key: format_result_payload(value) for key, value in payload.items()}
+    if isinstance(payload, list | tuple):
+        return [format_result_payload(value) for value in payload]
+    return payload
+
+
+def _is_learning_rate_key(key: str) -> bool:
+    """Return whether a field name represents a learning rate."""
+    return key.lower().replace(" ", "_") in {"lr", "learning_rate"}
 
 
 def _format_label(token: str) -> str:
@@ -244,4 +266,17 @@ def append_csv_row(
         writer = csv.DictWriter(handle, fieldnames=row_keys)
         if write_header:
             writer.writeheader()
-        writer.writerow(row)
+        writer.writerow(_format_csv_row(row))
+
+
+def _format_csv_row(row: dict[str, float | int | str]) -> dict[str, float | int | str]:
+    """Format float values in persisted result rows."""
+    formatted: dict[str, float | int | str] = {}
+    for key, value in row.items():
+        if isinstance(value, float):
+            formatted[key] = (
+                f"{value:.6g}" if _is_learning_rate_key(key) else format_float_result(value)
+            )
+            continue
+        formatted[key] = value
+    return formatted

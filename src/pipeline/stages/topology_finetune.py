@@ -68,7 +68,12 @@ from src.utils.config import (
     get_section,
 )
 from src.utils.early_stop import EarlyStopping
-from src.utils.logging import append_csv_row, log_epoch_progress, log_stage_event
+from src.utils.logging import (
+    append_csv_row,
+    format_result_payload,
+    log_epoch_progress,
+    log_stage_event,
+)
 from src.utils.losses import binary_classification_loss
 
 TOPOLOGY_FINETUNE_CSV_COLUMNS = [
@@ -3388,7 +3393,7 @@ def run_topology_finetuning_stage(
                     validation_result=validation_result,
                 )
                 context.metrics_path.write_text(
-                    json.dumps(best_metrics, indent=2, sort_keys=True),
+                    json.dumps(format_result_payload(best_metrics), indent=2, sort_keys=True),
                     encoding="utf-8",
                 )
                 log_stage_event(
@@ -3442,7 +3447,9 @@ def run_topology_finetuning_stage(
     if runtime.is_main_process and fallback_save and not best_metrics:
         context.metrics_path.write_text(
             json.dumps(
-                {"monitor_metric": context.monitor_metric, "monitor_value": 0.0},
+                format_result_payload(
+                    {"monitor_metric": context.monitor_metric, "monitor_value": 0.0}
+                ),
                 indent=2,
             ),
             encoding="utf-8",

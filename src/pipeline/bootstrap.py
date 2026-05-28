@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import random
+import warnings
 from types import ModuleType
 
 import numpy as np
@@ -37,8 +38,23 @@ def rank_from_env() -> int:
         return 0
 
 
+def configure_warning_filters() -> None:
+    """Configure process-wide warning filters for known third-party noise."""
+    warnings.filterwarnings(
+        "ignore",
+        category=FutureWarning,
+        message=(
+            r"`torch\.cuda\.amp\.custom_(?:fwd|bwd)\(args\.\.\.\)` is deprecated\. "
+            r"Please use `torch\.amp\.custom_(?:fwd|bwd)\(args\.\.\., device_type='cuda'\)` "
+            r"instead\."
+        ),
+        module=r"deepspeed\.runtime\.zero\.linear",
+    )
+
+
 def configure_root_logging(logging_module: ModuleType, rank: int) -> None:
     """Configure process-level logging."""
+    configure_warning_filters()
     logging_module.captureWarnings(True)
     if rank == 0:
         logging_module.basicConfig(level=logging.INFO, force=True)
@@ -48,6 +64,7 @@ def configure_root_logging(logging_module: ModuleType, rank: int) -> None:
 
 __all__ = [
     "configure_root_logging",
+    "configure_warning_filters",
     "parse_args",
     "rank_from_env",
     "set_global_seed",

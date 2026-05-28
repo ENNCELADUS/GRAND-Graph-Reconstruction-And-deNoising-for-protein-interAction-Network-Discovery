@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,34 @@ def test_configure_root_logging_non_main_rank(monkeypatch: pytest.MonkeyPatch) -
     assert observed["force"] is True
 
 
+@pytest.mark.parametrize("decorator_name", ["custom_fwd", "custom_bwd"])
+def test_configure_warning_filters_suppresses_deepspeed_amp_deprecation(
+    decorator_name: str,
+) -> None:
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        pipeline_bootstrap.configure_warning_filters()
+
+        warnings.warn_explicit(
+            f"`torch.cuda.amp.{decorator_name}(args...)` is deprecated. "
+            f"Please use `torch.amp.{decorator_name}(args..., device_type='cuda')` instead.",
+            FutureWarning,
+            filename="/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/"
+            "deepspeed/runtime/zero/linear.py",
+            lineno=66,
+            module="deepspeed.runtime.zero.linear",
+        )
+        warnings.warn_explicit(
+            "unrelated future warning",
+            FutureWarning,
+            filename="deepspeed/runtime/zero/linear.py",
+            lineno=99,
+            module="deepspeed.runtime.zero.linear",
+        )
+
+    assert [str(warning.message) for warning in captured] == ["unrelated future warning"]
+
+
 def test_prepare_stage_directories_can_skip_model_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -85,7 +114,7 @@ def test_format_stage_event_preserves_small_learning_rate() -> None:
 
     assert "LR: 0.0000" not in message
     assert "LR: 5e-05" in message
-    assert "Loss: 0.9276" in message
+    assert "Loss: 0.928" in message
 
 
 def test_ddp_find_unused_parameters_uses_strategy_default() -> None:

@@ -38,7 +38,7 @@ from src.utils.config import (
     get_section,
 )
 from src.utils.data_io import PRINGPairDataset, _collate_batch
-from src.utils.logging import append_csv_row, log_stage_event
+from src.utils.logging import append_csv_row, format_result_payload, log_stage_event
 
 dist = _dist
 
@@ -549,23 +549,24 @@ def run_topology_evaluation_stage(
         with (log_dir / "topology_metrics.json").open("w", encoding="utf-8") as handle:
             data_cfg = get_section(config, "data_config")
             benchmark_cfg = get_section(data_cfg, "benchmark")
+            payload = {
+                "model": model_name,
+                "run_id": run_id,
+                "species": as_str(
+                    benchmark_cfg.get("species", "human"),
+                    "data_config.benchmark.species",
+                ),
+                "split_strategy": as_str(
+                    benchmark_cfg.get("split_strategy", "BFS"),
+                    "data_config.benchmark.split_strategy",
+                ).upper(),
+                "decision_threshold": decision_threshold,
+                "summary": topology_result["summary"],
+                "per_node_size": _json_safe_per_node_size(topology_result["per_node_size"]),
+                "details": _json_safe_details(topology_result["details"]),
+            }
             json.dump(
-                {
-                    "model": model_name,
-                    "run_id": run_id,
-                    "species": as_str(
-                        benchmark_cfg.get("species", "human"),
-                        "data_config.benchmark.species",
-                    ),
-                    "split_strategy": as_str(
-                        benchmark_cfg.get("split_strategy", "BFS"),
-                        "data_config.benchmark.split_strategy",
-                    ).upper(),
-                    "decision_threshold": decision_threshold,
-                    "summary": topology_result["summary"],
-                    "per_node_size": _json_safe_per_node_size(topology_result["per_node_size"]),
-                    "details": _json_safe_details(topology_result["details"]),
-                },
+                format_result_payload(payload),
                 handle,
                 indent=2,
                 sort_keys=True,

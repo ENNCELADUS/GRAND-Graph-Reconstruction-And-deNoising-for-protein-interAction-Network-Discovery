@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from src.utils.logging import format_float_result
+
 STRATEGY_ORDER = ("BFS", "DFS", "RANDOM_WALK")
 STRATEGY_PREFIX = {"BFS": "bfs", "DFS": "dfs", "RANDOM_WALK": "rw"}
 METRIC_ORDER = (
@@ -170,7 +172,7 @@ def write_human_table2_reports(
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
-            writer.writerow(row)
+            writer.writerow(_format_report_row(row))
 
     markdown_lines = [
         (
@@ -185,12 +187,20 @@ def write_human_table2_reports(
     ]
     for row in rows:
         markdown_lines.append(
-            "| {category} | {model} | {bfs_graph_sim:.4f} | {bfs_relative_density:.4f} | "
-            "{bfs_deg_dist:.4f} | {bfs_cc:.4f} | {bfs_spectral:.4f} | "
-            "{dfs_graph_sim:.4f} | {dfs_relative_density:.4f} | {dfs_deg_dist:.4f} | "
-            "{dfs_cc:.4f} | {dfs_spectral:.4f} | {rw_graph_sim:.4f} | "
-            "{rw_relative_density:.4f} | {rw_deg_dist:.4f} | {rw_cc:.4f} | "
-            "{rw_spectral:.4f} | {avg_rank} |".format(**row)
+            "| {category} | {model} | {bfs_graph_sim} | {bfs_relative_density} | "
+            "{bfs_deg_dist} | {bfs_cc} | {bfs_spectral} | "
+            "{dfs_graph_sim} | {dfs_relative_density} | {dfs_deg_dist} | "
+            "{dfs_cc} | {dfs_spectral} | {rw_graph_sim} | "
+            "{rw_relative_density} | {rw_deg_dist} | {rw_cc} | "
+            "{rw_spectral} | {avg_rank} |".format(**_format_report_row(row))
         )
     markdown_path.write_text("\n".join(markdown_lines), encoding="utf-8")
     return csv_path, markdown_path
+
+
+def _format_report_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Format floating-point report values for CSV and Markdown output."""
+    return {
+        key: format_float_result(value) if isinstance(value, float) else value
+        for key, value in row.items()
+    }

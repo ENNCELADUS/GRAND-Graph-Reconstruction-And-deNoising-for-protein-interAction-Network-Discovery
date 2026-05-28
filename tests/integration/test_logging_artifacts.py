@@ -394,7 +394,7 @@ def test_evaluation_uses_fixed_pring_threshold_and_logs_it(
     log_text = eval_log.read_text(encoding="utf-8")
     assert "Decision Threshold" in log_text
     assert "fixed" in log_text
-    assert "0.5000" in log_text
+    assert "0.500" in log_text
 
     csv_lines = eval_csv.read_text(encoding="utf-8").splitlines()
     assert len(csv_lines) == 2

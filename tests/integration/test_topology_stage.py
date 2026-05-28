@@ -246,7 +246,7 @@ def test_run_topology_evaluation_stage_writes_expected_artifacts(tmp_path: Path)
     log_text = (log_dir / "log.log").read_text(encoding="utf-8")
     assert "Decision Threshold" in log_text
     assert "fixed" in log_text
-    assert "0.5000" in log_text
+    assert "0.500" in log_text
 
 
 def _fake_sharded_topology_result(node_sizes: tuple[int, ...]) -> dict[str, object]:

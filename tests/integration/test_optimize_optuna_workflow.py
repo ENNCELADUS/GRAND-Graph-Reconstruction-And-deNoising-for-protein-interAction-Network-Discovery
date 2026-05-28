@@ -306,6 +306,7 @@ def test_run_optimization_writes_trials_and_best_params(
     assert rows[0]["run_id"] == "20260320_110811_t0000"
     assert rows[1]["run_id"] == "20260320_110811_t0001"
     assert rows[2]["run_id"] == "20260320_110811_t0002"
+    assert rows[0]["value"] == "0.128"
 
 
 def test_run_optimization_rechecks_top_trials_and_uses_rechecked_best(
