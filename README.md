@@ -35,7 +35,14 @@ uv run python -m src.run --config configs/v3/v3.yaml
 
 ## Documentation
 
-TBD.
+Key design references live under `docs/design_patterns/`:
+
+- `pipeline.md`: pipeline runtime, stage ordering, launchers, and checkpoint flow.
+- `model.md`: model contract and factory registration.
+- `trainer.md`: trainer responsibilities and training strategies.
+- `evaluator.md`: metrics, threshold policy, and evaluation outputs.
+- `logging.md`: log, metric, checkpoint, and topology artifact paths.
+- `hpo.md`: Optuna/NAS-lite workflow and artifact contracts.
 
 ## Testing
 

@@ -12,7 +12,7 @@ This document defines the architectural standards for implementing models in the
 
 ### 1. File Structure
 *   **Path**: `src/model/{model_name}.py`
-*   **Content**: A single class inheriting from `nn.Module` (e.g., `class V3(nn.Module): ...`).
+*   **Content**: A public class inheriting from `nn.Module` (for example, `class V3(nn.Module): ...`).
 *   **Helper Modules**: Architecture-specific sub-modules (blocks, layers) should be defined within the same file or a private utility, keeping the public namespace clean.
 
 ### 2. The Contract (`nn.Module`)
@@ -65,6 +65,7 @@ The engine (`src/pipeline/engine.py`) handles model selection via `build_model()
 
 ```python
 MODEL_FACTORIES: dict[str, ModelFactory] = {
+    "tuna": _build_tuna_model,
     "v3":   _build_v3_model,
     "v3.1": _build_v3_1_model,
     "v4":   _build_v4_model,
@@ -80,3 +81,5 @@ def build_model(config: ConfigDict) -> nn.Module:
 ```
 
 After instantiation, the engine moves the model to the runtime device (`model.to(runtime.device)`) before passing it to any stage.
+
+The currently registered model names are `tuna`, `v3`, `v3.1`, `v4`, and `v5`. A model file that is not exported from `src/model/__init__.py` and registered in `MODEL_FACTORIES` is not selectable from YAML, even if the file exists under `src/model/`.

@@ -83,9 +83,11 @@ Trains the model on the configured train/valid split.
 
 Refines the model on graph-supervision data with topology-aware losses (edge prediction, node degree, graph similarity).
 
-1.  Loads the train-stage checkpoint (warm start) or starts from scratch.
+1.  Loads the train-stage checkpoint or `run_config.load_checkpoint_path` when `topology_finetune.init_mode: warm_start`; starts from scratch when `init_mode: scratch`.
 2.  Runs an internal training loop with topology-specific loss computation and edge-cover sampling.
 3.  Output: refined checkpoint path.
+
+Topology fine-tune checkpoints are model-weight checkpoints only. They are suitable for warm-starting a later stage or a new run, but they do not restore optimizer state, scheduler state, epoch counters, or early-stopping state for a true interrupted-run resume.
 
 ### 4. Adapt Stage (optional, SHOT)
 
@@ -123,6 +125,8 @@ Runs PRING-style graph reconstruction and computes topology metrics (graph simil
   * `Val <metric>` columns follow `training_config.logging.validation_metrics` order.
 * `evaluate.csv` strict header order:
   * `split,auroc,auprc,accuracy,sensitivity,specificity,precision,recall,f1,mcc`
+* `topology_finetune_step.csv` records pairwise, topology, coverage, timing, GPU-memory, and learning-rate fields for topology fine-tuning.
+* `topology_metrics.json`, `topology_metrics.csv`, and `graph_eval_results.pkl` are the persisted topology-evaluation summary/detail artifacts.
 * No `test_` prefixes are used in persisted eval CSV columns.
 
 ## Run Stages
@@ -137,8 +141,9 @@ Stage ordering is enforced: `train → topology_finetune → evaluate → topolo
 
 ## Launcher
 
-* Canonical HPC launchers: `scripts/v3.sh`, `scripts/v4.sh`, `scripts/v5.sh`.
-* CLI entry: `python -m src.pipeline --config configs/v5.yaml`
-* Legacy script: `python src/run.py --config configs/v5.yaml` (delegates to `src.pipeline`)
-* DDP launch: `python -m torch.distributed.run --nproc_per_node=N --module src.pipeline --config ...`
-* HPC scripts use `--module src.run` which delegates to `src.pipeline` via `src/run.py`.
+* Canonical local entry: `uv run python -m src.run --config configs/v3.yaml`.
+* Package entry also works: `uv run python -m src.pipeline --config configs/v3.yaml`.
+* Legacy script form works: `uv run python src/run.py --config configs/v3.yaml` (delegates to `src.pipeline`).
+* DDP launch: `uv run python -m torch.distributed.run --nproc_per_node=N --module src.run --config ...`.
+* Canonical HPC launchers: `scripts/v3.sh`, `scripts/v4.sh`, `scripts/v5.sh`, `scripts/v3_ablation.sh`, `scripts/v3_1_ablation.sh`, and `scripts/tuna.sh`.
+* Launcher scripts inspect `optimization.enabled`; optimized configs dispatch to `--module src.optimize.run`, otherwise they dispatch to `--module src.run`.

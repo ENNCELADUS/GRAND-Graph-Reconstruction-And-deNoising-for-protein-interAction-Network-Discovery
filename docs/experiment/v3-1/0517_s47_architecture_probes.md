@@ -1,34 +1,34 @@
 # 0517 s47 Architecture Probes
 
-Source configs: `configs/v3-1/0517/*.yaml`
+Run dates: 2026-05-17
 
-Aggregation rule: each row is seed 47 only.
+Model card: TBD (add later)
 
-## Ablation Definitions
+Configs:
+- `configs/v3-1/0517/*.yaml`
 
-| Run | Architecture change |
-|---|---|
-| `pair_context_gated_s47` | Reference run: single AB order, bidirectional cross-chain interaction, pair-context gated readout. |
-| `pair_context_gated_abba_s47` | Adds AB/BA max aggregation to the reference while keeping bidirectional cross-chain interaction. |
-| `pair_context_gated_abba_no_cross_s47` | Uses AB/BA max aggregation and skips post-encoder cross interaction; only the readout fuses chains. |
-| `pair_context_gated_abba_block_s47` | Uses AB/BA max aggregation with block-self interaction; preserves layer budget but prevents A-B token mixing before readout. |
-| `pair_context_gated_sn_d64_s47` | Width 64 with spectral norm on pair readout and MLP head. |
-| `pair_context_gated_sn_d128_s47` | Width 128 with spectral norm on pair readout and MLP head. |
-| `pair_context_gated_sn_d256_s47` | Width 256 with spectral norm on pair readout and MLP head. |
-| `pair_context_gated_sn_d512_s47` | Width 512 with spectral norm on pair readout and MLP head. |
-| `pair_context_gated_sn_d768_s47` | Width 768 with spectral norm on pair readout and MLP head. |
+Logs:
+- `logs/v3.1/train/pair_context_gated_*_s47/`
+- `logs/v3.1/evaluate/pair_context_gated_*_s47/`
 
-## Test Metrics
+## Run Setup
+
+Seed-47 v3.1 architecture probe on top of the pair-context gated readout. The batch tests AB/BA order aggregation, interaction-mode changes, and spectral-normalized readout/head widths while keeping the PRING Human BFS data and training recipe fixed.
+
+## Test results
 
 | Run | Seed | AUROC | AUPRC | Accuracy | Sensitivity | Specificity | Precision | F1 | MCC |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `pair_context_gated_abba_block_s47` | 47 | **0.693944** | **0.722210** | 0.630211 | 0.581975 | 0.678472 | 0.644251 | 0.611532 | 0.261667 |
-| `pair_context_gated_abba_no_cross_s47` | 47 | 0.693333 | 0.722024 | 0.630045 | 0.566160 | **0.693963** | **0.649237** | 0.604860 | **0.262272** |
-| `pair_context_gated_abba_s47` | 47 | 0.689112 | 0.720348 | **0.630599** | 0.586373 | 0.674849 | 0.643407 | 0.613567 | 0.262249 |
-| `pair_context_gated_s47` | 47 | 0.688510 | 0.717681 | 0.625444 | **0.632598** | 0.618285 | 0.623793 | **0.628165** | 0.250909 |
-| `pair_context_gated_sn_d64_s47` | 47 | 0.679722 | 0.712459 | 0.622967 | 0.589735 | 0.656216 | 0.631854 | 0.610068 | 0.246496 |
-| `pair_context_gated_sn_d128_s47` | 47 | 0.686096 | 0.712797 | 0.626959 | 0.583047 | 0.670894 | 0.639318 | 0.609887 | 0.254925 |
-| `pair_context_gated_sn_d256_s47` | 47 | 0.687333 | 0.714596 | 0.627107 | 0.614862 | 0.639358 | 0.630422 | 0.622545 | 0.254296 |
-| `pair_context_gated_sn_d512_s47` | 47 | 0.677833 | 0.706457 | 0.620694 | 0.611093 | 0.630301 | 0.623182 | 0.617078 | 0.241437 |
-| `pair_context_gated_sn_d768_s47` | 47 | 0.674223 | 0.704605 | 0.619456 | 0.575731 | 0.663204 | 0.631040 | 0.602118 | 0.239853 |
+| `pair_context_gated_abba_block_s47` | 47 | 0.694 | 0.722 | 0.630 | 0.582 | 0.678 | 0.644 | 0.612 | 0.262 |
+| `pair_context_gated_abba_no_cross_s47` | 47 | 0.693 | 0.722 | 0.630 | 0.566 | 0.694 | 0.649 | 0.605 | 0.262 |
+| `pair_context_gated_abba_s47` | 47 | 0.689 | 0.720 | 0.631 | 0.586 | 0.675 | 0.643 | 0.614 | 0.262 |
+| `pair_context_gated_s47` | 47 | 0.689 | 0.718 | 0.625 | 0.633 | 0.618 | 0.624 | 0.628 | 0.251 |
+| `pair_context_gated_sn_d64_s47` | 47 | 0.680 | 0.712 | 0.623 | 0.590 | 0.656 | 0.632 | 0.610 | 0.246 |
+| `pair_context_gated_sn_d128_s47` | 47 | 0.686 | 0.713 | 0.627 | 0.583 | 0.671 | 0.639 | 0.610 | 0.255 |
+| `pair_context_gated_sn_d256_s47` | 47 | 0.687 | 0.715 | 0.627 | 0.615 | 0.639 | 0.630 | 0.623 | 0.254 |
+| `pair_context_gated_sn_d512_s47` | 47 | 0.678 | 0.706 | 0.621 | 0.611 | 0.630 | 0.623 | 0.617 | 0.241 |
+| `pair_context_gated_sn_d768_s47` | 47 | 0.674 | 0.705 | 0.619 | 0.576 | 0.663 | 0.631 | 0.602 | 0.240 |
 
+## Main Readout
+
+AB/BA aggregation is useful. `abba_block_s47` has the best AUROC/AUPRC, while `abba_no_cross_s47` has the best MCC. Spectral-normalized width probes did not beat the AB/BA interaction-mode variants.

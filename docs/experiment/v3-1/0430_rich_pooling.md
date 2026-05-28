@@ -1,28 +1,39 @@
 # 0430 Rich Pooling Ablation
 
-Source configs: `configs/v3-1/0430/*.yaml`
+Run dates: 2026-04-30
 
-Aggregation rule: metrics are means across seeds 13, 47, and 101.
+Model card: TBD (add later)
 
-## Ablation Definitions
+Configs:
+- `configs/v3-1/0430/*.yaml`
 
-| Run | Architecture change |
-|---|---|
-| `full` | Rich pooling with ESM BOS/CLS, residue `mean`, residue attention, residue `max`, and gated fusion. |
-| `mean_attn` | Residue-only compact readout using `mean` and attention pooling; removes ESM BOS/CLS, max pooling, and gated fusion. |
-| `cls_mean_attn` | Adds ESM BOS/CLS back to `mean_attn`; still excludes max pooling and gated fusion. |
-| `no_cls` | Residue-only rich pooling with `mean`, attention, `max`, and gated fusion; excludes ESM BOS/CLS. |
-| `no_max` | Keeps ESM BOS/CLS, residue `mean`, attention, and gated fusion; removes max pooling. |
-| `no_gated` | Keeps ESM BOS/CLS, residue `mean`, attention, and `max`; removes gated fusion. |
+Logs:
+- `logs/v3.1/train/{full,mean_attn,cls_mean_attn,no_cls,no_max,no_gated}_s{13,47,101}/`
+- `logs/v3.1/evaluate/{full,mean_attn,cls_mean_attn,no_cls,no_max,no_gated}_s{13,47,101}/`
 
-## Test Metrics
+## Run Setup
+
+Three-seed v3.1 readout-component ablation on the PRING Human BFS split. All rows keep the same ESM3 cache, training objective, OHEM sampling, optimizer, scheduler, split, and fixed test metric suite. Metrics below are means across seeds 13, 47, and 101.
+
+Compared variants:
+- `full`: ESM BOS/CLS, residue mean, residue attention, residue max, and gated fusion.
+- `mean_attn`: residue mean + attention only.
+- `cls_mean_attn`: ESM BOS/CLS + residue mean + attention.
+- `no_cls`: residue mean + attention + max + gated fusion, without ESM BOS/CLS.
+- `no_max`: removes max pooling.
+- `no_gated`: removes gated fusion.
+
+## Test results
 
 | Run | Seeds | AUROC | AUPRC | Accuracy | Sensitivity | Specificity | Precision | F1 | MCC |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `no_cls` | 13/47/101 | **0.668268** | 0.689207 | **0.615661** | 0.585030 | 0.646309 | 0.623614 | 0.603363 | **0.232008** |
-| `no_max` | 13/47/101 | 0.667569 | **0.689211** | 0.614922 | 0.587567 | 0.642291 | 0.622056 | 0.603944 | 0.230465 |
-| `no_gated` | 13/47/101 | 0.663673 | 0.684698 | 0.613296 | **0.591386** | 0.635218 | 0.618818 | **0.604539** | 0.226992 |
-| `cls_mean_attn` | 13/47/101 | 0.662627 | 0.687704 | 0.611078 | 0.546983 | **0.675207** | **0.628095** | 0.584139 | 0.224408 |
-| `mean_attn` | 13/47/101 | 0.662320 | 0.682360 | 0.610696 | 0.583503 | 0.637904 | 0.617526 | 0.599792 | 0.221909 |
-| `full` | 13/47/101 | 0.660118 | 0.682508 | 0.611263 | 0.551319 | 0.671239 | 0.627115 | 0.586053 | 0.224622 |
+| `no_cls` | 13/47/101 | 0.668 | 0.689 | 0.616 | 0.585 | 0.646 | 0.624 | 0.603 | 0.232 |
+| `no_max` | 13/47/101 | 0.668 | 0.689 | 0.615 | 0.588 | 0.642 | 0.622 | 0.604 | 0.230 |
+| `no_gated` | 13/47/101 | 0.664 | 0.685 | 0.613 | 0.591 | 0.635 | 0.619 | 0.605 | 0.227 |
+| `cls_mean_attn` | 13/47/101 | 0.663 | 0.688 | 0.611 | 0.547 | 0.675 | 0.628 | 0.584 | 0.224 |
+| `mean_attn` | 13/47/101 | 0.662 | 0.682 | 0.611 | 0.584 | 0.638 | 0.618 | 0.600 | 0.222 |
+| `full` | 13/47/101 | 0.660 | 0.683 | 0.611 | 0.551 | 0.671 | 0.627 | 0.586 | 0.225 |
 
+## Main Readout
+
+`no_cls` is the strongest simple rich-pooling baseline by AUROC, accuracy, and MCC. Removing ESM BOS/CLS helps more than adding more pooled components; `full` underperforms the leaner variants.

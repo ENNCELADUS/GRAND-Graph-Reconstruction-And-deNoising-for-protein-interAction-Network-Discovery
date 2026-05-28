@@ -59,24 +59,25 @@ Stage logs and metrics are stored under the `logs/` directory, organized by mode
     *   `split,auroc,auprc,accuracy,sensitivity,specificity,precision,recall,f1,mcc`
 *   **Note**: The evaluator may compute extra metrics internally, but only this fixed schema is persisted.
 
-### 4. `topology_finetune.csv`
+### 4. `topology_finetune_step.csv`
 *   **Location**: `logs/{model}/topology_finetune/<run_id>/`
 *   **Role**: Per-epoch metrics during topology-aware fine-tuning.
-*   **Schema (strict order)**:
-    *   `Epoch,Epoch Time,Train Loss,Val Loss,Val auprc,Val auroc,Learning Rate`
+*   **Schema (strict order)**: `Epoch`, `Epoch Time`, train BCE/topology losses, validation pair/topology losses, internal-validation topology metrics, edge-coverage counters, BCE sampling counters, timing fields, peak GPU memory, topology loss scale, and `Learning Rate`.
 
 ### 5. Topology Evaluation Artifacts
 *   **Location**: `logs/{model}/topology_evaluate/<run_id>/`
 *   **Files**:
     *   `topology_metrics.json`: Graph similarity, relative density, MMD distances, and other topology metrics.
+    *   `topology_metrics.csv`: Per-node-size topology summary plus aggregate rows.
+    *   `graph_eval_results.pkl`: Serialized detailed topology-evaluation output.
     *   `all_test_ppi_pred.txt`: Pairwise predictions in PRING format for graph reconstruction.
-    *   `topology_evaluate.csv`: Summary metrics row.
 
 ### 6. `best_model.pth`
 *   **Location**: `models/{model}/{stage}/<run_id>/best_model.pth` (for `train`, `topology_finetune`, and `adapt` stages).
 *   **Role**: The saved state dictionary of the model achieving the best performance on the monitored metric.
 *   **Checkpoint I/O**: All checkpoint operations go through `PipelineRuntime.save_checkpoint()` and `load_checkpoint()`, which handle accelerator unwrapping, `wait_for_everyone()` barriers, and main-process-only writes.
 *   **Evaluation stages**: `evaluate` and `topology_evaluate` load checkpoints but do not create checkpoint directories because they do not save model weights.
+*   **Resume semantics**: Checkpoints contain model weights only. Loading a checkpoint is a warm start; optimizer, scheduler, epoch, and early-stopping state are not restored.
 
 ## Checkpoint Policy
 

@@ -18,3 +18,4 @@ TUnA quick reproduction source:
 | [0506_pair_readout.md](0506_pair_readout.md) | New pair readout modules. | `pair_context_gated` is the strongest three-seed v3.1 readout architecture in this result set. |
 | [0514_tuna_quick_reproduction.md](0514_tuna_quick_reproduction.md) | TUnA small-head quick reproduction. | TUnA's official block/no-cross setting is better than true cross-chain attention. |
 | [0517_s47_architecture_probes.md](0517_s47_architecture_probes.md) | AB/BA, interaction, width, and spectral-norm probes. | `abba_block` and `abba_no_cross` are the best seed-47 probes. |
+| [0523_followup_ablation.md](0523_followup_ablation.md) | Follow-up seed sweeps and width/spectral-norm controls. | `abba_no_cross` has the best seed-mean AUROC/MCC; `abba_block_sn_d256` has the best seed-mean AUPRC. |
