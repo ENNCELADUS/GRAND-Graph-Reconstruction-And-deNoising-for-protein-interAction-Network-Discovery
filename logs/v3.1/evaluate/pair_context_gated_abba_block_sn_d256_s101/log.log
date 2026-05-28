@@ -1,0 +1,7 @@
+2026-05-22 22:07:19 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 812 | Valid Batches: 762 | World Size: 4
+2026-05-23 00:55:57 INFO Stage Start | Checkpoint: models/v3.1/train/pair_context_gated_abba_block_sn_d256_s101/best_model.pth | Run Id: pair_context_gated_abba_block_sn_d256_s101
+2026-05-23 00:55:58 INFO Checkpoint Loaded | Path: models/v3.1/train/pair_context_gated_abba_block_sn_d256_s101/best_model.pth
+2026-05-23 00:55:58 INFO Decision Threshold | Mode: fixed | Value: 0.5000
+2026-05-23 01:04:20 INFO Evaluation Metrics | Accuracy: 0.6255 | AUPRC: 0.7173 | Auroc: 0.6881 | F1: 0.5921 | Mcc: 0.2544 | Precision: 0.6502 | Recall: 0.5435 | Sensitivity: 0.5435 | Specificity: 0.7075 | Split: test
+2026-05-23 01:04:20 INFO CSV Written | Path: logs/v3.1/evaluate/pair_context_gated_abba_block_sn_d256_s101/evaluate.csv
+2026-05-23 01:04:20 INFO Stage Done | Run Id: pair_context_gated_abba_block_sn_d256_s101
