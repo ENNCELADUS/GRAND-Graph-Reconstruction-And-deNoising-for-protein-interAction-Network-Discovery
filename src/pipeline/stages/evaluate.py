@@ -72,6 +72,14 @@ def _resolve_decision_threshold(
     return threshold, mode
 
 
+def _resolve_evaluate_mode(eval_cfg: ConfigDict) -> str:
+    """Resolve the evaluation inference mode."""
+    mode = as_str(eval_cfg.get("mode", "pairwise"), "evaluate.mode").lower()
+    if mode not in {"pairwise", "graph_assembly"}:
+        raise ValueError("evaluate.mode must be 'pairwise' or 'graph_assembly'")
+    return mode
+
+
 def run_evaluation_stage(
     runtime: PipelineRuntime,
     model: torch.nn.Module,
@@ -108,6 +116,7 @@ def run_evaluation_stage(
     configured_metrics = _metrics_from_config(eval_cfg)
     metrics_to_compute = sorted(set(configured_metrics + EVAL_CSV_COLUMNS[1:]))
     loss_config = _build_loss_config(training_cfg)
+    evaluate_mode = _resolve_evaluate_mode(eval_cfg)
     decision_threshold, threshold_mode = _resolve_decision_threshold(
         eval_cfg=eval_cfg,
     )
@@ -126,13 +135,61 @@ def run_evaluation_stage(
             mode=threshold_mode,
             value=decision_threshold,
         )
-    with torch.no_grad():
-        metrics = evaluator.evaluate(
+    if evaluate_mode == "graph_assembly":
+        from src.pipeline.stages.topology_evaluate import (
+            _build_topology_loader,
+            _model_supports_graph_forward,
+            _predict_tccig_graph_assembly_result,
+            _topology_paths,
+            write_graph_assembly_diagnostics,
+        )
+
+        if not _model_supports_graph_forward(model, runtime.accelerator):
+            raise ValueError("evaluate.mode='graph_assembly' requires a TCCIG graph model")
+        all_test_path, _, _ = _topology_paths(config)
+        topology_bundle = _build_topology_loader(config=config, split_path=all_test_path)
+        graph_assembly_result = _predict_tccig_graph_assembly_result(
+            config=config,
             model=model,
-            data_loader=dataloaders["test"],
+            dataset=topology_bundle.dataset,
+            records=topology_bundle.records,
             device=device,
+            accelerator=runtime.accelerator,
+        )
+        labels = torch.tensor(topology_bundle.dataset.labels(), dtype=torch.long)
+        probabilities = torch.tensor(graph_assembly_result.probabilities, dtype=torch.float32)
+        predictions = torch.tensor(graph_assembly_result.predictions, dtype=torch.long)
+        metrics = evaluator.metrics_from_outputs(
+            labels=labels,
+            probabilities=probabilities,
+            predictions=predictions,
+            average_loss=0.0,
             prefix=None,
         )
+        if runtime.is_main_process:
+            diagnostics_path = log_dir / "graph_assembly_diagnostics.json"
+            write_graph_assembly_diagnostics(
+                output_path=diagnostics_path,
+                result=graph_assembly_result,
+            )
+            log_stage_event(
+                logger,
+                "tccig_graph_assembly_evaluate",
+                assembly_rule=graph_assembly_result.assembly_rule,
+                m_hat=graph_assembly_result.m_hat,
+                selected_edges=graph_assembly_result.selected_edges,
+                candidate_count=graph_assembly_result.candidate_count,
+                pair_count=len(topology_bundle.records),
+            )
+            log_stage_event(logger, "graph_assembly_diagnostics_written", path=diagnostics_path)
+    else:
+        with torch.no_grad():
+            metrics = evaluator.evaluate(
+                model=model,
+                data_loader=dataloaders["test"],
+                device=device,
+                prefix=None,
+            )
     if runtime.is_main_process:
         csv_row: dict[str, float | int | str] = {"split": "test"}
         for metric_name in EVAL_CSV_COLUMNS[1:]:

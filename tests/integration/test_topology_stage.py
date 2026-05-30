@@ -12,6 +12,7 @@ import pytest
 import src.pipeline.stages.topology_evaluate as topology_stage
 import torch
 from src.pipeline.runtime import DistributedContext
+from src.pipeline.stages.evaluate import run_evaluation_stage
 from src.pipeline.stages.topology_evaluate import run_topology_evaluation_stage
 from src.pipeline.stages.train import build_model
 from src.utils.config import ConfigDict
@@ -249,6 +250,96 @@ def test_run_topology_evaluation_stage_writes_expected_artifacts(tmp_path: Path)
     assert "0.500" in log_text
 
 
+def test_tccig_graph_assembly_evaluate_uses_all_test_universe_and_writes_diagnostics(
+    tmp_path: Path,
+) -> None:
+    config = _build_topology_config(tmp_path)
+    cast(ConfigDict, config["run_config"])["stages"] = ["evaluate"]
+    cast(ConfigDict, config["run_config"])["eval_run_id"] = "graph_eval_case"
+    cast(ConfigDict, config["model_config"])["model"] = "tccig"
+    cast(ConfigDict, config["evaluate"])["mode"] = "graph_assembly"
+
+    class _GraphAssemblyModel(torch.nn.Module):
+        def forward_graph(self, **_: object) -> dict[str, torch.Tensor]:
+            return {}
+
+        def encode_graph_nodes(
+            self,
+            *,
+            protein_embeddings: torch.Tensor,
+            protein_lengths: torch.Tensor,
+        ) -> torch.Tensor:
+            del protein_lengths
+            return protein_embeddings.mean(dim=1)
+
+        def edge_budget_from_node_embeddings(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_count: int,
+        ) -> torch.Tensor:
+            del node_embeddings, candidate_count
+            return torch.tensor(2.0)
+
+        def decode_graph_candidates(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_pairs: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            del node_embeddings
+            scores = {
+                (0, 1): 0.9,
+                (0, 2): 0.1,
+                (1, 2): 0.8,
+            }
+            probabilities = torch.tensor(
+                [
+                    scores[(int(source), int(target))]
+                    for source, target in candidate_pairs.t().tolist()
+                ],
+                dtype=torch.float32,
+            )
+            return {"edge_probabilities": probabilities}
+
+    model = _GraphAssemblyModel()
+    checkpoint_path = Path(str(cast(ConfigDict, config["run_config"])["load_checkpoint_path"]))
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), checkpoint_path)
+    dataloaders = build_dataloaders(config=config)
+
+    previous_cwd = Path.cwd()
+    try:
+        __import__("os").chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"evaluate": "graph_eval_case"},
+        )
+        metrics = run_evaluation_stage(
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
+        )
+    finally:
+        __import__("os").chdir(previous_cwd)
+
+    assert metrics["auroc"] == pytest.approx(1.0)
+    assert metrics["auprc"] == pytest.approx(1.0)
+    assert metrics["f1"] == pytest.approx(1.0)
+
+    log_dir = tmp_path / "logs" / "tccig" / "evaluate" / "graph_eval_case"
+    evaluate_csv = log_dir / "evaluate.csv"
+    diagnostics_path = log_dir / "graph_assembly_diagnostics.json"
+    assert evaluate_csv.exists()
+    assert diagnostics_path.exists()
+    diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+    assert diagnostics["assembly_rule"] == "top_m_hat"
+    assert diagnostics["candidate_count"] == 3
+    assert diagnostics["selected_edges"] == 2
+    assert diagnostics["m_hat"] == pytest.approx(2.0)
+
+
 def test_tccig_graph_assembly_scores_candidates_and_selects_top_budget(
     tmp_path: Path,
 ) -> None:
@@ -312,6 +403,76 @@ def test_tccig_graph_assembly_scores_candidates_and_selects_top_budget(
     )
 
     assert predictions == [1, 0, 1]
+
+
+def test_tccig_topology_evaluate_writes_graph_assembly_diagnostics(tmp_path: Path) -> None:
+    config = _build_topology_config(tmp_path)
+    cast(ConfigDict, config["model_config"])["model"] = "tccig"
+
+    class _GraphAssemblyModel(torch.nn.Module):
+        def forward_graph(self, **_: object) -> dict[str, torch.Tensor]:
+            return {}
+
+        def encode_graph_nodes(
+            self,
+            *,
+            protein_embeddings: torch.Tensor,
+            protein_lengths: torch.Tensor,
+        ) -> torch.Tensor:
+            del protein_lengths
+            return protein_embeddings.mean(dim=1)
+
+        def edge_budget_from_node_embeddings(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_count: int,
+        ) -> torch.Tensor:
+            del node_embeddings, candidate_count
+            return torch.tensor(2.0)
+
+        def decode_graph_candidates(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_pairs: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            del node_embeddings
+            probabilities = torch.tensor([0.9, 0.1, 0.8], dtype=torch.float32)
+            return {"edge_probabilities": probabilities[: candidate_pairs.size(1)]}
+
+    model = _GraphAssemblyModel()
+    checkpoint_path = Path(str(cast(ConfigDict, config["run_config"])["load_checkpoint_path"]))
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), checkpoint_path)
+    dataloaders = build_dataloaders(config=config)
+
+    previous_cwd = Path.cwd()
+    try:
+        __import__("os").chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_evaluate": "topology_case"},
+        )
+        run_topology_evaluation_stage(
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
+        )
+    finally:
+        __import__("os").chdir(previous_cwd)
+
+    log_dir = tmp_path / "logs" / "tccig" / "topology_evaluate" / "topology_case"
+    diagnostics_path = log_dir / "graph_assembly_diagnostics.json"
+    assert diagnostics_path.exists()
+    diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+    assert diagnostics["assembly_rule"] == "top_m_hat"
+    assert diagnostics["candidate_count"] == 3
+    assert diagnostics["selected_edges"] == 2
+
+    metrics_payload = json.loads((log_dir / "topology_metrics.json").read_text(encoding="utf-8"))
+    assert metrics_payload["graph_assembly"]["assembly_rule"] == "top_m_hat"
 
 
 def test_tccig_graph_assembly_preserves_self_edge_records_as_negatives(

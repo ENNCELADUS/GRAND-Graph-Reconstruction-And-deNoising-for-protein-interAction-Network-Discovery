@@ -95,13 +95,17 @@ TOPOLOGY_FINETUNE_CSV_COLUMNS = [
     "Internal Val relative_density",
     "Internal Val deg_dist_mmd",
     "Internal Val cc_mmd",
-    "Internal Val Mean Pred Edges",
+    "Internal Val Top-m Mean Pred Edges",
+    "Internal Val Fixed Threshold Mean Pred Edges",
     "Internal Val Mean Target Edges",
-    "Internal Val Total Pred Edges",
+    "Internal Val Top-m Total Pred Edges",
+    "Internal Val Fixed Threshold Total Pred Edges",
     "Internal Val Total Target Edges",
-    "Internal Val Pred Edge Fraction",
+    "Internal Val Top-m Pred Edge Fraction",
+    "Internal Val Fixed Threshold Pred Edge Fraction",
     "Internal Val Target Edge Fraction",
-    "Internal Val Pred/Target Edge Ratio",
+    "Internal Val Top-m Pred/Target Edge Ratio",
+    "Internal Val Fixed Threshold Pred/Target Edge Ratio",
     "Internal Val Prob Min",
     "Internal Val Prob Mean",
     "Internal Val Prob Max",
@@ -146,13 +150,17 @@ INTERNAL_VALIDATION_SUMMARY_KEYS = (
     "cc_mmd",
 )
 INTERNAL_VALIDATION_DIAGNOSTIC_KEYS = (
-    "pred_edges_mean",
+    "top_m_pred_edges_mean",
+    "fixed_threshold_pred_edges_mean",
     "target_edges_mean",
-    "pred_edges_total",
+    "top_m_pred_edges_total",
+    "fixed_threshold_pred_edges_total",
     "target_edges_total",
-    "pred_edge_fraction",
+    "top_m_pred_edge_fraction",
+    "fixed_threshold_pred_edge_fraction",
     "target_edge_fraction",
-    "pred_target_edge_ratio",
+    "top_m_pred_target_edge_ratio",
+    "fixed_threshold_pred_target_edge_ratio",
     "probability_min",
     "probability_mean",
     "probability_max",
@@ -2019,7 +2027,8 @@ def _ordered_internal_validation_probabilities(
 def _internal_validation_diagnostics(
     *,
     probabilities: Sequence[float],
-    pred_edges_total: int,
+    top_m_pred_edges_total: int,
+    fixed_threshold_pred_edges_total: int,
     target_edges_total: int,
     candidate_pairs_total: int,
     graph_count: int,
@@ -2032,13 +2041,23 @@ def _internal_validation_diagnostics(
     probability_tensor = torch.tensor(probabilities, dtype=torch.float32)
     target_edges = float(target_edges_total)
     return {
-        "pred_edges_mean": float(pred_edges_total / max(1, graph_count)),
+        "top_m_pred_edges_mean": float(top_m_pred_edges_total / max(1, graph_count)),
+        "fixed_threshold_pred_edges_mean": float(
+            fixed_threshold_pred_edges_total / max(1, graph_count)
+        ),
         "target_edges_mean": float(target_edges_total / max(1, graph_count)),
-        "pred_edges_total": float(pred_edges_total),
+        "top_m_pred_edges_total": float(top_m_pred_edges_total),
+        "fixed_threshold_pred_edges_total": float(fixed_threshold_pred_edges_total),
         "target_edges_total": target_edges,
-        "pred_edge_fraction": float(pred_edges_total / candidate_pairs_total),
+        "top_m_pred_edge_fraction": float(top_m_pred_edges_total / candidate_pairs_total),
+        "fixed_threshold_pred_edge_fraction": float(
+            fixed_threshold_pred_edges_total / candidate_pairs_total
+        ),
         "target_edge_fraction": float(target_edges_total / candidate_pairs_total),
-        "pred_target_edge_ratio": float(pred_edges_total / max(1.0, target_edges)),
+        "top_m_pred_target_edge_ratio": float(top_m_pred_edges_total / max(1.0, target_edges)),
+        "fixed_threshold_pred_target_edge_ratio": float(
+            fixed_threshold_pred_edges_total / max(1.0, target_edges)
+        ),
         "probability_min": float(torch.min(probability_tensor).item()),
         "probability_mean": float(torch.mean(probability_tensor).item()),
         "probability_max": float(torch.max(probability_tensor).item()),
@@ -2049,26 +2068,6 @@ def _internal_validation_diagnostics(
             torch.mean((probability_tensor >= threshold).to(dtype=torch.float32)).item()
         ),
     }
-
-
-def _internal_validation_graph_inputs(
-    *,
-    nodes: Sequence[str],
-    embedding_repository: EmbeddingRepository,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Materialize one internal-validation protein set for graph-forward inference."""
-    embeddings = embedding_repository.get_many(nodes)
-    protein_embeddings = torch.nn.utils.rnn.pad_sequence(
-        [embeddings[node] for node in nodes],
-        batch_first=True,
-    ).to(device)
-    protein_lengths = torch.tensor(
-        [embeddings[node].size(0) for node in nodes],
-        dtype=torch.long,
-        device=device,
-    )
-    return protein_embeddings, protein_lengths
 
 
 def _top_m_predictions(
@@ -2090,97 +2089,174 @@ def _top_m_predictions(
     return predictions
 
 
-def _evaluate_internal_validation_graph_forward_bucket(
+def _canonical_validation_pair(protein_a: str, protein_b: str) -> tuple[str, str]:
+    """Return a stable undirected validation candidate-pair key."""
+    return (protein_a, protein_b) if protein_a <= protein_b else (protein_b, protein_a)
+
+
+def _evaluate_internal_validation_graph_forward_plan(
     *,
     model: nn.Module,
-    bucket: InternalValidationNodeBucketPlan,
+    validation_plan: InternalValidationPlan,
     embedding_repository: EmbeddingRepository,
+    inference_batch_size: int,
     threshold: float,
     device: torch.device,
     accelerator: AcceleratorLike,
-) -> tuple[list[nx.Graph], list[float], int]:
-    """Evaluate one validation bucket using TCCIG top-``m_hat`` graph assembly."""
+    compute_spectral_stats: bool,
+    compute_clustering_mmd: bool,
+) -> dict[str, float]:
+    """Evaluate TCCIG validation as one global top-``m_hat`` graph assembly."""
     graph_model = _unwrap_model_for_detached_forward(model=model, accelerator=accelerator)
-    pred_subgraphs: list[nx.Graph] = []
-    fixed_threshold_edge_count = 0
-    validation_probabilities: list[float] = []
-    assigned_subgraphs = (
-        enumerate(bucket.sampled_subgraphs)
-        if not accelerator.use_distributed
-        else (
-            (index, nodes)
-            for index, nodes in enumerate(bucket.sampled_subgraphs)
-            if index % accelerator.num_processes == accelerator.process_index
-        )
+    encode_graph_nodes = getattr(graph_model, "encode_graph_nodes", None)
+    decode_graph_candidates = getattr(graph_model, "decode_graph_candidates", None)
+    edge_budget_from_node_embeddings = getattr(
+        graph_model,
+        "edge_budget_from_node_embeddings",
+        None,
     )
-    local_results: list[tuple[int, nx.Graph, list[float], int]] = []
-    for subgraph_index, nodes in assigned_subgraphs:
-        protein_embeddings, protein_lengths = _internal_validation_graph_inputs(
-            nodes=nodes,
-            embedding_repository=embedding_repository,
-            device=device,
+    if not (
+        callable(encode_graph_nodes)
+        and callable(decode_graph_candidates)
+        and callable(edge_budget_from_node_embeddings)
+    ):
+        raise ValueError(
+            "TCCIG internal validation requires encode_graph_nodes, "
+            "decode_graph_candidates, and edge_budget_from_node_embeddings"
         )
-        with accelerator.autocast():
-            output = cast(
-                Mapping[str, torch.Tensor],
-                graph_model.forward_graph(
-                    protein_embeddings=protein_embeddings,
-                    protein_lengths=protein_lengths,
+
+    candidate_pairs_by_key: dict[tuple[str, str], None] = {}
+    total_candidate_pairs = 0
+    total_target_edges = 0
+    total_graphs = 0
+    for bucket in validation_plan.buckets:
+        total_candidate_pairs += len(bucket.pair_records)
+        total_target_edges += sum(
+            subgraph.number_of_edges() for subgraph in bucket.target_subgraphs
+        )
+        total_graphs += len(bucket.target_subgraphs)
+        for record in bucket.pair_records:
+            candidate_pairs_by_key.setdefault(
+                _canonical_validation_pair(record.protein_a, record.protein_b),
+                None,
+            )
+
+    if not candidate_pairs_by_key:
+        return _empty_internal_validation_summary()
+
+    candidate_pair_keys = tuple(candidate_pairs_by_key)
+    protein_ids = sorted({protein for pair in candidate_pair_keys for protein in pair})
+    embeddings = embedding_repository.get_many(protein_ids)
+    protein_embeddings = torch.nn.utils.rnn.pad_sequence(
+        [embeddings[protein_id] for protein_id in protein_ids],
+        batch_first=True,
+    ).to(device)
+    protein_lengths = torch.tensor(
+        [embeddings[protein_id].size(0) for protein_id in protein_ids],
+        dtype=torch.long,
+        device=device,
+    )
+    node_to_index = {protein_id: index for index, protein_id in enumerate(protein_ids)}
+    probabilities: list[float] = []
+    with torch.no_grad(), accelerator.autocast():
+        node_embeddings = cast(
+            torch.Tensor,
+            encode_graph_nodes(
+                protein_embeddings=protein_embeddings,
+                protein_lengths=protein_lengths,
+            ),
+        )
+        m_hat = float(
+            cast(
+                torch.Tensor,
+                edge_budget_from_node_embeddings(
+                    node_embeddings=node_embeddings,
+                    candidate_count=len(candidate_pair_keys),
                 ),
             )
-        probabilities = [
-            float(value) for value in output["edge_probabilities"].detach().cpu().tolist()
-        ]
-        fixed_predictions = [int(probability >= threshold) for probability in probabilities]
-        top_m_predictions = _top_m_predictions(
-            probabilities=probabilities,
-            m_hat=float(output["m_hat"].detach().cpu().item()),
+            .detach()
+            .cpu()
+            .item()
         )
-        candidate_pairs = output.get("candidate_pairs")
-        if candidate_pairs is None:
-            candidate_pairs = torch.triu_indices(len(nodes), len(nodes), offset=1)
-        pair_list = candidate_pairs.detach().cpu().t().tolist()
-        pred_subgraph = nx.Graph()
-        pred_subgraph.add_nodes_from(nodes)
-        for (source_index, target_index), prediction in zip(
-            pair_list,
-            top_m_predictions,
-            strict=True,
-        ):
-            if prediction > 0:
-                pred_subgraph.add_edge(nodes[int(source_index)], nodes[int(target_index)])
-        local_results.append(
-            (
-                subgraph_index,
-                pred_subgraph,
-                probabilities,
-                sum(fixed_predictions),
+        for start in range(0, len(candidate_pair_keys), inference_batch_size):
+            chunk = candidate_pair_keys[start : start + inference_batch_size]
+            candidate_pairs = torch.tensor(
+                [
+                    [node_to_index[protein_a] for protein_a, _ in chunk],
+                    [node_to_index[protein_b] for _, protein_b in chunk],
+                ],
+                dtype=torch.long,
+                device=device,
             )
-        )
+            output = cast(
+                Mapping[str, torch.Tensor],
+                decode_graph_candidates(
+                    node_embeddings=node_embeddings,
+                    candidate_pairs=candidate_pairs,
+                ),
+            )
+            probabilities.extend(
+                float(value) for value in output["edge_probabilities"].detach().cpu().tolist()
+            )
 
-    if accelerator.use_distributed:
-        gathered_results: list[list[tuple[int, nx.Graph, list[float], int]] | None] = [
-            None
-        ] * accelerator.num_processes
-        if dist.is_available() and dist.is_initialized():
-            dist.all_gather_object(gathered_results, local_results)
-        else:
-            gathered_results = [local_results]
-        local_results = [
-            result
-            for shard_results in gathered_results
-            if shard_results is not None
-            for result in shard_results
-        ]
+    if len(probabilities) != len(candidate_pair_keys):
+        raise ValueError("TCCIG internal validation did not score every candidate pair")
 
-    for _, pred_subgraph, probabilities, fixed_edge_count in sorted(
-        local_results,
-        key=lambda result: result[0],
-    ):
-        pred_subgraphs.append(pred_subgraph)
-        validation_probabilities.extend(probabilities)
-        fixed_threshold_edge_count += fixed_edge_count
-    return pred_subgraphs, validation_probabilities, fixed_threshold_edge_count
+    top_m_predictions = _top_m_predictions(probabilities=probabilities, m_hat=m_hat)
+    fixed_threshold_predictions = [int(probability >= threshold) for probability in probabilities]
+    top_m_selected = {
+        pair
+        for pair, prediction in zip(candidate_pair_keys, top_m_predictions, strict=True)
+        if prediction > 0
+    }
+    fixed_threshold_selected = {
+        pair
+        for pair, prediction in zip(candidate_pair_keys, fixed_threshold_predictions, strict=True)
+        if prediction > 0
+    }
+
+    pred_graphs_by_size: dict[int, list[nx.Graph]] = {}
+    fixed_threshold_pred_edges_total = 0
+    top_m_pred_edges_total = 0
+    target_graphs_by_size: dict[int, list[nx.Graph]] = {}
+    for bucket in validation_plan.buckets:
+        pred_subgraphs: list[nx.Graph] = []
+        for nodes in bucket.sampled_subgraphs:
+            pred_subgraph = nx.Graph()
+            pred_subgraph.add_nodes_from(nodes)
+            for index_a, protein_a in enumerate(nodes):
+                for protein_b in nodes[index_a + 1 :]:
+                    pair = _canonical_validation_pair(protein_a, protein_b)
+                    if pair in top_m_selected:
+                        pred_subgraph.add_edge(protein_a, protein_b)
+                        top_m_pred_edges_total += 1
+                    if pair in fixed_threshold_selected:
+                        fixed_threshold_pred_edges_total += 1
+            pred_subgraphs.append(pred_subgraph)
+        pred_graphs_by_size[bucket.node_size] = pred_subgraphs
+        target_graphs_by_size[bucket.node_size] = list(bucket.target_subgraphs)
+
+    if accelerator.use_distributed and not accelerator.is_main_process:
+        return _empty_internal_validation_summary()
+
+    result = evaluate_graph_samples(
+        pred_graphs_by_size=pred_graphs_by_size,
+        gt_graphs_by_size=target_graphs_by_size,
+        include_spectral_stats=compute_spectral_stats,
+        include_clustering_stats=compute_clustering_mmd,
+    )
+    summary = cast(Mapping[str, float], result["summary"])
+    return {
+        metric_name: float(summary[metric_name]) for metric_name in INTERNAL_VALIDATION_SUMMARY_KEYS
+    } | _internal_validation_diagnostics(
+        probabilities=probabilities,
+        top_m_pred_edges_total=top_m_pred_edges_total,
+        fixed_threshold_pred_edges_total=fixed_threshold_pred_edges_total,
+        target_edges_total=total_target_edges,
+        candidate_pairs_total=total_candidate_pairs,
+        graph_count=total_graphs,
+        threshold=threshold,
+    )
 
 
 def _evaluate_internal_validation_subgraphs(
@@ -2206,32 +2282,20 @@ def _evaluate_internal_validation_subgraphs(
     use_graph_assembly = _model_supports_graph_forward(model, accelerator)
 
     with torch.no_grad():
+        if use_graph_assembly:
+            return _evaluate_internal_validation_graph_forward_plan(
+                model=model,
+                validation_plan=validation_plan,
+                embedding_repository=embedding_repository,
+                inference_batch_size=inference_batch_size,
+                threshold=threshold,
+                device=device,
+                accelerator=accelerator,
+                compute_spectral_stats=compute_spectral_stats,
+                compute_clustering_mmd=compute_clustering_mmd,
+            )
+
         for bucket in validation_plan.buckets:
-            if use_graph_assembly:
-                pred_subgraphs, bucket_probabilities, fixed_threshold_edges = (
-                    _evaluate_internal_validation_graph_forward_bucket(
-                        model=model,
-                        bucket=bucket,
-                        embedding_repository=embedding_repository,
-                        threshold=threshold,
-                        device=device,
-                        accelerator=accelerator,
-                    )
-                )
-                if accelerator.use_distributed and not accelerator.is_main_process:
-                    continue
-
-                validation_probabilities.extend(bucket_probabilities)
-                pred_graphs_by_size[bucket.node_size] = pred_subgraphs
-                target_graphs_by_size[bucket.node_size] = list(bucket.target_subgraphs)
-                total_pred_edges += fixed_threshold_edges
-                total_target_edges += sum(
-                    subgraph.number_of_edges() for subgraph in bucket.target_subgraphs
-                )
-                total_candidate_pairs += len(bucket.pair_records)
-                total_graphs += len(bucket.target_subgraphs)
-                continue
-
             local_pair_records = _local_internal_validation_pair_records(
                 bucket=bucket,
                 accelerator=accelerator,
@@ -2312,7 +2376,8 @@ def _evaluate_internal_validation_subgraphs(
         metric_name: float(summary[metric_name]) for metric_name in INTERNAL_VALIDATION_SUMMARY_KEYS
     } | _internal_validation_diagnostics(
         probabilities=validation_probabilities,
-        pred_edges_total=total_pred_edges,
+        top_m_pred_edges_total=total_pred_edges,
+        fixed_threshold_pred_edges_total=total_pred_edges,
         target_edges_total=total_target_edges,
         candidate_pairs_total=total_candidate_pairs,
         graph_count=total_graphs,
@@ -3451,45 +3516,45 @@ def _internal_validation_diagnostic_csv_fields(
 ) -> dict[str, float]:
     """Map internal-validation diagnostic stats to persisted CSV columns."""
     return {
-        "Internal Val Mean Pred Edges": float(
-            internal_val_topology_stats.get("pred_edges_mean", 0.0)
+        "Internal Val Top-m Mean Pred Edges": float(
+            internal_val_topology_stats.get("top_m_pred_edges_mean", 0.0)
+        ),
+        "Internal Val Fixed Threshold Mean Pred Edges": float(
+            internal_val_topology_stats.get("fixed_threshold_pred_edges_mean", 0.0)
         ),
         "Internal Val Mean Target Edges": float(
             internal_val_topology_stats.get("target_edges_mean", 0.0)
         ),
-        "Internal Val Total Pred Edges": float(
-            internal_val_topology_stats.get("pred_edges_total", 0.0)
+        "Internal Val Top-m Total Pred Edges": float(
+            internal_val_topology_stats.get("top_m_pred_edges_total", 0.0)
+        ),
+        "Internal Val Fixed Threshold Total Pred Edges": float(
+            internal_val_topology_stats.get("fixed_threshold_pred_edges_total", 0.0)
         ),
         "Internal Val Total Target Edges": float(
             internal_val_topology_stats.get("target_edges_total", 0.0)
         ),
-        "Internal Val Pred Edge Fraction": float(
-            internal_val_topology_stats.get("pred_edge_fraction", 0.0)
+        "Internal Val Top-m Pred Edge Fraction": float(
+            internal_val_topology_stats.get("top_m_pred_edge_fraction", 0.0)
+        ),
+        "Internal Val Fixed Threshold Pred Edge Fraction": float(
+            internal_val_topology_stats.get("fixed_threshold_pred_edge_fraction", 0.0)
         ),
         "Internal Val Target Edge Fraction": float(
             internal_val_topology_stats.get("target_edge_fraction", 0.0)
         ),
-        "Internal Val Pred/Target Edge Ratio": float(
-            internal_val_topology_stats.get("pred_target_edge_ratio", 0.0)
+        "Internal Val Top-m Pred/Target Edge Ratio": float(
+            internal_val_topology_stats.get("top_m_pred_target_edge_ratio", 0.0)
         ),
-        "Internal Val Prob Min": float(
-            internal_val_topology_stats.get("probability_min", 0.0)
+        "Internal Val Fixed Threshold Pred/Target Edge Ratio": float(
+            internal_val_topology_stats.get("fixed_threshold_pred_target_edge_ratio", 0.0)
         ),
-        "Internal Val Prob Mean": float(
-            internal_val_topology_stats.get("probability_mean", 0.0)
-        ),
-        "Internal Val Prob Max": float(
-            internal_val_topology_stats.get("probability_max", 0.0)
-        ),
-        "Internal Val Prob P50": float(
-            internal_val_topology_stats.get("probability_p50", 0.0)
-        ),
-        "Internal Val Prob P90": float(
-            internal_val_topology_stats.get("probability_p90", 0.0)
-        ),
-        "Internal Val Prob P95": float(
-            internal_val_topology_stats.get("probability_p95", 0.0)
-        ),
+        "Internal Val Prob Min": float(internal_val_topology_stats.get("probability_min", 0.0)),
+        "Internal Val Prob Mean": float(internal_val_topology_stats.get("probability_mean", 0.0)),
+        "Internal Val Prob Max": float(internal_val_topology_stats.get("probability_max", 0.0)),
+        "Internal Val Prob P50": float(internal_val_topology_stats.get("probability_p50", 0.0)),
+        "Internal Val Prob P90": float(internal_val_topology_stats.get("probability_p90", 0.0)),
+        "Internal Val Prob P95": float(internal_val_topology_stats.get("probability_p95", 0.0)),
         "Internal Val Prob >= Threshold Fraction": float(
             internal_val_topology_stats.get("probability_ge_threshold_fraction", 0.0)
         ),

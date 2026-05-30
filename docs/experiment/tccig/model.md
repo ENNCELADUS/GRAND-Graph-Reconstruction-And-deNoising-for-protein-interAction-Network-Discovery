@@ -34,7 +34,8 @@ $$
 - Train-only teacher: optional online MGAE teacher masks positive training edges and distills candidate-edge probabilities into the student.
 - Active losses: masked BCE edge loss, teacher distillation, budget, density, degree MMD, and optional clustering MMD.
 - Probability calibration update: `src/model/tccig.py` now uses softmax module memberships with a centered module compatibility term instead of the previous `softplus(...)` + identity interaction term that added a universal positive logit offset. Scratch TCCIG training initializes the density-bias head from the supervised BCE positive rate when explicit negatives exist, otherwise from train-graph density.
-- Internal validation update: TCCIG topology monitoring now uses the same top-`m_hat` graph assembly semantics as topology evaluation. Fixed `0.5` threshold counts remain diagnostics for probability saturation, not the topology-monitor graph definition.
+- Evaluation semantics update: TCCIG can run `evaluate.mode: graph_assembly`, which scores the `all_test_ppi.txt` candidate universe with graph-context probabilities, reports ranking metrics from those probabilities, and reports hard binary metrics from the same top-`m_hat` assembly rule used by topology evaluation.
+- Internal validation update: TCCIG topology monitoring now builds one validation-wide deduplicated candidate universe from all sampled validation subgraphs, applies one global top-`m_hat` graph assembly, and projects the hard decisions back onto sampled subgraphs. Fixed `0.5` threshold counts remain diagnostics for probability saturation, not the topology-monitor graph definition.
 
 Not implemented yet: feature kNN/anchor candidate proposer, offline S2GAE/MaskGAE/Bandana teacher pretraining, spectral/module/ranking/calibration/sparsity losses as active nonzero objectives, and validation-calibrated threshold selection beyond the current top-`m_hat` assembly path.
 

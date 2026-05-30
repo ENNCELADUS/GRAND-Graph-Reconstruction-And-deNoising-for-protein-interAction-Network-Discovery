@@ -2,7 +2,12 @@
 
 The **Evaluator** module (`src/evaluate/base.py`) is responsible for assessing model performance. It provides a consistent interface for computing metrics during both training validation and final testing.
 
-Binary PPI predictions use the PRING benchmark setting: probabilities greater than or equal to `0.5` are classified as interacting pairs, and probabilities below `0.5` are classified as non-interacting pairs. Training validation, final evaluation, and topology reconstruction all use this same threshold.
+Default binary PPI evaluation uses the PRING benchmark setting: probabilities greater
+than or equal to `0.5` are classified as interacting pairs, and probabilities below
+`0.5` are classified as non-interacting pairs. TCCIG can opt into
+`evaluate.mode: graph_assembly`, where final evaluation uses graph-context
+probabilities on `all_test_ppi.txt` and top-`m_hat` hard predictions instead of the
+pairwise fixed-threshold path.
 
 ## Core Responsibilities
 
@@ -11,7 +16,8 @@ Binary PPI predictions use the PRING benchmark setting: probabilities greater th
 *   **Centralized Loss Reporting**: Computes loss with `training_config.loss` via `LossConfig` so train/val/test loss paths share the same objective configuration.
 *   **Inference Pass**: Runs a single pass over a data loader to collect logits/probabilities and labels. Uses `accelerator.autocast()` for mixed precision and `accelerator.gather_for_metrics()` for distributed metric gathering.
 *   **Stateless Reporting**: Returns a simple dictionary of results (e.g., `{"val_loss": 0.5, "val_auroc": 0.85}`).
-*   **Fixed Decision Threshold**: Uses the PRING benchmark convention of probability threshold `0.5` for binary PPI decisions.
+*   **Fixed Decision Threshold**: Uses the PRING benchmark convention of probability threshold `0.5` for default pairwise binary PPI decisions.
+*   **TCCIG Graph Assembly Evaluation**: When configured, computes ranking metrics from graph-context probabilities over `all_test_ppi.txt` and computes hard metrics from top-`m_hat` predictions.
 
 **Does NOT:**
 *   **State Management**: It does *not* change the model's training mode. The stage orchestrator is responsible for setting `model.eval()` and `torch.no_grad()`.
@@ -28,10 +34,14 @@ The Evaluator requires a real `AcceleratorLike` instance — there is no optiona
 
 ## Configuration Schema
 
-Metrics are defined in the `evaluate` section of the YAML config. `decision_threshold` is fixed at `0.5`; validation-selected thresholds are intentionally unsupported so PRING runs use the same operating point across validation, test, and topology reconstruction.
+Metrics are defined in the `evaluate` section of the YAML config. Pairwise
+`decision_threshold` is fixed at `0.5`; validation-selected thresholds are
+intentionally unsupported for the default PRING pairwise path. TCCIG graph assembly
+evaluation is selected explicitly with `mode: graph_assembly`.
 
 ```yaml
 evaluate:
+  mode: pairwise
   metrics: [
     "auroc",
     "auprc",
@@ -46,6 +56,17 @@ evaluate:
   decision_threshold:
     mode: fixed
     value: 0.5
+```
+
+TCCIG graph assembly evaluation uses the same CSV metric schema but changes the
+candidate universe and hard-decision rule:
+
+```yaml
+evaluate:
+  mode: graph_assembly
+  decision_threshold:
+    mode: fixed
+    value: 0.5  # diagnostic legacy threshold, not the hard graph rule
 ```
 
 ## Usage Pattern
@@ -69,10 +90,11 @@ append_csv_row(...)
 
 When `run_config.stages` contains `"evaluate"`, the stage:
 1.  Loads the checkpoint via `runtime.load_checkpoint()`.
-2.  Resolves the fixed PRING decision threshold (`0.5`).
+2.  Resolves the fixed PRING decision threshold (`0.5`) for the default pairwise path.
 3.  Instantiates the Evaluator with the runtime's accelerator.
-4.  Runs the evaluation pass on the test set.
+4.  Runs either pairwise test-set evaluation or TCCIG graph assembly evaluation on `all_test_ppi.txt`.
 5.  Writes the result to `logs/{model}/evaluate/{run_id}/evaluate.csv`.
+6.  For TCCIG graph assembly, also writes `graph_assembly_diagnostics.json`.
 
 ## Output Format
 

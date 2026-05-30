@@ -6,6 +6,7 @@ import json
 import logging
 import pickle
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
@@ -57,6 +58,18 @@ TOPOLOGY_CSV_COLUMNS = [
     *TOPOLOGY_METRIC_NAMES,
 ]
 EXPECTED_STRATEGIES = {"BFS", "DFS", "RANDOM_WALK"}
+
+
+@dataclass(frozen=True)
+class GraphAssemblyResult:
+    """TCCIG graph-assembly predictions and observability diagnostics."""
+
+    predictions: list[int]
+    probabilities: list[float]
+    m_hat: float
+    candidate_count: int
+    selected_edges: int
+    assembly_rule: str = "top_m_hat"
 
 
 class TopologyLoaderBundle(tuple):
@@ -373,7 +386,52 @@ def _assemble_top_m_hat_predictions(
     return predictions
 
 
-def _predict_tccig_graph_assembly_labels(
+def _probability_stats(probabilities: Sequence[float]) -> dict[str, float]:
+    """Return stable summary statistics for graph-assembly probabilities."""
+    if not probabilities:
+        return {
+            "probability_min": 0.0,
+            "probability_mean": 0.0,
+            "probability_max": 0.0,
+            "probability_p50": 0.0,
+            "probability_p90": 0.0,
+            "probability_p95": 0.0,
+        }
+    probability_tensor = torch.tensor(probabilities, dtype=torch.float32)
+    return {
+        "probability_min": float(torch.min(probability_tensor).item()),
+        "probability_mean": float(torch.mean(probability_tensor).item()),
+        "probability_max": float(torch.max(probability_tensor).item()),
+        "probability_p50": float(torch.quantile(probability_tensor, 0.50).item()),
+        "probability_p90": float(torch.quantile(probability_tensor, 0.90).item()),
+        "probability_p95": float(torch.quantile(probability_tensor, 0.95).item()),
+    }
+
+
+def graph_assembly_diagnostics(result: GraphAssemblyResult) -> dict[str, float | int | str]:
+    """Build the persisted diagnostics payload for a TCCIG graph assembly."""
+    return {
+        "assembly_rule": result.assembly_rule,
+        "m_hat": float(result.m_hat),
+        "record_count": len(result.predictions),
+        "candidate_count": int(result.candidate_count),
+        "selected_edges": int(result.selected_edges),
+    } | _probability_stats(result.probabilities)
+
+
+def write_graph_assembly_diagnostics(
+    *,
+    output_path: Path,
+    result: GraphAssemblyResult,
+) -> dict[str, float | int | str]:
+    """Persist graph-assembly diagnostics and return the payload."""
+    payload = graph_assembly_diagnostics(result)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(format_result_payload(payload), handle, indent=2, sort_keys=True)
+    return payload
+
+
+def _predict_tccig_graph_assembly_result(
     *,
     config: ConfigDict,
     model: torch.nn.Module,
@@ -381,7 +439,7 @@ def _predict_tccig_graph_assembly_labels(
     records: Sequence[tuple[str, str]],
     device: torch.device,
     accelerator: AcceleratorLike,
-) -> list[int]:
+) -> GraphAssemblyResult:
     """Run TCCIG Graph Assembly with top-``m_hat`` candidate selection."""
     graph_model = _unwrap_graph_model(model=model, accelerator=accelerator)
     encode_graph_nodes = getattr(graph_model, "encode_graph_nodes", None)
@@ -402,12 +460,16 @@ def _predict_tccig_graph_assembly_labels(
         )
 
     scorable_records_with_indices = [
-        (index, record)
-        for index, record in enumerate(records)
-        if record[0] != record[1]
+        (index, record) for index, record in enumerate(records) if record[0] != record[1]
     ]
     if not scorable_records_with_indices:
-        return [0] * len(records)
+        return GraphAssemblyResult(
+            predictions=[0] * len(records),
+            probabilities=[0.0] * len(records),
+            m_hat=0.0,
+            candidate_count=0,
+            selected_edges=0,
+        )
 
     scorable_indices = [index for index, _ in scorable_records_with_indices]
     scorable_records = [record for _, record in scorable_records_with_indices]
@@ -457,9 +519,42 @@ def _predict_tccig_graph_assembly_labels(
         m_hat=float(m_hat_tensor.detach().cpu().item()),
     )
     predictions = [0] * len(records)
-    for index, prediction in zip(scorable_indices, scorable_predictions, strict=True):
+    full_probabilities = [0.0] * len(records)
+    for index, probability, prediction in zip(
+        scorable_indices,
+        probabilities,
+        scorable_predictions,
+        strict=True,
+    ):
+        full_probabilities[index] = probability
         predictions[index] = prediction
-    return predictions
+    return GraphAssemblyResult(
+        predictions=predictions,
+        probabilities=full_probabilities,
+        m_hat=float(m_hat_tensor.detach().cpu().item()),
+        candidate_count=len(scorable_records),
+        selected_edges=sum(scorable_predictions),
+    )
+
+
+def _predict_tccig_graph_assembly_labels(
+    *,
+    config: ConfigDict,
+    model: torch.nn.Module,
+    dataset: PRINGPairDataset,
+    records: Sequence[tuple[str, str]],
+    device: torch.device,
+    accelerator: AcceleratorLike,
+) -> list[int]:
+    """Run TCCIG Graph Assembly and return hard labels only."""
+    return _predict_tccig_graph_assembly_result(
+        config=config,
+        model=model,
+        dataset=dataset,
+        records=records,
+        device=device,
+        accelerator=accelerator,
+    ).predictions
 
 
 def _ordered_predictions_from_shards(
@@ -728,8 +823,9 @@ def run_topology_evaluation_stage(
             distributed=runtime.is_distributed,
             world_size=runtime.world_size,
         )
+    graph_assembly_payload: dict[str, float | int | str] | None = None
     if _model_supports_graph_forward(model, runtime.accelerator):
-        predictions = _predict_tccig_graph_assembly_labels(
+        graph_assembly_result = _predict_tccig_graph_assembly_result(
             config=config,
             model=model,
             dataset=topology_bundle.dataset,
@@ -737,12 +833,25 @@ def run_topology_evaluation_stage(
             device=device,
             accelerator=runtime.accelerator,
         )
+        predictions = graph_assembly_result.predictions
         if runtime.is_main_process:
+            graph_assembly_payload = write_graph_assembly_diagnostics(
+                output_path=log_dir / "graph_assembly_diagnostics.json",
+                result=graph_assembly_result,
+            )
             log_stage_event(
                 logger,
                 "tccig_graph_assembly",
                 pair_count=len(records),
+                assembly_rule=graph_assembly_result.assembly_rule,
+                m_hat=graph_assembly_result.m_hat,
+                selected_edges=graph_assembly_result.selected_edges,
                 candidate_batch_size=_resolve_tccig_candidate_batch_size(config),
+            )
+            log_stage_event(
+                logger,
+                "graph_assembly_diagnostics_written",
+                path=log_dir / "graph_assembly_diagnostics.json",
             )
     else:
         predictions = _predict_topology_labels(
@@ -805,6 +914,8 @@ def run_topology_evaluation_stage(
                 "per_node_size": _json_safe_per_node_size(topology_result["per_node_size"]),
                 "details": _json_safe_details(topology_result["details"]),
             }
+            if graph_assembly_payload is not None:
+                payload["graph_assembly"] = graph_assembly_payload
             json.dump(
                 format_result_payload(payload),
                 handle,

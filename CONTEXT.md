@@ -12,6 +12,20 @@ The TCCIG evaluation procedure: score candidate protein pairs, predict an edge b
 `m_hat`, select the top-`m_hat` candidate edges, and evaluate the resulting hard graph
 with the existing PRING topology metrics.
 
+## Graph Assembly Evaluation
+
+The TCCIG `evaluate` mode that scores the PRING topology candidate universe
+(`all_test_ppi.txt`) with graph-context probabilities, computes ranking metrics from
+those probabilities, and computes hard binary metrics from the same top-`m_hat`
+assembly rule used by topology evaluation.
+
+## Internal Validation Candidate Universe
+
+The deduplicated set of unordered protein pairs induced by all sampled internal
+validation subgraphs. TCCIG internal validation assembles one validation-wide
+top-`m_hat` graph over this universe, then projects the hard decisions back onto
+the sampled subgraphs for topology metrics.
+
 ## Edge Probability
 
 A calibrated TCCIG candidate-pair score after sigmoid. Edge probabilities are used for

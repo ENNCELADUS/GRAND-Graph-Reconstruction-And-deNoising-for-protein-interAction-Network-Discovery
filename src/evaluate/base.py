@@ -184,23 +184,30 @@ class Evaluator:
         self,
         labels: torch.Tensor,
         probabilities: torch.Tensor,
+        predictions: torch.Tensor | None = None,
     ) -> dict[str, float]:
         """Compute configured metrics for binary classification.
 
         Args:
             labels: Ground-truth binary labels.
             probabilities: Predicted probabilities in ``[0, 1]``.
+            predictions: Optional hard binary predictions. When omitted, the
+                evaluator applies its configured decision threshold.
 
         Returns:
             Metric dictionary without split prefix.
         """
         results: dict[str, float] = {}
         has_both_classes = torch.unique(labels).numel() > 1
-        predictions = (probabilities >= self.decision_threshold).long()
+        resolved_predictions = (
+            (probabilities >= self.decision_threshold).long()
+            if predictions is None
+            else predictions.long()
+        )
         scorers = self._metric_scorers(
             labels=labels,
             probabilities=probabilities,
-            predictions=predictions,
+            predictions=resolved_predictions,
             has_both_classes=has_both_classes,
         )
         for metric in self.metrics:
@@ -272,10 +279,15 @@ class Evaluator:
         labels: torch.Tensor,
         probabilities: torch.Tensor,
         average_loss: float,
+        predictions: torch.Tensor | None = None,
         prefix: str | None = "val",
     ) -> dict[str, float]:
         """Compute metrics from precomputed labels/probabilities without another model pass."""
-        metric_values = self._compute_metrics(labels=labels, probabilities=probabilities)
+        metric_values = self._compute_metrics(
+            labels=labels,
+            probabilities=probabilities,
+            predictions=predictions,
+        )
         metric_values["loss"] = average_loss
         if prefix is None:
             return metric_values
