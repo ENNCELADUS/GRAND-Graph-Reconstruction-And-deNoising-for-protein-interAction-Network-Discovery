@@ -401,9 +401,19 @@ def _predict_tccig_graph_assembly_labels(
             "decode_graph_candidates, and edge_budget_from_node_embeddings"
         )
 
+    scorable_records_with_indices = [
+        (index, record)
+        for index, record in enumerate(records)
+        if record[0] != record[1]
+    ]
+    if not scorable_records_with_indices:
+        return [0] * len(records)
+
+    scorable_indices = [index for index, _ in scorable_records_with_indices]
+    scorable_records = [record for _, record in scorable_records_with_indices]
     protein_ids, protein_embeddings, protein_lengths = _load_tccig_node_inputs(
         dataset=dataset,
-        records=records,
+        records=scorable_records,
         device=device,
     )
     node_to_index = {protein_id: index for index, protein_id in enumerate(protein_ids)}
@@ -421,12 +431,12 @@ def _predict_tccig_graph_assembly_labels(
             torch.Tensor,
             edge_budget_from_node_embeddings(
                 node_embeddings=node_embeddings,
-                candidate_count=len(records),
+                candidate_count=len(scorable_records),
             ),
         )
-        for start in range(0, len(records), candidate_batch_size):
+        for start in range(0, len(scorable_records), candidate_batch_size):
             candidate_pairs = _candidate_pairs_for_records(
-                records=records[start : start + candidate_batch_size],
+                records=scorable_records[start : start + candidate_batch_size],
                 node_to_index=node_to_index,
                 device=device,
             )
@@ -440,12 +450,16 @@ def _predict_tccig_graph_assembly_labels(
             probabilities.extend(
                 float(value) for value in output["edge_probabilities"].detach().cpu().tolist()
             )
-    if len(probabilities) != len(records):
+    if len(probabilities) != len(scorable_records):
         raise ValueError("TCCIG graph assembly did not score every topology pair")
-    return _assemble_top_m_hat_predictions(
+    scorable_predictions = _assemble_top_m_hat_predictions(
         probabilities=probabilities,
         m_hat=float(m_hat_tensor.detach().cpu().item()),
     )
+    predictions = [0] * len(records)
+    for index, prediction in zip(scorable_indices, scorable_predictions, strict=True):
+        predictions[index] = prediction
+    return predictions
 
 
 def _ordered_predictions_from_shards(
