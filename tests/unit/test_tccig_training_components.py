@@ -6,6 +6,29 @@ import pytest
 import torch
 from src.topology.losses import TCCIGLossWeights, compute_tccig_losses
 from src.train.tccig.mgae import MGAETeacher, mask_positive_edges
+from src.train.tccig.teacher import OnlineTCCIGTeacher
+from torch import nn
+
+
+class _WrappedTeacher(nn.Module):
+    """DDP-shaped wrapper that hides custom teacher methods."""
+
+    def __init__(self, module: MGAETeacher) -> None:
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args: object, **kwargs: object) -> object:
+        return self.module(*args, **kwargs)
+
+
+class _UnwrappingAccelerator:
+    """Small accelerator double for wrapped-teacher regression coverage."""
+
+    def unwrap_model(self, model: nn.Module) -> nn.Module:
+        return model.module if isinstance(model, _WrappedTeacher) else model
+
+    def backward(self, loss: torch.Tensor) -> None:
+        loss.backward()
 
 
 def test_mask_positive_edges_masks_requested_fraction_and_keeps_visible_edges() -> None:
@@ -43,6 +66,32 @@ def test_mgae_teacher_training_step_returns_loss_and_logits() -> None:
     assert output.positive_logits.ndim == 1
     assert output.negative_logits.shape == output.positive_logits.shape
     output.loss.backward()
+
+
+def test_online_teacher_scores_when_prepared_teacher_is_wrapped() -> None:
+    teacher = MGAETeacher(input_dim=8, hidden_dim=12, num_layers=2, dropout=0.0)
+    online_teacher = OnlineTCCIGTeacher(
+        teacher=_WrappedTeacher(teacher),  # type: ignore[arg-type]
+        optimizer=torch.optim.SGD(teacher.parameters(), lr=1e-3),
+        mask_ratio=0.5,
+        negative_ratio=1,
+    )
+    node_features = torch.randn(5, 8)
+    positive_edges = torch.tensor([[0, 0, 1, 2], [1, 2, 2, 3]], dtype=torch.long)
+    candidate_pairs = torch.tensor([[0, 1, 3], [1, 2, 4]], dtype=torch.long)
+
+    probabilities = online_teacher.train_and_score(
+        node_features=node_features,
+        positive_edges=positive_edges,
+        candidate_pairs=candidate_pairs,
+        seed=31,
+        device=torch.device("cpu"),
+        accelerator=_UnwrappingAccelerator(),  # type: ignore[arg-type]
+        loss_scale=1.0,
+    )
+
+    assert probabilities.shape == (3,)
+    assert torch.all((probabilities >= 0.0) & (probabilities <= 1.0))
 
 
 def test_tccig_loss_skips_disabled_teacher_inputs() -> None:

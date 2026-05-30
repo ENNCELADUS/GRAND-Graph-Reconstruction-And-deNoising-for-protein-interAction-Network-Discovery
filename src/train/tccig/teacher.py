@@ -112,8 +112,14 @@ class OnlineTCCIGTeacher:
     ) -> torch.Tensor:
         """Run one online teacher update and return frozen candidate probabilities."""
         self.teacher.train()
+        unwrap_model = getattr(accelerator, "unwrap_model", None)
+        teacher_model = (
+            cast(MGAETeacher, unwrap_model(self.teacher))
+            if callable(unwrap_model)
+            else self.teacher
+        )
         self.optimizer.zero_grad(set_to_none=True)
-        teacher_step = self.teacher.training_step(
+        teacher_step = teacher_model.training_step(
             node_features=node_features.detach(),
             positive_edges=positive_edges,
             mask_ratio=self.mask_ratio,
@@ -126,7 +132,7 @@ class OnlineTCCIGTeacher:
 
         self.teacher.eval()
         with torch.no_grad():
-            teacher_logits = self.teacher.score_pairs(
+            teacher_logits = teacher_model.score_pairs(
                 node_features=node_features.detach(),
                 visible_positive_edges=positive_edges,
                 candidate_edges=candidate_pairs,
