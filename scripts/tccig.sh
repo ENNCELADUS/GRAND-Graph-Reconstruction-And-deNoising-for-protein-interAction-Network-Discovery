@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH -J TCCIG
-#SBATCH -p hexm
+#SBATCH -p hexm_l40
 #SBATCH -A hexm
 #SBATCH -N 1
 #SBATCH -t 4-00:00:00
 #SBATCH --mem=300G
 #SBATCH --cpus-per-task=32
-#SBATCH --gres=gpu:NVIDIAA40:4
-#SBATCH --output=logs/tccig_slurm_%j.out
-#SBATCH --error=logs/tccig_slurm_%j.err
+#SBATCH --gres=gpu:NVIDIAL40:4
+#SBATCH --output=logs/tccig/slurm_%j.out
+#SBATCH --error=logs/tccig/slurm_%j.err
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=2162352828@qq.com
 
