@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import inspect
+import math
 
+import pytest
 import torch
 from src.model.tccig import TCCIG
 from src.pipeline.stages.train import build_model
@@ -153,3 +155,66 @@ def test_tccig_pairwise_forward_is_invariant_to_batch_neighbors() -> None:
         )["logits"][0]
 
     assert torch.allclose(batched_logit, single_logit)
+
+
+def test_tccig_module_score_is_centered_at_neutral_membership() -> None:
+    model = TCCIG(**_tccig_config())
+    with torch.no_grad():
+        model.module_head.weight.zero_()
+        model.module_head.bias.zero_()
+    node_embeddings = torch.randn(4, 16)
+    candidate_pairs = torch.tensor([[0, 1, 2], [1, 2, 3]], dtype=torch.long)
+
+    output = model.decode_graph_candidates(
+        node_embeddings=node_embeddings,
+        candidate_pairs=candidate_pairs,
+    )
+
+    assert torch.allclose(
+        output["module_memberships"].sum(dim=-1),
+        torch.ones(4),
+    )
+    assert torch.allclose(
+        output["module_score"],
+        torch.zeros(3),
+        atol=1.0e-6,
+    )
+
+
+def test_tccig_density_bias_can_initialize_sparse_probability_prior() -> None:
+    model = TCCIG(**_tccig_config())
+    prior_probability = 0.04
+    bias = model.initialize_density_bias_with_prior(prior_probability)
+    with torch.no_grad():
+        for module in (model.pair_mlp, model.hub_head, model.lowrank_head, model.module_head):
+            for parameter in module.parameters():
+                parameter.zero_()
+
+    output = model.forward_graph(protein_embeddings=torch.randn(4, 5, 8))
+
+    assert bias == math.log(prior_probability / (1.0 - prior_probability))
+    assert output["edge_probabilities"].mean().item() == pytest.approx(
+        prior_probability,
+        abs=1.0e-6,
+    )
+
+
+def test_tccig_graph_and_pairwise_paths_share_centered_module_term() -> None:
+    model = TCCIG(**_tccig_config())
+    with torch.no_grad():
+        for module in (model.pair_mlp, model.hub_head, model.lowrank_head, model.density_bias_head):
+            for parameter in module.parameters():
+                parameter.zero_()
+    node_embeddings = torch.randn(3, 16)
+    candidate_pairs = torch.tensor([[0], [2]], dtype=torch.long)
+
+    graph_output = model.decode_graph_candidates(
+        node_embeddings=node_embeddings,
+        candidate_pairs=candidate_pairs,
+    )
+    pairwise_logit = model._decode_pairwise_edges(
+        node_a_embeddings=node_embeddings[:1],
+        node_b_embeddings=node_embeddings[2:3],
+    )
+
+    assert torch.allclose(graph_output["logits"], pairwise_logit)

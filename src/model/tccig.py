@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import cast
 
@@ -62,6 +63,15 @@ def _build_mlp(
         previous_dim = hidden_dim
     layers.append(nn.Linear(previous_dim, output_dim))
     return nn.Sequential(*layers)
+
+
+def _last_linear(module: nn.Module) -> nn.Linear | None:
+    """Return the final linear layer contained in a module."""
+    final_linear: nn.Linear | None = None
+    for child in module.modules():
+        if isinstance(child, nn.Linear):
+            final_linear = child
+    return final_linear
 
 
 class TCCIG(nn.Module):
@@ -245,6 +255,18 @@ class TCCIG(nn.Module):
         set_state = node_embeddings.mean(dim=0, keepdim=True)
         return torch.sigmoid(self.edge_budget_head(set_state).squeeze()) * float(candidate_count)
 
+    def initialize_density_bias_with_prior(self, positive_edge_probability: float) -> float:
+        """Initialize set-density bias to a sparse positive-edge prior."""
+        final_linear = _last_linear(self.density_bias_head)
+        if final_linear is None or final_linear.bias is None:
+            raise ValueError("density_bias_head must expose a final linear layer with bias")
+        clipped_probability = min(max(float(positive_edge_probability), 1.0e-8), 1.0 - 1.0e-8)
+        bias_value = math.log(clipped_probability / (1.0 - clipped_probability))
+        with torch.no_grad():
+            final_linear.weight.zero_()
+            final_linear.bias.fill_(bias_value)
+        return bias_value
+
     @staticmethod
     def _symmetric_pair_features(
         node_a_embeddings: torch.Tensor,
@@ -279,7 +301,7 @@ class TCCIG(nn.Module):
             node_embeddings=node_embeddings,
             candidate_count=candidate_count,
         )
-        module_memberships = functional.softplus(self.module_head(node_embeddings))
+        module_memberships = functional.softmax(self.module_head(node_embeddings), dim=-1)
         if candidate_count == 0:
             return {
                 "logits": node_embeddings.new_zeros((0,)),
@@ -300,7 +322,7 @@ class TCCIG(nn.Module):
         lowrank_score = (lowrank[src] * lowrank[dst]).sum(dim=-1)
         module_src = module_memberships[src]
         module_dst = module_memberships[dst]
-        module_score = (module_src @ self.module_interactions * module_dst).sum(dim=-1)
+        module_score = self._centered_module_score(module_src, module_dst)
         logits = pair_score + hub_score + lowrank_score + module_score + density_bias
         return {
             "logits": logits,
@@ -347,10 +369,20 @@ class TCCIG(nn.Module):
         lowrank_a = self.lowrank_head(node_a_embeddings)
         lowrank_b = self.lowrank_head(node_b_embeddings)
         lowrank_score = (lowrank_a * lowrank_b).sum(dim=-1)
-        module_a = functional.softplus(self.module_head(node_a_embeddings))
-        module_b = functional.softplus(self.module_head(node_b_embeddings))
-        module_score = (module_a @ self.module_interactions * module_b).sum(dim=-1)
+        module_a = functional.softmax(self.module_head(node_a_embeddings), dim=-1)
+        module_b = functional.softmax(self.module_head(node_b_embeddings), dim=-1)
+        module_score = self._centered_module_score(module_a, module_b)
         return pair_score + hub_score + lowrank_score + module_score + density_bias
+
+    def _centered_module_score(
+        self,
+        module_a: torch.Tensor,
+        module_b: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return module compatibility centered at neutral uniform membership."""
+        raw_score = (module_a @ self.module_interactions * module_b).sum(dim=-1)
+        neutral_score = 1.0 / float(self.num_modules)
+        return raw_score - raw_score.new_tensor(neutral_score)
 
     def estimate_edge_budget(
         self,

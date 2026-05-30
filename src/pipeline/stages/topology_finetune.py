@@ -2051,6 +2051,138 @@ def _internal_validation_diagnostics(
     }
 
 
+def _internal_validation_graph_inputs(
+    *,
+    nodes: Sequence[str],
+    embedding_repository: EmbeddingRepository,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Materialize one internal-validation protein set for graph-forward inference."""
+    embeddings = embedding_repository.get_many(nodes)
+    protein_embeddings = torch.nn.utils.rnn.pad_sequence(
+        [embeddings[node] for node in nodes],
+        batch_first=True,
+    ).to(device)
+    protein_lengths = torch.tensor(
+        [embeddings[node].size(0) for node in nodes],
+        dtype=torch.long,
+        device=device,
+    )
+    return protein_embeddings, protein_lengths
+
+
+def _top_m_predictions(
+    *,
+    probabilities: Sequence[float],
+    m_hat: float,
+) -> list[int]:
+    """Return hard predictions by selecting the top rounded edge budget."""
+    edge_budget = max(0, min(len(probabilities), int(round(m_hat))))
+    predictions = [0 for _ in probabilities]
+    if edge_budget == 0:
+        return predictions
+    top_indices = sorted(
+        range(len(probabilities)),
+        key=lambda index: (-float(probabilities[index]), index),
+    )[:edge_budget]
+    for index in top_indices:
+        predictions[index] = 1
+    return predictions
+
+
+def _evaluate_internal_validation_graph_forward_bucket(
+    *,
+    model: nn.Module,
+    bucket: InternalValidationNodeBucketPlan,
+    embedding_repository: EmbeddingRepository,
+    threshold: float,
+    device: torch.device,
+    accelerator: AcceleratorLike,
+) -> tuple[list[nx.Graph], list[float], int]:
+    """Evaluate one validation bucket using TCCIG top-``m_hat`` graph assembly."""
+    graph_model = _unwrap_model_for_detached_forward(model=model, accelerator=accelerator)
+    pred_subgraphs: list[nx.Graph] = []
+    fixed_threshold_edge_count = 0
+    validation_probabilities: list[float] = []
+    assigned_subgraphs = (
+        enumerate(bucket.sampled_subgraphs)
+        if not accelerator.use_distributed
+        else (
+            (index, nodes)
+            for index, nodes in enumerate(bucket.sampled_subgraphs)
+            if index % accelerator.num_processes == accelerator.process_index
+        )
+    )
+    local_results: list[tuple[int, nx.Graph, list[float], int]] = []
+    for subgraph_index, nodes in assigned_subgraphs:
+        protein_embeddings, protein_lengths = _internal_validation_graph_inputs(
+            nodes=nodes,
+            embedding_repository=embedding_repository,
+            device=device,
+        )
+        with accelerator.autocast():
+            output = cast(
+                Mapping[str, torch.Tensor],
+                graph_model.forward_graph(
+                    protein_embeddings=protein_embeddings,
+                    protein_lengths=protein_lengths,
+                ),
+            )
+        probabilities = [
+            float(value) for value in output["edge_probabilities"].detach().cpu().tolist()
+        ]
+        fixed_predictions = [int(probability >= threshold) for probability in probabilities]
+        top_m_predictions = _top_m_predictions(
+            probabilities=probabilities,
+            m_hat=float(output["m_hat"].detach().cpu().item()),
+        )
+        candidate_pairs = output.get("candidate_pairs")
+        if candidate_pairs is None:
+            candidate_pairs = torch.triu_indices(len(nodes), len(nodes), offset=1)
+        pair_list = candidate_pairs.detach().cpu().t().tolist()
+        pred_subgraph = nx.Graph()
+        pred_subgraph.add_nodes_from(nodes)
+        for (source_index, target_index), prediction in zip(
+            pair_list,
+            top_m_predictions,
+            strict=True,
+        ):
+            if prediction > 0:
+                pred_subgraph.add_edge(nodes[int(source_index)], nodes[int(target_index)])
+        local_results.append(
+            (
+                subgraph_index,
+                pred_subgraph,
+                probabilities,
+                sum(fixed_predictions),
+            )
+        )
+
+    if accelerator.use_distributed:
+        gathered_results: list[list[tuple[int, nx.Graph, list[float], int]] | None] = [
+            None
+        ] * accelerator.num_processes
+        if dist.is_available() and dist.is_initialized():
+            dist.all_gather_object(gathered_results, local_results)
+        else:
+            gathered_results = [local_results]
+        local_results = [
+            result
+            for shard_results in gathered_results
+            if shard_results is not None
+            for result in shard_results
+        ]
+
+    for _, pred_subgraph, probabilities, fixed_edge_count in sorted(
+        local_results,
+        key=lambda result: result[0],
+    ):
+        pred_subgraphs.append(pred_subgraph)
+        validation_probabilities.extend(probabilities)
+        fixed_threshold_edge_count += fixed_edge_count
+    return pred_subgraphs, validation_probabilities, fixed_threshold_edge_count
+
+
 def _evaluate_internal_validation_subgraphs(
     *,
     model: nn.Module,
@@ -2071,9 +2203,35 @@ def _evaluate_internal_validation_subgraphs(
     total_target_edges = 0
     total_candidate_pairs = 0
     total_graphs = 0
+    use_graph_assembly = _model_supports_graph_forward(model, accelerator)
 
     with torch.no_grad():
         for bucket in validation_plan.buckets:
+            if use_graph_assembly:
+                pred_subgraphs, bucket_probabilities, fixed_threshold_edges = (
+                    _evaluate_internal_validation_graph_forward_bucket(
+                        model=model,
+                        bucket=bucket,
+                        embedding_repository=embedding_repository,
+                        threshold=threshold,
+                        device=device,
+                        accelerator=accelerator,
+                    )
+                )
+                if accelerator.use_distributed and not accelerator.is_main_process:
+                    continue
+
+                validation_probabilities.extend(bucket_probabilities)
+                pred_graphs_by_size[bucket.node_size] = pred_subgraphs
+                target_graphs_by_size[bucket.node_size] = list(bucket.target_subgraphs)
+                total_pred_edges += fixed_threshold_edges
+                total_target_edges += sum(
+                    subgraph.number_of_edges() for subgraph in bucket.target_subgraphs
+                )
+                total_candidate_pairs += len(bucket.pair_records)
+                total_graphs += len(bucket.target_subgraphs)
+                continue
+
             local_pair_records = _local_internal_validation_pair_records(
                 bucket=bucket,
                 accelerator=accelerator,

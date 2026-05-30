@@ -1023,6 +1023,100 @@ def test_evaluate_internal_validation_subgraphs_matches_per_subgraph_baseline(
     assert batched_summary["probability_ge_threshold_fraction"] == pytest.approx(4.0 / 6.0)
 
 
+def test_tccig_internal_validation_uses_top_m_hat_for_topology_and_threshold_diagnostics(
+    tmp_path: Path,
+) -> None:
+    graph = nx.Graph()
+    graph.add_edges_from([("P1", "P2"), ("P2", "P3"), ("P2", "P4")])
+    cache_dir = tmp_path / "cache"
+    _write_embedding_cache(
+        cache_dir=cache_dir,
+        embeddings={
+            "P1": torch.full((2, 4), 1.0, dtype=torch.float32),
+            "P2": torch.full((2, 4), 2.0, dtype=torch.float32),
+            "P3": torch.full((2, 4), 3.0, dtype=torch.float32),
+            "P4": torch.full((2, 4), 4.0, dtype=torch.float32),
+        },
+        input_dim=4,
+        max_sequence_length=8,
+    )
+    embedding_index = {
+        protein_id: f"embeddings/{protein_id}.pt" for protein_id in ("P1", "P2", "P3", "P4")
+    }
+    sampled_subgraphs = {3: [("P1", "P2", "P3"), ("P2", "P3", "P4")]}
+    validation_plan = build_internal_validation_plan(
+        graph=graph,
+        sampled_subgraphs=sampled_subgraphs,
+    )
+    embedding_repository = EmbeddingRepository(
+        cache_dir=cache_dir,
+        embedding_index=embedding_index,
+        input_dim=4,
+        max_sequence_length=8,
+        max_cache_bytes=1_024,
+    )
+
+    class _ToyTCCIGModel(torch.nn.Module):
+        def forward_graph(
+            self,
+            *,
+            protein_embeddings: torch.Tensor,
+            protein_lengths: torch.Tensor | None = None,
+            candidate_pairs: torch.Tensor | None = None,
+        ) -> dict[str, torch.Tensor]:
+            del protein_embeddings, protein_lengths
+            pairs = (
+                torch.tensor([[0, 0, 1], [1, 2, 2]], dtype=torch.long)
+                if candidate_pairs is None
+                else candidate_pairs
+            )
+            logits = torch.tensor([3.0, 2.0, 1.0], dtype=torch.float32)[: pairs.size(1)]
+            return {
+                "candidate_pairs": pairs,
+                "logits": logits,
+                "edge_probabilities": torch.sigmoid(logits),
+                "m_hat": torch.tensor(1.0),
+            }
+
+    model = _ToyTCCIGModel().eval()
+    summary = _evaluate_internal_validation_subgraphs(
+        model=model,
+        validation_plan=validation_plan,
+        embedding_repository=embedding_repository,
+        inference_batch_size=4,
+        threshold=0.5,
+        device=torch.device("cpu"),
+        accelerator=NoOpAccelerator(),
+    )
+
+    expected_pred_graphs = {
+        3: [
+            nx.Graph([("P1", "P2")]),
+            nx.Graph([("P2", "P3")]),
+        ]
+    }
+    for pred_graph, nodes in zip(
+        expected_pred_graphs[3],
+        sampled_subgraphs[3],
+        strict=True,
+    ):
+        pred_graph.add_nodes_from(nodes)
+    expected_summary = evaluate_graph_samples(
+        pred_graphs_by_size=expected_pred_graphs,
+        gt_graphs_by_size={
+            3: [graph.subgraph(nodes).copy() for nodes in sampled_subgraphs[3]]
+        },
+        include_spectral_stats=False,
+    )["summary"]
+
+    for metric_name, expected_value in expected_summary.items():
+        assert summary[metric_name] == pytest.approx(expected_value)
+    assert summary["pred_edges_total"] == pytest.approx(6.0)
+    assert summary["target_edges_total"] == pytest.approx(4.0)
+    assert summary["pred_target_edge_ratio"] == pytest.approx(1.5)
+    assert summary["probability_ge_threshold_fraction"] == pytest.approx(1.0)
+
+
 def test_evaluate_internal_validation_subgraphs_shards_rank_local_work_and_merges_summary(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

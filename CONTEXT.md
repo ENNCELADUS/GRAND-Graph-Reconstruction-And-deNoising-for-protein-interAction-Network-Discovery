@@ -12,6 +12,18 @@ The TCCIG evaluation procedure: score candidate protein pairs, predict an edge b
 `m_hat`, select the top-`m_hat` candidate edges, and evaluate the resulting hard graph
 with the existing PRING topology metrics.
 
+## Edge Probability
+
+A calibrated TCCIG candidate-pair score after sigmoid. Edge probabilities are used for
+ranking candidate pairs and calibration diagnostics; they are not by themselves the
+definition of the predicted graph.
+
+## Fixed Threshold Diagnostic
+
+An observability-only view of how many TCCIG edge probabilities cross a fixed threshold,
+usually `0.5`. It helps detect score saturation but does not define the primary TCCIG
+topology-monitor graph.
+
 ## Train-Only Topology Teacher
 
 An auxiliary graph autoencoder trained only on training subgraphs. It provides soft

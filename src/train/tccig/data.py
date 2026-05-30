@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import cast
 
 import networkx as nx
 import torch
@@ -50,6 +52,9 @@ class TCCIGDataContext:
     best_checkpoint_path: Path
     metrics_path: Path
     csv_path: Path
+    density_prior_probability: float
+    density_prior_source: str
+    density_prior_bias: float
 
 
 def prepare_tccig_data_context(
@@ -129,6 +134,16 @@ def prepare_tccig_data_context(
     if internal_validation_plan.protein_ids:
         embedding_repository.preload(sorted(internal_validation_plan.protein_ids))
 
+    density_prior_probability, density_prior_source = _tccig_density_prior(
+        train_graph=train_graph,
+        train_negative_lookup=train_negative_lookup,
+        negative_ratio=train_cfg.negative_ratio,
+    )
+    density_prior_bias = _initialize_tccig_density_bias(
+        model=model,
+        positive_edge_probability=density_prior_probability,
+        accelerator=accelerator,
+    )
     evaluator = Evaluator(
         metrics=["auprc"],
         loss_config=_build_loss_config(training_cfg),
@@ -157,4 +172,67 @@ def prepare_tccig_data_context(
         best_checkpoint_path=model_dir / "best_model.pth",
         metrics_path=log_dir / "tccig_train_metrics.json",
         csv_path=log_dir / "tccig_train_step.csv",
+        density_prior_probability=density_prior_probability,
+        density_prior_source=density_prior_source,
+        density_prior_bias=density_prior_bias,
     )
+
+
+def _graph_positive_edge_probability(graph: nx.Graph) -> float:
+    """Return the full train-graph positive-edge density."""
+    num_nodes = graph.number_of_nodes()
+    if num_nodes < 2:
+        raise ValueError("TCCIG density-bias initialization requires at least 2 train nodes")
+    possible_edges = num_nodes * (num_nodes - 1) / 2.0
+    return float(graph.number_of_edges() / possible_edges)
+
+
+def _supervised_positive_probability(
+    *,
+    train_graph: nx.Graph,
+    train_negative_lookup: ExplicitNegativePairLookup,
+    negative_ratio: int,
+) -> float | None:
+    """Return the supervised BCE positive rate when explicit negatives exist."""
+    positive_count = int(train_graph.number_of_edges())
+    if positive_count <= 0 or negative_ratio <= 0 or not train_negative_lookup.negative_pairs:
+        return None
+    negative_count = min(len(train_negative_lookup.negative_pairs), positive_count * negative_ratio)
+    if negative_count <= 0:
+        return None
+    return float(positive_count / float(positive_count + negative_count))
+
+
+def _tccig_density_prior(
+    *,
+    train_graph: nx.Graph,
+    train_negative_lookup: ExplicitNegativePairLookup,
+    negative_ratio: int,
+) -> tuple[float, str]:
+    """Return the preferred sparse prior for TCCIG density-bias initialization."""
+    supervised_probability = _supervised_positive_probability(
+        train_graph=train_graph,
+        train_negative_lookup=train_negative_lookup,
+        negative_ratio=negative_ratio,
+    )
+    if supervised_probability is not None:
+        return supervised_probability, "supervised_bce"
+    return _graph_positive_edge_probability(train_graph), "graph_density"
+
+
+def _initialize_tccig_density_bias(
+    *,
+    model: nn.Module,
+    positive_edge_probability: float,
+    accelerator: AcceleratorLike,
+) -> float:
+    """Initialize a TCCIG model's density-bias head from a sparse prior."""
+    unwrap_model = getattr(accelerator, "unwrap_model", None)
+    unwrapped_model = cast(nn.Module, unwrap_model(model)) if callable(unwrap_model) else model
+    initializer = getattr(unwrapped_model, "initialize_density_bias_with_prior", None)
+    if not callable(initializer):
+        raise ValueError("tccig_train requires initialize_density_bias_with_prior on the model")
+    bias_value = float(initializer(positive_edge_probability))
+    if not math.isfinite(bias_value):
+        raise ValueError("TCCIG density-bias initialization produced a non-finite bias")
+    return bias_value

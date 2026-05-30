@@ -131,6 +131,13 @@ class TCCIGTrainRunner:
                 train_cfg.internal_validation_compute_spectral_stats
             ),
         )
+        log_stage_event(
+            self.logger,
+            "density_bias_initialized",
+            positive_edge_probability=data_context.density_prior_probability,
+            source=data_context.density_prior_source,
+            bias=data_context.density_prior_bias,
+        )
 
     def _run_epochs(
         self,
@@ -143,6 +150,8 @@ class TCCIGTrainRunner:
     ) -> Path:
         best_metrics: dict[str, float | str] = {}
         previous_topology_loss_scale: float | None = None
+        best_auprc_value = float("-inf")
+        best_auprc_epoch = 0
 
         for epoch in range(train_cfg.epochs):
             epoch_start = time.perf_counter()
@@ -181,6 +190,11 @@ class TCCIGTrainRunner:
                 val_total_loss=validation_result.val_total_loss,
                 val_topology_loss=validation_result.val_topology_loss,
             )
+            current_auprc = float(validation_result.val_pair_stats.get("val_auprc", 0.0))
+            best_auprc_improved = current_auprc > best_auprc_value
+            if best_auprc_improved:
+                best_auprc_value = current_auprc
+                best_auprc_epoch = epoch + 1
             should_stop, saved_metrics = self._persist_epoch_result(
                 stage_model=stage_model,
                 train_cfg=train_cfg,
@@ -191,6 +205,9 @@ class TCCIGTrainRunner:
                 validation_result=validation_result,
                 monitor_value=monitor_value,
                 peak_gpu_mem_mb=peak_gpu_mem_mb,
+                best_auprc_epoch=best_auprc_epoch,
+                best_auprc_value=best_auprc_value,
+                best_auprc_improved=best_auprc_improved,
             )
             if saved_metrics is not None:
                 best_metrics = saved_metrics
@@ -221,6 +238,9 @@ class TCCIGTrainRunner:
         validation_result: topology_train.ValidationEpochResult,
         monitor_value: float,
         peak_gpu_mem_mb: float,
+        best_auprc_epoch: int,
+        best_auprc_value: float,
+        best_auprc_improved: bool,
     ) -> tuple[bool, dict[str, float | str] | None]:
         should_stop = False
         save_best_checkpoint = False
@@ -252,6 +272,16 @@ class TCCIGTrainRunner:
                     train_stats=train_stats,
                     validation_result=validation_result,
                 )
+                saved_metrics.update(
+                    {
+                        "best_topology_epoch": float(epoch + 1),
+                        "best_topology_auprc": float(
+                            validation_result.val_pair_stats.get("val_auprc", 0.0)
+                        ),
+                        "best_auprc_epoch": float(best_auprc_epoch),
+                        "best_auprc": float(best_auprc_value),
+                    }
+                )
                 data_context.metrics_path.write_text(
                     json.dumps(format_result_payload(saved_metrics), indent=2, sort_keys=True),
                     encoding="utf-8",
@@ -263,6 +293,19 @@ class TCCIGTrainRunner:
                     monitor=train_cfg.monitor_metric,
                     value=monitor_value,
                 )
+        elif self.runtime.is_main_process and data_context.metrics_path.exists():
+            self._update_best_auprc_metrics(
+                metrics_path=data_context.metrics_path,
+                best_auprc_epoch=best_auprc_epoch,
+                best_auprc_value=best_auprc_value,
+            )
+        if self.runtime.is_main_process and best_auprc_improved:
+            log_stage_event(
+                self.logger,
+                "best_auprc_observed",
+                epoch=best_auprc_epoch,
+                value=best_auprc_value,
+            )
         self._log_epoch_done(
             epoch=epoch,
             train_stats=train_stats,
@@ -270,6 +313,21 @@ class TCCIGTrainRunner:
             peak_gpu_mem_mb=peak_gpu_mem_mb,
         )
         return should_stop, saved_metrics
+
+    @staticmethod
+    def _update_best_auprc_metrics(
+        *,
+        metrics_path: Path,
+        best_auprc_epoch: int,
+        best_auprc_value: float,
+    ) -> None:
+        payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+        payload["best_auprc_epoch"] = float(best_auprc_epoch)
+        payload["best_auprc"] = float(best_auprc_value)
+        metrics_path.write_text(
+            json.dumps(format_result_payload(payload), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
 
     def _log_epoch_done(
         self,
