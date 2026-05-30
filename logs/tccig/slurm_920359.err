@@ -1,0 +1,210 @@
+/bin/bash: warning: setlocale: LC_ALL: cannot change locale (C.UTF-8)
+Warning: torch was built against CUDA 12.8, but using toolkit 12.5 at /public/software/CUDA/cuda-12.5.
+Set GRAND_CUDA_VERSION or CUDA_HOME to an exact-match toolkit to avoid DS_SKIP_CUDA_CHECK=1.
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+INFO:src.pipeline.__main__:Loaded config: configs/tccig/01.yaml
+WARNING:accelerate.utils.other:[RANK 0] Detected kernel version 3.10.0, which is below the recommended minimum of 5.5.0; this can cause the process to hang. It is recommended to upgrade the kernel to the minimum version or higher.
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+
+2026-05-30 16:18:28 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-05-30 16:18:37 INFO Stage Start | Init Mode: scratch | Run Id: tccig_scratch
+2026-05-30 16:19:11 INFO Tccig Train Config | Epochs: 20 | Internal Validation Compute Spectral Stats: False | Internal Validation Inference Batch Size: 1024 | Internal Validation Node Sizes: [20, 40, 60, 80, 100] | Internal Validation Pairs: 108500 | Internal Validation Subgraphs: 50 | Monitor: val_topology_loss | Pair Batch Size: 32
+2026-05-30 16:22:31 INFO Epoch Progress | Epoch: 1 | Loss: 0.600 | Progress: 0% | Step: 1/329
+2026-05-30 16:23:03 INFO Epoch Progress | Epoch: 1 | Loss: 3.424 | Progress: 25% | Step: 83/329
+2026-05-30 16:23:34 INFO Epoch Progress | Epoch: 1 | Loss: 3.176 | Progress: 50% | Step: 166/329
+2026-05-30 16:24:05 INFO Epoch Progress | Epoch: 1 | Loss: 2.873 | Progress: 76% | Step: 249/329
+2026-05-30 16:24:35 INFO Epoch Progress | Epoch: 1 | Loss: 2.626 | Progress: 100% | Step: 329/329
+2026-05-30 16:32:43 INFO Best Saved | Epoch: 1 | Monitor: val_topology_loss | Value: 222.804
+2026-05-30 16:32:43 INFO Epoch Done | All Subgraph Pairs: 3221295 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.178 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.063 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 196.713 | Epoch: 1 | Internal Val Graph Sim: 0.105 | Internal Val Topology S: 279.625 | Mean Positive Edge Reuse: 1.000 | Peak Gpu Mem Mb: 23899.291 | Planned Subgraphs: 1316 | Positive Edge Coverage Ratio: 1.000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.000 | Total Positive Edges: 48771 | Train Forward Backward S: 125.244 | Train Loss: 2.641 | Val AUPRC: 0.500 | Val Pair Pass S: 207.815 | Val Threshold S: 0.000
+2026-05-30 16:35:59 INFO Epoch Progress | Epoch: 2 | Loss: 1.691 | Progress: 0% | Step: 1/329
+2026-05-30 16:36:31 INFO Epoch Progress | Epoch: 2 | Loss: 1.508 | Progress: 25% | Step: 83/329
+2026-05-30 16:37:03 INFO Epoch Progress | Epoch: 2 | Loss: 1.356 | Progress: 50% | Step: 166/329
+2026-05-30 16:37:36 INFO Epoch Progress | Epoch: 2 | Loss: 1.229 | Progress: 76% | Step: 249/329
+2026-05-30 16:38:07 INFO Epoch Progress | Epoch: 2 | Loss: 1.123 | Progress: 100% | Step: 329/329
+2026-05-30 16:46:41 INFO Epoch Done | All Subgraph Pairs: 3221295 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.178 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.063 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 199.464 | Epoch: 2 | Internal Val Graph Sim: 0.105 | Internal Val Topology S: 287.544 | Mean Positive Edge Reuse: 1.000 | Peak Gpu Mem Mb: 23899.291 | Planned Subgraphs: 1316 | Positive Edge Coverage Ratio: 1.000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.000 | Total Positive Edges: 48771 | Train Forward Backward S: 129.403 | Train Loss: 1.130 | Val AUPRC: 0.665 | Val Pair Pass S: 214.903 | Val Threshold S: 0.000
+2026-05-30 16:50:09 INFO Epoch Progress | Epoch: 3 | Loss: 0.719 | Progress: 0% | Step: 1/330
+2026-05-30 16:50:42 INFO Epoch Progress | Epoch: 3 | Loss: 0.689 | Progress: 25% | Step: 83/330
+2026-05-30 16:51:16 INFO Epoch Progress | Epoch: 3 | Loss: 0.673 | Progress: 50% | Step: 166/330
+2026-05-30 16:51:49 INFO Epoch Progress | Epoch: 3 | Loss: 0.661 | Progress: 75% | Step: 249/330
+2026-05-30 16:52:20 INFO Epoch Progress | Epoch: 3 | Loss: 0.648 | Progress: 100% | Step: 330/330
+2026-05-30 17:00:41 INFO Epoch Done | All Subgraph Pairs: 3224455 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.178 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.063 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 200.682 | Epoch: 3 | Internal Val Graph Sim: 0.105 | Internal Val Topology S: 283.183 | Mean Positive Edge Reuse: 1.000 | Peak Gpu Mem Mb: 23899.291 | Planned Subgraphs: 1317 | Positive Edge Coverage Ratio: 1.000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.000 | Total Positive Edges: 48771 | Train Forward Backward S: 130.841 | Train Loss: 0.645 | Val AUPRC: 0.671 | Val Pair Pass S: 217.125 | Val Threshold S: 0.000
+2026-05-30 17:04:05 INFO Epoch Progress | Epoch: 4 | Loss: 0.565 | Progress: 0% | Step: 1/330
+2026-05-30 17:04:38 INFO Epoch Progress | Epoch: 4 | Loss: 0.587 | Progress: 25% | Step: 83/330
+2026-05-30 17:05:11 INFO Epoch Progress | Epoch: 4 | Loss: 0.589 | Progress: 50% | Step: 166/330
+2026-05-30 17:05:43 INFO Epoch Progress | Epoch: 4 | Loss: 0.584 | Progress: 75% | Step: 249/330
+2026-05-30 17:06:14 INFO Epoch Progress | Epoch: 4 | Loss: 0.580 | Progress: 100% | Step: 330/330
+2026-05-30 17:14:40 INFO Epoch Done | All Subgraph Pairs: 3224455 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.178 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.063 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 203.095 | Epoch: 4 | Internal Val Graph Sim: 0.105 | Internal Val Topology S: 286.792 | Mean Positive Edge Reuse: 1.000 | Peak Gpu Mem Mb: 23899.291 | Planned Subgraphs: 1317 | Positive Edge Coverage Ratio: 1.000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.000 | Total Positive Edges: 48771 | Train Forward Backward S: 129.857 | Train Loss: 0.578 | Val AUPRC: 0.681 | Val Pair Pass S: 216.135 | Val Threshold S: 0.000
+2026-05-30 17:18:16 INFO Epoch Progress | Epoch: 5 | Loss: 0.599 | Progress: 0% | Step: 1/330
+2026-05-30 17:18:51 INFO Epoch Progress | Epoch: 5 | Loss: 0.565 | Progress: 25% | Step: 83/330
+2026-05-30 17:19:24 INFO Epoch Progress | Epoch: 5 | Loss: 0.563 | Progress: 50% | Step: 166/330
+2026-05-30 17:19:57 INFO Epoch Progress | Epoch: 5 | Loss: 0.563 | Progress: 75% | Step: 249/330
+2026-05-30 17:20:29 INFO Epoch Progress | Epoch: 5 | Loss: 0.562 | Progress: 100% | Step: 330/330
+2026-05-30 17:28:56 INFO Epoch Done | All Subgraph Pairs: 3224455 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.178 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.063 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 210.733 | Epoch: 5 | Internal Val Graph Sim: 0.105 | Internal Val Topology S: 292.140 | Mean Positive Edge Reuse: 1.000 | Peak Gpu Mem Mb: 23899.291 | Planned Subgraphs: 1317 | Positive Edge Coverage Ratio: 1.000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.000 | Total Positive Edges: 48771 | Train Forward Backward S: 132.833 | Train Loss: 0.563 | Val AUPRC: 0.688 | Val Pair Pass S: 214.788 | Val Threshold S: 0.000
+2026-05-30 17:28:56 INFO Early Stop | Epoch: 5
+2026-05-30 17:28:56 INFO Stage Done | Run Id: tccig_scratch
+2026-05-30 17:28:56 INFO Stage Start | Checkpoint: models/tccig/tccig_train/tccig_scratch/best_model.pth | Run Id: tccig_scratch
+2026-05-30 17:28:56 INFO Checkpoint Loaded | Path: models/tccig/tccig_train/tccig_scratch/best_model.pth
+2026-05-30 17:28:56 INFO Decision Threshold | Mode: fixed | Value: 0.500
+2026-05-30 17:37:32 INFO Evaluation Metrics | Accuracy: 0.500 | AUPRC: 0.500 | Auroc: 0.500 | F1: 0.667 | Mcc: 0.000 | Precision: 0.500 | Recall: 1.000 | Sensitivity: 1.000 | Specificity: 0.000 | Split: test
+2026-05-30 17:37:32 INFO CSV Written | Path: logs/tccig/evaluate/tccig_scratch/evaluate.csv
+2026-05-30 17:37:32 INFO Stage Done | Run Id: tccig_scratch
+2026-05-30 17:37:32 INFO Stage Start | Checkpoint: models/tccig/tccig_train/tccig_scratch/best_model.pth | Run Id: tccig_scratch
+2026-05-30 17:37:32 INFO Decision Threshold | Mode: fixed | Value: 0.500
+2026-05-30 17:38:19 INFO Topology Inference Ready | Cached Embedding Count: 2017 | Distributed: True | Pair Count: 2035153 | World Size: 4
+[rank3]: Traceback (most recent call last):
+[rank3]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank3]:   File "<frozen runpy>", line 88, in _run_code
+[rank3]:   File "/public/home/wangar2023/grand/src/run.py", line 21, in <module>
+[rank3]:     _main()
+[rank3]:   File "/public/home/wangar2023/grand/src/run.py", line 17, in _main
+[rank3]:     main()
+[rank3]:   File "/public/home/wangar2023/grand/src/pipeline/__main__.py", line 22, in main
+[rank3]:     execute_pipeline(config.raw)
+[rank3]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 157, in execute_pipeline
+[rank3]:     execute_pipeline_with_runtime(
+[rank3]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 292, in execute_pipeline_with_runtime
+[rank3]:     run_topology_evaluation_stage_fn(
+[rank3]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_evaluate.py", line 718, in run_topology_evaluation_stage
+[rank3]:     predictions = _predict_tccig_graph_assembly_labels(
+[rank3]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_evaluate.py", line 435, in _predict_tccig_graph_assembly_labels
+[rank3]:     decode_graph_candidates(
+[rank3]:   File "/public/home/wangar2023/grand/src/model/tccig.py", line 324, in decode_graph_candidates
+[rank3]:     pairs = self._validate_candidate_pairs(
+[rank3]:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank3]:   File "/public/home/wangar2023/grand/src/model/tccig.py", line 227, in _validate_candidate_pairs
+[rank3]:     raise ValueError("candidate_pairs must not contain self edges")
+[rank3]: ValueError: candidate_pairs must not contain self edges
+[rank2]: Traceback (most recent call last):
+[rank2]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank2]:   File "<frozen runpy>", line 88, in _run_code
+[rank2]:   File "/public/home/wangar2023/grand/src/run.py", line 21, in <module>
+[rank2]:     _main()
+[rank2]:   File "/public/home/wangar2023/grand/src/run.py", line 17, in _main
+[rank2]:     main()
+[rank2]:   File "/public/home/wangar2023/grand/src/pipeline/__main__.py", line 22, in main
+[rank2]:     execute_pipeline(config.raw)
+[rank2]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 157, in execute_pipeline
+[rank2]:     execute_pipeline_with_runtime(
+[rank2]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 292, in execute_pipeline_with_runtime
+[rank2]:     run_topology_evaluation_stage_fn(
+[rank2]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_evaluate.py", line 718, in run_topology_evaluation_stage
+[rank2]:     predictions = _predict_tccig_graph_assembly_labels(
+[rank2]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_evaluate.py", line 435, in _predict_tccig_graph_assembly_labels
+[rank2]:     decode_graph_candidates(
+[rank2]:   File "/public/home/wangar2023/grand/src/model/tccig.py", line 324, in decode_graph_candidates
+[rank2]:     pairs = self._validate_candidate_pairs(
+[rank2]:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank2]:   File "/public/home/wangar2023/grand/src/model/tccig.py", line 227, in _validate_candidate_pairs
+[rank2]:     raise ValueError("candidate_pairs must not contain self edges")
+[rank2]: ValueError: candidate_pairs must not contain self edges
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank0]:   File "<frozen runpy>", line 88, in _run_code
+[rank0]:   File "/public/home/wangar2023/grand/src/run.py", line 21, in <module>
+[rank0]:     _main()
+[rank0]:   File "/public/home/wangar2023/grand/src/run.py", line 17, in _main
+[rank0]:     main()
+[rank0]:   File "/public/home/wangar2023/grand/src/pipeline/__main__.py", line 22, in main
+[rank0]:     execute_pipeline(config.raw)
+[rank0]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 157, in execute_pipeline
+[rank0]:     execute_pipeline_with_runtime(
+[rank0]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 292, in execute_pipeline_with_runtime
+[rank0]:     run_topology_evaluation_stage_fn(
+[rank0]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_evaluate.py", line 718, in run_topology_evaluation_stage
+[rank0]:     predictions = _predict_tccig_graph_assembly_labels(
+[rank0]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_evaluate.py", line 435, in _predict_tccig_graph_assembly_labels
+[rank0]:     decode_graph_candidates(
+[rank0]:   File "/public/home/wangar2023/grand/src/model/tccig.py", line 324, in decode_graph_candidates
+[rank0]:     pairs = self._validate_candidate_pairs(
+[rank0]:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank0]:   File "/public/home/wangar2023/grand/src/model/tccig.py", line 227, in _validate_candidate_pairs
+[rank0]:     raise ValueError("candidate_pairs must not contain self edges")
+[rank0]: ValueError: candidate_pairs must not contain self edges
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "<frozen runpy>", line 198, in _run_module_as_main
+[rank1]:   File "<frozen runpy>", line 88, in _run_code
+[rank1]:   File "/public/home/wangar2023/grand/src/run.py", line 21, in <module>
+[rank1]:     _main()
+[rank1]:   File "/public/home/wangar2023/grand/src/run.py", line 17, in _main
+[rank1]:     main()
+[rank1]:   File "/public/home/wangar2023/grand/src/pipeline/__main__.py", line 22, in main
+[rank1]:     execute_pipeline(config.raw)
+[rank1]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 157, in execute_pipeline
+[rank1]:     execute_pipeline_with_runtime(
+[rank1]:   File "/public/home/wangar2023/grand/src/pipeline/engine.py", line 292, in execute_pipeline_with_runtime
+[rank1]:     run_topology_evaluation_stage_fn(
+[rank1]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_evaluate.py", line 718, in run_topology_evaluation_stage
+[rank1]:     predictions = _predict_tccig_graph_assembly_labels(
+[rank1]:                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/src/pipeline/stages/topology_evaluate.py", line 435, in _predict_tccig_graph_assembly_labels
+[rank1]:     decode_graph_candidates(
+[rank1]:   File "/public/home/wangar2023/grand/src/model/tccig.py", line 324, in decode_graph_candidates
+[rank1]:     pairs = self._validate_candidate_pairs(
+[rank1]:             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+[rank1]:   File "/public/home/wangar2023/grand/src/model/tccig.py", line 227, in _validate_candidate_pairs
+[rank1]:     raise ValueError("candidate_pairs must not contain self edges")
+[rank1]: ValueError: candidate_pairs must not contain self edges
+W0530 17:38:33.928000 118738 .venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 118823 closing signal SIGTERM
+W0530 17:38:33.931000 118738 .venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 118824 closing signal SIGTERM
+W0530 17:38:33.932000 118738 .venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:1010] Sending process 118826 closing signal SIGTERM
+E0530 17:38:36.305000 118738 .venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/api.py:984] failed (exitcode: 1) local_rank: 2 (pid: 118825) of binary: /public/home/wangar2023/grand/.venv/bin/python3
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/run.py", line 995, in <module>
+    main()
+  File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^
+  File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/run.py", line 991, in main
+    run(args)
+  File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/run.py", line 982, in run
+    elastic_launch(
+  File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: 
+============================================================
+src.run FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-05-30_17:38:36
+  host      : hexm03
+  rank      : 0 (local_rank: 0)
+  exitcode  : 1 (pid: 118823)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[2]:
+  time      : 2026-05-30_17:38:36
+  host      : hexm03
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 118824)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+[3]:
+  time      : 2026-05-30_17:38:36
+  host      : hexm03
+  rank      : 3 (local_rank: 3)
+  exitcode  : 1 (pid: 118826)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-05-30_17:38:33
+  host      : hexm03
+  rank      : 2 (local_rank: 2)
+  exitcode  : 1 (pid: 118825)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================
