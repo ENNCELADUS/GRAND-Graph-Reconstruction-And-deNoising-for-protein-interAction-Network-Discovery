@@ -575,26 +575,27 @@ def compute_tccig_losses(
     teacher_probabilities: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute enabled TCCIG losses and skip disabled terms entirely."""
-    resolved_labels = labels.to(device=logits.device, dtype=logits.dtype)
+    loss_logits = logits.float()
+    resolved_labels = labels.to(device=loss_logits.device, dtype=loss_logits.dtype)
     edge_labels = (
         resolved_labels
         if bce_labels is None
-        else bce_labels.to(device=logits.device, dtype=logits.dtype)
+        else bce_labels.to(device=loss_logits.device, dtype=loss_logits.dtype)
     )
     edge_loss = (
-        _masked_bce(logits=logits, labels=edge_labels, mask=bce_mask)
+        _masked_bce(logits=loss_logits, labels=edge_labels, mask=bce_mask)
         if weights.edge != 0.0
-        else _zero_like(logits)
+        else _zero_like(loss_logits)
     )
     teacher = (
-        _teacher_loss(logits=logits, teacher_probabilities=teacher_probabilities)
+        _teacher_loss(logits=loss_logits, teacher_probabilities=teacher_probabilities)
         if weights.teacher != 0.0
-        else _zero_like(logits)
+        else _zero_like(loss_logits)
     )
     budget = (
-        _budget_loss(m_hat=m_hat, labels=resolved_labels)
+        _budget_loss(m_hat=m_hat.float(), labels=resolved_labels)
         if weights.budget != 0.0
-        else _zero_like(logits)
+        else _zero_like(loss_logits)
     )
 
     topology_weight_config = TopologyLossWeights(
@@ -612,28 +613,28 @@ def compute_tccig_losses(
             num_nodes=num_nodes,
             pair_index_a=pair_index_a,
             pair_index_b=pair_index_b,
-            pred_pair_probabilities=torch.sigmoid(logits),
+            pred_pair_probabilities=torch.sigmoid(loss_logits),
             target_pair_probabilities=resolved_labels,
             include_clustering_mmd=weights.clustering != 0.0,
         )
         if should_compute_topology
         else {
-            "relative_density": _zero_like(logits),
-            "degree_mmd": _zero_like(logits),
-            "clustering_mmd": _zero_like(logits),
-            "total_topology": _zero_like(logits),
+            "relative_density": _zero_like(loss_logits),
+            "degree_mmd": _zero_like(loss_logits),
+            "clustering_mmd": _zero_like(loss_logits),
+            "total_topology": _zero_like(loss_logits),
         }
     )
 
-    rank = _zero_like(logits)
-    module = _zero_like(logits)
-    spectral = _zero_like(logits)
+    rank = _zero_like(loss_logits)
+    module = _zero_like(loss_logits)
+    spectral = _zero_like(loss_logits)
     calibration = (
-        functional.mse_loss(torch.sigmoid(logits), resolved_labels)
+        functional.mse_loss(torch.sigmoid(loss_logits), resolved_labels)
         if weights.calibration != 0.0
-        else _zero_like(logits)
+        else _zero_like(loss_logits)
     )
-    sparse = torch.sigmoid(logits).mean() if weights.sparse != 0.0 else _zero_like(logits)
+    sparse = torch.sigmoid(loss_logits).mean() if weights.sparse != 0.0 else _zero_like(loss_logits)
 
     total = (
         weights.edge * edge_loss

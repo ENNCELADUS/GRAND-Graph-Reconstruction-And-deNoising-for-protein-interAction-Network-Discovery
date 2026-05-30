@@ -137,3 +137,35 @@ def test_tccig_loss_requires_teacher_probabilities_when_enabled() -> None:
             m_hat=torch.tensor(1.5),
             weights=TCCIGLossWeights(teacher=0.1),
         )
+
+
+def test_tccig_loss_stays_finite_for_saturated_half_precision_logits() -> None:
+    num_nodes = 40
+    candidate_pairs = torch.triu_indices(num_nodes, num_nodes, offset=1)
+    logits = torch.full(
+        (candidate_pairs.size(1),),
+        -100.0,
+        dtype=torch.float16,
+        requires_grad=True,
+    )
+    labels = torch.zeros(candidate_pairs.size(1), dtype=torch.float16)
+    labels[:16] = 1.0
+
+    losses = compute_tccig_losses(
+        logits=logits,
+        labels=labels,
+        pair_index_a=candidate_pairs[0],
+        pair_index_b=candidate_pairs[1],
+        num_nodes=num_nodes,
+        m_hat=torch.tensor(0.0, dtype=torch.float16),
+        weights=TCCIGLossWeights(
+            teacher=0.0,
+            budget=0.1,
+            density=0.1,
+            degree=0.05,
+            clustering=0.02,
+        ),
+    )
+
+    assert torch.isfinite(losses["total"])
+    assert torch.isfinite(losses["relative_density"])
