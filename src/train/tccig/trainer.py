@@ -150,75 +150,74 @@ class TCCIGStudentTrainer:
                 model=self.model,
                 sync_gradients=is_window_boundary,
             ):
-                with self.accelerator.autocast():
-                    protein_embeddings, protein_lengths = _load_graph_inputs(
-                        nodes=task.nodes,
-                        embedding_repository=self.embedding_repository,
-                        device=self.device,
+                protein_embeddings, protein_lengths = _load_graph_inputs(
+                    nodes=task.nodes,
+                    embedding_repository=self.embedding_repository,
+                    device=self.device,
+                )
+                output = cast(
+                    dict[str, torch.Tensor],
+                    graph_model.forward_graph(
+                        protein_embeddings=protein_embeddings,
+                        protein_lengths=protein_lengths,
+                    ),
+                )
+                logits = topology_train._squeeze_binary_logits(output["logits"])
+                candidate_pairs = output["candidate_pairs"]
+                labels, bce_labels, bce_mask = _candidate_supervision(
+                    graph=self.graph,
+                    nodes=task.nodes,
+                    candidate_pairs=candidate_pairs,
+                    assigned_positive_edges=task.assigned_positive_edges,
+                    assigned_negative_edges=task.assigned_negative_edges,
+                    device=self.device,
+                )
+                positive_edges = _positive_edge_index_for_nodes(
+                    graph=self.graph,
+                    nodes=task.nodes,
+                    device=self.device,
+                )
+                teacher_probabilities: torch.Tensor | None = None
+                effective_weights = loss_weights
+                should_distill = (
+                    self.teacher is not None
+                    and loss_weights.teacher != 0.0
+                    and positive_edges.size(1) > 0
+                )
+                if should_distill and self.teacher is not None:
+                    node_features = _masked_mean_pool_embeddings(
+                        protein_embeddings=protein_embeddings,
+                        protein_lengths=protein_lengths,
                     )
-                    output = cast(
-                        dict[str, torch.Tensor],
-                        graph_model.forward_graph(
-                            protein_embeddings=protein_embeddings,
-                            protein_lengths=protein_lengths,
-                        ),
-                    )
-                    logits = topology_train._squeeze_binary_logits(output["logits"])
-                    candidate_pairs = output["candidate_pairs"]
-                    labels, bce_labels, bce_mask = _candidate_supervision(
-                        graph=self.graph,
-                        nodes=task.nodes,
+                    teacher_probabilities = self.teacher.train_and_score(
+                        node_features=node_features,
+                        positive_edges=positive_edges,
                         candidate_pairs=candidate_pairs,
-                        assigned_positive_edges=task.assigned_positive_edges,
-                        assigned_negative_edges=task.assigned_negative_edges,
+                        seed=epoch_seed + task_index,
                         device=self.device,
+                        accelerator=self.accelerator,
+                        loss_scale=0.0 if task.is_padding else 1.0,
                     )
-                    positive_edges = _positive_edge_index_for_nodes(
-                        graph=self.graph,
-                        nodes=task.nodes,
-                        device=self.device,
-                    )
-                    teacher_probabilities: torch.Tensor | None = None
-                    effective_weights = loss_weights
-                    should_distill = (
-                        self.teacher is not None
-                        and loss_weights.teacher != 0.0
-                        and positive_edges.size(1) > 0
-                    )
-                    if should_distill and self.teacher is not None:
-                        node_features = _masked_mean_pool_embeddings(
-                            protein_embeddings=protein_embeddings,
-                            protein_lengths=protein_lengths,
-                        )
-                        teacher_probabilities = self.teacher.train_and_score(
-                            node_features=node_features,
-                            positive_edges=positive_edges,
-                            candidate_pairs=candidate_pairs,
-                            seed=epoch_seed + task_index,
-                            device=self.device,
-                            accelerator=self.accelerator,
-                            loss_scale=0.0 if task.is_padding else 1.0,
-                        )
-                    else:
-                        effective_weights = replace(effective_weights, teacher=0.0)
-                    losses = compute_tccig_losses(
-                        logits=logits,
-                        labels=labels,
-                        bce_labels=bce_labels,
-                        bce_mask=bce_mask,
-                        pair_index_a=candidate_pairs[0],
-                        pair_index_b=candidate_pairs[1],
-                        num_nodes=len(task.nodes),
-                        m_hat=output["m_hat"],
-                        weights=effective_weights,
-                        teacher_probabilities=teacher_probabilities,
-                    )
-                    total_loss = losses["total"]
-                    backward_loss = total_loss * 0.0 if task.is_padding else total_loss
-                    topology_losses = _topology_losses_for_aggregates(
-                        losses=losses,
-                        reference=losses["edge"],
-                    )
+                else:
+                    effective_weights = replace(effective_weights, teacher=0.0)
+                losses = compute_tccig_losses(
+                    logits=logits,
+                    labels=labels,
+                    bce_labels=bce_labels,
+                    bce_mask=bce_mask,
+                    pair_index_a=candidate_pairs[0],
+                    pair_index_b=candidate_pairs[1],
+                    num_nodes=len(task.nodes),
+                    m_hat=output["m_hat"],
+                    weights=effective_weights,
+                    teacher_probabilities=teacher_probabilities,
+                )
+                total_loss = losses["total"]
+                backward_loss = total_loss * 0.0 if task.is_padding else total_loss
+                topology_losses = _topology_losses_for_aggregates(
+                    losses=losses,
+                    reference=losses["edge"],
+                )
 
                 self.accelerator.backward(backward_loss / float(current_window_size))
                 if is_window_boundary:

@@ -259,6 +259,7 @@ def test_tccig_student_trainer_runs_online_teacher_for_padding_task(
 
     assert teacher.training_steps == 2
     assert accelerator.backward_calls == 4
+    assert accelerator.autocast_calls == 0
 
 
 def test_topology_finetune_rejects_tccig_graph_forward_model(tmp_path: Path) -> None:
