@@ -7,6 +7,7 @@ import os
 import pickle
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
+from copy import deepcopy
 from csv import DictReader
 from pathlib import Path
 from typing import cast
@@ -3729,7 +3730,8 @@ def test_0407_ablation_configs_use_warm_start_val_loss_recipe() -> None:
         assert topology_eval_cfg["inference_batch_size"] == 128
 
 
-def test_0426_large_n_ablation_configs_disable_finetune_clustering_mmd() -> None:
+def test_0426_large_n_ablation_configs_match_0407_ws_n40_except_size() -> None:
+    base_config = load_config("configs/v3/ablations/0407/ws_n40.yaml")
     expected_node_sizes = {
         "ws_n60.yaml": 60,
         "ws_n80.yaml": 80,
@@ -3741,22 +3743,31 @@ def test_0426_large_n_ablation_configs_disable_finetune_clustering_mmd() -> None
         config = load_config(config_path)
         run_cfg = config["run_config"]
         topology_cfg = config["topology_finetune"]
-        topology_eval_cfg = config["topology_evaluate"]
         assert isinstance(run_cfg, dict)
         assert isinstance(topology_cfg, dict)
-        assert isinstance(topology_eval_cfg, dict)
 
         run_id = f"ws_n{node_size}"
         assert run_cfg["topology_finetune_run_id"] == run_id
-        assert run_cfg["eval_run_id"] == run_id
-        assert run_cfg["topology_eval_run_id"] == run_id
+        assert run_cfg["eval_run_id"] == f"{run_id}_0.5"
+        assert run_cfg["topology_eval_run_id"] == f"{run_id}_0.5"
+        assert run_cfg["load_checkpoint_path"] == (
+            f"models/v3/topology_finetune/{run_id}/best_model.pth"
+        )
         assert topology_cfg["subgraph_node_range"] == [node_size, node_size]
-        assert topology_cfg["compute_clustering_mmd"] is False
-        assert topology_cfg["internal_validation_compute_clustering_mmd"] is False
-        assert topology_cfg["pair_batch_size"] == 32
-        assert topology_cfg["subgraphs_per_forward"] == 1
-        assert topology_eval_cfg["inference_batch_size"] == 128
-        assert "compute_clustering_mmd" not in topology_eval_cfg
+
+        normalized_config = deepcopy(config)
+        normalized_run_cfg = normalized_config["run_config"]
+        normalized_topology_cfg = normalized_config["topology_finetune"]
+        assert isinstance(normalized_run_cfg, dict)
+        assert isinstance(normalized_topology_cfg, dict)
+        normalized_run_cfg["topology_finetune_run_id"] = "ws_n40"
+        normalized_run_cfg["eval_run_id"] = "ws_n40_0.5"
+        normalized_run_cfg["topology_eval_run_id"] = "ws_n40_0.5"
+        normalized_run_cfg["load_checkpoint_path"] = (
+            "models/v3/topology_finetune/ws_n40/best_model.pth"
+        )
+        normalized_topology_cfg["subgraph_node_range"] = [40, 40]
+        assert normalized_config == base_config
 
 
 def test_0426_chunked_backward_configs_cover_large_and_range_n() -> None:
@@ -3764,8 +3775,7 @@ def test_0426_chunked_backward_configs_cover_large_and_range_n() -> None:
         config = load_config(Path("configs/v3/ablations/0426") / filename)
         topology_cfg = config["topology_finetune"]
         assert isinstance(topology_cfg, dict)
-        assert topology_cfg["chunked_backward"] is True
-        assert topology_cfg["compute_clustering_mmd"] is False
+        assert topology_cfg["subgraphs_per_forward"] == 1
 
     expected_ranges = {
         "ws_range_n20_60.yaml": ([20, 60], (20, 30, 40, 50, 60)),
