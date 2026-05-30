@@ -22,6 +22,20 @@ $$
 
 核心原则：**training 可以从 training graphs/source interactomes 学 topology prior；test-time 对 target unseen protein set 只能输入 intrinsic features，不能输入 target edges、degrees、neighborhoods、communities、Laplacian 或任何 target topology-derived signal。** 这直接对应 research_problem.md 的边界：graph 是 scientific object，不是 pairwise predictions 的可视化；edge probabilities 可以局部合理，但 thresholded graph 仍可能 density、hub、clustering、module structure 错误。
 
+## Implementation status: 2026-05-30
+
+当前 `tccig-train-stage` 分支实现的是这个 full design 的 v1 子集：
+
+- Public model: `src/model/tccig.py` registers `model_config.model: tccig` and exposes `forward_graph(...)` for feature-only graph scoring.
+- Config and launcher: canonical config is `configs/tccig/tccig.yaml`; canonical HPC launcher is `scripts/tccig.sh`.
+- Student path: cached protein embeddings → mean pooling/projection → set-summary conditioning → all-pairs candidate universe for sampled subgraphs, or PRING candidate records during topology evaluation.
+- Edge decoder: symmetric pair features, hub propensity, low-rank affinity, overlapping module memberships, set-level density bias, and learned `m_hat`.
+- Graph Assembly: topology evaluation encodes unique test proteins once, scores candidate records in chunks, and selects top-`m_hat` edges.
+- Train-only teacher: optional online MGAE teacher masks positive training edges and distills candidate-edge probabilities into the student.
+- Active losses: masked BCE edge loss, teacher distillation, budget, density, degree MMD, and optional clustering MMD.
+
+Not implemented yet: feature kNN/anchor candidate proposer, offline S2GAE/MaskGAE/Bandana teacher pretraining, spectral/module/ranking/calibration/sparsity losses as active nonzero objectives, and validation-calibrated threshold selection beyond the current top-`m_hat` assembly path.
+
 
 # 1. Overall pipeline
 

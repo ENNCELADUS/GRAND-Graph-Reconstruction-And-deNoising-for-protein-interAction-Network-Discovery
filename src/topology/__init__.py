@@ -16,9 +16,11 @@ from src.topology.finetune_data import (
     sample_training_subgraphs,
     summarize_edge_cover_epoch,
 )
-from src.topology.finetune_losses import (
+from src.topology.losses import (
+    TCCIGLossWeights,
     TopologyLossWeights,
     build_symmetric_adjacency,
+    compute_tccig_losses,
     compute_topology_losses,
     soft_graph_similarity_loss,
     soft_relative_density_loss,
@@ -42,6 +44,7 @@ __all__ = [
     "EdgeCoverEpochPlan",
     "ExplicitNegativePairLookup",
     "SubgraphPairChunk",
+    "TCCIGLossWeights",
     "TopologyLossWeights",
     "TOPOLOGY_EVAL_NODE_SIZES",
     "TOPOLOGY_EVAL_SAMPLES_PER_SIZE",
@@ -52,6 +55,7 @@ __all__ = [
     "compute_graph_similarity",
     "compute_normalized_mmd_ratio",
     "compute_relative_density",
+    "compute_tccig_losses",
     "compute_topology_losses",
     "evaluate_graph_samples",
     "evaluate_predicted_graph",

@@ -1,7 +1,7 @@
 # Repository Guidelines
 
 ## Quick Context
-- **What**: This project predicts protein–protein interactions using ESM-3 + downstream neural network classifiers.
+- **What**: This project predicts protein–protein interactions using ESM-3 + downstream neural network classifiers and feature-only graph generators.
 - **Goal**: Reproducible, config-driven pipelines for Pretraining, Finetuning, and Evaluation.
 - **Role**: Act as a careful junior engineer. Follow **Plan → Confirm → Code**.
 

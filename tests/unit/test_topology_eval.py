@@ -12,6 +12,7 @@ import pytest
 import torch
 from src.pipeline.runtime import DistributedContext
 from src.pipeline.stages.topology_evaluate import (
+    _assemble_top_m_hat_predictions,
     _gather_ordered_predictions,
     _ordered_predictions_from_shards,
     write_topology_predictions,
@@ -227,6 +228,15 @@ def test_write_topology_predictions_emits_pring_format(tmp_path: Path) -> None:
         "P3\tP4\t0",
         "P5\tP6\t1",
     ]
+
+
+def test_assemble_top_m_hat_predictions_uses_top_budget() -> None:
+    predictions = _assemble_top_m_hat_predictions(
+        probabilities=[0.2, 0.9, 0.4, 0.8],
+        m_hat=2.1,
+    )
+
+    assert predictions == [0, 1, 0, 1]
 
 
 def test_ordered_predictions_from_shards_restores_original_pair_order() -> None:

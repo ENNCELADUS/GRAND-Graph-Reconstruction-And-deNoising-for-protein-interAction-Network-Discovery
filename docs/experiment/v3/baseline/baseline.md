@@ -1,6 +1,6 @@
 # Topology Fine-Tuning Baseline: Methodology
 
-This document describes the implemented topology fine-tuning baseline in `src/pipeline/stages/topology_finetune.py`, `src/topology/finetune_data.py`, and `src/topology/finetune_losses.py`. The baseline fine-tunes the pairwise `v3` PPI scorer on edge-cover training subgraphs, using pairwise BCE supervision together with differentiable graph-topology objectives.
+This document describes the implemented topology fine-tuning baseline in `src/pipeline/stages/topology_finetune.py`, `src/topology/finetune_data.py`, and `src/topology/losses.py`. The baseline fine-tunes the pairwise `v3` PPI scorer on edge-cover training subgraphs, using pairwise BCE supervision together with differentiable graph-topology objectives.
 
 ## 1. Model and Data
 

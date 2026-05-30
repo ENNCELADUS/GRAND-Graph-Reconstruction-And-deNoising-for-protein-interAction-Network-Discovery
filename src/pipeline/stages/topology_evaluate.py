@@ -11,6 +11,7 @@ from typing import Any, cast
 
 import torch
 import torch.distributed as _dist
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, Dataset
 
 from src.embed import ensure_embeddings_ready
@@ -56,6 +57,31 @@ TOPOLOGY_CSV_COLUMNS = [
     *TOPOLOGY_METRIC_NAMES,
 ]
 EXPECTED_STRATEGIES = {"BFS", "DFS", "RANDOM_WALK"}
+
+
+class TopologyLoaderBundle(tuple):
+    """Three-item loader tuple with access to the backing PRING dataset."""
+
+    data_loader: DataLoader[dict[str, object]]
+    records: list[tuple[str, str]]
+    cached_embedding_count: int
+    dataset: PRINGPairDataset
+
+    def __new__(
+        cls,
+        *,
+        data_loader: DataLoader[dict[str, object]],
+        records: list[tuple[str, str]],
+        cached_embedding_count: int,
+        dataset: PRINGPairDataset,
+    ) -> TopologyLoaderBundle:
+        """Create a backwards-compatible three-item topology loader bundle."""
+        value = super().__new__(cls, (data_loader, records, cached_embedding_count))
+        value.data_loader = data_loader
+        value.records = records
+        value.cached_embedding_count = cached_embedding_count
+        value.dataset = dataset
+        return value
 
 
 def write_topology_predictions(
@@ -124,7 +150,7 @@ def _build_topology_loader(
     *,
     config: ConfigDict,
     split_path: Path,
-) -> tuple[DataLoader[dict[str, object]], list[tuple[str, str]], int]:
+) -> TopologyLoaderBundle:
     """Build deterministic topology inference loader for embedding-backed models."""
     model_cfg = get_section(config, "model_config")
     data_cfg = get_section(config, "data_config")
@@ -188,7 +214,12 @@ def _build_topology_loader(
         drop_last=False,
         collate_fn=_collate_topology_batch,
     )
-    return (cast(DataLoader[dict[str, object]], loader), all_records, len(dataset._embedding_cache))
+    return TopologyLoaderBundle(
+        data_loader=cast(DataLoader[dict[str, object]], loader),
+        records=all_records,
+        cached_embedding_count=len(dataset._embedding_cache),
+        dataset=dataset,
+    )
 
 
 def _predict_topology_labels(
@@ -238,6 +269,183 @@ def _predict_topology_labels(
         preview = ", ".join(str(index) for index in missing[:10])
         raise ValueError(f"Missing topology predictions for indices: {preview}")
     return [int(prediction) for prediction in ordered if prediction is not None]
+
+
+def _model_supports_graph_forward(model: torch.nn.Module, accelerator: AcceleratorLike) -> bool:
+    """Return whether a model exposes the TCCIG graph-forward contract."""
+    unwrap_model = getattr(accelerator, "unwrap_model", None)
+    candidate = cast(torch.nn.Module, unwrap_model(model)) if callable(unwrap_model) else model
+    return callable(getattr(candidate, "forward_graph", None))
+
+
+def _unwrap_graph_model(
+    *,
+    model: torch.nn.Module,
+    accelerator: AcceleratorLike,
+) -> torch.nn.Module:
+    """Return the module object that owns graph-forward helper methods."""
+    unwrap_model = getattr(accelerator, "unwrap_model", None)
+    return cast(torch.nn.Module, unwrap_model(model)) if callable(unwrap_model) else model
+
+
+def _tccig_topology_eval_config(config: ConfigDict) -> ConfigDict:
+    """Return optional ``topology_evaluate.tccig`` config."""
+    topology_cfg = _topology_config(config)
+    raw_config = topology_cfg.get("tccig", {})
+    if raw_config is None:
+        return {}
+    if not isinstance(raw_config, dict):
+        raise ValueError("topology_evaluate.tccig must be a mapping")
+    return cast(ConfigDict, raw_config)
+
+
+def _resolve_tccig_candidate_batch_size(config: ConfigDict) -> int:
+    """Return candidate chunk size for TCCIG graph assembly."""
+    topology_cfg = _topology_config(config)
+    tccig_cfg = _tccig_topology_eval_config(config)
+    training_cfg = get_section(config, "training_config")
+    fallback_batch_size = as_int(
+        topology_cfg.get("inference_batch_size", training_cfg.get("batch_size", 8)),
+        "topology_evaluate.inference_batch_size",
+    )
+    batch_size = as_int(
+        tccig_cfg.get("candidate_batch_size", max(1024, fallback_batch_size)),
+        "topology_evaluate.tccig.candidate_batch_size",
+    )
+    if batch_size <= 0:
+        raise ValueError("topology_evaluate.tccig.candidate_batch_size must be > 0")
+    return batch_size
+
+
+def _load_tccig_node_inputs(
+    *,
+    dataset: PRINGPairDataset,
+    records: Sequence[tuple[str, str]],
+    device: torch.device,
+) -> tuple[tuple[str, ...], torch.Tensor, torch.Tensor]:
+    """Load unique topology-evaluation protein embeddings for graph assembly."""
+    protein_ids = tuple(sorted({protein for record in records for protein in record}))
+    if len(protein_ids) < 2:
+        raise ValueError("TCCIG topology evaluation requires at least two proteins")
+    embedding_tensors = [dataset._load_embedding(protein_id) for protein_id in protein_ids]
+    protein_embeddings = pad_sequence(embedding_tensors, batch_first=True).to(device)
+    protein_lengths = torch.tensor(
+        [embedding.size(0) for embedding in embedding_tensors],
+        dtype=torch.long,
+        device=device,
+    )
+    return protein_ids, protein_embeddings, protein_lengths
+
+
+def _candidate_pairs_for_records(
+    *,
+    records: Sequence[tuple[str, str]],
+    node_to_index: Mapping[str, int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Map PRING pair records to local graph candidate-pair indices."""
+    return torch.tensor(
+        [
+            [node_to_index[protein_a] for protein_a, _ in records],
+            [node_to_index[protein_b] for _, protein_b in records],
+        ],
+        dtype=torch.long,
+        device=device,
+    )
+
+
+def _assemble_top_m_hat_predictions(
+    *,
+    probabilities: Sequence[float],
+    m_hat: float,
+) -> list[int]:
+    """Select the top-``m_hat`` candidate edges and return hard PRING labels."""
+    edge_budget = max(0, min(len(probabilities), int(round(m_hat))))
+    predictions = [0 for _ in probabilities]
+    if edge_budget == 0:
+        return predictions
+    top_indices = sorted(
+        range(len(probabilities)),
+        key=lambda index: (-float(probabilities[index]), index),
+    )[:edge_budget]
+    for index in top_indices:
+        predictions[index] = 1
+    return predictions
+
+
+def _predict_tccig_graph_assembly_labels(
+    *,
+    config: ConfigDict,
+    model: torch.nn.Module,
+    dataset: PRINGPairDataset,
+    records: Sequence[tuple[str, str]],
+    device: torch.device,
+    accelerator: AcceleratorLike,
+) -> list[int]:
+    """Run TCCIG Graph Assembly with top-``m_hat`` candidate selection."""
+    graph_model = _unwrap_graph_model(model=model, accelerator=accelerator)
+    encode_graph_nodes = getattr(graph_model, "encode_graph_nodes", None)
+    decode_graph_candidates = getattr(graph_model, "decode_graph_candidates", None)
+    edge_budget_from_node_embeddings = getattr(
+        graph_model,
+        "edge_budget_from_node_embeddings",
+        None,
+    )
+    if not (
+        callable(encode_graph_nodes)
+        and callable(decode_graph_candidates)
+        and callable(edge_budget_from_node_embeddings)
+    ):
+        raise ValueError(
+            "TCCIG topology evaluation requires encode_graph_nodes, "
+            "decode_graph_candidates, and edge_budget_from_node_embeddings"
+        )
+
+    protein_ids, protein_embeddings, protein_lengths = _load_tccig_node_inputs(
+        dataset=dataset,
+        records=records,
+        device=device,
+    )
+    node_to_index = {protein_id: index for index, protein_id in enumerate(protein_ids)}
+    candidate_batch_size = _resolve_tccig_candidate_batch_size(config)
+    probabilities: list[float] = []
+    with torch.inference_mode(), accelerator.autocast():
+        node_embeddings = cast(
+            torch.Tensor,
+            encode_graph_nodes(
+                protein_embeddings=protein_embeddings,
+                protein_lengths=protein_lengths,
+            ),
+        )
+        m_hat_tensor = cast(
+            torch.Tensor,
+            edge_budget_from_node_embeddings(
+                node_embeddings=node_embeddings,
+                candidate_count=len(records),
+            ),
+        )
+        for start in range(0, len(records), candidate_batch_size):
+            candidate_pairs = _candidate_pairs_for_records(
+                records=records[start : start + candidate_batch_size],
+                node_to_index=node_to_index,
+                device=device,
+            )
+            output = cast(
+                dict[str, torch.Tensor],
+                decode_graph_candidates(
+                    node_embeddings=node_embeddings,
+                    candidate_pairs=candidate_pairs,
+                ),
+            )
+            probabilities.extend(
+                float(value) for value in output["edge_probabilities"].detach().cpu().tolist()
+            )
+    if len(probabilities) != len(records):
+        raise ValueError("TCCIG graph assembly did not score every topology pair")
+    return _assemble_top_m_hat_predictions(
+        probabilities=probabilities,
+        m_hat=float(m_hat_tensor.detach().cpu().item()),
+    )
 
 
 def _ordered_predictions_from_shards(
@@ -488,10 +696,11 @@ def run_topology_evaluation_stage(
         log_stage_event(logger, "decision_threshold", mode=threshold_mode, value=decision_threshold)
 
     all_test_path, gt_graph_path, sampled_nodes_path = _topology_paths(config)
-    topology_loader, records, cached_embedding_count = _build_topology_loader(
+    topology_bundle = _build_topology_loader(
         config=config,
         split_path=all_test_path,
     )
+    topology_loader, records, cached_embedding_count = topology_bundle
     topology_loader = cast(
         DataLoader[dict[str, object]],
         runtime.accelerator.prepare(topology_loader),
@@ -505,14 +714,31 @@ def run_topology_evaluation_stage(
             distributed=runtime.is_distributed,
             world_size=runtime.world_size,
         )
-    predictions = _predict_topology_labels(
-        model=model,
-        data_loader=topology_loader,
-        device=device,
-        total_records=len(records),
-        decision_threshold=decision_threshold,
-        accelerator=runtime.accelerator,
-    )
+    if _model_supports_graph_forward(model, runtime.accelerator):
+        predictions = _predict_tccig_graph_assembly_labels(
+            config=config,
+            model=model,
+            dataset=topology_bundle.dataset,
+            records=records,
+            device=device,
+            accelerator=runtime.accelerator,
+        )
+        if runtime.is_main_process:
+            log_stage_event(
+                logger,
+                "tccig_graph_assembly",
+                pair_count=len(records),
+                candidate_batch_size=_resolve_tccig_candidate_batch_size(config),
+            )
+    else:
+        predictions = _predict_topology_labels(
+            model=model,
+            data_loader=topology_loader,
+            device=device,
+            total_records=len(records),
+            decision_threshold=decision_threshold,
+            accelerator=runtime.accelerator,
+        )
 
     prediction_path = log_dir / "all_test_ppi_pred.txt"
     if runtime.is_main_process and as_bool(

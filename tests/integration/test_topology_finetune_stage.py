@@ -1900,11 +1900,7 @@ def test_chunked_backward_detached_pass_bypasses_ddp_reducer_state(
         def forward(self, **batch: torch.Tensor) -> dict[str, torch.Tensor]:
             if self.training and not torch.is_grad_enabled():
                 self.unreduced_no_grad_forward_seen = True
-            if (
-                self.training
-                and torch.is_grad_enabled()
-                and self.unreduced_no_grad_forward_seen
-            ):
+            if self.training and torch.is_grad_enabled() and self.unreduced_no_grad_forward_seen:
                 raise RuntimeError("Expected to have finished reduction in the prior iteration")
             return self.module(**batch)
 
@@ -3351,9 +3347,7 @@ def test_v3_1_0430_multiseed_rich_pooling_ablation_configs() -> None:
 
     config_dir = Path("configs/v3-1/0430")
     expected_files = {
-        f"{ablation}_s{seed}.yaml"
-        for ablation in expected_components
-        for seed in expected_seeds
+        f"{ablation}_s{seed}.yaml" for ablation in expected_components for seed in expected_seeds
     }
     assert {path.name for path in config_dir.glob("*.yaml")} == expected_files
 
@@ -3412,9 +3406,7 @@ def test_v3_1_0506_pair_readout_ablation_configs() -> None:
     expected_seeds = {13, 47, 101}
     config_dir = Path("configs/v3-1/0506")
     expected_files = {
-        f"{ablation}_s{seed}.yaml"
-        for ablation in expected_modes
-        for seed in expected_seeds
+        f"{ablation}_s{seed}.yaml" for ablation in expected_modes for seed in expected_seeds
     }
 
     assert {path.name for path in config_dir.glob("*.yaml")} == expected_files
@@ -3509,9 +3501,7 @@ def test_v3_1_0522_d256_no_spectral_norm_configs() -> None:
     config_dir = Path("configs/v3-1/0522")
     assert {path.name for path in config_dir.glob("*.yaml")} == set(expected_configs)
 
-    for filename, (seed, interaction_mode, order_aggregation) in sorted(
-        expected_configs.items()
-    ):
+    for filename, (seed, interaction_mode, order_aggregation) in sorted(expected_configs.items()):
         run_id = filename.removesuffix(".yaml")
         config = load_config(config_dir / filename)
         run_cfg = config["run_config"]

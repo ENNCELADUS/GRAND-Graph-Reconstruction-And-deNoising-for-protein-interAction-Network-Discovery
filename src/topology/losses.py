@@ -1,4 +1,4 @@
-"""Differentiable graph-topology losses for PRING-style fine-tuning."""
+"""Differentiable topology loss math for graph-aware training."""
 
 from __future__ import annotations
 
@@ -491,4 +491,172 @@ def compute_topology_losses(
         "degree_mmd": degree_mmd,
         "clustering_mmd": clustering_mmd,
         "total_topology": total_topology,
+    }
+
+
+@dataclass(frozen=True)
+class TCCIGLossWeights:
+    """Configurable TCCIG loss weights.
+
+    Terms with zero weight are not computed and do not require their optional inputs.
+    """
+
+    edge: float = 1.0
+    teacher: float = 0.1
+    budget: float = 0.1
+    density: float = 0.1
+    degree: float = 0.05
+    clustering: float = 0.02
+    rank: float = 0.0
+    module: float = 0.0
+    spectral: float = 0.0
+    calibration: float = 0.0
+    sparse: float = 0.0
+
+
+def _zero_like(reference: torch.Tensor) -> torch.Tensor:
+    """Return a differentiable zero on the same device and dtype."""
+    return reference.sum() * 0.0
+
+
+def _masked_bce(
+    *,
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    mask: torch.Tensor | None,
+) -> torch.Tensor:
+    """Compute BCE over either all pairs or a supplied pair mask."""
+    per_pair = functional.binary_cross_entropy_with_logits(logits, labels, reduction="none")
+    if mask is None:
+        return per_pair.mean() if per_pair.numel() else _zero_like(logits)
+    mask = mask.to(device=logits.device, dtype=logits.dtype)
+    mask_sum = mask.sum()
+    if float(mask_sum.detach().item()) <= 0.0:
+        return _zero_like(logits)
+    return (per_pair * mask).sum() / mask_sum
+
+
+def _budget_loss(
+    *,
+    m_hat: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """Match predicted and target log edge counts."""
+    target_edge_count = labels.sum().to(device=m_hat.device, dtype=m_hat.dtype)
+    return functional.smooth_l1_loss(
+        torch.log1p(m_hat.clamp(min=0.0)),
+        torch.log1p(target_edge_count),
+    )
+
+
+def _teacher_loss(
+    *,
+    logits: torch.Tensor,
+    teacher_probabilities: torch.Tensor | None,
+) -> torch.Tensor:
+    """Compute soft BCE distillation from teacher probabilities."""
+    if teacher_probabilities is None:
+        raise ValueError("teacher_probabilities are required when teacher loss is enabled")
+    soft_targets = teacher_probabilities.to(device=logits.device, dtype=logits.dtype)
+    return functional.binary_cross_entropy_with_logits(logits, soft_targets)
+
+
+def compute_tccig_losses(
+    *,
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    pair_index_a: torch.Tensor,
+    pair_index_b: torch.Tensor,
+    num_nodes: int,
+    m_hat: torch.Tensor,
+    weights: TCCIGLossWeights,
+    bce_labels: torch.Tensor | None = None,
+    bce_mask: torch.Tensor | None = None,
+    teacher_probabilities: torch.Tensor | None = None,
+) -> dict[str, torch.Tensor]:
+    """Compute enabled TCCIG losses and skip disabled terms entirely."""
+    resolved_labels = labels.to(device=logits.device, dtype=logits.dtype)
+    edge_labels = (
+        resolved_labels
+        if bce_labels is None
+        else bce_labels.to(device=logits.device, dtype=logits.dtype)
+    )
+    edge_loss = (
+        _masked_bce(logits=logits, labels=edge_labels, mask=bce_mask)
+        if weights.edge != 0.0
+        else _zero_like(logits)
+    )
+    teacher = (
+        _teacher_loss(logits=logits, teacher_probabilities=teacher_probabilities)
+        if weights.teacher != 0.0
+        else _zero_like(logits)
+    )
+    budget = (
+        _budget_loss(m_hat=m_hat, labels=resolved_labels)
+        if weights.budget != 0.0
+        else _zero_like(logits)
+    )
+
+    topology_weight_config = TopologyLossWeights(
+        alpha=0.0,
+        beta=weights.density,
+        gamma=weights.degree,
+        delta=weights.clustering,
+    )
+    should_compute_topology = any(
+        value != 0.0 for value in (weights.density, weights.degree, weights.clustering)
+    )
+    topology_losses = (
+        compute_topology_losses(
+            weights=topology_weight_config,
+            num_nodes=num_nodes,
+            pair_index_a=pair_index_a,
+            pair_index_b=pair_index_b,
+            pred_pair_probabilities=torch.sigmoid(logits),
+            target_pair_probabilities=resolved_labels,
+            include_clustering_mmd=weights.clustering != 0.0,
+        )
+        if should_compute_topology
+        else {
+            "relative_density": _zero_like(logits),
+            "degree_mmd": _zero_like(logits),
+            "clustering_mmd": _zero_like(logits),
+            "total_topology": _zero_like(logits),
+        }
+    )
+
+    rank = _zero_like(logits)
+    module = _zero_like(logits)
+    spectral = _zero_like(logits)
+    calibration = (
+        functional.mse_loss(torch.sigmoid(logits), resolved_labels)
+        if weights.calibration != 0.0
+        else _zero_like(logits)
+    )
+    sparse = torch.sigmoid(logits).mean() if weights.sparse != 0.0 else _zero_like(logits)
+
+    total = (
+        weights.edge * edge_loss
+        + weights.teacher * teacher
+        + weights.budget * budget
+        + topology_losses["total_topology"]
+        + weights.rank * rank
+        + weights.module * module
+        + weights.spectral * spectral
+        + weights.calibration * calibration
+        + weights.sparse * sparse
+    )
+    return {
+        "edge": edge_loss,
+        "teacher": teacher,
+        "budget": budget,
+        "relative_density": topology_losses["relative_density"],
+        "degree_mmd": topology_losses["degree_mmd"],
+        "clustering_mmd": topology_losses["clustering_mmd"],
+        "rank": rank,
+        "module": module,
+        "spectral": spectral,
+        "calibration": calibration,
+        "sparse": sparse,
+        "total": total,
     }

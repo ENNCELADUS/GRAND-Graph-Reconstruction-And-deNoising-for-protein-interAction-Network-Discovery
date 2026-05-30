@@ -249,6 +249,71 @@ def test_run_topology_evaluation_stage_writes_expected_artifacts(tmp_path: Path)
     assert "0.500" in log_text
 
 
+def test_tccig_graph_assembly_scores_candidates_and_selects_top_budget(
+    tmp_path: Path,
+) -> None:
+    config = _build_topology_config(tmp_path)
+    processed_dir = Path(str(config["data_config"]["benchmark"]["processed_dir"]))  # type: ignore[index]
+    bundle = topology_stage._build_topology_loader(
+        config=config,
+        split_path=processed_dir / "all_test_ppi.txt",
+    )
+
+    class _GraphAssemblyModel(torch.nn.Module):
+        def forward_graph(self, **_: object) -> dict[str, torch.Tensor]:
+            return {}
+
+        def encode_graph_nodes(
+            self,
+            *,
+            protein_embeddings: torch.Tensor,
+            protein_lengths: torch.Tensor,
+        ) -> torch.Tensor:
+            del protein_lengths
+            return protein_embeddings.mean(dim=1)
+
+        def edge_budget_from_node_embeddings(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_count: int,
+        ) -> torch.Tensor:
+            del node_embeddings, candidate_count
+            return torch.tensor(2.0)
+
+        def decode_graph_candidates(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_pairs: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            del node_embeddings
+            scores = {
+                (0, 1): 0.9,
+                (0, 2): 0.1,
+                (1, 2): 0.8,
+            }
+            probabilities = torch.tensor(
+                [
+                    scores[(int(source), int(target))]
+                    for source, target in candidate_pairs.t().tolist()
+                ],
+                dtype=torch.float32,
+            )
+            return {"edge_probabilities": probabilities}
+
+    predictions = topology_stage._predict_tccig_graph_assembly_labels(
+        config=config,
+        model=_GraphAssemblyModel(),
+        dataset=bundle.dataset,
+        records=bundle.records,
+        device=torch.device("cpu"),
+        accelerator=build_stage_runtime(config).accelerator,
+    )
+
+    assert predictions == [1, 0, 1]
+
+
 def _fake_sharded_topology_result(node_sizes: tuple[int, ...]) -> dict[str, object]:
     details: dict[str, dict[int, list[float] | float]] = {
         "graph_sim": {},

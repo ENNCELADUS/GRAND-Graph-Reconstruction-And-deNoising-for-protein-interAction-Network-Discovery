@@ -1,12 +1,17 @@
 # Trainer Design
 
-The **Trainer** module is responsible for the core training loop execution. It is designed to be generic, handling one epoch of training at a time, while delegating policy decisions (like scheduling and unfreezing) to **Strategy** objects.
+The **Trainer** module is responsible for training-loop execution. The default
+`Trainer` is intentionally scoped to pairwise mini-batch classification; model
+families with different training contracts live under role-specific packages in
+`src/train/`.
 
 ## Core Responsibilities
 
-### The Trainer (`src/train/base.py`)
+### Pairwise Trainer (`src/train/base.py`)
 
-The `Trainer` class encapsulates the mechanics of updating the model weights. It requires a real `AcceleratorLike` instance — there is no fallback builder or optional accelerator path.
+The `Trainer` class encapsulates the mechanics of updating pairwise classifier
+weights. It requires a real `AcceleratorLike` instance — there is no fallback
+builder or optional accelerator path.
 
 **Does:**
 *   **Execute `train_one_epoch(...)`**: Runs the standard forward-backward pass for a single epoch.
@@ -24,6 +29,25 @@ The `Trainer` class encapsulates the mechanics of updating the model weights. It
 *   **Logging**: The trainer emits heartbeat logs to the provided logger, but file creation and stage management are handled by the stage via `src/utils/logging.py`.
 *   **Checkpointing**: File I/O for saving models is managed by `PipelineRuntime.save_checkpoint()`.
 *   **Global Configuration Parsing**: The Trainer receives only the specific configuration objects (optimizer cfg, scheduler cfg, loss cfg) it needs, not the entire global config.
+
+### TCCIG Training (`src/train/tccig/`)
+
+TCCIG uses a separate training package instead of subclassing the pairwise
+`Trainer`. Its contract is graph-forward subgraph training: sample protein
+subgraphs, load cached embeddings, call `forward_graph`, optionally update a
+train-only MGAE teacher, compute TCCIG/topology losses, validate with topology
+metrics, and checkpoint through `PipelineRuntime`.
+
+The student model must keep the inference path feature-only: no target edges,
+degrees, communities, neighborhoods, or Laplacian tensors are accepted by
+`forward_graph`. Candidate pairs are canonicalized as undirected edges, and the
+decoder uses symmetric pair features so graph scores are invariant to protein-set
+ordering.
+
+`src/train/tccig/runner.py` owns the TCCIG stage lifecycle. `trainer.py`,
+`teacher.py`, `data.py`, `validation.py`, and `config.py` own their respective
+roles. Shared topology-training mechanics that are not TCCIG-specific belong in
+`src/train/topology/`.
 
 ### Strategies (`src/train/strategies/`)
 
@@ -56,6 +80,8 @@ Inside `train_one_epoch`:
 src/train/
 ├── base.py                # Trainer class (requires AcceleratorLike)
 ├── config.py              # OptimizerConfig, SchedulerConfig, LossConfig
+├── topology/              # shared topology-training mechanics
+├── tccig/                 # TCCIG-specific training pipeline
 └── strategies/
     ├── lifecycle.py       # TrainingStrategy, NoOpStrategy, StagedUnfreezeStrategy
     └── ohem.py            # OHEMSampleStrategy

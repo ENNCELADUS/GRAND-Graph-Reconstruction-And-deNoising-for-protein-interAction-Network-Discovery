@@ -33,16 +33,13 @@ from src.topology.finetune_data import (
     InternalValidationPairRecord,
     InternalValidationPlan,
     SubgraphPairChunk,
-    build_explicit_negative_lookup,
     build_internal_validation_plan,
-    build_pair_supervision_graph,
     iter_subgraph_pair_chunks,
     iter_supervised_pair_chunks,
-    load_split_node_ids,
     sample_edge_cover_subgraphs,
     sample_topology_evaluation_subgraphs,
 )
-from src.topology.finetune_losses import (
+from src.topology.losses import (
     TopologyLossWeights,
     TopologyLossWeightSchedule,
     build_symmetric_adjacency,
@@ -58,6 +55,11 @@ from src.topology.loss_balancing import (
     update_gradnorm_task_weights,
 )
 from src.topology.metrics import evaluate_graph_samples
+from src.topology.supervision import (
+    load_supervision_graphs,
+    load_train_negative_lookup,
+    resolve_supervision_dataset_path,
+)
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -356,79 +358,33 @@ def _resolve_supervision_dataset_path(
     fallback_key: str,
 ) -> Path:
     """Resolve and validate one topology supervision dataset path."""
-    raw_path = finetune_cfg.get(config_key, dataloader_cfg.get(fallback_key, ""))
-    path = Path(str(raw_path))
-    if not str(raw_path):
-        raise ValueError(
-            f"Missing topology supervision dataset path for topology_finetune.{config_key}"
-        )
-    if path.exists():
-        return path
-    raise FileNotFoundError(
-        "Topology fine-tuning supervision dataset not found: "
-        f"{path}. Runtime generation is disabled; prepare them offline and update "
-        f"topology_finetune.{config_key} before launching the pipeline."
+    return resolve_supervision_dataset_path(
+        stage_cfg=finetune_cfg,
+        dataloader_cfg=dataloader_cfg,
+        stage_name="topology_finetune",
+        config_key=config_key,
+        fallback_key=fallback_key,
     )
 
 
 def _load_supervision_graphs(*, config: ConfigDict) -> tuple[nx.Graph, nx.Graph]:
     """Build train/validation supervision graphs without leaking validation edges."""
-    data_cfg = get_section(config, "data_config")
-    benchmark_cfg = get_section(data_cfg, "benchmark")
-    dataloader_cfg = get_section(data_cfg, "dataloader")
     finetune_cfg = _topology_finetune_config(config)
-    processed_dir = Path(str(benchmark_cfg.get("processed_dir", "")))
-    species = as_str(benchmark_cfg.get("species", "human"), "data_config.benchmark.species")
-    split_strategy = as_str(
-        benchmark_cfg.get("split_strategy", "BFS"),
-        "data_config.benchmark.split_strategy",
-    ).upper()
-    split_path = processed_dir / f"{species}_{split_strategy}_split.pkl"
-    train_pair_path = _resolve_supervision_dataset_path(
-        finetune_cfg=finetune_cfg,
-        dataloader_cfg=dataloader_cfg,
-        config_key="supervision_train_dataset",
-        fallback_key="train_dataset",
+    return load_supervision_graphs(
+        config=config,
+        stage_cfg=finetune_cfg,
+        stage_name="topology_finetune",
     )
-    valid_pair_path = _resolve_supervision_dataset_path(
-        finetune_cfg=finetune_cfg,
-        dataloader_cfg=dataloader_cfg,
-        config_key="supervision_valid_dataset",
-        fallback_key="valid_dataset",
-    )
-    train_nodes = load_split_node_ids(split_path=split_path, split_name="train")
-    train_graph = build_pair_supervision_graph(
-        pair_path=train_pair_path,
-        node_ids=train_nodes,
-    )
-    internal_val_graph = build_pair_supervision_graph(
-        pair_path=valid_pair_path,
-        node_ids=train_nodes,
-    )
-    return train_graph, internal_val_graph
 
 
 def _load_train_negative_lookup(*, config: ConfigDict) -> ExplicitNegativePairLookup:
     """Load explicit train negatives used for masked BCE supervision."""
-    data_cfg = get_section(config, "data_config")
-    benchmark_cfg = get_section(data_cfg, "benchmark")
-    dataloader_cfg = get_section(data_cfg, "dataloader")
     finetune_cfg = _topology_finetune_config(config)
-    processed_dir = Path(str(benchmark_cfg.get("processed_dir", "")))
-    species = as_str(benchmark_cfg.get("species", "human"), "data_config.benchmark.species")
-    split_strategy = as_str(
-        benchmark_cfg.get("split_strategy", "BFS"),
-        "data_config.benchmark.split_strategy",
-    ).upper()
-    split_path = processed_dir / f"{species}_{split_strategy}_split.pkl"
-    train_nodes = load_split_node_ids(split_path=split_path, split_name="train")
-    train_pair_path = _resolve_supervision_dataset_path(
-        finetune_cfg=finetune_cfg,
-        dataloader_cfg=dataloader_cfg,
-        config_key="supervision_train_dataset",
-        fallback_key="train_dataset",
+    return load_train_negative_lookup(
+        config=config,
+        stage_cfg=finetune_cfg,
+        stage_name="topology_finetune",
     )
-    return build_explicit_negative_lookup(pair_path=train_pair_path, node_ids=train_nodes)
 
 
 def _parse_loss_weights(config: ConfigDict) -> TopologyLossWeights:
@@ -467,29 +423,42 @@ def _parse_loss_weights(config: ConfigDict) -> TopologyLossWeights:
     )
 
 
-def _parse_loss_weight_schedule(finetune_cfg: ConfigDict) -> TopologyLossWeightSchedule:
-    """Parse topology-loss weight scheduling from ``topology_finetune`` config."""
+def _model_supports_graph_forward(model: nn.Module, accelerator: AcceleratorLike | None) -> bool:
+    """Return whether a model exposes the TCCIG graph-forward contract."""
+    if accelerator is not None:
+        candidate = _unwrap_model_for_detached_forward(model=model, accelerator=accelerator)
+    else:
+        candidate = cast(nn.Module, getattr(model, "module", model))
+    return callable(getattr(candidate, "forward_graph", None))
+
+
+def _parse_loss_weight_schedule(
+    finetune_cfg: ConfigDict,
+    *,
+    stage_name: str = "topology_finetune",
+) -> TopologyLossWeightSchedule:
+    """Parse topology-loss weight scheduling from a topology training config."""
     raw_schedule = finetune_cfg.get("loss_weight_schedule", {})
     if not isinstance(raw_schedule, dict):
-        raise ValueError("topology_finetune.loss_weight_schedule must be a mapping")
+        raise ValueError(f"{stage_name}.loss_weight_schedule must be a mapping")
     warmup_epochs = as_int(
         raw_schedule.get("warmup_epochs", 0),
-        "topology_finetune.loss_weight_schedule.warmup_epochs",
+        f"{stage_name}.loss_weight_schedule.warmup_epochs",
     )
     ramp_epochs = as_int(
         raw_schedule.get("ramp_epochs", 0),
-        "topology_finetune.loss_weight_schedule.ramp_epochs",
+        f"{stage_name}.loss_weight_schedule.ramp_epochs",
     )
     if warmup_epochs < 0:
-        raise ValueError("topology_finetune.loss_weight_schedule.warmup_epochs must be >= 0")
+        raise ValueError(f"{stage_name}.loss_weight_schedule.warmup_epochs must be >= 0")
     if ramp_epochs < 0:
-        raise ValueError("topology_finetune.loss_weight_schedule.ramp_epochs must be >= 0")
+        raise ValueError(f"{stage_name}.loss_weight_schedule.ramp_epochs must be >= 0")
     schedule = as_str(
         raw_schedule.get("schedule", "linear"),
-        "topology_finetune.loss_weight_schedule.schedule",
+        f"{stage_name}.loss_weight_schedule.schedule",
     ).lower()
     if schedule not in {"linear", "cosine"}:
-        raise ValueError("topology_finetune.loss_weight_schedule.schedule must be linear or cosine")
+        raise ValueError(f"{stage_name}.loss_weight_schedule.schedule must be linear or cosine")
     return TopologyLossWeightSchedule(
         warmup_epochs=warmup_epochs,
         ramp_epochs=ramp_epochs,
@@ -564,7 +533,11 @@ def _parse_gradnorm_config(finetune_cfg: ConfigDict) -> TopologyGradNormConfig:
 SUBGRAPH_NODE_RANGE_STEP = 10
 
 
-def _resolve_sampling_node_bounds(finetune_cfg: ConfigDict) -> tuple[int, int]:
+def _resolve_sampling_node_bounds(
+    finetune_cfg: ConfigDict,
+    *,
+    stage_name: str = "topology_finetune",
+) -> tuple[int, int]:
     """Resolve subgraph node limits for topology fine-tuning."""
     raw_range = finetune_cfg.get("subgraph_node_range")
     if (
@@ -573,26 +546,31 @@ def _resolve_sampling_node_bounds(finetune_cfg: ConfigDict) -> tuple[int, int]:
         or len(raw_range) != 2
     ):
         raise ValueError(
-            "topology_finetune.subgraph_node_range must be a two-item sequence "
-            "[min_nodes, max_nodes]"
+            f"{stage_name}.subgraph_node_range must be a two-item sequence [min_nodes, max_nodes]"
         )
-    min_nodes = as_int(raw_range[0], "topology_finetune.subgraph_node_range[0]")
-    max_nodes = as_int(raw_range[1], "topology_finetune.subgraph_node_range[1]")
+    min_nodes = as_int(raw_range[0], f"{stage_name}.subgraph_node_range[0]")
+    max_nodes = as_int(raw_range[1], f"{stage_name}.subgraph_node_range[1]")
     if min_nodes <= 0:
-        raise ValueError("topology_finetune.subgraph_node_range[0] must be positive")
+        raise ValueError(f"{stage_name}.subgraph_node_range[0] must be positive")
     if max_nodes <= 0:
-        raise ValueError("topology_finetune.subgraph_node_range[1] must be positive")
+        raise ValueError(f"{stage_name}.subgraph_node_range[1] must be positive")
     if min_nodes > max_nodes:
         raise ValueError(
-            "topology_finetune.subgraph_node_range[0] must be <= "
-            "topology_finetune.subgraph_node_range[1]"
+            f"{stage_name}.subgraph_node_range[0] must be <= {stage_name}.subgraph_node_range[1]"
         )
     return min_nodes, max_nodes
 
 
-def _resolve_sampling_node_sizes(finetune_cfg: ConfigDict) -> tuple[int, ...]:
+def _resolve_sampling_node_sizes(
+    finetune_cfg: ConfigDict,
+    *,
+    stage_name: str = "topology_finetune",
+) -> tuple[int, ...]:
     """Resolve discrete training subgraph node sizes from the configured range."""
-    min_nodes, max_nodes = _resolve_sampling_node_bounds(finetune_cfg)
+    min_nodes, max_nodes = _resolve_sampling_node_bounds(
+        finetune_cfg,
+        stage_name=stage_name,
+    )
     if min_nodes == max_nodes:
         return (min_nodes,)
     node_sizes = list(range(min_nodes, max_nodes + 1, SUBGRAPH_NODE_RANGE_STEP))
@@ -612,20 +590,25 @@ def _resolve_init_mode(finetune_cfg: ConfigDict) -> str:
     return init_mode
 
 
-def _resolve_bce_negative_ratio(finetune_cfg: ConfigDict) -> int:
+def _resolve_bce_negative_ratio(
+    finetune_cfg: ConfigDict,
+    *,
+    stage_name: str = "topology_finetune",
+) -> int:
     """Return the epoch-plan negative-to-positive BCE ratio."""
     negative_ratio = as_int(
         finetune_cfg.get("bce_negative_ratio", 5),
-        "topology_finetune.bce_negative_ratio",
+        f"{stage_name}.bce_negative_ratio",
     )
     if negative_ratio < 0:
-        raise ValueError("topology_finetune.bce_negative_ratio must be >= 0")
+        raise ValueError(f"{stage_name}.bce_negative_ratio must be >= 0")
     return negative_ratio
 
 
 def _resolve_edge_chunk_size(
     *,
     finetune_cfg: ConfigDict,
+    stage_name: str = "topology_finetune",
 ) -> int | None:
     """Return the positive-edge chunk size for one topology epoch plan."""
     raw_edge_chunk_size = finetune_cfg.get("edge_chunk_size")
@@ -633,21 +616,25 @@ def _resolve_edge_chunk_size(
         return None
     edge_chunk_size = as_int(
         raw_edge_chunk_size,
-        "topology_finetune.edge_chunk_size",
+        f"{stage_name}.edge_chunk_size",
     )
     if edge_chunk_size <= 0:
-        raise ValueError("topology_finetune.edge_chunk_size must be > 0")
+        raise ValueError(f"{stage_name}.edge_chunk_size must be > 0")
     return edge_chunk_size
 
 
-def _resolve_gradient_accumulation_steps(finetune_cfg: ConfigDict) -> int:
+def _resolve_gradient_accumulation_steps(
+    finetune_cfg: ConfigDict,
+    *,
+    stage_name: str = "topology_finetune",
+) -> int:
     """Return the number of subgraphs to accumulate before optimizer step."""
     steps = as_int(
         finetune_cfg.get("gradient_accumulation_steps", 1),
-        "topology_finetune.gradient_accumulation_steps",
+        f"{stage_name}.gradient_accumulation_steps",
     )
     if steps <= 0:
-        raise ValueError("topology_finetune.gradient_accumulation_steps must be > 0")
+        raise ValueError(f"{stage_name}.gradient_accumulation_steps must be > 0")
     return steps
 
 
@@ -686,6 +673,7 @@ def _resolve_subgraphs_per_forward(finetune_cfg: ConfigDict) -> int:
 def _build_internal_validation_node_sets(
     *,
     finetune_cfg: ConfigDict,
+    stage_name: str = "topology_finetune",
     graph: nx.Graph,
     seed: int,
 ) -> dict[int, list[tuple[str, ...]]]:
@@ -694,63 +682,86 @@ def _build_internal_validation_node_sets(
         graph=graph,
         seed=seed,
         strategy="mixed",
-        node_sizes=_resolve_internal_validation_node_sizes(finetune_cfg),
-        samples_per_size=_resolve_internal_validation_samples_per_size(finetune_cfg),
+        node_sizes=_resolve_internal_validation_node_sizes(finetune_cfg, stage_name=stage_name),
+        samples_per_size=_resolve_internal_validation_samples_per_size(
+            finetune_cfg,
+            stage_name=stage_name,
+        ),
     )
 
 
-def _resolve_internal_validation_node_sizes(finetune_cfg: ConfigDict) -> tuple[int, ...]:
+def _resolve_internal_validation_node_sizes(
+    finetune_cfg: ConfigDict,
+    *,
+    stage_name: str = "topology_finetune",
+) -> tuple[int, ...]:
     """Return the node-size buckets used for internal topology validation."""
     raw_node_sizes = finetune_cfg.get("internal_validation_node_sizes", TOPOLOGY_EVAL_NODE_SIZES)
     if not isinstance(raw_node_sizes, Sequence) or isinstance(raw_node_sizes, (str, bytes)):
-        raise ValueError("topology_finetune.internal_validation_node_sizes must be a sequence")
+        raise ValueError(f"{stage_name}.internal_validation_node_sizes must be a sequence")
     node_sizes = [
-        as_int(node_size, "topology_finetune.internal_validation_node_sizes")
+        as_int(node_size, f"{stage_name}.internal_validation_node_sizes")
         for node_size in raw_node_sizes
     ]
     if not node_sizes:
-        raise ValueError("topology_finetune.internal_validation_node_sizes must not be empty")
+        raise ValueError(f"{stage_name}.internal_validation_node_sizes must not be empty")
     if any(node_size <= 0 for node_size in node_sizes):
-        raise ValueError("topology_finetune.internal_validation_node_sizes must be > 0")
+        raise ValueError(f"{stage_name}.internal_validation_node_sizes must be > 0")
     return tuple(dict.fromkeys(node_sizes))
 
 
-def _resolve_internal_validation_samples_per_size(finetune_cfg: ConfigDict) -> int:
+def _resolve_internal_validation_samples_per_size(
+    finetune_cfg: ConfigDict,
+    *,
+    stage_name: str = "topology_finetune",
+) -> int:
     """Return the number of internal-validation subgraphs sampled per node size."""
     samples_per_size = as_int(
         finetune_cfg.get(
             "internal_validation_samples_per_size",
             DEFAULT_INTERNAL_VALIDATION_SAMPLES_PER_SIZE,
         ),
-        "topology_finetune.internal_validation_samples_per_size",
+        f"{stage_name}.internal_validation_samples_per_size",
     )
     if samples_per_size <= 0:
-        raise ValueError("topology_finetune.internal_validation_samples_per_size must be > 0")
+        raise ValueError(f"{stage_name}.internal_validation_samples_per_size must be > 0")
     return samples_per_size
 
 
-def _resolve_internal_validation_compute_spectral_stats(finetune_cfg: ConfigDict) -> bool:
+def _resolve_internal_validation_compute_spectral_stats(
+    finetune_cfg: ConfigDict,
+    *,
+    stage_name: str = "topology_finetune",
+) -> bool:
     """Return whether internal validation should compute Laplacian spectral metrics."""
     return as_bool(
         finetune_cfg.get("internal_validation_compute_spectral_stats", False),
-        "topology_finetune.internal_validation_compute_spectral_stats",
+        f"{stage_name}.internal_validation_compute_spectral_stats",
     )
 
 
-def _resolve_compute_clustering_mmd(finetune_cfg: ConfigDict) -> bool:
+def _resolve_compute_clustering_mmd(
+    finetune_cfg: ConfigDict,
+    *,
+    stage_name: str = "topology_finetune",
+) -> bool:
     """Return whether topology fine-tuning should compute the O(n^3) clustering loss."""
     return as_bool(
         finetune_cfg.get("compute_clustering_mmd", True),
-        "topology_finetune.compute_clustering_mmd",
+        f"{stage_name}.compute_clustering_mmd",
     )
 
 
-def _resolve_internal_validation_compute_clustering_mmd(finetune_cfg: ConfigDict) -> bool:
+def _resolve_internal_validation_compute_clustering_mmd(
+    finetune_cfg: ConfigDict,
+    *,
+    stage_name: str = "topology_finetune",
+) -> bool:
     """Return whether internal validation should compute clustering-coefficient MMD."""
     default_value = finetune_cfg.get("compute_clustering_mmd", True)
     return as_bool(
         finetune_cfg.get("internal_validation_compute_clustering_mmd", default_value),
-        "topology_finetune.internal_validation_compute_clustering_mmd",
+        f"{stage_name}.internal_validation_compute_clustering_mmd",
     )
 
 
@@ -762,45 +773,59 @@ def _resolve_chunked_backward(finetune_cfg: ConfigDict) -> bool:
     )
 
 
-def _resolve_internal_validation_inference_batch_size(finetune_cfg: ConfigDict) -> int:
+def _resolve_internal_validation_inference_batch_size(
+    finetune_cfg: ConfigDict,
+    *,
+    stage_name: str = "topology_finetune",
+) -> int:
     """Return the batch size used for internal validation inference only."""
     batch_size = as_int(
         finetune_cfg.get("internal_validation_inference_batch_size", 128),
-        "topology_finetune.internal_validation_inference_batch_size",
+        f"{stage_name}.internal_validation_inference_batch_size",
     )
     if batch_size <= 0:
-        raise ValueError("topology_finetune.internal_validation_inference_batch_size must be > 0")
+        raise ValueError(f"{stage_name}.internal_validation_inference_batch_size must be > 0")
     return batch_size
 
 
-def _resolve_internal_validation_warmup_cadence(finetune_cfg: ConfigDict) -> int:
+def _resolve_internal_validation_warmup_cadence(
+    finetune_cfg: ConfigDict,
+    *,
+    stage_name: str = "topology_finetune",
+) -> int:
     """Return internal topology-validation cadence while topology loss is disabled."""
     cadence = as_int(
         finetune_cfg.get("internal_validation_warmup_cadence", 0),
-        "topology_finetune.internal_validation_warmup_cadence",
+        f"{stage_name}.internal_validation_warmup_cadence",
     )
     if cadence < 0:
-        raise ValueError("topology_finetune.internal_validation_warmup_cadence must be >= 0")
+        raise ValueError(f"{stage_name}.internal_validation_warmup_cadence must be >= 0")
     return cadence
 
 
-def _resolve_embedding_cache_max_bytes(finetune_cfg: ConfigDict) -> int:
+def _resolve_embedding_cache_max_bytes(
+    finetune_cfg: ConfigDict,
+    *,
+    stage_name: str = "topology_finetune",
+) -> int:
     """Return the byte ceiling for the stage-local embedding cache."""
     max_bytes = as_int(
         finetune_cfg.get("embedding_cache_max_bytes", 1_073_741_824),
-        "topology_finetune.embedding_cache_max_bytes",
+        f"{stage_name}.embedding_cache_max_bytes",
     )
     if max_bytes <= 0:
-        raise ValueError("topology_finetune.embedding_cache_max_bytes must be > 0")
+        raise ValueError(f"{stage_name}.embedding_cache_max_bytes must be > 0")
     return max_bytes
 
 
 def _resolve_internal_validation_threshold(
     *,
     config: ConfigDict,
+    stage_cfg: ConfigDict | None = None,
+    stage_name: str = "topology_finetune",
 ) -> tuple[float, str]:
     """Resolve the fixed hard threshold used for internal topology validation."""
-    finetune_cfg = _topology_finetune_config(config)
+    finetune_cfg = _topology_finetune_config(config) if stage_cfg is None else stage_cfg
     evaluate_cfg = config.get("evaluate", {})
     if not isinstance(evaluate_cfg, dict):
         raise ValueError("evaluate must be a mapping")
@@ -812,20 +837,20 @@ def _resolve_internal_validation_threshold(
     if isinstance(raw_threshold, dict):
         mode = as_str(
             raw_threshold.get("mode", "fixed"),
-            "topology_finetune.decision_threshold.mode",
+            f"{stage_name}.decision_threshold.mode",
         ).lower()
         if mode != "fixed":
-            raise ValueError("topology_finetune.decision_threshold.mode must be 'fixed'")
+            raise ValueError(f"{stage_name}.decision_threshold.mode must be 'fixed'")
         threshold = as_float(
             raw_threshold.get("value", DEFAULT_DECISION_THRESHOLD),
-            "topology_finetune.decision_threshold",
+            f"{stage_name}.decision_threshold",
         )
         if threshold != DEFAULT_DECISION_THRESHOLD:
-            raise ValueError("topology_finetune.decision_threshold must be 0.5")
+            raise ValueError(f"{stage_name}.decision_threshold must be 0.5")
         return (threshold, "fixed")
-    threshold = as_float(raw_threshold, "topology_finetune.decision_threshold")
+    threshold = as_float(raw_threshold, f"{stage_name}.decision_threshold")
     if threshold != DEFAULT_DECISION_THRESHOLD:
-        raise ValueError("topology_finetune.decision_threshold must be 0.5")
+        raise ValueError(f"{stage_name}.decision_threshold must be 0.5")
     return (threshold, "fixed")
 
 
@@ -2406,6 +2431,21 @@ def _validation_topology_loss(
     )
 
 
+def _effective_validation_loss_weights(
+    *,
+    context: TopologyFinetuneStageContext,
+    topology_loss_scale_value: float,
+) -> TopologyLossWeights:
+    """Return scaled validation topology weights for pairwise fine-tuning."""
+    return replace(
+        context.loss_weights,
+        alpha=context.loss_weights.alpha * topology_loss_scale_value,
+        beta=context.loss_weights.beta * topology_loss_scale_value,
+        gamma=context.loss_weights.gamma * topology_loss_scale_value,
+        delta=context.loss_weights.delta * topology_loss_scale_value,
+    )
+
+
 def _fit_epoch(
     *,
     config: ConfigDict,
@@ -2876,6 +2916,7 @@ def _validate_embedding_cache(
 def _should_run_internal_validation(
     *,
     finetune_cfg: ConfigDict,
+    stage_name: str = "topology_finetune",
     epoch_index: int,
     topology_loss_scale_value: float,
     previous_topology_loss_scale: float | None,
@@ -2884,7 +2925,7 @@ def _should_run_internal_validation(
     del previous_topology_loss_scale
     if topology_loss_scale_value > 0.0:
         return True
-    cadence = _resolve_internal_validation_warmup_cadence(finetune_cfg)
+    cadence = _resolve_internal_validation_warmup_cadence(finetune_cfg, stage_name=stage_name)
     return cadence > 0 and (epoch_index + 1) % cadence == 0
 
 
@@ -3205,6 +3246,8 @@ def run_topology_finetuning_stage(
     config = runtime.config.raw
     device = runtime.device
     model_name, _ = extract_model_kwargs(config)
+    if model_name == "tccig" or _model_supports_graph_forward(model, runtime.accelerator):
+        raise ValueError("TCCIG graph-forward training must use the tccig_train stage")
     run_id = runtime.stage_run_id("topology_finetune")
     paths = runtime.stage_paths("topology_finetune")
     log_dir = paths.log_dir
@@ -3327,12 +3370,10 @@ def run_topology_finetuning_stage(
             train_stats=train_stats,
             global_subgraph_count=int(train_stats["planned_subgraphs"]),
         )
-        effective_validation_loss_weights = replace(
-            context.loss_weights,
-            alpha=context.loss_weights.alpha * float(train_stats["topology_loss_scale"]),
-            beta=context.loss_weights.beta * float(train_stats["topology_loss_scale"]),
-            gamma=context.loss_weights.gamma * float(train_stats["topology_loss_scale"]),
-            delta=context.loss_weights.delta * float(train_stats["topology_loss_scale"]),
+        topology_loss_scale_value = float(train_stats["topology_loss_scale"])
+        effective_validation_loss_weights = _effective_validation_loss_weights(
+            context=context,
+            topology_loss_scale_value=topology_loss_scale_value,
         )
 
         # Every rank must execute the validation path before the next collective.
@@ -3346,10 +3387,10 @@ def run_topology_finetuning_stage(
             context=context,
             loss_weights=effective_validation_loss_weights,
             epoch_index=epoch,
-            topology_loss_scale=float(train_stats["topology_loss_scale"]),
+            topology_loss_scale=topology_loss_scale_value,
             previous_topology_loss_scale=previous_topology_loss_scale,
         )
-        previous_topology_loss_scale = float(train_stats["topology_loss_scale"])
+        previous_topology_loss_scale = topology_loss_scale_value
         peak_gpu_mem_mb = (
             float(torch.cuda.max_memory_allocated(device) / (1024.0 * 1024.0))
             if device.type == "cuda"

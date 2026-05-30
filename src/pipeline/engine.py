@@ -20,6 +20,7 @@ from src.pipeline.runtime import (
 )
 from src.pipeline.stages.adapt import run_shot_adaptation_stage
 from src.pipeline.stages.evaluate import run_evaluation_stage
+from src.pipeline.stages.tccig_train import run_tccig_train_stage
 from src.pipeline.stages.topology_evaluate import run_topology_evaluation_stage
 from src.pipeline.stages.topology_finetune import run_topology_finetuning_stage
 from src.pipeline.stages.train import build_model, run_training_stage
@@ -33,6 +34,7 @@ DEFAULT_STAGES: tuple[str, ...] = ("train", "evaluate")
 ALLOWED_STAGES: tuple[str, ...] = (
     "train",
     "topology_finetune",
+    "tccig_train",
     "evaluate",
     "topology_evaluate",
 )
@@ -51,6 +53,12 @@ def selected_stages(run_cfg: ConfigDict) -> tuple[str, ...]:
         raise ValueError("run_config.stages must not be empty")
     if len(set(configured_stages)) != len(configured_stages):
         raise ValueError("run_config.stages must not contain duplicates")
+    if "tccig_train" in configured_stages and (
+        "train" in configured_stages or "topology_finetune" in configured_stages
+    ):
+        raise ValueError(
+            "run_config.stages cannot combine tccig_train with train or topology_finetune"
+        )
     unsupported = [stage for stage in configured_stages if stage not in STAGE_ORDER]
     if unsupported:
         raise ValueError(
@@ -63,7 +71,7 @@ def selected_stages(run_cfg: ConfigDict) -> tuple[str, ...]:
         if stage_order < previous_order:
             raise ValueError(
                 "run_config.stages must follow: train -> topology_finetune -> "
-                "evaluate -> topology_evaluate"
+                "tccig_train -> evaluate -> topology_evaluate"
             )
         previous_order = stage_order
     return configured_stages
@@ -132,6 +140,7 @@ def execute_pipeline(
     build_accelerator_fn: Callable[..., AcceleratorLike] | None = None,
     run_training_stage_fn: Callable[..., Path] | None = None,
     run_topology_finetuning_stage_fn: Callable[..., Path] | None = None,
+    run_tccig_train_stage_fn: Callable[..., Path] | None = None,
     run_adaptation_stage_fn: Callable[..., Path] | None = None,
     run_evaluation_stage_fn: Callable[..., dict[str, float]] | None = None,
     run_topology_evaluation_stage_fn: Callable[
@@ -153,6 +162,7 @@ def execute_pipeline(
             run_topology_finetuning_stage_fn=(
                 run_topology_finetuning_stage_fn or run_topology_finetuning_stage
             ),
+            run_tccig_train_stage_fn=run_tccig_train_stage_fn or run_tccig_train_stage,
             run_adaptation_stage_fn=run_adaptation_stage_fn or run_shot_adaptation_stage,
             run_evaluation_stage_fn=run_evaluation_stage_fn or run_evaluation_stage,
             run_topology_evaluation_stage_fn=(
@@ -170,6 +180,7 @@ def execute_pipeline_with_runtime(
     build_model_fn: Callable[[ConfigDict], nn.Module],
     run_training_stage_fn: Callable[..., Path],
     run_topology_finetuning_stage_fn: Callable[..., Path],
+    run_tccig_train_stage_fn: Callable[..., Path],
     run_adaptation_stage_fn: Callable[..., Path],
     run_evaluation_stage_fn: Callable[..., dict[str, float]],
     run_topology_evaluation_stage_fn: Callable[..., dict[str, float]],
@@ -215,6 +226,7 @@ def execute_pipeline_with_runtime(
 
     train_checkpoint_path: Path | None = None
     finetuned_checkpoint_path: Path | None = None
+    tccig_checkpoint_path: Path | None = None
     adapted_checkpoint_path: Path | None = None
 
     if "train" in selected:
@@ -237,10 +249,21 @@ def execute_pipeline_with_runtime(
             checkpoint_path=finetune_input_checkpoint,
         )
 
+    if "tccig_train" in selected:
+        tccig_checkpoint_path = run_tccig_train_stage_fn(
+            runtime,
+            model,
+            dataloaders,
+        )
+
     if "evaluate" in selected:
-        eval_input_checkpoint = finetuned_checkpoint_path or evaluation_checkpoint_path(
-            train_checkpoint_path=train_checkpoint_path,
-            load_checkpoint_path=load_checkpoint_path,
+        eval_input_checkpoint = (
+            tccig_checkpoint_path
+            or finetuned_checkpoint_path
+            or evaluation_checkpoint_path(
+                train_checkpoint_path=train_checkpoint_path,
+                load_checkpoint_path=load_checkpoint_path,
+            )
         )
         if should_run_shot_adaptation(config):
             adapted_checkpoint_path = run_adaptation_stage_fn(
@@ -258,7 +281,8 @@ def execute_pipeline_with_runtime(
 
     if "topology_evaluate" in selected:
         topology_eval_checkpoint = (
-            finetuned_checkpoint_path
+            tccig_checkpoint_path
+            or finetuned_checkpoint_path
             or adapted_checkpoint_path
             or evaluation_checkpoint_path(
                 train_checkpoint_path=train_checkpoint_path,

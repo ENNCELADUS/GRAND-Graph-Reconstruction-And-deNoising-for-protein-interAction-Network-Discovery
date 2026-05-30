@@ -31,6 +31,7 @@ from src.utils.logging import prepare_stage_directories, setup_stage_logger
 _STAGE_RUN_ID_KEYS: tuple[tuple[str, str], ...] = (
     ("train", "train_run_id"),
     ("topology_finetune", "topology_finetune_run_id"),
+    ("tccig_train", "tccig_train_run_id"),
     ("adapt", "adapt_run_id"),
     ("evaluate", "eval_run_id"),
     ("topology_evaluate", "topology_eval_run_id"),

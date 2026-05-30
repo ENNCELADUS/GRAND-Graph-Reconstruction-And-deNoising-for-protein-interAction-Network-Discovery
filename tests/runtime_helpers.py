@@ -143,6 +143,7 @@ def build_stage_runtime(
     stage_ids = {
         "train": "train_run",
         "topology_finetune": "topology_ft_run",
+        "tccig_train": "tccig_train_run",
         "adapt": "adapt_run",
         "evaluate": "eval_run",
         "topology_evaluate": "topology_eval_run",

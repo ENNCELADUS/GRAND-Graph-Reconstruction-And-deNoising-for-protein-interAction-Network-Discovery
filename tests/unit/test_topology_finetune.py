@@ -8,7 +8,7 @@ from pathlib import Path
 
 import networkx as nx
 import pytest
-import src.topology.finetune_losses as finetune_losses_module
+import src.topology.losses as topology_losses_module
 import torch
 import torch.nn.functional as functional
 from src.topology.finetune_data import (
@@ -25,7 +25,7 @@ from src.topology.finetune_data import (
     sample_edge_cover_subgraphs,
     sample_training_subgraphs,
 )
-from src.topology.finetune_losses import (
+from src.topology.losses import (
     TopologyLossWeights,
     build_symmetric_adjacency,
     compute_topology_losses,
@@ -844,7 +844,7 @@ def test_compute_topology_losses_can_skip_clustering_mmd(monkeypatch: pytest.Mon
         raise AssertionError("clustering MMD should be skipped for topology finetune")
 
     monkeypatch.setattr(
-        finetune_losses_module,
+        topology_losses_module,
         "_clustering_distribution_mmd",
         _unexpected_clustering_mmd,
     )
@@ -879,7 +879,7 @@ def test_compute_topology_losses_skips_zero_weight_degree_mmd(
         raise AssertionError("zero-weight degree MMD should be skipped")
 
     monkeypatch.setattr(
-        finetune_losses_module,
+        topology_losses_module,
         "_degree_distribution_mmd_from_pairs",
         _unexpected_degree_mmd,
     )
@@ -912,7 +912,7 @@ def test_compute_topology_losses_skips_zero_weight_graph_similarity(
         raise AssertionError("zero-weight graph similarity should be skipped")
 
     monkeypatch.setattr(
-        finetune_losses_module,
+        topology_losses_module,
         "_pairwise_graph_similarity_loss",
         _unexpected_graph_similarity,
     )
@@ -945,7 +945,7 @@ def test_compute_topology_losses_skips_zero_weight_relative_density(
         raise AssertionError("zero-weight relative density should be skipped")
 
     monkeypatch.setattr(
-        finetune_losses_module,
+        topology_losses_module,
         "_pairwise_relative_density_loss",
         _unexpected_relative_density,
     )
@@ -978,7 +978,7 @@ def test_compute_topology_losses_skips_zero_weight_clustering_mmd(
         raise AssertionError("zero-weight clustering MMD should be skipped")
 
     monkeypatch.setattr(
-        finetune_losses_module,
+        topology_losses_module,
         "_clustering_distribution_mmd",
         _unexpected_clustering_mmd,
     )
@@ -1044,49 +1044,49 @@ def test_compute_topology_losses_pairwise_path_matches_dense_path() -> None:
 
 
 def test_topology_loss_scale_respects_warmup_and_linear_ramp() -> None:
-    schedule = finetune_losses_module.TopologyLossWeightSchedule(
+    schedule = topology_losses_module.TopologyLossWeightSchedule(
         warmup_epochs=2,
         ramp_epochs=3,
         schedule="linear",
     )
 
-    assert finetune_losses_module.topology_loss_scale(epoch=0, schedule=schedule) == pytest.approx(
+    assert topology_losses_module.topology_loss_scale(epoch=0, schedule=schedule) == pytest.approx(
         0.0
     )
-    assert finetune_losses_module.topology_loss_scale(epoch=1, schedule=schedule) == pytest.approx(
+    assert topology_losses_module.topology_loss_scale(epoch=1, schedule=schedule) == pytest.approx(
         0.0
     )
-    assert finetune_losses_module.topology_loss_scale(epoch=2, schedule=schedule) == pytest.approx(
+    assert topology_losses_module.topology_loss_scale(epoch=2, schedule=schedule) == pytest.approx(
         0.0
     )
-    assert finetune_losses_module.topology_loss_scale(epoch=3, schedule=schedule) == pytest.approx(
+    assert topology_losses_module.topology_loss_scale(epoch=3, schedule=schedule) == pytest.approx(
         1.0 / 3.0
     )
-    assert finetune_losses_module.topology_loss_scale(epoch=4, schedule=schedule) == pytest.approx(
+    assert topology_losses_module.topology_loss_scale(epoch=4, schedule=schedule) == pytest.approx(
         2.0 / 3.0
     )
-    assert finetune_losses_module.topology_loss_scale(epoch=5, schedule=schedule) == pytest.approx(
+    assert topology_losses_module.topology_loss_scale(epoch=5, schedule=schedule) == pytest.approx(
         1.0
     )
 
 
 def test_topology_loss_scale_supports_cosine_ramp() -> None:
-    schedule = finetune_losses_module.TopologyLossWeightSchedule(
+    schedule = topology_losses_module.TopologyLossWeightSchedule(
         warmup_epochs=1,
         ramp_epochs=4,
         schedule="cosine",
     )
 
-    assert finetune_losses_module.topology_loss_scale(epoch=0, schedule=schedule) == pytest.approx(
+    assert topology_losses_module.topology_loss_scale(epoch=0, schedule=schedule) == pytest.approx(
         0.0
     )
-    assert finetune_losses_module.topology_loss_scale(epoch=1, schedule=schedule) == pytest.approx(
+    assert topology_losses_module.topology_loss_scale(epoch=1, schedule=schedule) == pytest.approx(
         0.0
     )
-    assert finetune_losses_module.topology_loss_scale(epoch=3, schedule=schedule) == pytest.approx(
+    assert topology_losses_module.topology_loss_scale(epoch=3, schedule=schedule) == pytest.approx(
         0.5,
         abs=1e-6,
     )
-    assert finetune_losses_module.topology_loss_scale(epoch=5, schedule=schedule) == pytest.approx(
+    assert topology_losses_module.topology_loss_scale(epoch=5, schedule=schedule) == pytest.approx(
         1.0
     )

@@ -25,6 +25,7 @@ class RunSettings:
     seed: int
     train_run_id: str | None
     topology_finetune_run_id: str | None
+    tccig_train_run_id: str | None
     adapt_run_id: str | None
     eval_run_id: str | None
     topology_eval_run_id: str | None
@@ -87,6 +88,7 @@ class PipelineConfig:
                 seed=as_int(run_cfg.get("seed", 0), "run_config.seed"),
                 train_run_id=_optional_str(run_cfg.get("train_run_id")),
                 topology_finetune_run_id=_optional_str(run_cfg.get("topology_finetune_run_id")),
+                tccig_train_run_id=_optional_str(run_cfg.get("tccig_train_run_id")),
                 adapt_run_id=_optional_str(run_cfg.get("adapt_run_id")),
                 eval_run_id=_optional_str(run_cfg.get("eval_run_id")),
                 topology_eval_run_id=_optional_str(run_cfg.get("topology_eval_run_id")),

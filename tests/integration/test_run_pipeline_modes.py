@@ -42,6 +42,7 @@ class PipelineCalls:
 
     training: list[tuple[str, str]] = field(default_factory=list)
     topology_finetuning: list[tuple[Path | None, str]] = field(default_factory=list)
+    tccig_training: list[tuple[str, str]] = field(default_factory=list)
     adaptation: list[tuple[Path, str]] = field(default_factory=list)
     evaluation: list[tuple[Path, str]] = field(default_factory=list)
     topology_evaluation: list[tuple[Path, str]] = field(default_factory=list)
@@ -136,6 +137,16 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         )
         return Path("artifacts/topology_finetune_best_model.pth")
 
+    def fake_run_tccig_train_stage(
+        runtime: PipelineRuntime,
+        model: nn.Module,
+        dataloaders: dict[str, DataLoader[dict[str, torch.Tensor]]],
+    ) -> Path:
+        del model, dataloaders
+        stage = "tccig_train"
+        calls.tccig_training.append((stage, runtime.stage_run_id(stage)))
+        return Path("artifacts/tccig_train_best_model.pth")
+
     def fake_run_adaptation_stage(
         runtime: PipelineRuntime,
         model: nn.Module,
@@ -181,6 +192,7 @@ def patched_pipeline(monkeypatch: pytest.MonkeyPatch) -> PipelineCalls:
         "run_topology_finetuning_stage",
         fake_run_topology_finetuning_stage,
     )
+    monkeypatch.setattr(run_module, "run_tccig_train_stage", fake_run_tccig_train_stage)
     monkeypatch.setattr(run_module, "run_shot_adaptation_stage", fake_run_adaptation_stage)
     monkeypatch.setattr(run_module, "run_evaluation_stage", fake_run_evaluation_stage)
     monkeypatch.setattr(
@@ -203,6 +215,28 @@ def test_execute_pipeline_all_stages(
     assert patched_pipeline.adaptation == []
     assert patched_pipeline.evaluation == [(Path("artifacts/train_best_model.pth"), "eval_run")]
     assert patched_pipeline.topology_evaluation == []
+
+
+def test_execute_pipeline_tccig_train_then_evaluate(
+    base_config: ConfigDict,
+    patched_pipeline: PipelineCalls,
+) -> None:
+    run_cfg = base_config["run_config"]
+    assert isinstance(run_cfg, dict)
+    run_cfg["stages"] = ["tccig_train", "evaluate", "topology_evaluate"]
+    run_cfg["tccig_train_run_id"] = "tccig_run"
+
+    run_module.execute_pipeline(base_config)
+
+    assert patched_pipeline.training == []
+    assert patched_pipeline.topology_finetuning == []
+    assert patched_pipeline.tccig_training == [("tccig_train", "tccig_run")]
+    assert patched_pipeline.evaluation == [
+        (Path("artifacts/tccig_train_best_model.pth"), "eval_run")
+    ]
+    assert patched_pipeline.topology_evaluation == [
+        (Path("artifacts/tccig_train_best_model.pth"), "topology_eval_run")
+    ]
 
 
 def test_execute_pipeline_train_only(
@@ -456,6 +490,7 @@ def test_execute_pipeline_distributed_worker_reuses_main_run_ids(
         payload[0] = {
             "train": "shared_train_run",
             "topology_finetune": "shared_topology_run",
+            "tccig_train": "shared_tccig_run",
             "adapt": "shared_adapt_run",
             "evaluate": "shared_eval_run",
             "topology_evaluate": "shared_topology_eval_run",
@@ -470,6 +505,7 @@ def test_execute_pipeline_distributed_worker_reuses_main_run_ids(
         [
             "rank1_train_run",
             "rank1_topology_run",
+            "rank1_tccig_run",
             "rank1_adapt_run",
             "rank1_eval_run",
             "rank1_topology_eval_run",
@@ -901,6 +937,8 @@ def test_execute_pipeline_train_then_topology_finetune_scratch_ignores_train_che
         (["evaluate", "train"], "must follow"),
         (["train", "train"], "duplicates"),
         (["pretrain"], "unsupported"),
+        (["train", "tccig_train"], "cannot combine"),
+        (["topology_finetune", "tccig_train"], "cannot combine"),
     ],
 )
 def test_execute_pipeline_invalid_stages_raise(
