@@ -39,13 +39,6 @@ from src.topology.finetune_data import (
     sample_edge_cover_subgraphs,
     sample_topology_evaluation_subgraphs,
 )
-from src.topology.losses import (
-    TopologyLossWeights,
-    TopologyLossWeightSchedule,
-    build_symmetric_adjacency,
-    compute_topology_losses,
-    topology_loss_scale,
-)
 from src.topology.loss_balancing import (
     TopologyAdaptiveLossState,
     TopologyGradNormConfig,
@@ -53,6 +46,13 @@ from src.topology.loss_balancing import (
     initialize_output_head_bias_with_prior,
     normalize_topology_loss_terms,
     update_gradnorm_task_weights,
+)
+from src.topology.losses import (
+    TopologyLossWeights,
+    TopologyLossWeightSchedule,
+    build_symmetric_adjacency,
+    compute_topology_losses,
+    topology_loss_scale,
 )
 from src.topology.metrics import evaluate_graph_samples
 from src.topology.supervision import (
@@ -95,6 +95,20 @@ TOPOLOGY_FINETUNE_CSV_COLUMNS = [
     "Internal Val relative_density",
     "Internal Val deg_dist_mmd",
     "Internal Val cc_mmd",
+    "Internal Val Mean Pred Edges",
+    "Internal Val Mean Target Edges",
+    "Internal Val Total Pred Edges",
+    "Internal Val Total Target Edges",
+    "Internal Val Pred Edge Fraction",
+    "Internal Val Target Edge Fraction",
+    "Internal Val Pred/Target Edge Ratio",
+    "Internal Val Prob Min",
+    "Internal Val Prob Mean",
+    "Internal Val Prob Max",
+    "Internal Val Prob P50",
+    "Internal Val Prob P90",
+    "Internal Val Prob P95",
+    "Internal Val Prob >= Threshold Fraction",
     "Planned Subgraphs",
     "Covered Positive Edges",
     "Total Positive Edges",
@@ -131,6 +145,23 @@ INTERNAL_VALIDATION_SUMMARY_KEYS = (
     "deg_dist_mmd",
     "cc_mmd",
 )
+INTERNAL_VALIDATION_DIAGNOSTIC_KEYS = (
+    "pred_edges_mean",
+    "target_edges_mean",
+    "pred_edges_total",
+    "target_edges_total",
+    "pred_edge_fraction",
+    "target_edge_fraction",
+    "pred_target_edge_ratio",
+    "probability_min",
+    "probability_mean",
+    "probability_max",
+    "probability_p50",
+    "probability_p90",
+    "probability_p95",
+    "probability_ge_threshold_fraction",
+)
+INTERNAL_VALIDATION_KEYS = INTERNAL_VALIDATION_SUMMARY_KEYS + INTERNAL_VALIDATION_DIAGNOSTIC_KEYS
 DEFAULT_INTERNAL_VALIDATION_SAMPLES_PER_SIZE = 20
 
 
@@ -270,7 +301,7 @@ class ScratchBiasInitialization:
 
 def _empty_internal_validation_summary() -> dict[str, float]:
     """Return zeroed internal-validation summary metrics."""
-    return dict.fromkeys(INTERNAL_VALIDATION_SUMMARY_KEYS, 0.0)
+    return dict.fromkeys(INTERNAL_VALIDATION_KEYS, 0.0)
 
 
 def _empty_validation_epoch_result() -> ValidationEpochResult:
@@ -1926,21 +1957,21 @@ def _local_internal_validation_pair_records(
     )
 
 
-def _ordered_internal_validation_predictions(
+def _ordered_internal_validation_probabilities(
     *,
     local_indices: Sequence[int],
-    local_predictions: Sequence[int],
+    local_probabilities: Sequence[float],
     total_records: int,
     accelerator: AcceleratorLike,
-) -> list[int]:
-    """Gather sharded internal-validation predictions and restore global order."""
-    if len(local_indices) != len(local_predictions):
-        raise ValueError("local_indices and local_predictions must have matching lengths")
+) -> list[float]:
+    """Gather sharded internal-validation probabilities and restore global order."""
+    if len(local_indices) != len(local_probabilities):
+        raise ValueError("local_indices and local_probabilities must have matching lengths")
 
     if not accelerator.use_distributed:
-        ordered: list[int | None] = [None] * total_records
-        for index, prediction in zip(local_indices, local_predictions, strict=True):
-            ordered[int(index)] = int(prediction)
+        ordered: list[float | None] = [None] * total_records
+        for index, probability in zip(local_indices, local_probabilities, strict=True):
+            ordered[int(index)] = float(probability)
     else:
         local_length = torch.tensor(
             [len(local_indices)],
@@ -1953,36 +1984,71 @@ def _ordered_internal_validation_predictions(
             dim=0,
             pad_index=-1,
         )
-        padded_predictions = accelerator.pad_across_processes(
-            torch.tensor(local_predictions, dtype=torch.long, device=accelerator.device),
+        padded_probabilities = accelerator.pad_across_processes(
+            torch.tensor(local_probabilities, dtype=torch.float32, device=accelerator.device),
             dim=0,
             pad_index=0,
         )
         gathered_indices = accelerator.gather(padded_indices).detach().cpu()
-        gathered_predictions = accelerator.gather(padded_predictions).detach().cpu()
+        gathered_probabilities = accelerator.gather(padded_probabilities).detach().cpu()
         ordered = [None] * total_records
         max_length = max(gathered_lengths, default=0)
         offset = 0
         for shard_length in gathered_lengths:
             shard_indices = gathered_indices[offset : offset + max_length][:shard_length].tolist()
-            shard_predictions = gathered_predictions[offset : offset + max_length][
+            shard_probabilities = gathered_probabilities[offset : offset + max_length][
                 :shard_length
             ].tolist()
-            for index, prediction in zip(shard_indices, shard_predictions, strict=True):
+            for index, probability in zip(shard_indices, shard_probabilities, strict=True):
                 if index < 0 or index >= total_records:
                     raise ValueError(f"Internal-validation pair index out of bounds: {index}")
                 if ordered[index] is not None:
                     raise ValueError(
-                        f"Duplicate internal-validation prediction for pair index {index}"
+                        f"Duplicate internal-validation probability for pair index {index}"
                     )
-                ordered[index] = int(prediction)
+                ordered[index] = float(probability)
             offset += max_length
 
-    missing_indices = [index for index, prediction in enumerate(ordered) if prediction is None]
+    missing_indices = [index for index, probability in enumerate(ordered) if probability is None]
     if missing_indices:
         preview = ", ".join(str(index) for index in missing_indices[:10])
-        raise ValueError(f"Missing internal-validation predictions for indices: {preview}")
-    return [int(prediction) for prediction in ordered if prediction is not None]
+        raise ValueError(f"Missing internal-validation probabilities for indices: {preview}")
+    return [float(probability) for probability in ordered if probability is not None]
+
+
+def _internal_validation_diagnostics(
+    *,
+    probabilities: Sequence[float],
+    pred_edges_total: int,
+    target_edges_total: int,
+    candidate_pairs_total: int,
+    graph_count: int,
+    threshold: float,
+) -> dict[str, float]:
+    """Summarize hard-graph density and score calibration for validation graphs."""
+    if not probabilities or candidate_pairs_total <= 0:
+        return dict.fromkeys(INTERNAL_VALIDATION_DIAGNOSTIC_KEYS, 0.0)
+
+    probability_tensor = torch.tensor(probabilities, dtype=torch.float32)
+    target_edges = float(target_edges_total)
+    return {
+        "pred_edges_mean": float(pred_edges_total / max(1, graph_count)),
+        "target_edges_mean": float(target_edges_total / max(1, graph_count)),
+        "pred_edges_total": float(pred_edges_total),
+        "target_edges_total": target_edges,
+        "pred_edge_fraction": float(pred_edges_total / candidate_pairs_total),
+        "target_edge_fraction": float(target_edges_total / candidate_pairs_total),
+        "pred_target_edge_ratio": float(pred_edges_total / max(1.0, target_edges)),
+        "probability_min": float(torch.min(probability_tensor).item()),
+        "probability_mean": float(torch.mean(probability_tensor).item()),
+        "probability_max": float(torch.max(probability_tensor).item()),
+        "probability_p50": float(torch.quantile(probability_tensor, 0.50).item()),
+        "probability_p90": float(torch.quantile(probability_tensor, 0.90).item()),
+        "probability_p95": float(torch.quantile(probability_tensor, 0.95).item()),
+        "probability_ge_threshold_fraction": float(
+            torch.mean((probability_tensor >= threshold).to(dtype=torch.float32)).item()
+        ),
+    }
 
 
 def _evaluate_internal_validation_subgraphs(
@@ -2000,6 +2066,11 @@ def _evaluate_internal_validation_subgraphs(
     """Compute internal subgraph topology metrics on fixed validation samples."""
     pred_graphs_by_size: dict[int, list[nx.Graph]] = {}
     target_graphs_by_size: dict[int, list[nx.Graph]] = {}
+    validation_probabilities: list[float] = []
+    total_pred_edges = 0
+    total_target_edges = 0
+    total_candidate_pairs = 0
+    total_graphs = 0
 
     with torch.no_grad():
         for bucket in validation_plan.buckets:
@@ -2008,7 +2079,7 @@ def _evaluate_internal_validation_subgraphs(
                 accelerator=accelerator,
             )
             local_pair_indices: list[int] = []
-            local_pair_predictions: list[int] = []
+            local_pair_probabilities: list[float] = []
             for indexed_pair_batch in _chunked_indexed_pair_records(
                 indexed_pair_records=local_pair_records,
                 batch_size=inference_batch_size,
@@ -2035,17 +2106,21 @@ def _evaluate_internal_validation_subgraphs(
                     strict=True,
                 ):
                     local_pair_indices.append(global_index)
-                    local_pair_predictions.append(int(float(probability) >= threshold))
+                    local_pair_probabilities.append(float(probability))
 
-            ordered_predictions = _ordered_internal_validation_predictions(
+            ordered_probabilities = _ordered_internal_validation_probabilities(
                 local_indices=local_pair_indices,
-                local_predictions=local_pair_predictions,
+                local_probabilities=local_pair_probabilities,
                 total_records=len(bucket.pair_records),
                 accelerator=accelerator,
             )
+            ordered_predictions = [
+                int(probability >= threshold) for probability in ordered_probabilities
+            ]
             if accelerator.use_distributed and not accelerator.is_main_process:
                 continue
 
+            validation_probabilities.extend(ordered_probabilities)
             pred_subgraphs = [nx.Graph() for _ in bucket.sampled_subgraphs]
             for subgraph, nodes in zip(pred_subgraphs, bucket.sampled_subgraphs, strict=True):
                 subgraph.add_nodes_from(nodes)
@@ -2058,6 +2133,12 @@ def _evaluate_internal_validation_subgraphs(
                 )
             pred_graphs_by_size[bucket.node_size] = pred_subgraphs
             target_graphs_by_size[bucket.node_size] = list(bucket.target_subgraphs)
+            total_pred_edges += sum(subgraph.number_of_edges() for subgraph in pred_subgraphs)
+            total_target_edges += sum(
+                subgraph.number_of_edges() for subgraph in bucket.target_subgraphs
+            )
+            total_candidate_pairs += len(bucket.pair_records)
+            total_graphs += len(bucket.target_subgraphs)
 
     if accelerator.use_distributed and not accelerator.is_main_process:
         return _empty_internal_validation_summary()
@@ -2071,7 +2152,14 @@ def _evaluate_internal_validation_subgraphs(
     summary = cast(Mapping[str, float], result["summary"])
     return {
         metric_name: float(summary[metric_name]) for metric_name in INTERNAL_VALIDATION_SUMMARY_KEYS
-    }
+    } | _internal_validation_diagnostics(
+        probabilities=validation_probabilities,
+        pred_edges_total=total_pred_edges,
+        target_edges_total=total_target_edges,
+        candidate_pairs_total=total_candidate_pairs,
+        graph_count=total_graphs,
+        threshold=threshold,
+    )
 
 
 def _masked_bce_loss(
@@ -3156,6 +3244,9 @@ def _build_epoch_csv_row(
     """Build the persisted CSV row for one fine-tuning epoch."""
     internal_val_topology_stats = validation_result.internal_val_topology_stats
     val_pair_stats = validation_result.val_pair_stats
+    internal_val_diagnostics = _internal_validation_diagnostic_csv_fields(
+        internal_val_topology_stats
+    )
     return {
         "Epoch": epoch,
         "Epoch Time": epoch_seconds,
@@ -3173,6 +3264,7 @@ def _build_epoch_csv_row(
         "Internal Val relative_density": internal_val_topology_stats["relative_density"],
         "Internal Val deg_dist_mmd": internal_val_topology_stats["deg_dist_mmd"],
         "Internal Val cc_mmd": internal_val_topology_stats["cc_mmd"],
+        **internal_val_diagnostics,
         "Planned Subgraphs": int(train_stats["planned_subgraphs"]),
         "Covered Positive Edges": int(train_stats["covered_positive_edges"]),
         "Total Positive Edges": int(train_stats["total_positive_edges"]),
@@ -3193,6 +3285,66 @@ def _build_epoch_csv_row(
         "peak_gpu_mem_mb": peak_gpu_mem_mb,
         "Topology Loss Scale": train_stats["topology_loss_scale"],
         "Learning Rate": float(optimizer.param_groups[0]["lr"]),
+    }
+
+
+def _internal_validation_diagnostic_csv_fields(
+    internal_val_topology_stats: Mapping[str, float],
+) -> dict[str, float]:
+    """Map internal-validation diagnostic stats to persisted CSV columns."""
+    return {
+        "Internal Val Mean Pred Edges": float(
+            internal_val_topology_stats.get("pred_edges_mean", 0.0)
+        ),
+        "Internal Val Mean Target Edges": float(
+            internal_val_topology_stats.get("target_edges_mean", 0.0)
+        ),
+        "Internal Val Total Pred Edges": float(
+            internal_val_topology_stats.get("pred_edges_total", 0.0)
+        ),
+        "Internal Val Total Target Edges": float(
+            internal_val_topology_stats.get("target_edges_total", 0.0)
+        ),
+        "Internal Val Pred Edge Fraction": float(
+            internal_val_topology_stats.get("pred_edge_fraction", 0.0)
+        ),
+        "Internal Val Target Edge Fraction": float(
+            internal_val_topology_stats.get("target_edge_fraction", 0.0)
+        ),
+        "Internal Val Pred/Target Edge Ratio": float(
+            internal_val_topology_stats.get("pred_target_edge_ratio", 0.0)
+        ),
+        "Internal Val Prob Min": float(
+            internal_val_topology_stats.get("probability_min", 0.0)
+        ),
+        "Internal Val Prob Mean": float(
+            internal_val_topology_stats.get("probability_mean", 0.0)
+        ),
+        "Internal Val Prob Max": float(
+            internal_val_topology_stats.get("probability_max", 0.0)
+        ),
+        "Internal Val Prob P50": float(
+            internal_val_topology_stats.get("probability_p50", 0.0)
+        ),
+        "Internal Val Prob P90": float(
+            internal_val_topology_stats.get("probability_p90", 0.0)
+        ),
+        "Internal Val Prob P95": float(
+            internal_val_topology_stats.get("probability_p95", 0.0)
+        ),
+        "Internal Val Prob >= Threshold Fraction": float(
+            internal_val_topology_stats.get("probability_ge_threshold_fraction", 0.0)
+        ),
+    }
+
+
+def _internal_validation_diagnostic_payload(
+    internal_val_topology_stats: Mapping[str, float],
+) -> dict[str, float]:
+    """Map internal-validation diagnostic stats to JSON metric keys."""
+    return {
+        f"internal_val_{key}": float(internal_val_topology_stats.get(key, 0.0))
+        for key in INTERNAL_VALIDATION_DIAGNOSTIC_KEYS
     }
 
 
@@ -3220,6 +3372,7 @@ def _build_best_metrics_payload(
         "internal_val_relative_density": internal_val_topology_stats["relative_density"],
         "internal_val_deg_dist_mmd": internal_val_topology_stats["deg_dist_mmd"],
         "internal_val_cc_mmd": internal_val_topology_stats["cc_mmd"],
+        **_internal_validation_diagnostic_payload(internal_val_topology_stats),
         "planned_subgraphs": train_stats["planned_subgraphs"],
         "covered_positive_edges": train_stats["covered_positive_edges"],
         "total_positive_edges": train_stats["total_positive_edges"],

@@ -292,7 +292,7 @@ def test_topology_finetune_rejects_tccig_graph_forward_model(tmp_path: Path) -> 
 
 
 def test_tccig_config_uses_top_level_train_namespace() -> None:
-    config = load_config("configs/tccig/tccig.yaml")
+    config = load_config("configs/tccig/01.yaml")
     run_cfg = cast(Mapping[str, object], config["run_config"])
     train_cfg = parse_tccig_train_config(config)
 

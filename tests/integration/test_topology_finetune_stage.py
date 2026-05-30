@@ -332,7 +332,7 @@ class _DistributedValidationAccelerator(_RecordingAccelerator):
         self,
         *,
         peer_indices: Sequence[int],
-        peer_predictions: Sequence[int],
+        peer_predictions: Sequence[float],
     ) -> None:
         super().__init__()
         self.use_distributed = True
@@ -341,7 +341,7 @@ class _DistributedValidationAccelerator(_RecordingAccelerator):
         self.local_process_index = 0
         self.num_processes = 2
         self._peer_indices = [int(index) for index in peer_indices]
-        self._peer_predictions = [int(prediction) for prediction in peer_predictions]
+        self._peer_predictions = [float(prediction) for prediction in peer_predictions]
         self._gather_calls = 0
 
     def gather(self, value: torch.Tensor) -> torch.Tensor:
@@ -989,8 +989,38 @@ def test_evaluate_internal_validation_subgraphs_matches_per_subgraph_baseline(
         gt_graphs_by_size=expected_target_graphs,
         include_spectral_stats=False,
     )["summary"]
+    expected_probabilities = torch.sigmoid(
+        torch.tensor([-20.0, -10.0, 0.0, 0.0, 10.0, 20.0], dtype=torch.float32)
+    )
 
-    assert batched_summary == pytest.approx(expected_summary)
+    for metric_name, expected_value in expected_summary.items():
+        assert batched_summary[metric_name] == pytest.approx(expected_value)
+    assert batched_summary["pred_edges_total"] == pytest.approx(4.0)
+    assert batched_summary["target_edges_total"] == pytest.approx(4.0)
+    assert batched_summary["pred_edges_mean"] == pytest.approx(2.0)
+    assert batched_summary["target_edges_mean"] == pytest.approx(2.0)
+    assert batched_summary["pred_edge_fraction"] == pytest.approx(4.0 / 6.0)
+    assert batched_summary["target_edge_fraction"] == pytest.approx(4.0 / 6.0)
+    assert batched_summary["pred_target_edge_ratio"] == pytest.approx(1.0)
+    assert batched_summary["probability_min"] == pytest.approx(
+        float(expected_probabilities.min().item())
+    )
+    assert batched_summary["probability_mean"] == pytest.approx(
+        float(expected_probabilities.mean().item())
+    )
+    assert batched_summary["probability_max"] == pytest.approx(
+        float(expected_probabilities.max().item())
+    )
+    assert batched_summary["probability_p50"] == pytest.approx(
+        float(torch.quantile(expected_probabilities, 0.50).item())
+    )
+    assert batched_summary["probability_p90"] == pytest.approx(
+        float(torch.quantile(expected_probabilities, 0.90).item())
+    )
+    assert batched_summary["probability_p95"] == pytest.approx(
+        float(torch.quantile(expected_probabilities, 0.95).item())
+    )
+    assert batched_summary["probability_ge_threshold_fraction"] == pytest.approx(4.0 / 6.0)
 
 
 def test_evaluate_internal_validation_subgraphs_shards_rank_local_work_and_merges_summary(
@@ -1104,12 +1134,19 @@ def test_evaluate_internal_validation_subgraphs_shards_rank_local_work_and_merge
     peer_indices = [
         index for index, record in enumerate(bucket.pair_records) if record.subgraph_index % 2 == 1
     ]
+    protein_values = {
+        protein_id: float(index)
+        for index, protein_id in enumerate(("P1", "P2", "P3", "P4", "P5", "P6"), start=1)
+    }
     peer_predictions = [
-        int(
-            expected_pred_graphs[3][record.subgraph_index].has_edge(
-                record.protein_a,
-                record.protein_b,
-            )
+        float(
+            torch.sigmoid(
+                torch.tensor(
+                    (protein_values[record.protein_a] + protein_values[record.protein_b] - 7.0)
+                    * 10.0,
+                    dtype=torch.float32,
+                )
+            ).item()
         )
         for index, record in enumerate(bucket.pair_records)
         if index in peer_indices
@@ -1130,7 +1167,8 @@ def test_evaluate_internal_validation_subgraphs_shards_rank_local_work_and_merge
         compute_spectral_stats=False,
     )
 
-    assert summary == pytest.approx(expected_summary)
+    for metric_name, expected_value in expected_summary.items():
+        assert summary[metric_name] == pytest.approx(expected_value)
     assert processed_subgraph_indices == {0, 2}
 
 
@@ -3196,12 +3234,7 @@ def test_evaluate_validation_epoch_skips_internal_topology_validation_during_war
     )
 
     assert result.internal_val_topology_stats == pytest.approx(
-        {
-            "graph_sim": 0.0,
-            "relative_density": 0.0,
-            "deg_dist_mmd": 0.0,
-            "cc_mmd": 0.0,
-        }
+        topology_finetune_stage._empty_internal_validation_summary()
     )
     assert result.internal_validation_seconds == pytest.approx(0.0)
 

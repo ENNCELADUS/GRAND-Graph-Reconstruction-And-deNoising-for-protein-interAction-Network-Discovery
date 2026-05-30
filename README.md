@@ -28,7 +28,7 @@ GRAND uses a config-driven pipeline. Run commands through `uv run` so the projec
 uv run python -m src.run --config configs/v3/v3.yaml
 
 # Run the TCCIG graph-generator pipeline locally
-uv run python -m src.run --config configs/tccig/tccig.yaml
+uv run python -m src.run --config configs/tccig/01.yaml
 
 # To run only selected stages, edit `run_config.stages` in YAML, e.g.:
 # stages: ["train"] or stages: ["evaluate"].

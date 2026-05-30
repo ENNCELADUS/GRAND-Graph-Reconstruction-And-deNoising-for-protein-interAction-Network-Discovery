@@ -17,7 +17,7 @@ set -euo pipefail
 cd /public/home/wangar2023/grand/
 source ~/.bashrc
 
-DEFAULT_CONFIG="${GRAND_TCCIG_CONFIG:-configs/tccig/tccig.yaml}"
+DEFAULT_CONFIG="${GRAND_TCCIG_CONFIG:-configs/tccig/01.yaml}"
 TARGET_PATH="${1:-$DEFAULT_CONFIG}"
 
 mkdir -p logs/tccig models/tccig

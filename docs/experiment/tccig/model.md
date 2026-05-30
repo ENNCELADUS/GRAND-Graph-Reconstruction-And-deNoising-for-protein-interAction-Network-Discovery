@@ -27,7 +27,7 @@ $$
 当前 `tccig-train-stage` 分支实现的是这个 full design 的 v1 子集：
 
 - Public model: `src/model/tccig.py` registers `model_config.model: tccig` and exposes `forward_graph(...)` for feature-only graph scoring.
-- Config and launcher: canonical config is `configs/tccig/tccig.yaml`; canonical HPC launcher is `scripts/tccig.sh`.
+- Config and launcher: canonical config is `configs/tccig/01.yaml`; canonical HPC launcher is `scripts/tccig.sh`.
 - Student path: cached protein embeddings → mean pooling/projection → set-summary conditioning → all-pairs candidate universe for sampled subgraphs, or PRING candidate records during topology evaluation.
 - Edge decoder: symmetric pair features, hub propensity, low-rank affinity, overlapping module memberships, set-level density bias, and learned `m_hat`.
 - Graph Assembly: topology evaluation encodes unique test proteins once, scores candidate records in chunks, and selects top-`m_hat` edges.

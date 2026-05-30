@@ -156,7 +156,7 @@ Stage ordering is enforced: `train → topology_finetune → tccig_train → eva
 ## Launcher
 
 * Canonical local entry: `uv run python -m src.run --config configs/v3/v3.yaml`.
-* TCCIG local entry: `uv run python -m src.run --config configs/tccig/tccig.yaml`.
+* TCCIG local entry: `uv run python -m src.run --config configs/tccig/01.yaml`.
 * Package entry also works: `uv run python -m src.pipeline --config configs/v3/v3.yaml`.
 * Legacy script form works: `uv run python src/run.py --config configs/v3/v3.yaml` (delegates to `src.pipeline`).
 * DDP launch: `uv run python -m torch.distributed.run --nproc_per_node=N --module src.run --config ...`.
