@@ -1,5 +1,51 @@
+Warning: torch was built against CUDA 12.8, but using toolkit 12.5 at /public/software/CUDA/cuda-12.5.
+Set GRAND_CUDA_VERSION or CUDA_HOME to an exact-match toolkit to avoid DS_SKIP_CUDA_CHECK=1.
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+INFO:src.pipeline.__main__:Loaded config: configs/v3/ablations/0427_loss_ablation/topo_gs_rd_bce_high.yaml
+WARNING:accelerate.utils.other:[RANK 0] Detected kernel version 3.10.0, which is below the recommended minimum of 5.5.0; this can cause the process to hang. It is recommended to upgrade the kernel to the minimum version or higher.
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+
+2026-05-26 15:52:55 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-05-26 15:52:55 INFO Stage Start | Checkpoint: models/v3/topology_finetune/topo_gs_rd_bce_high/best_model.pth | Run Id: topo_gs_rd_bce_high
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/deepspeed/runtime/zero/linear.py:47: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  @autocast_custom_fwd
+
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/deepspeed/runtime/zero/linear.py:66: FutureWarning: `torch.cuda.amp.custom_bwd(args...)` is deprecated. Please use `torch.amp.custom_bwd(args..., device_type='cuda')` instead.
+  @autocast_custom_bwd
+
+2026-05-26 15:53:05 INFO Checkpoint Loaded | Path: models/v3/topology_finetune/topo_gs_rd_bce_high/best_model.pth
+2026-05-26 15:53:05 INFO Decision Threshold | Mode: fixed | Value: 0.5000
+2026-05-26 16:00:52 INFO Evaluation Metrics | Accuracy: 0.6194 | AUPRC: 0.6992 | Auroc: 0.6836 | F1: 0.5244 | Mcc: 0.2605 | Precision: 0.6990 | Recall: 0.4196 | Sensitivity: 0.4196 | Specificity: 0.8193 | Split: test
+2026-05-26 16:00:52 INFO CSV Written | Path: logs/v3/evaluate/topo_gs_rd_bce_high/evaluate.csv
+2026-05-26 16:00:52 INFO Stage Done | Run Id: topo_gs_rd_bce_high
+2026-05-26 16:00:52 INFO Stage Start | Checkpoint: models/v3/topology_finetune/topo_gs_rd_bce_high/best_model.pth | Run Id: topo_gs_rd_bce_high
+2026-05-26 16:00:53 INFO Decision Threshold | Mode: fixed | Value: 0.5000
+2026-05-26 16:01:42 INFO Topology Inference Ready | Cached Embedding Count: 2017 | Distributed: True | Pair Count: 2035153 | World Size: 4
+2026-05-26 18:10:22 INFO Pair Predictions Written | Path: logs/v3/topology_evaluate/topo_gs_rd_bce_high/all_test_ppi_pred.txt
+2026-05-26 18:12:13 INFO Topology Metrics Written | Path: logs/v3/topology_evaluate/topo_gs_rd_bce_high/topology_metrics.json
+2026-05-26 18:12:13 INFO Comparison Report Skipped | Reason: missing_baselines:src/topology/baselines/pring_human_table2.json
+2026-05-26 18:12:13 INFO Stage Done | Run Id: topo_gs_rd_bce_high
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+INFO:src.pipeline.__main__:Loaded config: configs/v3/ablations/0427_loss_ablation/topo_gs_rd_bce_low.yaml
+WARNING:accelerate.utils.other:[RANK 0] Detected kernel version 3.10.0, which is below the recommended minimum of 5.5.0; this can cause the process to hang. It is recommended to upgrade the kernel to the minimum version or higher.
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+
 2026-05-26 18:14:25 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
 2026-05-26 18:14:25 INFO Stage Start | Checkpoint: models/v3/train/20260308_002906/best_model.pth | Init Mode: warm_start | Run Id: topo_gs_rd_bce_low
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/deepspeed/runtime/zero/linear.py:47: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  @autocast_custom_fwd
+
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/deepspeed/runtime/zero/linear.py:66: FutureWarning: `torch.cuda.amp.custom_bwd(args...)` is deprecated. Please use `torch.amp.custom_bwd(args..., device_type='cuda')` instead.
+  @autocast_custom_bwd
+
 2026-05-26 18:15:05 INFO Finetune Config | Epochs: 20 | Internal Validation Compute Spectral Stats: False | Internal Validation Inference Batch Size: 128 | Internal Validation Node Sizes: [20, 40, 60, 80, 100] | Internal Validation Pairs: 108500 | Internal Validation Subgraphs: 50 | Monitor: val_topology_loss | Pair Batch Size: 32
 2026-05-26 18:24:31 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
 2026-05-26 18:24:43 INFO Epoch Progress | Epoch: 1 | Loss: 1.3643 | Progress: 0% | Step: 1/667
@@ -155,3 +201,80 @@
 2026-05-29 17:09:04 INFO Epoch Done | All Subgraph Pairs: 1621245 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.1257 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 555.5059 | Epoch: 20 | Internal Val Graph Sim: 0.2646 | Internal Val Topology S: 387.5739 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 26399.9399 | Planned Subgraphs: 2669 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 11500.8346 | Train Loss: 1.0392 | Val AUPRC: 0.9421 | Val Pair Pass S: 209.0407 | Val Threshold S: 0.0000
 2026-05-29 17:09:04 INFO Early Stop | Epoch: 20
 2026-05-29 17:09:04 INFO Stage Done | Run Id: topo_gs_rd_bce_low
+2026-05-29 17:09:04 INFO Stage Start | Checkpoint: models/v3/topology_finetune/topo_gs_rd_bce_low/best_model.pth | Run Id: topo_gs_rd_bce_low
+2026-05-29 17:09:04 INFO Checkpoint Loaded | Path: models/v3/topology_finetune/topo_gs_rd_bce_low/best_model.pth
+2026-05-29 17:09:04 INFO Decision Threshold | Mode: fixed | Value: 0.5000
+2026-05-29 17:16:33 INFO Evaluation Metrics | Accuracy: 0.6074 | AUPRC: 0.7050 | Auroc: 0.6851 | F1: 0.4347 | Mcc: 0.2716 | Precision: 0.7766 | Recall: 0.3018 | Sensitivity: 0.3018 | Specificity: 0.9132 | Split: test
+2026-05-29 17:16:33 INFO CSV Written | Path: logs/v3/evaluate/topo_gs_rd_bce_low/evaluate.csv
+2026-05-29 17:16:33 INFO Stage Done | Run Id: topo_gs_rd_bce_low
+2026-05-29 17:16:33 INFO Stage Start | Checkpoint: models/v3/topology_finetune/topo_gs_rd_bce_low/best_model.pth | Run Id: topo_gs_rd_bce_low
+2026-05-29 17:16:33 INFO Decision Threshold | Mode: fixed | Value: 0.5000
+2026-05-29 17:17:22 INFO Topology Inference Ready | Cached Embedding Count: 2017 | Distributed: True | Pair Count: 2035153 | World Size: 4
+2026-05-29 19:24:16 INFO Pair Predictions Written | Path: logs/v3/topology_evaluate/topo_gs_rd_bce_low/all_test_ppi_pred.txt
+2026-05-29 19:24:59 INFO Topology Metrics Written | Path: logs/v3/topology_evaluate/topo_gs_rd_bce_low/topology_metrics.json
+2026-05-29 19:24:59 INFO Comparison Report Skipped | Reason: missing_baselines:src/topology/baselines/pring_human_table2.json
+2026-05-29 19:24:59 INFO Stage Done | Run Id: topo_gs_rd_bce_low
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed. 
+*****************************************
+INFO:src.pipeline.__main__:Loaded config: configs/v3/ablations/0427_loss_ablation/topo_rd_only.yaml
+WARNING:accelerate.utils.other:[RANK 0] Detected kernel version 3.10.0, which is below the recommended minimum of 5.5.0; this can cause the process to hang. It is recommended to upgrade the kernel to the minimum version or higher.
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/torch/distributed/c10d_logger.py:83: UserWarning: barrier(): using the device under current context. You can specify `device_id` in `init_process_group` to mute this warning.
+  return func(*args, **kwargs)
+
+2026-05-29 19:26:02 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-05-29 19:26:02 INFO Stage Start | Checkpoint: models/v3/train/20260308_002906/best_model.pth | Init Mode: warm_start | Run Id: topo_rd_only
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/deepspeed/runtime/zero/linear.py:47: FutureWarning: `torch.cuda.amp.custom_fwd(args...)` is deprecated. Please use `torch.amp.custom_fwd(args..., device_type='cuda')` instead.
+  @autocast_custom_fwd
+
+WARNING:py.warnings:/public/home/wangar2023/grand/.venv/lib/python3.11/site-packages/deepspeed/runtime/zero/linear.py:66: FutureWarning: `torch.cuda.amp.custom_bwd(args...)` is deprecated. Please use `torch.amp.custom_bwd(args..., device_type='cuda')` instead.
+  @autocast_custom_bwd
+
+2026-05-29 19:26:51 INFO Finetune Config | Epochs: 20 | Internal Validation Compute Spectral Stats: False | Internal Validation Inference Batch Size: 128 | Internal Validation Node Sizes: [20, 40, 60, 80, 100] | Internal Validation Pairs: 108500 | Internal Validation Subgraphs: 50 | Monitor: val_topology_loss | Pair Batch Size: 32
+2026-05-29 19:36:08 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-29 19:36:19 INFO Epoch Progress | Epoch: 1 | Loss: 0.6469 | Progress: 0% | Step: 1/667
+2026-05-29 20:27:03 INFO Epoch Progress | Epoch: 1 | Loss: 0.6411 | Progress: 25% | Step: 167/667
+2026-05-29 21:18:41 INFO Epoch Progress | Epoch: 1 | Loss: 0.5928 | Progress: 50% | Step: 334/667
+2026-05-29 22:05:00 INFO Epoch Progress | Epoch: 1 | Loss: 0.7144 | Progress: 75% | Step: 501/667
+2026-05-29 22:46:56 INFO Epoch Progress | Epoch: 1 | Loss: 0.8025 | Progress: 100% | Step: 667/667
+2026-05-29 22:57:29 INFO Best Saved | Epoch: 1 | Monitor: val_topology_loss | Value: 63.5779
+2026-05-29 22:57:29 INFO Epoch Done | All Subgraph Pairs: 1620810 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.1257 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 573.9691 | Epoch: 1 | Internal Val Graph Sim: 0.1971 | Internal Val Topology S: 399.7870 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 26117.5688 | Planned Subgraphs: 2668 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 11307.5374 | Train Loss: 0.8366 | Val AUPRC: 0.9136 | Val Pair Pass S: 232.5212 | Val Threshold S: 0.0000
+2026-05-29 23:07:00 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-29 23:07:12 INFO Epoch Progress | Epoch: 2 | Loss: 0.9976 | Progress: 0% | Step: 1/667
+2026-05-29 23:58:55 INFO Epoch Progress | Epoch: 2 | Loss: 0.7663 | Progress: 25% | Step: 167/667
+2026-05-30 00:52:31 INFO Epoch Progress | Epoch: 2 | Loss: 0.6101 | Progress: 50% | Step: 334/667
+2026-05-30 01:40:11 INFO Epoch Progress | Epoch: 2 | Loss: 0.7050 | Progress: 75% | Step: 501/667
+2026-05-30 02:21:52 INFO Epoch Progress | Epoch: 2 | Loss: 0.8035 | Progress: 100% | Step: 667/667
+2026-05-30 02:31:48 INFO Best Saved | Epoch: 2 | Monitor: val_topology_loss | Value: 21.4399
+2026-05-30 02:31:48 INFO Epoch Done | All Subgraph Pairs: 1620810 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.1257 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 562.1497 | Epoch: 2 | Internal Val Graph Sim: 0.2209 | Internal Val Topology S: 385.5606 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 26510.3628 | Planned Subgraphs: 2668 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 11576.4147 | Train Loss: 0.8269 | Val AUPRC: 0.9273 | Val Pair Pass S: 210.1031 | Val Threshold S: 0.0000
+2026-05-30 02:41:27 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-30 02:41:37 INFO Epoch Progress | Epoch: 3 | Loss: 0.6267 | Progress: 0% | Step: 1/668
+2026-05-30 03:32:14 INFO Epoch Progress | Epoch: 3 | Loss: 0.6300 | Progress: 25% | Step: 167/668
+2026-05-30 04:24:33 INFO Epoch Progress | Epoch: 3 | Loss: 0.5263 | Progress: 50% | Step: 334/668
+2026-05-30 05:11:32 INFO Epoch Progress | Epoch: 3 | Loss: 0.6450 | Progress: 75% | Step: 501/668
+2026-05-30 05:53:28 INFO Epoch Progress | Epoch: 3 | Loss: 0.7546 | Progress: 100% | Step: 668/668
+2026-05-30 06:03:25 INFO Best Saved | Epoch: 3 | Monitor: val_topology_loss | Value: 16.5013
+2026-05-30 06:03:25 INFO Epoch Done | All Subgraph Pairs: 1622025 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.1256 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 567.0907 | Epoch: 3 | Internal Val Graph Sim: 0.2276 | Internal Val Topology S: 387.5739 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 26307.4404 | Planned Subgraphs: 2670 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 11408.8422 | Train Loss: 0.7661 | Val AUPRC: 0.9294 | Val Pair Pass S: 209.1572 | Val Threshold S: 0.0000
+2026-05-30 06:12:35 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-30 06:12:46 INFO Epoch Progress | Epoch: 4 | Loss: 0.7497 | Progress: 0% | Step: 1/668
+2026-05-30 07:03:50 INFO Epoch Progress | Epoch: 4 | Loss: 0.6038 | Progress: 25% | Step: 167/668
+2026-05-30 07:56:01 INFO Epoch Progress | Epoch: 4 | Loss: 0.5127 | Progress: 50% | Step: 334/668
+2026-05-30 08:43:26 INFO Epoch Progress | Epoch: 4 | Loss: 0.6168 | Progress: 75% | Step: 501/668
+2026-05-30 09:25:19 INFO Epoch Progress | Epoch: 4 | Loss: 0.7246 | Progress: 100% | Step: 668/668
+2026-05-30 09:35:18 INFO Best Saved | Epoch: 4 | Monitor: val_topology_loss | Value: 14.1076
+2026-05-30 09:35:18 INFO Epoch Done | All Subgraph Pairs: 1621245 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.1257 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 557.9840 | Epoch: 4 | Internal Val Graph Sim: 0.2312 | Internal Val Topology S: 389.4238 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 26022.8574 | Planned Subgraphs: 2669 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 11431.1093 | Train Loss: 0.7421 | Val AUPRC: 0.9306 | Val Pair Pass S: 210.1059 | Val Threshold S: 0.0000
+2026-05-30 09:45:12 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-30 09:45:25 INFO Epoch Progress | Epoch: 5 | Loss: 0.6782 | Progress: 0% | Step: 1/667
+2026-05-30 10:36:07 INFO Epoch Progress | Epoch: 5 | Loss: 0.5949 | Progress: 25% | Step: 167/667
+2026-05-30 11:28:23 INFO Epoch Progress | Epoch: 5 | Loss: 0.4961 | Progress: 50% | Step: 334/667
+2026-05-30 12:15:36 INFO Epoch Progress | Epoch: 5 | Loss: 0.5941 | Progress: 75% | Step: 501/667
+2026-05-30 12:57:28 INFO Epoch Progress | Epoch: 5 | Loss: 0.6974 | Progress: 100% | Step: 667/667
+2026-05-30 13:07:24 INFO Best Saved | Epoch: 5 | Monitor: val_topology_loss | Value: 12.7591
+2026-05-30 13:07:24 INFO Epoch Done | All Subgraph Pairs: 1620030 | Bce Negative Pairs: 154979 | Bce Negative Ratio: 3.1777 | Bce Positive Pairs: 48771 | Bce Supervised Fraction: 0.1258 | Bce Target Negative Pairs: 243855 | Covered Positive Edges: 48771 | Edge Cover Sampling S: 571.6559 | Epoch: 5 | Internal Val Graph Sim: 0.2343 | Internal Val Topology S: 387.8652 | Mean Positive Edge Reuse: 1.0000 | Peak Gpu Mem Mb: 26460.3521 | Planned Subgraphs: 2667 | Positive Edge Coverage Ratio: 1.0000 | Supervised Pairs: 203750 | Topo Loss Scale: 1.0000 | Total Positive Edges: 48771 | Train Forward Backward S: 11433.1100 | Train Loss: 0.7273 | Val AUPRC: 0.9312 | Val Pair Pass S: 208.1841 | Val Threshold S: 0.0000
+2026-05-30 13:16:16 INFO Bce Negative Assignment Clipped | Actual Negative Pairs: 154979 | Bce Negative Ratio: 5 | Target Negative Pairs: 243855
+2026-05-30 13:16:26 INFO Epoch Progress | Epoch: 6 | Loss: 0.6203 | Progress: 0% | Step: 1/668
+2026-05-30 14:07:32 INFO Epoch Progress | Epoch: 6 | Loss: 0.5670 | Progress: 25% | Step: 167/668
+2026-05-30 14:59:50 INFO Epoch Progress | Epoch: 6 | Loss: 0.4807 | Progress: 50% | Step: 334/668
+2026-05-30 15:47:05 INFO Epoch Progress | Epoch: 6 | Loss: 0.5833 | Progress: 75% | Step: 501/668
+slurmstepd: error: *** JOB 917913 ON hexm01 CANCELLED AT 2026-05-30T15:50:50 DUE TO TIME LIMIT ***
