@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import pickle
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -373,7 +374,12 @@ def _assemble_top_m_hat_predictions(
     m_hat: float,
 ) -> list[int]:
     """Select the top-``m_hat`` candidate edges and return hard PRING labels."""
-    edge_budget = max(0, min(len(probabilities), int(round(m_hat))))
+    if math.isinf(m_hat) and m_hat > 0:
+        edge_budget = len(probabilities)
+    elif not math.isfinite(m_hat):
+        edge_budget = 0
+    else:
+        edge_budget = max(0, min(len(probabilities), int(round(m_hat))))
     predictions = [0 for _ in probabilities]
     if edge_budget == 0:
         return predictions

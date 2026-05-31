@@ -340,6 +340,81 @@ def test_tccig_graph_assembly_evaluate_uses_all_test_universe_and_writes_diagnos
     assert diagnostics["m_hat"] == pytest.approx(2.0)
 
 
+def test_tccig_graph_assembly_evaluate_clamps_infinite_edge_budget(
+    tmp_path: Path,
+) -> None:
+    config = _build_topology_config(tmp_path)
+    cast(ConfigDict, config["run_config"])["stages"] = ["evaluate"]
+    cast(ConfigDict, config["run_config"])["eval_run_id"] = "graph_eval_inf_budget"
+    cast(ConfigDict, config["model_config"])["model"] = "tccig"
+    cast(ConfigDict, config["evaluate"])["mode"] = "graph_assembly"
+
+    class _InfiniteBudgetGraphAssemblyModel(torch.nn.Module):
+        def forward_graph(self, **_: object) -> dict[str, torch.Tensor]:
+            return {}
+
+        def encode_graph_nodes(
+            self,
+            *,
+            protein_embeddings: torch.Tensor,
+            protein_lengths: torch.Tensor,
+        ) -> torch.Tensor:
+            del protein_lengths
+            return protein_embeddings.mean(dim=1)
+
+        def edge_budget_from_node_embeddings(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_count: int,
+        ) -> torch.Tensor:
+            del node_embeddings, candidate_count
+            return torch.tensor(float("inf"))
+
+        def decode_graph_candidates(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_pairs: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            del node_embeddings
+            return {"edge_probabilities": torch.full((candidate_pairs.size(1),), 0.5)}
+
+    model = _InfiniteBudgetGraphAssemblyModel()
+    checkpoint_path = Path(str(cast(ConfigDict, config["run_config"])["load_checkpoint_path"]))
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), checkpoint_path)
+    dataloaders = build_dataloaders(config=config)
+
+    previous_cwd = Path.cwd()
+    try:
+        __import__("os").chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"evaluate": "graph_eval_inf_budget"},
+        )
+        run_evaluation_stage(
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
+        )
+    finally:
+        __import__("os").chdir(previous_cwd)
+
+    diagnostics_path = (
+        tmp_path
+        / "logs"
+        / "tccig"
+        / "evaluate"
+        / "graph_eval_inf_budget"
+        / "graph_assembly_diagnostics.json"
+    )
+    diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+    assert diagnostics["candidate_count"] == 3
+    assert diagnostics["selected_edges"] == 3
+
+
 def test_tccig_graph_assembly_scores_candidates_and_selects_top_budget(
     tmp_path: Path,
 ) -> None:
