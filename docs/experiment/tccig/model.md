@@ -22,7 +22,7 @@ $$
 
 核心原则：**training 可以从 training graphs/source interactomes 学 topology prior；test-time 对 target unseen protein set 只能输入 intrinsic features，不能输入 target edges、degrees、neighborhoods、communities、Laplacian 或任何 target topology-derived signal。** 这直接对应 research_problem.md 的边界：graph 是 scientific object，不是 pairwise predictions 的可视化；edge probabilities 可以局部合理，但 thresholded graph 仍可能 density、hub、clustering、module structure 错误。
 
-## Implementation status: 2026-05-30
+## Implementation status: 2026-05-31
 
 当前 `tccig-train-stage` 分支实现的是这个 full design 的 v1 子集：
 
@@ -36,6 +36,19 @@ $$
 - Probability calibration update: `src/model/tccig.py` now uses softmax module memberships with a centered module compatibility term instead of the previous `softplus(...)` + identity interaction term that added a universal positive logit offset. Scratch TCCIG training initializes the density-bias head from the supervised BCE positive rate when explicit negatives exist, otherwise from train-graph density.
 - Evaluation semantics update: TCCIG can run `evaluate.mode: graph_assembly`, which scores the `all_test_ppi.txt` candidate universe with graph-context probabilities, reports ranking metrics from those probabilities, and reports hard binary metrics from the same top-`m_hat` assembly rule used by topology evaluation.
 - Internal validation update: TCCIG topology monitoring now builds one validation-wide deduplicated candidate universe from all sampled validation subgraphs, applies one global top-`m_hat` graph assembly, and projects the hard decisions back onto sampled subgraphs. Fixed `0.5` threshold counts remain diagnostics for probability saturation, not the topology-monitor graph definition.
+- P0 fixed eval-only result: `configs/tccig/p0_fixed_eval_only.yaml`
+  evaluates `models/tccig/tccig_train/p0_fixed/best_model.pth` with graph
+  assembly semantics. Compared with `tccig_scratch`, topology metrics improved
+  but remain weak: summary `graph_sim` `0.159 -> 0.191`, `relative_density`
+  `0.402 -> 0.572`, `deg_dist_mmd` `37.962 -> 26.239`, `cc_mmd`
+  `15.404 -> 9.804`, and `laplacian_eigen_mmd` `34.264 -> 21.923`.
+- P0 fixed evaluation interpretation: graph-assembly hard metrics are no
+  longer the old all-positive fixed-threshold result. The final successful run
+  selected `88,478` of `2,033,136` candidate edges with `m_hat = 88478.148`,
+  producing test AUROC `0.581`, AUPRC `0.082`, accuracy `0.948`, precision
+  `0.055`, recall `0.180`, F1 `0.084`, MCC `0.078`, and specificity `0.958`.
+  Probability scores remain saturated (`mean = 0.981`, `p50 = 0.984`,
+  `p95 = 0.991`), so calibration and density-prior fixes remain open.
 
 Not implemented yet: feature kNN/anchor candidate proposer, offline S2GAE/MaskGAE/Bandana teacher pretraining, spectral/module/ranking/calibration/sparsity losses as active nonzero objectives, and validation-calibrated threshold selection beyond the current top-`m_hat` assembly path.
 

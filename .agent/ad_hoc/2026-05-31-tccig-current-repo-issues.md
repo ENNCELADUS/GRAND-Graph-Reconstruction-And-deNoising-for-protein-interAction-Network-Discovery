@@ -3,13 +3,15 @@
 Date: 2026-05-31
 Scope: `/Users/richardwang/Documents/grand`
 
-This note records the current TCCIG diagnosis so future agents do not treat the
-latest poor results as a single model-capacity problem. The main issue is that
+This note records the TCCIG diagnosis around the `tccig_scratch` run and the
+2026-05-31 P0 fixed eval-only follow-up. Future agents should not treat the poor
+results as a single model-capacity problem. The first failure mode was that
 training, normal evaluation, internal topology validation, and official
-`topology_evaluate` currently evaluate different objects and use different
-decision rules.
+`topology_evaluate` evaluated different objects and used different decision
+rules; after P0, the remaining failures are score saturation, weak ranking, and
+edge-budget / density calibration.
 
-## Current Runtime Paths
+## Baseline Runtime Paths Before P0
 
 - Training uses `forward_graph()` on sampled 60-80 node subgraphs and performs
   all-pairs graph reconstruction.
@@ -24,7 +26,47 @@ Because of this, normal `evaluate` and `topology_evaluate` are not expected to
 match. More importantly, internal topology validation is also not isomorphic to
 official `topology_evaluate`, so checkpoint selection is unreliable.
 
-## Observed Symptoms
+## P0 Fixed Result Update
+
+The P0 fixed eval-only run is archived in commit `baf4087` with
+`configs/tccig/p0_fixed_eval_only.yaml` and results under
+`logs/tccig/{evaluate,topology_evaluate,tccig_train}/p0_fixed/`. It evaluates
+`models/tccig/tccig_train/p0_fixed/best_model.pth` using graph assembly
+semantics for both `evaluate` and `topology_evaluate`.
+
+Pairwise-style CSV comparison:
+
+| run | AUROC | AUPRC | accuracy | specificity | precision | recall | F1 | MCC |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `tccig_scratch` | 0.625 | 0.644 | 0.500 | 0.000 | 0.500 | 1.000 | 0.667 | 0.000 |
+| `p0_fixed` | 0.581 | 0.082 | 0.948 | 0.958 | 0.055 | 0.180 | 0.084 | 0.078 |
+
+Topology summary comparison:
+
+| run | graph_sim | relative_density | deg_dist_mmd | cc_mmd | laplacian_eigen_mmd |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `tccig_scratch` | 0.159 | 0.402 | 37.962 | 15.404 | 34.264 |
+| `p0_fixed` | 0.191 | 0.572 | 26.239 | 9.804 | 21.923 |
+
+Graph assembly diagnostics for the successful P0 fixed rerun:
+
+- `candidate_count = 2033136`
+- `record_count = 2035153`
+- `m_hat = 88478.148`
+- `selected_edges = 88478`
+- probability quantiles: min `0.000`, mean `0.981`, p50 `0.984`, p90 `0.990`,
+  p95 `0.991`, max `1.000`
+
+Interpretation: P0 fixed confirms that the scratch `evaluate.csv` hard metrics
+were dominated by the fixed-threshold all-positive decision rule, not by a
+usable graph reconstruction. The unified graph-assembly path improves official
+topology metrics and makes specificity nonzero, but graph similarity remains
+low and precision/recall are still poor. The original inference therefore holds
+in a narrower form: evaluation semantics were a real blocker, but the model is
+still limited by saturated probabilities, weak ranking over the full candidate
+universe, and density-prior / edge-budget calibration.
+
+## Baseline Observed Symptoms
 
 - Normal evaluation reports approximately:
   - accuracy `0.500`
@@ -49,7 +91,7 @@ official `topology_evaluate`, so checkpoint selection is unreliable.
   not improve in a stable way. The model is learning some ranking signal, but it
   is not producing realistic graph reconstructions.
 
-## Main Root Causes
+## Root Causes From Baseline Diagnosis
 
 1. Evaluation semantics differ.
    Normal `evaluate` uses pairwise `forward()` plus fixed threshold `0.5`, while
@@ -97,6 +139,10 @@ official `topology_evaluate`, so checkpoint selection is unreliable.
 ## Priority Fixes
 
 ### P0: Unify Evaluation Semantics
+
+Status after `p0_fixed`: implemented for the canonical TCCIG eval-only path and
+used to rerun the checkpoint. Keep these requirements as invariants for future
+configs and result interpretation.
 
 - Add graph-mode evaluation for TCCIG so normal evaluation can score candidate
   records using `forward_graph()` probabilities.
