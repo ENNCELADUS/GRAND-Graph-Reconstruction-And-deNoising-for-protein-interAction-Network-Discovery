@@ -1,9 +1,9 @@
 run_config:
   stages: ["tccig_train", "evaluate", "topology_evaluate"]
   seed: 47
-  tccig_train_run_id: "p0_fixed"
-  eval_run_id: "p0_fixed"
-  topology_eval_run_id: "p0_fixed"
+  tccig_train_run_id: "p2_fixed"
+  eval_run_id: "p2_fixed"
+  topology_eval_run_id: "p2_fixed"
   load_checkpoint_path: null
   save_best_only: true
 
@@ -91,7 +91,7 @@ tccig_train:
     ramp_epochs: 0
     schedule: "linear"
   teacher:
-    enabled: true
+    enabled: false
     hidden_dim: 128
     num_layers: 2
     decoder_hidden_dim: 128
@@ -103,7 +103,7 @@ tccig_train:
       weight_decay: 0.0
   losses:
     edge: 1.0
-    teacher: 0.1
+    teacher: 0.0
     budget: 0.1
     density: 0.1
     degree: 0.05

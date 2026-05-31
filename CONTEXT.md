@@ -38,6 +38,19 @@ An observability-only view of how many TCCIG edge probabilities cross a fixed th
 usually `0.5`. It helps detect score saturation but does not define the primary TCCIG
 topology-monitor graph.
 
+## Graph Density Prior
+
+The train-graph edge density used to initialize the TCCIG density-bias head. It is
+computed from positive training edges over the full train-node pair universe and is
+distinct from the supervised BCE positive rate induced by negative sampling.
+
+## Debug Assembly
+
+A non-official TCCIG topology-evaluation assembly used to diagnose budget choice under
+the same ranked edge probabilities. Debug assemblies can compare model `m_hat`,
+validation-density, and oracle-test-density budgets, but they do not redefine the
+official Graph Assembly decision rule.
+
 ## Validation-Calibrated Pairwise Threshold
 
 A TCCIG-only pairwise classification threshold selected from validation-set edge

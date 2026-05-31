@@ -12,9 +12,12 @@ import pytest
 import torch
 from src.pipeline.runtime import DistributedContext
 from src.pipeline.stages.topology_evaluate import (
+    GraphAssemblyResult,
     _assemble_top_m_hat_predictions,
+    _density_edge_budget,
     _gather_ordered_predictions,
     _ordered_predictions_from_shards,
+    graph_assembly_diagnostics,
     write_topology_predictions,
 )
 from src.topology.metrics import (
@@ -237,6 +240,31 @@ def test_assemble_top_m_hat_predictions_uses_top_budget() -> None:
     )
 
     assert predictions == [0, 1, 0, 1]
+
+
+def test_graph_assembly_diagnostics_reports_full_pair_budget_ratios() -> None:
+    diagnostics = graph_assembly_diagnostics(
+        GraphAssemblyResult(
+            predictions=[1, 0, 1],
+            probabilities=[0.9, 0.1, 0.8],
+            m_hat=2.0,
+            n_nodes=3,
+            full_pair_count=3,
+            candidate_count=2,
+            selected_edges=2,
+        )
+    )
+
+    assert diagnostics["n_nodes"] == 3
+    assert diagnostics["full_pair_count"] == 3
+    assert diagnostics["m_hat_per_candidate"] == pytest.approx(1.0)
+    assert diagnostics["m_hat_per_full_pair"] == pytest.approx(2.0 / 3.0)
+
+
+def test_density_edge_budget_uses_full_pair_density_and_candidate_clamp() -> None:
+    budget = _density_edge_budget(density=0.75, n_nodes=4, candidate_count=3)
+
+    assert budget == pytest.approx(3.0)
 
 
 def test_ordered_predictions_from_shards_restores_original_pair_order() -> None:

@@ -209,14 +209,8 @@ def _tccig_density_prior(
     train_negative_lookup: ExplicitNegativePairLookup,
     negative_ratio: int,
 ) -> tuple[float, str]:
-    """Return the preferred sparse prior for TCCIG density-bias initialization."""
-    supervised_probability = _supervised_positive_probability(
-        train_graph=train_graph,
-        train_negative_lookup=train_negative_lookup,
-        negative_ratio=negative_ratio,
-    )
-    if supervised_probability is not None:
-        return supervised_probability, "supervised_bce"
+    """Return the graph-density prior for TCCIG density-bias initialization."""
+    del train_negative_lookup, negative_ratio
     return _graph_positive_edge_probability(train_graph), "graph_density"
 
 

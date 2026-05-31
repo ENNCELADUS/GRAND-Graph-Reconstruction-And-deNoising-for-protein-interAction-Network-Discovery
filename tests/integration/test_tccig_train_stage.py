@@ -24,6 +24,7 @@ from src.topology.finetune_data import (
 )
 from src.train.config import OptimizerConfig
 from src.train.tccig.config import parse_tccig_train_config
+from src.train.tccig.data import _tccig_density_prior
 from src.train.tccig.mgae import MGAETeacher
 from src.train.tccig.teacher import OnlineTCCIGTeacher
 from src.train.tccig.trainer import TCCIGStudentTrainer
@@ -297,6 +298,41 @@ def test_tccig_config_uses_top_level_train_namespace() -> None:
     train_cfg = parse_tccig_train_config(config)
 
     assert run_cfg["stages"] == ["tccig_train", "evaluate", "topology_evaluate"]
+    assert run_cfg["tccig_train_run_id"] == "p2_fixed"
+    assert run_cfg["eval_run_id"] == "p2_fixed"
+    assert run_cfg["topology_eval_run_id"] == "p2_fixed"
     assert "tccig_train" in config
     assert "topology_finetune" not in config
+    raw_train_cfg = cast(Mapping[str, object], config["tccig_train"])
+    teacher_cfg = cast(Mapping[str, object], raw_train_cfg["teacher"])
+    loss_cfg = cast(Mapping[str, object], raw_train_cfg["losses"])
+    assert teacher_cfg["enabled"] is False
+    assert loss_cfg["teacher"] == pytest.approx(0.0)
     assert isinstance(train_cfg.optimizer, OptimizerConfig)
+
+
+def test_tccig_density_prior_uses_graph_density_with_explicit_negatives() -> None:
+    graph = nx.Graph()
+    graph.add_nodes_from(["P1", "P2", "P3", "P4"])
+    graph.add_edge("P1", "P2")
+    negative_lookup = ExplicitNegativePairLookup(
+        negative_pairs=frozenset(
+            {
+                ("P1", "P3"),
+                ("P1", "P4"),
+                ("P2", "P3"),
+                ("P2", "P4"),
+                ("P3", "P4"),
+            }
+        ),
+        partners_by_node={},
+    )
+
+    probability, source = _tccig_density_prior(
+        train_graph=graph,
+        train_negative_lookup=negative_lookup,
+        negative_ratio=5,
+    )
+
+    assert source == "graph_density"
+    assert probability == pytest.approx(1.0 / 6.0)

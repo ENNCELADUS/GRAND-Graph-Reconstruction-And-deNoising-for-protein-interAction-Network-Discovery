@@ -78,6 +78,8 @@ def _build_topology_config(tmp_path: Path) -> ConfigDict:
         pickle.dump(gt_graph, handle)
     with (processed_dir / "test_sampled_nodes.pkl").open("wb") as handle:
         pickle.dump({3: [["P1", "P2", "P3"]]}, handle)
+    with (processed_dir / "human_BFS_split.pkl").open("wb") as handle:
+        pickle.dump({"train": {"P1", "P2", "P3"}, "test": {"P1", "P2", "P3"}}, handle)
 
     cache_dir = tmp_path / "cache"
     _write_embedding_cache(
@@ -349,9 +351,13 @@ def test_tccig_graph_assembly_evaluate_uses_all_test_universe_and_writes_diagnos
     assert diagnostics_path.exists()
     diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
     assert diagnostics["assembly_rule"] == "top_m_hat"
+    assert diagnostics["n_nodes"] == 3
+    assert diagnostics["full_pair_count"] == 3
     assert diagnostics["candidate_count"] == 3
     assert diagnostics["selected_edges"] == 2
     assert diagnostics["m_hat"] == pytest.approx(2.0)
+    assert diagnostics["m_hat_per_candidate"] == pytest.approx(2.0 / 3.0, abs=1.0e-3)
+    assert diagnostics["m_hat_per_full_pair"] == pytest.approx(2.0 / 3.0, abs=1.0e-3)
     assert diagnostics["threshold_mode"] == "validation_mcc"
     assert diagnostics["threshold_value"] == pytest.approx(0.7)
 
@@ -587,6 +593,11 @@ def test_tccig_graph_assembly_scores_candidates_and_selects_top_budget(
 def test_tccig_topology_evaluate_writes_graph_assembly_diagnostics(tmp_path: Path) -> None:
     config = _build_topology_config(tmp_path)
     cast(ConfigDict, config["model_config"])["model"] = "tccig"
+    processed_dir = Path(str(cast(ConfigDict, config["data_config"])["benchmark"]["processed_dir"]))
+    config["tccig_train"] = {
+        "supervision_train_dataset": str(processed_dir / "human_train_ppi.txt"),
+        "supervision_valid_dataset": str(processed_dir / "human_val_ppi.txt"),
+    }
 
     class _GraphAssemblyModel(torch.nn.Module):
         def forward_graph(self, **_: object) -> dict[str, torch.Tensor]:
@@ -647,8 +658,12 @@ def test_tccig_topology_evaluate_writes_graph_assembly_diagnostics(tmp_path: Pat
     assert diagnostics_path.exists()
     diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
     assert diagnostics["assembly_rule"] == "top_m_hat"
+    assert diagnostics["n_nodes"] == 3
+    assert diagnostics["full_pair_count"] == 3
     assert diagnostics["candidate_count"] == 3
     assert diagnostics["selected_edges"] == 2
+    assert diagnostics["m_hat_per_candidate"] == pytest.approx(2.0 / 3.0, abs=1.0e-3)
+    assert diagnostics["m_hat_per_full_pair"] == pytest.approx(2.0 / 3.0, abs=1.0e-3)
 
     metrics_payload = json.loads((log_dir / "topology_metrics.json").read_text(encoding="utf-8"))
     assert metrics_payload["graph_assembly"]["assembly_rule"] == "top_m_hat"
@@ -657,6 +672,28 @@ def test_tccig_topology_evaluate_writes_graph_assembly_diagnostics(tmp_path: Pat
         "mode": "fixed",
         "value": 0.5,
     }
+    debug_assemblies = metrics_payload["debug_assemblies"]
+    assert set(debug_assemblies) == {
+        "model_m_hat",
+        "validation_density",
+        "oracle_test_density",
+    }
+    assert debug_assemblies["model_m_hat"]["diagnostic_only"] is False
+    assert debug_assemblies["model_m_hat"]["budget"] == pytest.approx(2.0)
+    assert debug_assemblies["validation_density"]["diagnostic_only"] is True
+    assert debug_assemblies["validation_density"]["source_density"] == pytest.approx(
+        1.0 / 3.0,
+        abs=1.0e-3,
+    )
+    assert debug_assemblies["validation_density"]["budget"] == pytest.approx(1.0)
+    assert debug_assemblies["validation_density"]["selected_edges"] == 1
+    assert debug_assemblies["oracle_test_density"]["diagnostic_only"] is True
+    assert debug_assemblies["oracle_test_density"]["source_density"] == pytest.approx(
+        2.0 / 3.0,
+        abs=1.0e-3,
+    )
+    assert debug_assemblies["oracle_test_density"]["budget"] == pytest.approx(2.0)
+    assert "summary" in debug_assemblies["validation_density"]
 
 
 def test_tccig_graph_assembly_preserves_self_edge_records_as_negatives(

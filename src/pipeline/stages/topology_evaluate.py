@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+import networkx as nx
 import torch
 import torch.distributed as _dist
 from torch.nn.utils.rnn import pad_sequence
@@ -32,6 +33,7 @@ from src.topology import (
     reconstruct_graph,
     write_human_table2_reports,
 )
+from src.topology.supervision import load_supervision_graphs
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -68,6 +70,8 @@ class GraphAssemblyResult:
     predictions: list[int]
     probabilities: list[float]
     m_hat: float
+    n_nodes: int
+    full_pair_count: int
     candidate_count: int
     selected_edges: int
     assembly_rule: str = "top_m_hat"
@@ -392,6 +396,73 @@ def _assemble_top_m_hat_predictions(
     return predictions
 
 
+def _full_pair_count(n_nodes: int) -> int:
+    """Return the number of possible undirected non-self pairs."""
+    if n_nodes < 2:
+        return 0
+    return n_nodes * (n_nodes - 1) // 2
+
+
+def _safe_ratio(numerator: float, denominator: int) -> float:
+    """Return a finite ratio for diagnostics."""
+    if denominator <= 0:
+        return 0.0
+    return float(numerator / float(denominator))
+
+
+def _graph_edge_density(graph: nx.Graph) -> float:
+    """Return graph edge density over the graph's full node universe."""
+    return _safe_ratio(float(graph.number_of_edges()), _full_pair_count(graph.number_of_nodes()))
+
+
+def _density_edge_budget(
+    *,
+    density: float,
+    n_nodes: int,
+    candidate_count: int,
+) -> float:
+    """Convert a full-pair graph density into a clamped candidate budget."""
+    if not math.isfinite(density) or density <= 0.0:
+        return 0.0
+    raw_budget = float(density) * float(_full_pair_count(n_nodes))
+    return max(0.0, min(float(candidate_count), raw_budget))
+
+
+def _assemble_predictions_for_budget(
+    *,
+    records: Sequence[tuple[str, str]],
+    probabilities: Sequence[float],
+    edge_budget: float,
+) -> list[int]:
+    """Assemble non-self records with a fixed top-K budget."""
+    if len(records) != len(probabilities):
+        raise ValueError("records and probabilities must have the same length")
+    scorable_indices = [
+        index for index, (protein_a, protein_b) in enumerate(records) if protein_a != protein_b
+    ]
+    scorable_predictions = _assemble_top_m_hat_predictions(
+        probabilities=[float(probabilities[index]) for index in scorable_indices],
+        m_hat=edge_budget,
+    )
+    predictions = [0 for _ in records]
+    for index, prediction in zip(scorable_indices, scorable_predictions, strict=True):
+        predictions[index] = prediction
+    return predictions
+
+
+def _validation_graph_density(config: ConfigDict) -> float | None:
+    """Return supervision-validation graph density when TCCIG training config exists."""
+    train_cfg = config.get("tccig_train")
+    if not isinstance(train_cfg, dict):
+        return None
+    _, validation_graph = load_supervision_graphs(
+        config=config,
+        stage_cfg=cast(ConfigDict, train_cfg),
+        stage_name="tccig_train",
+    )
+    return _graph_edge_density(validation_graph)
+
+
 def _probability_stats(probabilities: Sequence[float]) -> dict[str, float]:
     """Return stable summary statistics for graph-assembly probabilities."""
     if not probabilities:
@@ -419,8 +490,12 @@ def graph_assembly_diagnostics(result: GraphAssemblyResult) -> dict[str, float |
     return {
         "assembly_rule": result.assembly_rule,
         "m_hat": float(result.m_hat),
+        "n_nodes": int(result.n_nodes),
+        "full_pair_count": int(result.full_pair_count),
         "record_count": len(result.predictions),
         "candidate_count": int(result.candidate_count),
+        "m_hat_per_candidate": _safe_ratio(float(result.m_hat), result.candidate_count),
+        "m_hat_per_full_pair": _safe_ratio(float(result.m_hat), result.full_pair_count),
         "selected_edges": int(result.selected_edges),
     } | _probability_stats(result.probabilities)
 
@@ -472,10 +547,14 @@ def _predict_tccig_graph_assembly_result(
         (index, record) for index, record in enumerate(records) if record[0] != record[1]
     ]
     if not scorable_records_with_indices:
+        protein_ids = {protein_id for record in records for protein_id in record}
+        n_nodes = len(protein_ids)
         return GraphAssemblyResult(
             predictions=[0] * len(records),
             probabilities=[0.0] * len(records),
             m_hat=0.0,
+            n_nodes=n_nodes,
+            full_pair_count=_full_pair_count(n_nodes),
             candidate_count=0,
             selected_edges=0,
         )
@@ -487,6 +566,7 @@ def _predict_tccig_graph_assembly_result(
         records=scorable_records,
         device=device,
     )
+    n_nodes = len(protein_ids)
     node_to_index = {protein_id: index for index, protein_id in enumerate(protein_ids)}
     candidate_batch_size = _resolve_tccig_candidate_batch_size(config)
     probabilities: list[float] = []
@@ -541,6 +621,8 @@ def _predict_tccig_graph_assembly_result(
         predictions=predictions,
         probabilities=full_probabilities,
         m_hat=float(m_hat_tensor.detach().cpu().item()),
+        n_nodes=n_nodes,
+        full_pair_count=_full_pair_count(n_nodes),
         candidate_count=len(scorable_records),
         selected_edges=sum(scorable_predictions),
     )
@@ -778,6 +860,138 @@ def _evaluate_predicted_graph_sharded(
     )
 
 
+def _debug_assembly_payload(
+    *,
+    budget_source: str,
+    budget: float,
+    predictions: Sequence[int],
+    result: GraphAssemblyResult,
+    topology_result: Mapping[str, Any],
+    diagnostic_only: bool,
+    source_density: float | None = None,
+) -> dict[str, Any]:
+    """Build one debug assembly diagnostics payload."""
+    selected_edges = int(sum(int(prediction > 0) for prediction in predictions))
+    payload: dict[str, Any] = {
+        "budget_source": budget_source,
+        "diagnostic_only": diagnostic_only,
+        "budget": float(budget),
+        "n_nodes": int(result.n_nodes),
+        "full_pair_count": int(result.full_pair_count),
+        "candidate_count": int(result.candidate_count),
+        "selected_edges": selected_edges,
+        "budget_per_candidate": _safe_ratio(float(budget), result.candidate_count),
+        "budget_per_full_pair": _safe_ratio(float(budget), result.full_pair_count),
+        "selected_edges_per_candidate": _safe_ratio(float(selected_edges), result.candidate_count),
+        "selected_edges_per_full_pair": _safe_ratio(float(selected_edges), result.full_pair_count),
+        "summary": topology_result["summary"],
+    }
+    if source_density is not None:
+        payload["source_density"] = float(source_density)
+    return payload
+
+
+def _evaluate_debug_assembly(
+    *,
+    budget_source: str,
+    budget: float,
+    result: GraphAssemblyResult,
+    records: Sequence[tuple[str, str]],
+    gt_graph: object,
+    test_graph_nodes: Mapping[int, list[list[str]]],
+    distributed_context: DistributedContext,
+    diagnostic_only: bool,
+    source_density: float | None = None,
+) -> dict[str, Any]:
+    """Evaluate one non-official graph assembly under a fixed edge budget."""
+    predictions = _assemble_predictions_for_budget(
+        records=records,
+        probabilities=result.probabilities,
+        edge_budget=budget,
+    )
+    predicted_edges = [
+        (protein_a, protein_b)
+        for (protein_a, protein_b), prediction in zip(records, predictions, strict=True)
+        if prediction > 0
+    ]
+    topology_result = _evaluate_predicted_graph_sharded(
+        pred_graph=reconstruct_graph(predicted_edges),
+        gt_graph=gt_graph,
+        test_graph_nodes=test_graph_nodes,
+        distributed_context=distributed_context,
+    )
+    return _debug_assembly_payload(
+        budget_source=budget_source,
+        budget=budget,
+        predictions=predictions,
+        result=result,
+        topology_result=topology_result,
+        diagnostic_only=diagnostic_only,
+        source_density=source_density,
+    )
+
+
+def _evaluate_tccig_debug_assemblies(
+    *,
+    config: ConfigDict,
+    result: GraphAssemblyResult,
+    records: Sequence[tuple[str, str]],
+    official_topology_result: Mapping[str, Any],
+    gt_graph: object,
+    test_graph_nodes: Mapping[int, list[list[str]]],
+    distributed_context: DistributedContext,
+) -> dict[str, Any]:
+    """Evaluate budget-control debug assemblies for TCCIG graph assembly."""
+    debug_assemblies: dict[str, Any] = {
+        "model_m_hat": _debug_assembly_payload(
+            budget_source="model_m_hat",
+            budget=float(result.m_hat),
+            predictions=result.predictions,
+            result=result,
+            topology_result=official_topology_result,
+            diagnostic_only=False,
+        )
+    }
+
+    validation_density = _validation_graph_density(config)
+    if validation_density is not None:
+        validation_budget = _density_edge_budget(
+            density=validation_density,
+            n_nodes=result.n_nodes,
+            candidate_count=result.candidate_count,
+        )
+        debug_assemblies["validation_density"] = _evaluate_debug_assembly(
+            budget_source="validation_density",
+            budget=validation_budget,
+            result=result,
+            records=records,
+            gt_graph=gt_graph,
+            test_graph_nodes=test_graph_nodes,
+            distributed_context=distributed_context,
+            diagnostic_only=True,
+            source_density=validation_density,
+        )
+
+    oracle_density = _graph_edge_density(cast(nx.Graph, gt_graph))
+    oracle_budget = _density_edge_budget(
+        density=oracle_density,
+        n_nodes=result.n_nodes,
+        candidate_count=result.candidate_count,
+    )
+    debug_assemblies["oracle_test_density"] = _evaluate_debug_assembly(
+        budget_source="oracle_test_density",
+        budget=oracle_budget,
+        result=result,
+        records=records,
+        gt_graph=gt_graph,
+        test_graph_nodes=test_graph_nodes,
+        distributed_context=distributed_context,
+        diagnostic_only=True,
+        source_density=oracle_density,
+    )
+    return debug_assemblies
+
+
 def run_topology_evaluation_stage(
     runtime: PipelineRuntime,
     model: torch.nn.Module,
@@ -841,6 +1055,7 @@ def run_topology_evaluation_stage(
             world_size=runtime.world_size,
         )
     graph_assembly_payload: dict[str, float | int | str] | None = None
+    graph_assembly_result: GraphAssemblyResult | None = None
     if graph_forward_model:
         graph_assembly_result = _predict_tccig_graph_assembly_result(
             config=config,
@@ -908,6 +1123,17 @@ def run_topology_evaluation_stage(
         test_graph_nodes=test_graph_nodes,
         distributed_context=runtime.distributed,
     )
+    debug_assemblies_payload: dict[str, Any] | None = None
+    if graph_assembly_result is not None:
+        debug_assemblies_payload = _evaluate_tccig_debug_assemblies(
+            config=config,
+            result=graph_assembly_result,
+            records=records,
+            official_topology_result=topology_result,
+            gt_graph=gt_graph,
+            test_graph_nodes=test_graph_nodes,
+            distributed_context=runtime.distributed,
+        )
 
     if runtime.is_main_process:
         with (log_dir / "graph_eval_results.pkl").open("wb") as handle:
@@ -938,6 +1164,8 @@ def run_topology_evaluation_stage(
                     "mode": threshold_mode,
                     "value": decision_threshold,
                 }
+                if debug_assemblies_payload is not None:
+                    payload["debug_assemblies"] = debug_assemblies_payload
             json.dump(
                 format_result_payload(payload),
                 handle,

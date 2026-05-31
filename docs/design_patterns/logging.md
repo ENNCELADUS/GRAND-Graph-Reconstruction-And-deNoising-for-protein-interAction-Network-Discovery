@@ -24,6 +24,13 @@ Stage logs and metrics are stored under the `logs/` directory, organized by mode
 
 **Note**: The `<run_id>` is either provided in the config or automatically generated (timestamped) by the runtime. In distributed mode, run IDs are broadcast from rank 0 to ensure consistency.
 
+**Run ID collision policy**: Treat run IDs as immutable experiment IDs. Reusing
+the same run ID can append duplicate rows to CSV summaries and overwrite JSON,
+prediction, and log artifacts. When rerunning an experiment for a new fix, use a
+new run ID such as `p1_fixed`; if a collision already happened, copy the
+newly-written artifacts to a new run directory before restoring the original
+tracked run from Git.
+
 ## Artifact Types
 
 ### 1. `log.log`
@@ -58,6 +65,10 @@ Stage logs and metrics are stored under the `logs/` directory, organized by mode
 *   **Schema (strict order)**:
     *   `split,auroc,auprc,accuracy,sensitivity,specificity,precision,recall,f1,mcc`
 *   **Note**: The evaluator may compute extra metrics internally, but only this fixed schema is persisted.
+*   **TCCIG note**: in `evaluate.mode: graph_assembly`, hard metrics are computed
+    from top-`m_hat` graph assembly. Fixed `0.5` thresholds and
+    validation-calibrated pairwise thresholds are diagnostics, not the graph
+    decision rule.
 
 ### 4. `topology_finetune_step.csv`
 *   **Location**: `logs/{model}/topology_finetune/<run_id>/`
@@ -71,6 +82,11 @@ Stage logs and metrics are stored under the `logs/` directory, organized by mode
     *   `topology_metrics.csv`: Per-node-size topology summary plus aggregate rows.
     *   `graph_eval_results.pkl`: Serialized detailed topology-evaluation output.
     *   `all_test_ppi_pred.txt`: Pairwise predictions in PRING format for graph reconstruction.
+*   **TCCIG note**: `topology_metrics.json` records `decision_rule: top_m_hat`
+    for graph-forward TCCIG runs and stores fixed-threshold settings only under
+    `fixed_threshold_diagnostic`. It also records `debug_assemblies` for
+    non-official budget diagnostics such as validation-density and
+    oracle-test-density top-K assemblies.
 
 ### 6. `best_model.pth`
 *   **Location**: `models/{model}/{stage}/<run_id>/best_model.pth` (for `train`, `topology_finetune`, and `adapt` stages).

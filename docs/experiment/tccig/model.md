@@ -22,7 +22,7 @@ $$
 
 核心原则：**training 可以从 training graphs/source interactomes 学 topology prior；test-time 对 target unseen protein set 只能输入 intrinsic features，不能输入 target edges、degrees、neighborhoods、communities、Laplacian 或任何 target topology-derived signal。** 这直接对应 research_problem.md 的边界：graph 是 scientific object，不是 pairwise predictions 的可视化；edge probabilities 可以局部合理，但 thresholded graph 仍可能 density、hub、clustering、module structure 错误。
 
-## Implementation status: 2026-05-31
+## Implementation status: 2026-06-01
 
 当前 `tccig-train-stage` 分支实现的是这个 full design 的 v1 子集：
 
@@ -33,7 +33,7 @@ $$
 - Graph Assembly: topology evaluation encodes unique test proteins once, scores candidate records in chunks, and selects top-`m_hat` edges.
 - Train-only teacher: optional online MGAE teacher masks positive training edges and distills candidate-edge probabilities into the student.
 - Active losses: masked BCE edge loss, teacher distillation, budget, density, degree MMD, and optional clustering MMD.
-- Probability calibration update: `src/model/tccig.py` now uses softmax module memberships with a centered module compatibility term instead of the previous `softplus(...)` + identity interaction term that added a universal positive logit offset. Scratch TCCIG training initializes the density-bias head from the supervised BCE positive rate when explicit negatives exist, otherwise from train-graph density.
+- Probability calibration update: `src/model/tccig.py` now uses softmax module memberships with a centered module compatibility term instead of the previous `softplus(...)` + identity interaction term that added a universal positive logit offset. Scratch TCCIG training initializes the density-bias head from train-graph density rather than the supervised BCE positive rate induced by negative sampling.
 - Evaluation semantics update: TCCIG can run `evaluate.mode: graph_assembly`, which scores the `all_test_ppi.txt` candidate universe with graph-context probabilities, reports ranking metrics from those probabilities, and reports hard binary metrics from the same top-`m_hat` assembly rule used by topology evaluation.
 - Internal validation update: TCCIG topology monitoring now builds one validation-wide deduplicated candidate universe from all sampled validation subgraphs, applies one global top-`m_hat` graph assembly, and projects the hard decisions back onto sampled subgraphs. Fixed `0.5` threshold counts remain diagnostics for probability saturation, not the topology-monitor graph definition.
 - P0 fixed eval-only result: `configs/tccig/p0_fixed_eval_only.yaml`
@@ -49,8 +49,27 @@ $$
   `0.055`, recall `0.180`, F1 `0.084`, MCC `0.078`, and specificity `0.958`.
   Probability scores remain saturated (`mean = 0.981`, `p50 = 0.984`,
   `p95 = 0.991`), so calibration and density-prior fixes remain open.
+- P1 fixed-threshold cleanup result: `logs/tccig/{tccig_train,evaluate,topology_evaluate}/p1_fixed/`
+  archives the 2026-06-01 rerun after adding TCCIG-only validation-calibrated
+  pairwise threshold diagnostics. The graph-assembly metrics are intentionally
+  unchanged from P0 because the hard graph still uses top-`m_hat`: AUROC `0.581`,
+  AUPRC `0.082`, accuracy `0.948`, precision `0.055`, recall `0.180`, F1
+  `0.084`, MCC `0.078`, and specificity `0.958`. Topology remains weak:
+  `graph_sim = 0.191`, `relative_density = 0.572`, `deg_dist_mmd = 26.193`,
+  `cc_mmd = 9.779`, and `laplacian_eigen_mmd = 21.940`.
+- P1 interpretation: the selected validation-MCC threshold is `0.993` with
+  validation MCC `0.271`, F1 `0.574`, Youden `0.261`, predicted-positive rate
+  `0.367`, and validation positive rate `0.500`. This confirms that fixed
+  threshold `0.5` is only a saturation diagnostic for this checkpoint; it does
+  not fix graph reconstruction. The remaining blockers are density prior,
+  edge-budget calibration, checkpoint monitoring, and decoder saturation.
+- P2 code update: canonical `configs/tccig/01.yaml` now uses run id `p2_fixed`,
+  disables the online teacher for the Run B ablation, initializes TCCIG density
+  bias from train-graph density, and records edge-budget diagnostics plus
+  debug assemblies for model `m_hat`, validation-density, and oracle-test-density
+  budgets in topology evaluation.
 
-Not implemented yet: feature kNN/anchor candidate proposer, offline S2GAE/MaskGAE/Bandana teacher pretraining, spectral/module/ranking/calibration/sparsity losses as active nonzero objectives, and validation-calibrated threshold selection beyond the current top-`m_hat` assembly path.
+Not implemented yet: feature kNN/anchor candidate proposer, offline S2GAE/MaskGAE/Bandana teacher pretraining, spectral/module/ranking/calibration/sparsity losses as active nonzero objectives, composite checkpoint monitoring, and decoder scale/gating.
 
 
 # 1. Overall pipeline
