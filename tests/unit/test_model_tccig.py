@@ -45,6 +45,20 @@ def test_tccig_forward_graph_is_feature_only_and_returns_graph_outputs() -> None
     assert output["node_embeddings"].shape == (4, 16)
 
 
+def test_tccig_edge_budget_stays_finite_for_large_candidate_universe_in_half_precision() -> None:
+    model = TCCIG(**_tccig_config()).half()
+    node_embeddings = torch.randn(16, 16, dtype=torch.float16)
+    candidate_count = 2_033_136
+
+    edge_budget = model.edge_budget_from_node_embeddings(
+        node_embeddings=node_embeddings,
+        candidate_count=candidate_count,
+    )
+
+    assert torch.isfinite(edge_budget)
+    assert 0.0 <= float(edge_budget.detach()) <= float(candidate_count)
+
+
 def test_tccig_decode_graph_candidates_treats_pairs_as_undirected_edges() -> None:
     torch.manual_seed(17)
     model = TCCIG(**_tccig_config())

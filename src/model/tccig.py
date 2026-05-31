@@ -253,7 +253,8 @@ class TCCIG(nn.Module):
         if candidate_count < 0:
             raise ValueError("candidate_count must be non-negative")
         set_state = node_embeddings.mean(dim=0, keepdim=True)
-        return torch.sigmoid(self.edge_budget_head(set_state).squeeze()) * float(candidate_count)
+        budget_fraction = torch.sigmoid(self.edge_budget_head(set_state).squeeze()).float()
+        return budget_fraction * float(candidate_count)
 
     def initialize_density_bias_with_prior(self, positive_edge_probability: float) -> float:
         """Initialize set-density bias to a sparse positive-edge prior."""
