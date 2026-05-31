@@ -429,9 +429,12 @@ def write_graph_assembly_diagnostics(
     *,
     output_path: Path,
     result: GraphAssemblyResult,
+    extra_payload: Mapping[str, float | int | str] | None = None,
 ) -> dict[str, float | int | str]:
     """Persist graph-assembly diagnostics and return the payload."""
     payload = graph_assembly_diagnostics(result)
+    if extra_payload is not None:
+        payload.update(extra_payload)
     with output_path.open("w", encoding="utf-8") as handle:
         json.dump(format_result_payload(payload), handle, indent=2, sort_keys=True)
     return payload
@@ -807,7 +810,15 @@ def run_topology_evaluation_stage(
     decision_threshold, threshold_mode = _resolve_decision_threshold(
         eval_cfg=threshold_cfg,
     )
-    if runtime.is_main_process:
+    graph_forward_model = _model_supports_graph_forward(model, runtime.accelerator)
+    if runtime.is_main_process and graph_forward_model:
+        log_stage_event(
+            logger,
+            "fixed_threshold_diagnostic",
+            mode=threshold_mode,
+            value=decision_threshold,
+        )
+    elif runtime.is_main_process:
         log_stage_event(logger, "decision_threshold", mode=threshold_mode, value=decision_threshold)
 
     all_test_path, gt_graph_path, sampled_nodes_path = _topology_paths(config)
@@ -830,7 +841,7 @@ def run_topology_evaluation_stage(
             world_size=runtime.world_size,
         )
     graph_assembly_payload: dict[str, float | int | str] | None = None
-    if _model_supports_graph_forward(model, runtime.accelerator):
+    if graph_forward_model:
         graph_assembly_result = _predict_tccig_graph_assembly_result(
             config=config,
             model=model,
@@ -922,6 +933,11 @@ def run_topology_evaluation_stage(
             }
             if graph_assembly_payload is not None:
                 payload["graph_assembly"] = graph_assembly_payload
+                payload["decision_rule"] = graph_assembly_payload["assembly_rule"]
+                payload["fixed_threshold_diagnostic"] = {
+                    "mode": threshold_mode,
+                    "value": decision_threshold,
+                }
             json.dump(
                 format_result_payload(payload),
                 handle,

@@ -260,6 +260,20 @@ def test_tccig_graph_assembly_evaluate_uses_all_test_universe_and_writes_diagnos
     cast(ConfigDict, config["evaluate"])["mode"] = "graph_assembly"
 
     class _GraphAssemblyModel(torch.nn.Module):
+        def forward(
+            self,
+            emb_a: torch.Tensor,
+            emb_b: torch.Tensor,
+            **_: object,
+        ) -> dict[str, torch.Tensor]:
+            pair_sum = emb_a.mean(dim=(1, 2)) + emb_b.mean(dim=(1, 2))
+            probabilities = torch.where(
+                pair_sum <= 3.5,
+                torch.full_like(pair_sum, 0.7),
+                torch.full_like(pair_sum, 0.6),
+            )
+            return {"logits": torch.logit(probabilities)}
+
         def forward_graph(self, **_: object) -> dict[str, torch.Tensor]:
             return {}
 
@@ -338,6 +352,87 @@ def test_tccig_graph_assembly_evaluate_uses_all_test_universe_and_writes_diagnos
     assert diagnostics["candidate_count"] == 3
     assert diagnostics["selected_edges"] == 2
     assert diagnostics["m_hat"] == pytest.approx(2.0)
+    assert diagnostics["threshold_mode"] == "validation_mcc"
+    assert diagnostics["threshold_value"] == pytest.approx(0.7)
+
+
+def test_tccig_pairwise_evaluate_uses_validation_calibrated_threshold(
+    tmp_path: Path,
+) -> None:
+    config = _build_topology_config(tmp_path)
+    data_cfg = cast(ConfigDict, config["data_config"])
+    benchmark_cfg = cast(ConfigDict, data_cfg["benchmark"])
+    processed_dir = Path(str(benchmark_cfg["processed_dir"]))
+    _write_split(
+        processed_dir / "human_val_ppi.txt",
+        [("P1", "P2", 1), ("P1", "P3", 0), ("P2", "P3", 0)],
+    )
+    _write_split(
+        processed_dir / "human_test_ppi.txt",
+        [("P1", "P2", 1), ("P1", "P3", 0)],
+    )
+    cast(ConfigDict, config["run_config"])["stages"] = ["evaluate"]
+    cast(ConfigDict, config["run_config"])["eval_run_id"] = "tccig_pairwise_threshold_case"
+    cast(ConfigDict, config["model_config"])["model"] = "tccig"
+    cast(ConfigDict, config["evaluate"])["mode"] = "pairwise"
+    cast(ConfigDict, config["evaluate"])["tccig_pairwise_threshold"] = {
+        "mode": "validation_mcc"
+    }
+
+    class _PairwiseTCCIGModel(torch.nn.Module):
+        def forward(
+            self,
+            emb_a: torch.Tensor,
+            emb_b: torch.Tensor,
+            **_: object,
+        ) -> dict[str, torch.Tensor]:
+            pair_sum = emb_a.mean(dim=(1, 2)) + emb_b.mean(dim=(1, 2))
+            probabilities = torch.where(
+                pair_sum <= 3.5,
+                torch.full_like(pair_sum, 0.7),
+                torch.where(
+                    pair_sum <= 4.5,
+                    torch.full_like(pair_sum, 0.6),
+                    torch.full_like(pair_sum, 0.2),
+                ),
+            )
+            return {"logits": torch.logit(probabilities)}
+
+    model = _PairwiseTCCIGModel()
+    checkpoint_path = Path(str(cast(ConfigDict, config["run_config"])["load_checkpoint_path"]))
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), checkpoint_path)
+    dataloaders = build_dataloaders(config=config)
+
+    previous_cwd = Path.cwd()
+    try:
+        __import__("os").chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"evaluate": "tccig_pairwise_threshold_case"},
+        )
+        metrics = run_evaluation_stage(
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
+        )
+    finally:
+        __import__("os").chdir(previous_cwd)
+
+    assert metrics["accuracy"] == pytest.approx(1.0)
+    assert metrics["specificity"] == pytest.approx(1.0)
+
+    log_text = (
+        tmp_path
+        / "logs"
+        / "tccig"
+        / "evaluate"
+        / "tccig_pairwise_threshold_case"
+        / "log.log"
+    ).read_text(encoding="utf-8")
+    assert "tccig_pairwise_threshold" in log_text
+    assert "Threshold Value: 0.700" in log_text
 
 
 def test_tccig_graph_assembly_evaluate_clamps_infinite_edge_budget(
@@ -350,6 +445,15 @@ def test_tccig_graph_assembly_evaluate_clamps_infinite_edge_budget(
     cast(ConfigDict, config["evaluate"])["mode"] = "graph_assembly"
 
     class _InfiniteBudgetGraphAssemblyModel(torch.nn.Module):
+        def forward(
+            self,
+            emb_a: torch.Tensor,
+            emb_b: torch.Tensor,
+            **_: object,
+        ) -> dict[str, torch.Tensor]:
+            pair_sum = emb_a.mean(dim=(1, 2)) + emb_b.mean(dim=(1, 2))
+            return {"logits": torch.logit(torch.full_like(pair_sum, 0.5))}
+
         def forward_graph(self, **_: object) -> dict[str, torch.Tensor]:
             return {}
 
@@ -548,6 +652,11 @@ def test_tccig_topology_evaluate_writes_graph_assembly_diagnostics(tmp_path: Pat
 
     metrics_payload = json.loads((log_dir / "topology_metrics.json").read_text(encoding="utf-8"))
     assert metrics_payload["graph_assembly"]["assembly_rule"] == "top_m_hat"
+    assert metrics_payload["decision_rule"] == "top_m_hat"
+    assert metrics_payload["fixed_threshold_diagnostic"] == {
+        "mode": "fixed",
+        "value": 0.5,
+    }
 
 
 def test_tccig_graph_assembly_preserves_self_edge_records_as_negatives(

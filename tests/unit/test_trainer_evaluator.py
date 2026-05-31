@@ -10,7 +10,7 @@ import torch.nn.functional as functional
 from src.evaluate import Evaluator
 from src.pipeline.runtime import DistributedContext
 from src.pipeline.stages.adapt import ADAPT_CSV_COLUMNS
-from src.pipeline.stages.evaluate import EVAL_CSV_COLUMNS
+from src.pipeline.stages.evaluate import EVAL_CSV_COLUMNS, select_tccig_pairwise_threshold
 from src.pipeline.stages.train import _training_validation_metrics
 from src.train.base import OptimizerConfig, SchedulerConfig, Trainer
 from src.train.strategies.ohem import OHEMSampleStrategy
@@ -605,3 +605,55 @@ def test_evaluator_rejects_non_pring_decision_threshold() -> None:
             accelerator=NoOpAccelerator(),
             decision_threshold=0.3,
         )
+
+
+def test_select_tccig_pairwise_threshold_optimizes_mcc_with_tie_breaks() -> None:
+    labels = torch.tensor([1, 1, 0, 0], dtype=torch.long)
+    probabilities = torch.tensor([0.9, 0.2, 0.8, 0.1], dtype=torch.float32)
+
+    result = select_tccig_pairwise_threshold(
+        labels=labels,
+        probabilities=probabilities,
+        threshold_cfg={"mode": "validation_mcc"},
+    )
+
+    assert result.threshold == pytest.approx(0.2)
+    assert result.mode == "validation_mcc"
+    assert result.fallback_reason is None
+    assert result.target_metric == pytest.approx(0.577350269)
+
+
+def test_select_tccig_pairwise_threshold_supports_f1_and_youden_modes() -> None:
+    labels = torch.tensor([1, 1, 0, 0], dtype=torch.long)
+    probabilities = torch.tensor([0.9, 0.2, 0.8, 0.1], dtype=torch.float32)
+
+    f1_result = select_tccig_pairwise_threshold(
+        labels=labels,
+        probabilities=probabilities,
+        threshold_cfg={"mode": "validation_f1"},
+    )
+    youden_result = select_tccig_pairwise_threshold(
+        labels=labels,
+        probabilities=probabilities,
+        threshold_cfg={"mode": "validation_youden"},
+    )
+
+    assert f1_result.threshold == pytest.approx(0.2)
+    assert f1_result.target_metric == pytest.approx(0.8)
+    assert youden_result.threshold == pytest.approx(0.2)
+    assert youden_result.target_metric == pytest.approx(0.5)
+
+
+def test_select_tccig_pairwise_threshold_falls_back_for_one_class_validation() -> None:
+    labels = torch.tensor([1, 1, 1], dtype=torch.long)
+    probabilities = torch.tensor([0.9, 0.8, 0.7], dtype=torch.float32)
+
+    result = select_tccig_pairwise_threshold(
+        labels=labels,
+        probabilities=probabilities,
+        threshold_cfg={"mode": "validation_mcc"},
+    )
+
+    assert result.threshold == pytest.approx(0.5)
+    assert result.mode == "validation_mcc"
+    assert result.fallback_reason == "validation_labels_single_class"

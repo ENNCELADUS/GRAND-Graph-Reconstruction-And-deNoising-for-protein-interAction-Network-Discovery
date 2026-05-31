@@ -38,6 +38,12 @@ An observability-only view of how many TCCIG edge probabilities cross a fixed th
 usually `0.5`. It helps detect score saturation but does not define the primary TCCIG
 topology-monitor graph.
 
+## Validation-Calibrated Pairwise Threshold
+
+A TCCIG-only pairwise classification threshold selected from validation-set edge
+probabilities and labels. It defines pairwise hard metrics for diagnostic
+classification views, but it does not define the assembled TCCIG graph.
+
 ## Train-Only Topology Teacher
 
 An auxiliary graph autoencoder trained only on training subgraphs. It provides soft

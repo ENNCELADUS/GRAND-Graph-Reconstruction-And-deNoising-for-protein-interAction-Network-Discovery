@@ -37,7 +37,10 @@ The Evaluator requires a real `AcceleratorLike` instance — there is no optiona
 Metrics are defined in the `evaluate` section of the YAML config. Pairwise
 `decision_threshold` is fixed at `0.5`; validation-selected thresholds are
 intentionally unsupported for the default PRING pairwise path. TCCIG graph assembly
-evaluation is selected explicitly with `mode: graph_assembly`.
+evaluation is selected explicitly with `mode: graph_assembly`. TCCIG pairwise
+diagnostic classification may separately select a validation-calibrated threshold
+with `evaluate.tccig_pairwise_threshold`; this does not change the global PRING
+pairwise threshold contract.
 
 ```yaml
 evaluate:
@@ -64,10 +67,17 @@ candidate universe and hard-decision rule:
 ```yaml
 evaluate:
   mode: graph_assembly
+  tccig_pairwise_threshold:
+    mode: validation_mcc  # diagnostic pairwise threshold, not the graph rule
   decision_threshold:
     mode: fixed
     value: 0.5  # diagnostic legacy threshold, not the hard graph rule
 ```
+
+For TCCIG `mode: pairwise`, `tccig_pairwise_threshold` controls the hard
+predictions used for pairwise diagnostic metrics. Supported modes are `fixed`,
+`validation_mcc`, `validation_f1`, and `validation_youden`; the default is
+`validation_mcc`.
 
 ## Usage Pattern
 
@@ -90,7 +100,7 @@ append_csv_row(...)
 
 When `run_config.stages` contains `"evaluate"`, the stage:
 1.  Loads the checkpoint via `runtime.load_checkpoint()`.
-2.  Resolves the fixed PRING decision threshold (`0.5`) for the default pairwise path.
+2.  Resolves the fixed PRING decision threshold (`0.5`) for the default pairwise path, or the TCCIG-only validation-calibrated pairwise threshold for TCCIG pairwise diagnostics.
 3.  Instantiates the Evaluator with the runtime's accelerator.
 4.  Runs either pairwise test-set evaluation or TCCIG graph assembly evaluation on `all_test_ppi.txt`.
 5.  Writes the result to `logs/{model}/evaluate/{run_id}/evaluate.csv`.

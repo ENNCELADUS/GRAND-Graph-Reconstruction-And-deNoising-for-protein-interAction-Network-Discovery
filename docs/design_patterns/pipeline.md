@@ -116,7 +116,7 @@ Assesses final model performance on the test set.
 
 1.  Loads the best available checkpoint (from adapt, tccig_train, topology_finetune, or train).
 2.  Resolves `evaluate.mode` (`pairwise` by default, `graph_assembly` for the canonical TCCIG config).
-3.  Computes all configured metrics via `Evaluator`. Pairwise mode uses the fixed PRING decision threshold (`0.5`); TCCIG graph assembly mode scores `all_test_ppi.txt`, reports AUROC/AUPRC from graph-context probabilities, and reports hard metrics from top-`m_hat` predictions.
+3.  Computes all configured metrics via `Evaluator`. Default pairwise mode uses the fixed PRING decision threshold (`0.5`); TCCIG pairwise diagnostics may use `evaluate.tccig_pairwise_threshold`. TCCIG graph assembly mode scores `all_test_ppi.txt`, reports AUROC/AUPRC from graph-context probabilities, and reports hard metrics from top-`m_hat` predictions.
 4.  Writes `evaluate.csv`.
 5.  TCCIG graph assembly mode also writes `graph_assembly_diagnostics.json`.
 
@@ -138,7 +138,7 @@ Runs PRING-style graph reconstruction and computes topology metrics (graph simil
   * `Val <metric>` columns follow `training_config.logging.validation_metrics` order.
 * `evaluate.csv` strict header order:
   * `split,auroc,auprc,accuracy,sensitivity,specificity,precision,recall,f1,mcc`
-* `graph_assembly_diagnostics.json` records TCCIG assembly metadata when `evaluate` or `topology_evaluate` uses Graph Assembly.
+* `graph_assembly_diagnostics.json` records TCCIG assembly metadata when `evaluate` or `topology_evaluate` uses Graph Assembly. The graph decision rule remains top-`m_hat`; validation-calibrated pairwise thresholds are diagnostic metadata.
 * `topology_finetune_step.csv` records pairwise, topology, coverage, timing, GPU-memory, and learning-rate fields for topology fine-tuning.
 * `tccig_train_step.csv` records the analogous TCCIG graph-forward training and topology-validation fields, including separate top-`m_hat` and fixed-threshold internal-validation edge diagnostics.
 * `topology_metrics.json`, `topology_metrics.csv`, and `graph_eval_results.pkl` are the persisted topology-evaluation summary/detail artifacts.
