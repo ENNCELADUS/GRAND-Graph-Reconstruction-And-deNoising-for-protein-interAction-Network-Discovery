@@ -1,0 +1,22 @@
+2026-05-31 01:56:28 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-05-31 03:03:28 INFO Stage Start | Checkpoint: models/tccig/tccig_train/p0_fixed/best_model.pth | Run Id: p0_fixed
+2026-05-31 03:03:28 INFO Checkpoint Loaded | Path: models/tccig/tccig_train/p0_fixed/best_model.pth
+2026-05-31 03:03:28 INFO Decision Threshold | Mode: fixed | Value: 0.500
+2026-05-31 22:50:30 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-05-31 22:50:30 INFO Stage Start | Checkpoint: models/tccig/tccig_train/p0_fixed/best_model.pth | Run Id: p0_fixed
+2026-05-31 22:50:39 INFO Checkpoint Loaded | Path: models/tccig/tccig_train/p0_fixed/best_model.pth
+2026-05-31 22:50:39 INFO Decision Threshold | Mode: fixed | Value: 0.500
+2026-05-31 22:51:41 INFO Tccig Graph Assembly Evaluate | Assembly Rule: top_m_hat | Candidate Count: 2033136 | M Hat: inf | Pair Count: 2035153 | Selected Edges: 2033136
+2026-05-31 22:51:41 INFO Graph Assembly Diagnostics Written | Path: logs/tccig/evaluate/p0_fixed/graph_assembly_diagnostics.json
+2026-05-31 22:51:41 INFO Evaluation Metrics | Accuracy: 0.012 | AUPRC: 0.082 | Auroc: 0.581 | F1: 0.024 | Mcc: -0.257 | Precision: 0.012 | Recall: 0.929 | Sensitivity: 0.929 | Specificity: 0.000 | Split: test
+2026-05-31 22:51:41 INFO CSV Written | Path: logs/tccig/evaluate/p0_fixed/evaluate.csv
+2026-05-31 22:51:41 INFO Stage Done | Run Id: p0_fixed
+2026-05-31 23:38:42 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-05-31 23:38:42 INFO Stage Start | Checkpoint: models/tccig/tccig_train/p0_fixed/best_model.pth | Run Id: p0_fixed
+2026-05-31 23:38:51 INFO Checkpoint Loaded | Path: models/tccig/tccig_train/p0_fixed/best_model.pth
+2026-05-31 23:38:51 INFO Decision Threshold | Mode: fixed | Value: 0.500
+2026-05-31 23:39:53 INFO Tccig Graph Assembly Evaluate | Assembly Rule: top_m_hat | Candidate Count: 2033136 | M Hat: 88478.148 | Pair Count: 2035153 | Selected Edges: 88478
+2026-05-31 23:39:53 INFO Graph Assembly Diagnostics Written | Path: logs/tccig/evaluate/p0_fixed/graph_assembly_diagnostics.json
+2026-05-31 23:39:53 INFO Evaluation Metrics | Accuracy: 0.948 | AUPRC: 0.082 | Auroc: 0.581 | F1: 0.084 | Mcc: 0.078 | Precision: 0.055 | Recall: 0.180 | Sensitivity: 0.180 | Specificity: 0.958 | Split: test
+2026-05-31 23:39:53 INFO CSV Written | Path: logs/tccig/evaluate/p0_fixed/evaluate.csv
+2026-05-31 23:39:53 INFO Stage Done | Run Id: p0_fixed
