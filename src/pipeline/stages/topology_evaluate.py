@@ -1343,6 +1343,9 @@ def run_topology_evaluation_stage(
         )
         log_stage_event(logger, "pair_predictions_written", path=prediction_path)
 
+    if graph_forward_model and runtime.is_distributed and not runtime.is_main_process:
+        return {}
+
     predicted_edges = [
         (protein_a, protein_b)
         for (protein_a, protein_b), prediction in zip(records, predictions, strict=True)
@@ -1353,11 +1356,16 @@ def run_topology_evaluation_stage(
         gt_graph = pickle.load(handle)
     with sampled_nodes_path.open("rb") as handle:
         test_graph_nodes = pickle.load(handle)
+    graph_metric_context = (
+        DistributedContext(ddp_enabled=False, is_distributed=False)
+        if graph_forward_model
+        else runtime.distributed
+    )
     topology_result = _evaluate_predicted_graph_sharded(
         pred_graph=pred_graph,
         gt_graph=gt_graph,
         test_graph_nodes=test_graph_nodes,
-        distributed_context=runtime.distributed,
+        distributed_context=graph_metric_context,
     )
     debug_assemblies_payload: dict[str, Any] | None = None
     if graph_assembly_result is not None:
@@ -1368,7 +1376,7 @@ def run_topology_evaluation_stage(
             official_topology_result=topology_result,
             gt_graph=gt_graph,
             test_graph_nodes=test_graph_nodes,
-            distributed_context=runtime.distributed,
+            distributed_context=graph_metric_context,
         )
 
     if runtime.is_main_process:
@@ -1416,5 +1424,6 @@ def run_topology_evaluation_stage(
         log_stage_event(logger, "topology_metrics_written", path=log_dir / "topology_metrics.json")
         _maybe_write_comparison_report(config=config, model_name=model_name, logger=logger)
         log_stage_event(logger, "stage_done", run_id=run_id)
-    runtime.barrier()
+    if not graph_forward_model:
+        runtime.barrier()
     return cast(dict[str, float], topology_result["summary"])

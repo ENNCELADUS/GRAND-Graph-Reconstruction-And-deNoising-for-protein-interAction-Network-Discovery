@@ -786,6 +786,80 @@ def test_tccig_topology_evaluate_writes_graph_assembly_diagnostics(tmp_path: Pat
     assert "summary" in debug_assemblies["validation_density"]
 
 
+def test_tccig_graph_forward_topology_metrics_skip_non_main_distributed_rank(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _build_topology_config(tmp_path)
+    checkpoint_path = Path(str(cast(ConfigDict, config["run_config"])["load_checkpoint_path"]))
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    dataloaders = build_dataloaders(config=config)
+
+    class _GraphAssemblyModel(torch.nn.Module):
+        def forward_graph(self, **_: object) -> dict[str, torch.Tensor]:
+            return {}
+
+        def encode_graph_nodes(
+            self,
+            *,
+            protein_embeddings: torch.Tensor,
+            protein_lengths: torch.Tensor,
+        ) -> torch.Tensor:
+            del protein_lengths
+            return protein_embeddings.mean(dim=1)
+
+        def edge_budget_from_node_embeddings(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_count: int,
+        ) -> torch.Tensor:
+            del node_embeddings, candidate_count
+            return torch.tensor(2.0)
+
+        def decode_graph_candidates(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_pairs: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            del node_embeddings
+            return {"edge_probabilities": torch.ones(candidate_pairs.size(1))}
+
+    model = _GraphAssemblyModel()
+    torch.save(model.state_dict(), checkpoint_path)
+
+    def _fail_graph_metrics(**_: object) -> dict[str, object]:
+        raise AssertionError("non-main graph-forward rank should skip graph metrics")
+
+    monkeypatch.setattr(topology_stage, "evaluate_predicted_graph", _fail_graph_metrics)
+
+    previous_cwd = Path.cwd()
+    try:
+        __import__("os").chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_evaluate": "graph_forward_non_main"},
+            distributed=DistributedContext(
+                ddp_enabled=True,
+                is_distributed=True,
+                rank=1,
+                local_rank=1,
+                world_size=2,
+            ),
+        )
+        summary = run_topology_evaluation_stage(
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
+        )
+    finally:
+        __import__("os").chdir(previous_cwd)
+
+    assert summary == {}
+
+
 def test_tccig_graph_assembly_preserves_self_edge_records_as_negatives(
     tmp_path: Path,
 ) -> None:
