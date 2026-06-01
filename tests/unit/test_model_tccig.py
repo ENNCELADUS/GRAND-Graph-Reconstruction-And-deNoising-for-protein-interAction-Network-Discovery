@@ -113,6 +113,25 @@ def test_tccig_decode_graph_candidates_accepts_encoded_retrieval_state() -> None
     )
 
 
+def test_tccig_encode_graph_nodes_does_not_compute_residue_retrieval_factor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(57)
+    model = TCCIG(**_tccig_config())
+
+    def _raise_if_residue_factor_is_used(**_: object) -> torch.Tensor:
+        raise AssertionError("encode_graph_nodes should not compute residue retrieval factors")
+
+    monkeypatch.setattr(model, "_encode_residue_factor", _raise_if_residue_factor_is_used)
+
+    node_embeddings = model.encode_graph_nodes(
+        protein_embeddings=torch.randn(3, 5, 8),
+        protein_lengths=torch.tensor([5, 4, 3], dtype=torch.long),
+    )
+
+    assert node_embeddings.shape == (3, 16)
+
+
 def test_tccig_pooled_input_retrieval_only_matches_esm_cosine_baseline() -> None:
     config = _tccig_config() | {
         "decoder_mode": "retrieval_only",

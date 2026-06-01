@@ -92,11 +92,11 @@ Current remaining limitations: feature kNN/anchor candidate proposal and ANN bac
 ## R0-R5 queue
 
 - R0 `gpr_r0_esm_cosine_human_bfs_20260602b`: pooled ESM cosine retrieval-only baseline with validation-density assembly.
-- R1 `gpr_r1_sorf_dual_human_bfs_20260602b`: SORF residue-factorized dual retriever.
-- R2 `gpr_r2_graph_prior_human_bfs_20260602b`: adds offline graph-prior structural and degree targets.
-- R3 `gpr_r3_hard_negative_human_bfs_20260602b`: adds exact top-k hard-negative mining plus margin loss/cache artifacts.
-- R4 `gpr_r4_reranker_human_bfs_20260602b`: adds local candidate reranker; external pair/context teacher remains disabled.
-- R5 `gpr_r5_hybrid_assembly_human_bfs_20260602b`: enables hybrid validation-density plus predicted degree-cap assembly while keeping validation-density-only and model-`m_hat` debug assemblies.
+- R1 `gpr_r1_sorf_dual_human_bfs_20260602c`: SORF residue-factorized dual retriever.
+- R2 `gpr_r2_graph_prior_human_bfs_20260602c`: adds offline graph-prior structural and degree targets.
+- R3 `gpr_r3_hard_negative_human_bfs_20260602c`: adds exact top-k hard-negative mining plus margin loss/cache artifacts.
+- R4 `gpr_r4_reranker_human_bfs_20260602c`: adds local candidate reranker; external pair/context teacher remains disabled.
+- R5 `gpr_r5_hybrid_assembly_human_bfs_20260602c`: enables hybrid validation-density plus predicted degree-cap assembly while keeping validation-density-only and model-`m_hat` debug assemblies.
 
 
 # 1. Overall pipeline

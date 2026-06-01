@@ -473,10 +473,9 @@ class TCCIG(nn.Module):
         protein_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode a protein set for graph-level candidate scoring."""
-        return self.encode_proteins(
-            protein_embeddings=protein_embeddings,
-            protein_lengths=protein_lengths,
-        )["node"]
+        if protein_embeddings.size(-1) != self.input_dim:
+            raise ValueError("protein embedding dimension must match model_config.input_dim")
+        return self._encode_nodes(protein_embeddings, protein_lengths)
 
     @staticmethod
     def _all_pairs(num_nodes: int, device: torch.device) -> torch.Tensor:
