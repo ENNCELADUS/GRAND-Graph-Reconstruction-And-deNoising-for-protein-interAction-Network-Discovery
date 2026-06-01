@@ -1,0 +1,17 @@
+{
+  "assembly_rule": "top_m_hat",
+  "candidate_count": 2033136,
+  "full_pair_count": 2033136,
+  "m_hat": 53701.148,
+  "m_hat_per_candidate": 0.026,
+  "m_hat_per_full_pair": 0.026,
+  "n_nodes": 2017,
+  "probability_max": 1.0,
+  "probability_mean": 0.999,
+  "probability_min": 0.0,
+  "probability_p50": 1.0,
+  "probability_p90": 1.0,
+  "probability_p95": 1.0,
+  "record_count": 2035153,
+  "selected_edges": 53701
+}
