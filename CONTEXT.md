@@ -32,6 +32,12 @@ A calibrated TCCIG candidate-pair score after sigmoid. Edge probabilities are us
 ranking candidate pairs and calibration diagnostics; they are not by themselves the
 definition of the predicted graph.
 
+## Edge Probability Saturation
+
+A TCCIG failure mode where sigmoid edge probabilities collapse near `1.0` across the
+candidate universe, making fixed-threshold diagnostics useless and reducing useful
+ranking and calibration signal.
+
 ## Fixed Threshold Diagnostic
 
 An observability-only view of how many TCCIG edge probabilities cross a fixed threshold,

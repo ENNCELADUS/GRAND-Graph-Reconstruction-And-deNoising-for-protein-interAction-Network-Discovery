@@ -25,6 +25,55 @@ def _tccig_config() -> dict[str, object]:
     }
 
 
+def test_tccig_lowrank_score_is_scaled_by_dimension() -> None:
+    config = _tccig_config() | {"decoder_structural_gate_init": 1.0}
+    model = TCCIG(**config)
+    with torch.no_grad():
+        for module in (model.pair_mlp, model.hub_head, model.module_head, model.density_bias_head):
+            for parameter in module.parameters():
+                parameter.zero_()
+        model.lowrank_head.weight.zero_()
+        model.lowrank_head.bias.copy_(torch.tensor([1.0, 2.0, 3.0, 4.0]))
+
+    output = model.decode_graph_candidates(
+        node_embeddings=torch.zeros(2, 16),
+        candidate_pairs=torch.tensor([[0], [1]], dtype=torch.long),
+    )
+
+    assert output["lowrank_score"].item() == pytest.approx(15.0)
+    assert output["logits"].item() == pytest.approx(15.0)
+
+
+def test_tccig_structural_scores_are_gated_at_initialization() -> None:
+    config = _tccig_config() | {
+        "lowrank_dim": 1,
+        "num_modules": 2,
+        "decoder_structural_gate_init": 0.25,
+    }
+    model = TCCIG(**config)
+    with torch.no_grad():
+        for module in (model.pair_mlp, model.density_bias_head):
+            for parameter in module.parameters():
+                parameter.zero_()
+        model.hub_head.weight.zero_()
+        model.hub_head.bias.fill_(2.0)
+        model.lowrank_head.weight.zero_()
+        model.lowrank_head.bias.fill_(3.0)
+        model.module_head.weight.zero_()
+        model.module_head.bias.zero_()
+        model.module_interactions.copy_(torch.eye(2) * 5.0)
+
+    output = model.decode_graph_candidates(
+        node_embeddings=torch.zeros(2, 16),
+        candidate_pairs=torch.tensor([[0], [1]], dtype=torch.long),
+    )
+
+    assert output["hub_score"].item() == pytest.approx(1.0)
+    assert output["lowrank_score"].item() == pytest.approx(2.25)
+    assert output["module_score"].item() == pytest.approx(0.5)
+    assert output["logits"].item() == pytest.approx(3.75)
+
+
 def test_tccig_forward_graph_is_feature_only_and_returns_graph_outputs() -> None:
     model = TCCIG(**_tccig_config())
     embeddings = torch.randn(4, 5, 8)
@@ -214,11 +263,16 @@ def test_tccig_density_bias_can_initialize_sparse_probability_prior() -> None:
 
 
 def test_tccig_graph_and_pairwise_paths_share_centered_module_term() -> None:
-    model = TCCIG(**_tccig_config())
+    config = _tccig_config() | {"decoder_structural_gate_init": 0.25}
+    model = TCCIG(**config)
     with torch.no_grad():
-        for module in (model.pair_mlp, model.hub_head, model.lowrank_head, model.density_bias_head):
+        for module in (model.pair_mlp, model.density_bias_head):
             for parameter in module.parameters():
                 parameter.zero_()
+        model.hub_head.weight.fill_(0.1)
+        model.hub_head.bias.fill_(0.2)
+        model.lowrank_head.weight.fill_(0.1)
+        model.lowrank_head.bias.fill_(0.3)
     node_embeddings = torch.randn(3, 16)
     candidate_pairs = torch.tensor([[0], [2]], dtype=torch.long)
 

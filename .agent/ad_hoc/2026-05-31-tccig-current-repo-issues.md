@@ -165,6 +165,31 @@ only "how many edges to select." The full-candidate ranking/localization and
 decoder calibration are poor. Treat P2 as evidence that density-prior correction
 alone is not the main model-quality fix.
 
+Updated conclusion: P2 largely rules out the hypothesis that changing only the
+density prior to train-graph density and turning off the online teacher will make
+TCCIG materially better. The main failure is now narrower:
+
+- Decoder logits and probabilities are severely saturated. P2 topology assembly
+  has probability mean `0.999`, with p50, p90, p95, and max all equal to `1.000`.
+- Ranking and localization are weak. The oracle-test-density debug assembly
+  reaches only `graph_sim = 0.135`, so even a diagnostic budget based on the test
+  graph density does not recover the right local structure.
+- Current TCCIG is not the v3 warm-start graph-generator path. It trains a
+  scratch weak-supervision graph decoder; graph-similarity loss has effective
+  weight `0.0`, while `rank`, `module`, and `spectral` remain placeholders.
+- P2 makes the density-bias prior sparse, but it does not initialize the
+  edge-budget head. `m_hat` still comes from
+  `sigmoid(edge_budget_head(set_state)) * candidate_count`, while other decoder
+  branches can still push logits to large positive values.
+- BCE supervision is sparse for the all-pairs decoder. P2 reports `203750`
+  supervised pairs out of `3224455` all-subgraph pairs, a supervised fraction of
+  `0.063`.
+
+The next fixes should therefore follow controlled variables in this order:
+decoder saturation, budget prior / edge-budget head calibration, v3 teacher or
+warm-start alignment, dense or PU supervision plus graph-similarity loss, and
+only then frozen or online topology-teacher ablations.
+
 ## Baseline Observed Symptoms
 
 - Normal evaluation reports approximately:
@@ -213,25 +238,52 @@ alone is not the main model-quality fix.
    topology checkpoint, best AUPRC checkpoint, and best internal graph-sim epoch
    can therefore diverge.
 
-5. The current teacher is an online train-only MGAE teacher, not a stable
+5. The validation AUPRC is still pairwise-style, not graph assembly.
+   `TCCIGValidationRunner` collects pairwise probabilities through the standard
+   evaluator contract. That path uses pair-specific context and is not the same
+   object as `forward_graph()` plus global graph assembly, so "best validation
+   AUPRC" should not be treated as the best graph-generator checkpoint.
+
+6. The current teacher is an online train-only MGAE teacher, not a stable
    S2GAE/MaskGAE/Bandana-style teacher.
    It is updated inside the student step and then immediately used for
    distillation, which makes the teacher target noisy and non-stationary.
 
-6. Decoder logits saturate.
+7. Decoder logits saturate.
    `pair_score`, `hub_score`, `lowrank_score`, `module_score`, and
    `density_bias` are added directly. The low-rank dot product is not scaled by
    `sqrt(dim)`, and structural branches do not have small learnable gates. This
    likely contributes to sigmoid saturation.
 
-7. Density prior uses supervised BCE positive rate instead of graph density.
+8. Density prior used supervised BCE positive rate instead of graph density
+   before P2.
    The initialized positive probability is about `0.239`, while the validation
    target edge fraction is closer to `0.038`. This is too dense for graph
    reconstruction and makes calibration harder. P2 fixed this initialization
    bug, but the P2 result shows the remaining failure is not explained by the
    prior alone.
 
-8. Some configured losses are placeholders.
+9. Train-graph density is not the same as sampled topology-evaluation density.
+   P2 initializes the density bias with the full train graph density
+   (`positive_probability = 0.001`), but internal validation subgraphs can have
+   target edge fractions around `0.038`. PRING-style sampled subgraphs are more
+   local and denser than the full upper-triangle universe, so a full-graph prior
+   can understate the edge budget needed for sampled graph reconstruction.
+
+10. The edge-budget head is not initialized by the graph-density prior.
+    P2 only initializes `density_bias_head`; graph assembly still predicts
+    `m_hat` through a separately initialized `edge_budget_head`. P2 therefore
+    leaves two density notions in play: full-train-graph density for
+    `density_bias_head` and learned sampled-subgraph budget for
+    `edge_budget_head`.
+
+11. BCE supervision is too sparse for full-candidate ranking.
+    `_candidate_supervision()` masks unassigned pairs out of the BCE loss. In P2,
+    only `0.063` of all-subgraph pairs had direct BCE supervision, leaving about
+    `94%` of pair scores constrained only by weak distribution losses such as
+    density, degree, and clustering.
+
+12. Some configured losses are placeholders.
    In `compute_tccig_losses()`, `rank`, `module`, and `spectral` are currently
    zero-valued placeholders. Do not treat configurations enabling those terms as
    real topology supervision until the losses are implemented or explicitly
@@ -301,6 +353,10 @@ fix score saturation or graph reconstruction.
 
 ### P3: Adjust Loss Schedule and Checkpoint Monitor
 
+Status after `p2_fixed`: still open, but this is no longer the first model fix.
+P2 reinforces that `val_topology_loss`, pairwise validation AUPRC, and official
+topology assembly can select or describe different objects.
+
 - P2 reinforces this priority: the epoch selected by `val_topology_loss` did
   not translate into better official topology metrics, and the best validation
   AUPRC occurred at a different epoch.
@@ -314,6 +370,8 @@ fix score saturation or graph reconstruction.
 
 ### P4: Fix Decoder Saturation
 
+Status after `p2_fixed`: highest-priority next code fix.
+
 - P2 makes this the next highest-leverage model-quality fix. Probability
   quantiles collapsed harder after graph-density prior initialization, so
   budget changes alone are insufficient.
@@ -325,10 +383,47 @@ fix score saturation or graph reconstruction.
   specificity should become non-zero under a tuned threshold, and calibration
   metrics should improve.
 
-### P5: Simplify Teacher Before Adding More Pretext Complexity
+### P5: Calibrate Edge-Budget Head Against the Intended Density
+
+Status after `p2_fixed`: open. P2 fixed the density-bias prior but not the
+edge-budget head used by official graph assembly.
+
+- Decide which budget prior should drive `edge_budget_head`: full-train-graph
+  density, validation sampled-subgraph density, or a separate learned prior.
+- If using a prior initialization, initialize the final edge-budget-head bias to
+  the chosen budget fraction and zero the final weight, analogous to the density
+  bias initialization.
+- Report budget targets side-by-side: train graph density, validation sampled
+  density, test graph density diagnostic, and predicted `m_hat` fraction.
+- Success criterion: predicted `m_hat / candidate_count` should be explainable
+  from an explicit prior or learned target, not an accidental random-head
+  calibration.
+
+### P6: Add Denser Supervision and Graph-Similarity Loss
+
+Status after `p2_fixed`: open. This should follow decoder saturation fixes so
+the extra supervision is not spent correcting saturated logits.
+
+- Add a real graph-similarity term to TCCIG training if the target metric is
+  graph overlap / reconstruction.
+- Consider dense negatives, PU-style supervision, or expanded sampled-pair BCE
+  so full-candidate ranking receives direct gradient on more than the current
+  `0.063` supervised fraction.
+- Keep `rank`, `module`, and `spectral` disabled or explicitly marked as
+  placeholders until real losses exist.
+- Success criterion: oracle-density top-K should improve before relying on
+  edge-budget tuning; otherwise the ranking/localization problem remains.
+
+### P7: Align With v3 Warm-Start / Teacher Strategy
 
 - The P2 teacher-disabled ablation did not improve official graph metrics; do
   not treat the online teacher as the primary cause of the current failure.
+- Current TCCIG is a scratch weak-supervision graph decoder, while v3 topology
+  finetune is warm-started and explicitly uses graph similarity, relative
+  density, degree, and clustering losses.
+- After saturation and budget-head calibration are controlled, test whether
+  v3-style warm-start or frozen-teacher distillation improves graph similarity
+  without collapsing AUPRC.
 - Then try a pretrained frozen teacher.
 - Only after evaluation semantics, density prior, edge-budget diagnostics, and
   decoder calibration are corrected should S2GAE/MaskGAE/Bandana-style teacher
@@ -346,15 +441,26 @@ fix score saturation or graph reconstruction.
 
 3. Run D: decoder scale/gate.
    Goal: improve calibration and reduce sigmoid saturation. P2 indicates this
-   should move ahead of further density-prior tuning.
+   should move ahead of further teacher or density-prior tuning.
 
-4. Run C: warmup/ramp plus slightly higher learning rate.
+4. Run F: edge-budget-head prior calibration.
+   Goal: test whether initializing or otherwise constraining
+   `edge_budget_head` to an explicit density notion improves `m_hat` calibration
+   after decoder logits stop saturating.
+
+5. Run C: warmup/ramp plus slightly higher learning rate.
    Goal: make optimization smoother and prevent topology losses from dominating
    too early, after decoder saturation is addressed or at least instrumented.
 
-5. Run E: frozen teacher distillation.
+6. Run G: denser BCE or PU supervision plus real graph-similarity loss.
+   Goal: improve top-ranked edge localization, measured first by
+   oracle-density top-K graph similarity and then by official model-`m_hat`
+   assembly.
+
+7. Run E: frozen teacher distillation or v3 warm-start.
    Goal: test whether a stable teacher improves graph similarity or degree MMD
-   without significantly harming AUPRC.
+   without significantly harming AUPRC, after saturation and budget calibration
+   are controlled.
 
 ## Minimal Execution Order
 
@@ -362,9 +468,11 @@ fix score saturation or graph reconstruction.
 2. Separate threshold calibration from graph assembly budget.
 3. Initialize density from graph density.
 4. Persist probability and `m_hat` diagnostics.
-5. Reduce or freeze teacher influence.
-6. Add decoder scaling/gating.
-7. Only then add richer teacher pretext tasks.
+5. Add decoder scaling/gating.
+6. Calibrate or initialize the edge-budget head.
+7. Add denser pair supervision and a real graph-similarity term.
+8. Then test v3 warm-start, frozen teacher influence, or richer teacher pretext
+   tasks.
 
 Short explanation of the current result: the model is not completely failing,
 because pairwise ranking improves. The main failure is graph reconstruction and

@@ -93,6 +93,10 @@ class TCCIG(nn.Module):
             model_config.get("lowrank_dim", max(1, self.d_model // 4)),
             "model_config.lowrank_dim",
         )
+        self.decoder_structural_gate_init = _to_float(
+            model_config.get("decoder_structural_gate_init", 0.1),
+            "model_config.decoder_structural_gate_init",
+        )
         self.num_modules = _to_int(
             model_config.get("num_modules", 64),
             "model_config.num_modules",
@@ -151,6 +155,9 @@ class TCCIG(nn.Module):
         self.lowrank_head = nn.Linear(self.d_model, self.lowrank_dim)
         self.module_head = nn.Linear(self.d_model, self.num_modules)
         self.module_interactions = nn.Parameter(torch.eye(self.num_modules))
+        self.hub_score_gate = nn.Parameter(torch.tensor(self.decoder_structural_gate_init))
+        self.lowrank_score_gate = nn.Parameter(torch.tensor(self.decoder_structural_gate_init))
+        self.module_score_gate = nn.Parameter(torch.tensor(self.decoder_structural_gate_init))
         self.density_bias_head = _build_mlp(
             input_dim=self.d_model,
             hidden_dims=[self.d_model],
@@ -318,12 +325,19 @@ class TCCIG(nn.Module):
         h_dst = node_embeddings[dst]
         pair_features = self._symmetric_pair_features(h_src, h_dst)
         pair_score = self.pair_mlp(pair_features).squeeze(-1)
-        hub_score = self.hub_head(h_src).squeeze(-1) + self.hub_head(h_dst).squeeze(-1)
+        hub_score = self.hub_score_gate * (
+            self.hub_head(h_src).squeeze(-1) + self.hub_head(h_dst).squeeze(-1)
+        )
         lowrank = self.lowrank_head(node_embeddings)
-        lowrank_score = (lowrank[src] * lowrank[dst]).sum(dim=-1)
+        lowrank_score = self.lowrank_score_gate * (
+            (lowrank[src] * lowrank[dst]).sum(dim=-1) / math.sqrt(float(self.lowrank_dim))
+        )
         module_src = module_memberships[src]
         module_dst = module_memberships[dst]
-        module_score = self._centered_module_score(module_src, module_dst)
+        module_score = self.module_score_gate * self._centered_module_score(
+            module_src,
+            module_dst,
+        )
         logits = pair_score + hub_score + lowrank_score + module_score + density_bias
         return {
             "logits": logits,
@@ -364,15 +378,18 @@ class TCCIG(nn.Module):
         density_bias = self.density_bias_head(pair_state).squeeze(-1)
         pair_features = self._symmetric_pair_features(node_a_embeddings, node_b_embeddings)
         pair_score = self.pair_mlp(pair_features).squeeze(-1)
-        hub_score = self.hub_head(node_a_embeddings).squeeze(-1) + self.hub_head(
-            node_b_embeddings
-        ).squeeze(-1)
+        hub_score = self.hub_score_gate * (
+            self.hub_head(node_a_embeddings).squeeze(-1)
+            + self.hub_head(node_b_embeddings).squeeze(-1)
+        )
         lowrank_a = self.lowrank_head(node_a_embeddings)
         lowrank_b = self.lowrank_head(node_b_embeddings)
-        lowrank_score = (lowrank_a * lowrank_b).sum(dim=-1)
+        lowrank_score = self.lowrank_score_gate * (
+            (lowrank_a * lowrank_b).sum(dim=-1) / math.sqrt(float(self.lowrank_dim))
+        )
         module_a = functional.softmax(self.module_head(node_a_embeddings), dim=-1)
         module_b = functional.softmax(self.module_head(node_b_embeddings), dim=-1)
-        module_score = self._centered_module_score(module_a, module_b)
+        module_score = self.module_score_gate * self._centered_module_score(module_a, module_b)
         return pair_score + hub_score + lowrank_score + module_score + density_bias
 
     def _centered_module_score(

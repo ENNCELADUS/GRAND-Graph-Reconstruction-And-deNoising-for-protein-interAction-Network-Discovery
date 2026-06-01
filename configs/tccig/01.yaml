@@ -1,9 +1,9 @@
 run_config:
   stages: ["tccig_train", "evaluate", "topology_evaluate"]
   seed: 47
-  tccig_train_run_id: "p2_fixed"
-  eval_run_id: "p2_fixed"
-  topology_eval_run_id: "p2_fixed"
+  tccig_train_run_id: "p4_fixed"
+  eval_run_id: "p4_fixed"
+  topology_eval_run_id: "p4_fixed"
   load_checkpoint_path: null
   save_best_only: true
 
@@ -40,6 +40,7 @@ model_config:
   dropout: 0.10
   lowrank_dim: 128
   num_modules: 64
+  decoder_structural_gate_init: 0.1
   self_refinement_rounds: 0
   candidate_proposer:
     type: "all_pairs"

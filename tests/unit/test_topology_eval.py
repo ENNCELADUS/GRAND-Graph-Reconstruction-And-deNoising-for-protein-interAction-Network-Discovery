@@ -261,6 +261,36 @@ def test_graph_assembly_diagnostics_reports_full_pair_budget_ratios() -> None:
     assert diagnostics["m_hat_per_full_pair"] == pytest.approx(2.0 / 3.0)
 
 
+def test_graph_assembly_diagnostics_reports_logits_and_component_stats() -> None:
+    diagnostics = graph_assembly_diagnostics(
+        GraphAssemblyResult(
+            predictions=[1, 0, 1],
+            probabilities=[0.9, 0.1, 0.8],
+            logits=[2.0, -1.0, 1.0],
+            component_scores={
+                "pair_score": [1.0, 2.0, 3.0],
+                "hub_score": [0.1, 0.2, 0.3],
+                "density_bias": [-4.0],
+            },
+            m_hat=2.0,
+            n_nodes=3,
+            full_pair_count=3,
+            candidate_count=3,
+            selected_edges=2,
+        )
+    )
+
+    assert diagnostics["logit_min"] == pytest.approx(-1.0)
+    assert diagnostics["logit_mean"] == pytest.approx(2.0 / 3.0)
+    assert diagnostics["logit_p50"] == pytest.approx(1.0)
+    assert diagnostics["logit_p90"] == pytest.approx(1.8)
+    assert diagnostics["logit_p95"] == pytest.approx(1.9)
+    assert diagnostics["logit_max"] == pytest.approx(2.0)
+    assert diagnostics["component_pair_score_mean"] == pytest.approx(2.0)
+    assert diagnostics["component_hub_score_p95"] == pytest.approx(0.29)
+    assert diagnostics["component_density_bias_mean"] == pytest.approx(-4.0)
+
+
 def test_density_edge_budget_uses_full_pair_density_and_candidate_clamp() -> None:
     budget = _density_edge_budget(density=0.75, n_nodes=4, candidate_count=3)
 

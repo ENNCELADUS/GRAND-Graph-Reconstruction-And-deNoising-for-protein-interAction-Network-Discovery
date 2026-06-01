@@ -75,6 +75,8 @@ class GraphAssemblyResult:
     candidate_count: int
     selected_edges: int
     assembly_rule: str = "top_m_hat"
+    logits: list[float] | None = None
+    component_scores: Mapping[str, Sequence[float]] | None = None
 
 
 class TopologyLoaderBundle(tuple):
@@ -465,29 +467,34 @@ def _validation_graph_density(config: ConfigDict) -> float | None:
 
 def _probability_stats(probabilities: Sequence[float]) -> dict[str, float]:
     """Return stable summary statistics for graph-assembly probabilities."""
-    if not probabilities:
+    return _sequence_stats(prefix="probability", values=probabilities)
+
+
+def _sequence_stats(*, prefix: str, values: Sequence[float]) -> dict[str, float]:
+    """Return stable summary statistics with a caller-provided key prefix."""
+    if not values:
         return {
-            "probability_min": 0.0,
-            "probability_mean": 0.0,
-            "probability_max": 0.0,
-            "probability_p50": 0.0,
-            "probability_p90": 0.0,
-            "probability_p95": 0.0,
+            f"{prefix}_min": 0.0,
+            f"{prefix}_mean": 0.0,
+            f"{prefix}_max": 0.0,
+            f"{prefix}_p50": 0.0,
+            f"{prefix}_p90": 0.0,
+            f"{prefix}_p95": 0.0,
         }
-    probability_tensor = torch.tensor(probabilities, dtype=torch.float32)
+    value_tensor = torch.tensor(values, dtype=torch.float32)
     return {
-        "probability_min": float(torch.min(probability_tensor).item()),
-        "probability_mean": float(torch.mean(probability_tensor).item()),
-        "probability_max": float(torch.max(probability_tensor).item()),
-        "probability_p50": float(torch.quantile(probability_tensor, 0.50).item()),
-        "probability_p90": float(torch.quantile(probability_tensor, 0.90).item()),
-        "probability_p95": float(torch.quantile(probability_tensor, 0.95).item()),
+        f"{prefix}_min": float(torch.min(value_tensor).item()),
+        f"{prefix}_mean": float(torch.mean(value_tensor).item()),
+        f"{prefix}_max": float(torch.max(value_tensor).item()),
+        f"{prefix}_p50": float(torch.quantile(value_tensor, 0.50).item()),
+        f"{prefix}_p90": float(torch.quantile(value_tensor, 0.90).item()),
+        f"{prefix}_p95": float(torch.quantile(value_tensor, 0.95).item()),
     }
 
 
 def graph_assembly_diagnostics(result: GraphAssemblyResult) -> dict[str, float | int | str]:
     """Build the persisted diagnostics payload for a TCCIG graph assembly."""
-    return {
+    payload: dict[str, float | int | str] = {
         "assembly_rule": result.assembly_rule,
         "m_hat": float(result.m_hat),
         "n_nodes": int(result.n_nodes),
@@ -498,6 +505,12 @@ def graph_assembly_diagnostics(result: GraphAssemblyResult) -> dict[str, float |
         "m_hat_per_full_pair": _safe_ratio(float(result.m_hat), result.full_pair_count),
         "selected_edges": int(result.selected_edges),
     } | _probability_stats(result.probabilities)
+    if result.logits is not None:
+        payload.update(_sequence_stats(prefix="logit", values=result.logits))
+    if result.component_scores is not None:
+        for name, values in sorted(result.component_scores.items()):
+            payload.update(_sequence_stats(prefix=f"component_{name}", values=values))
+    return payload
 
 
 def write_graph_assembly_diagnostics(
@@ -570,6 +583,14 @@ def _predict_tccig_graph_assembly_result(
     node_to_index = {protein_id: index for index, protein_id in enumerate(protein_ids)}
     candidate_batch_size = _resolve_tccig_candidate_batch_size(config)
     probabilities: list[float] = []
+    logits: list[float] = []
+    component_scores: dict[str, list[float]] = {
+        "density_bias": [],
+        "hub_score": [],
+        "lowrank_score": [],
+        "module_score": [],
+        "pair_score": [],
+    }
     with torch.inference_mode(), accelerator.autocast():
         node_embeddings = cast(
             torch.Tensor,
@@ -598,6 +619,19 @@ def _predict_tccig_graph_assembly_result(
                     candidate_pairs=candidate_pairs,
                 ),
             )
+            logits_tensor = output.get("logits")
+            if logits_tensor is not None:
+                logits.extend(
+                    float(value) for value in logits_tensor.detach().float().cpu().reshape(-1)
+                )
+            for component_name in component_scores:
+                component_tensor = output.get(component_name)
+                if component_tensor is None:
+                    continue
+                component_scores[component_name].extend(
+                    float(value)
+                    for value in component_tensor.detach().float().cpu().reshape(-1)
+                )
             probabilities.extend(
                 float(value) for value in output["edge_probabilities"].detach().cpu().tolist()
             )
@@ -625,6 +659,8 @@ def _predict_tccig_graph_assembly_result(
         full_pair_count=_full_pair_count(n_nodes),
         candidate_count=len(scorable_records),
         selected_edges=sum(scorable_predictions),
+        logits=logits or None,
+        component_scores=component_scores if any(component_scores.values()) else None,
     )
 
 
