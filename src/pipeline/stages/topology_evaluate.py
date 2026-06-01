@@ -340,24 +340,38 @@ def _resolve_tccig_candidate_batch_size(config: ConfigDict) -> int:
     return batch_size
 
 
+def _resolve_tccig_node_batch_size(config: ConfigDict) -> int:
+    """Return protein-encoding chunk size for TCCIG graph assembly."""
+    tccig_cfg = _tccig_topology_eval_config(config)
+    batch_size = as_int(
+        tccig_cfg.get("node_batch_size", 64),
+        "topology_evaluate.tccig.node_batch_size",
+    )
+    if batch_size <= 0:
+        raise ValueError("topology_evaluate.tccig.node_batch_size must be > 0")
+    return batch_size
+
+
 def _load_tccig_node_inputs(
     *,
     dataset: PRINGPairDataset,
     records: Sequence[tuple[str, str]],
-    device: torch.device,
-) -> tuple[tuple[str, ...], torch.Tensor, torch.Tensor]:
+    device: torch.device | None = None,
+) -> tuple[tuple[str, ...], tuple[torch.Tensor, ...], torch.Tensor | None, torch.Tensor | None]:
     """Load unique topology-evaluation protein embeddings for graph assembly."""
     protein_ids = tuple(sorted({protein for record in records for protein in record}))
     if len(protein_ids) < 2:
         raise ValueError("TCCIG topology evaluation requires at least two proteins")
-    embedding_tensors = [dataset._load_embedding(protein_id) for protein_id in protein_ids]
+    embedding_tensors = tuple(dataset._load_embedding(protein_id) for protein_id in protein_ids)
+    if device is None:
+        return protein_ids, embedding_tensors, None, None
     protein_embeddings = pad_sequence(embedding_tensors, batch_first=True).to(device)
     protein_lengths = torch.tensor(
         [embedding.size(0) for embedding in embedding_tensors],
         dtype=torch.long,
         device=device,
     )
-    return protein_ids, protein_embeddings, protein_lengths
+    return protein_ids, embedding_tensors, protein_embeddings, protein_lengths
 
 
 def _candidate_pairs_for_records(
@@ -684,14 +698,14 @@ def _predict_tccig_graph_assembly_result(
 
     scorable_indices = [index for index, _ in scorable_records_with_indices]
     scorable_records = [record for _, record in scorable_records_with_indices]
-    protein_ids, protein_embeddings, protein_lengths = _load_tccig_node_inputs(
+    protein_ids, embedding_tensors, protein_embeddings, protein_lengths = _load_tccig_node_inputs(
         dataset=dataset,
         records=scorable_records,
-        device=device,
     )
     n_nodes = len(protein_ids)
     node_to_index = {protein_id: index for index, protein_id in enumerate(protein_ids)}
     candidate_batch_size = _resolve_tccig_candidate_batch_size(config)
+    node_batch_size = _resolve_tccig_node_batch_size(config)
     probabilities: list[float] = []
     logits: list[float] = []
     component_scores: dict[str, list[float]] = {
@@ -704,8 +718,26 @@ def _predict_tccig_graph_assembly_result(
     }
     encoded: Mapping[str, torch.Tensor] | None = None
     degree_predictions: torch.Tensor | None = None
+    encode_proteins_batched = getattr(graph_model, "encode_proteins_batched", None)
     with torch.inference_mode(), accelerator.autocast():
-        if callable(encode_proteins):
+        if callable(encode_proteins_batched):
+            encoded = cast(
+                Mapping[str, torch.Tensor],
+                encode_proteins_batched(
+                    protein_embeddings=embedding_tensors,
+                    device=device,
+                    batch_size=node_batch_size,
+                ),
+            )
+            node_embeddings = encoded["node"]
+            degree_predictions = encoded.get("degree")
+        elif callable(encode_proteins):
+            if protein_embeddings is None or protein_lengths is None:
+                _, _, protein_embeddings, protein_lengths = _load_tccig_node_inputs(
+                    dataset=dataset,
+                    records=scorable_records,
+                    device=device,
+                )
             encoded = cast(
                 Mapping[str, torch.Tensor],
                 encode_proteins(
@@ -716,6 +748,12 @@ def _predict_tccig_graph_assembly_result(
             node_embeddings = encoded["node"]
             degree_predictions = encoded.get("degree")
         else:
+            if protein_embeddings is None or protein_lengths is None:
+                _, _, protein_embeddings, protein_lengths = _load_tccig_node_inputs(
+                    dataset=dataset,
+                    records=scorable_records,
+                    device=device,
+                )
             node_embeddings = cast(
                 torch.Tensor,
                 encode_graph_nodes(

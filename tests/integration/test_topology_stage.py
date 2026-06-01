@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import pickle
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import cast
 
@@ -588,6 +589,91 @@ def test_tccig_graph_assembly_scores_candidates_and_selects_top_budget(
         accelerator=build_stage_runtime(config).accelerator,
     )
 
+    assert predictions == [1, 0, 1]
+
+
+def test_tccig_graph_assembly_uses_batched_protein_encoder(tmp_path: Path) -> None:
+    config = _build_topology_config(tmp_path)
+    cast(ConfigDict, config["topology_evaluate"])["tccig"] = {
+        "candidate_batch_size": 8,
+        "node_batch_size": 2,
+    }
+    processed_dir = Path(str(config["data_config"]["benchmark"]["processed_dir"]))  # type: ignore[index]
+    bundle = topology_stage._build_topology_loader(
+        config=config,
+        split_path=processed_dir / "all_test_ppi.txt",
+    )
+
+    class _BatchedGraphAssemblyModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.observed_batch_size: int | None = None
+
+        def forward_graph(self, **_: object) -> dict[str, torch.Tensor]:
+            return {}
+
+        def encode_graph_nodes(self, **_: object) -> torch.Tensor:
+            raise AssertionError("graph assembly should use the richer batched encoder")
+
+        def encode_proteins(self, **_: object) -> dict[str, torch.Tensor]:
+            raise AssertionError("graph assembly should not build one global padded tensor")
+
+        def encode_proteins_batched(
+            self,
+            *,
+            protein_embeddings: Sequence[torch.Tensor],
+            device: torch.device,
+            batch_size: int,
+        ) -> dict[str, torch.Tensor]:
+            self.observed_batch_size = batch_size
+            node_embeddings = torch.stack(
+                [embedding.to(device).mean(dim=0) for embedding in protein_embeddings],
+                dim=0,
+            )
+            return {"node": node_embeddings}
+
+        def edge_budget_from_node_embeddings(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_count: int,
+        ) -> torch.Tensor:
+            del node_embeddings, candidate_count
+            return torch.tensor(2.0)
+
+        def decode_graph_candidates(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_pairs: torch.Tensor,
+            encoded: Mapping[str, torch.Tensor] | None = None,
+        ) -> dict[str, torch.Tensor]:
+            del node_embeddings, encoded
+            scores = {
+                (0, 1): 0.9,
+                (0, 2): 0.1,
+                (1, 2): 0.8,
+            }
+            probabilities = torch.tensor(
+                [
+                    scores[(int(source), int(target))]
+                    for source, target in candidate_pairs.t().tolist()
+                ],
+                dtype=torch.float32,
+            )
+            return {"edge_probabilities": probabilities}
+
+    model = _BatchedGraphAssemblyModel()
+    predictions = topology_stage._predict_tccig_graph_assembly_labels(
+        config=config,
+        model=model,
+        dataset=bundle.dataset,
+        records=bundle.records,
+        device=torch.device("cpu"),
+        accelerator=build_stage_runtime(config).accelerator,
+    )
+
+    assert model.observed_batch_size == 2
     assert predictions == [1, 0, 1]
 
 

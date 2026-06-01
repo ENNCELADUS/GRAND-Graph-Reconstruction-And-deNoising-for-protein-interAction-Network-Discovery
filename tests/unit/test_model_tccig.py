@@ -132,6 +132,31 @@ def test_tccig_encode_graph_nodes_does_not_compute_residue_retrieval_factor(
     assert node_embeddings.shape == (3, 16)
 
 
+def test_tccig_batched_protein_encoding_matches_full_encoding() -> None:
+    torch.manual_seed(59)
+    model = TCCIG(**_tccig_config()).eval()
+    embeddings = torch.randn(4, 5, 8)
+    lengths = torch.tensor([5, 4, 3, 2], dtype=torch.long)
+    variable_length_embeddings = [
+        embeddings[index, : int(length.item())].clone()
+        for index, length in enumerate(lengths)
+    ]
+
+    full = model.encode_proteins(
+        protein_embeddings=embeddings,
+        protein_lengths=lengths,
+    )
+    batched = model.encode_proteins_batched(
+        protein_embeddings=variable_length_embeddings,
+        device=torch.device("cpu"),
+        batch_size=2,
+    )
+
+    assert full.keys() == batched.keys()
+    for key, full_value in full.items():
+        assert torch.allclose(batched[key], full_value, atol=1.0e-6)
+
+
 def test_tccig_pooled_input_retrieval_only_matches_esm_cosine_baseline() -> None:
     config = _tccig_config() | {
         "decoder_mode": "retrieval_only",

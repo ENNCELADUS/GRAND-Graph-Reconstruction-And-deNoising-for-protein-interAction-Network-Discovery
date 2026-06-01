@@ -466,6 +466,123 @@ class TCCIG(nn.Module):
             "degree": degree_prediction,
         }
 
+    def encode_proteins_batched(
+        self,
+        *,
+        protein_embeddings: Sequence[torch.Tensor],
+        device: torch.device | None = None,
+        batch_size: int = 64,
+    ) -> dict[str, torch.Tensor]:
+        """Encode variable-length proteins without one global padded token tensor."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        embedding_tensors = tuple(protein_embeddings)
+        if not embedding_tensors:
+            raise ValueError("protein_embeddings must not be empty")
+        for embedding in embedding_tensors:
+            if embedding.dim() != 2 or embedding.size(-1) != self.input_dim:
+                raise ValueError("each protein embedding must have shape (seq_len, input_dim)")
+        resolved_device = device or next(self.parameters()).device
+        pooled_chunks: list[torch.Tensor] = []
+        for start in range(0, len(embedding_tensors), batch_size):
+            batch_embeddings, batch_lengths = self._pad_embedding_batch(
+                embedding_tensors[start : start + batch_size],
+                device=resolved_device,
+            )
+            pooled_chunks.append(self._masked_mean_pool(batch_embeddings, batch_lengths))
+        pooled_input = torch.cat(pooled_chunks, dim=0)
+        h0 = cast(torch.Tensor, self.protein_projection(pooled_input))
+        set_summary = h0.mean(dim=0, keepdim=True).expand_as(h0)
+        node_embeddings = cast(
+            torch.Tensor,
+            self.set_context(torch.cat([h0, set_summary], dim=-1)),
+        )
+        module_memberships = functional.softmax(self.module_head(node_embeddings), dim=-1)
+        degree_prediction = functional.softplus(self.degree_head(node_embeddings).squeeze(-1))
+        if self.retrieval_feature_source == "pooled_input":
+            retrieval_features = self._maybe_normalize(
+                self._resize_feature_vector(pooled_input, self.retrieval_dim)
+            )
+            residue_features = self._maybe_normalize(
+                self._resize_feature_vector(pooled_input, self.rff_features)
+            )
+            return {
+                "node": node_embeddings,
+                "query": retrieval_features,
+                "key": retrieval_features,
+                "struct": retrieval_features,
+                "residue": residue_features,
+                "module": module_memberships,
+                "degree": degree_prediction,
+            }
+        residue = self._encode_residue_factor_batched(
+            embedding_tensors=embedding_tensors,
+            device=resolved_device,
+            batch_size=batch_size,
+        )
+        return {
+            "node": node_embeddings,
+            "query": self._maybe_normalize(self.query_head(node_embeddings)),
+            "key": self._maybe_normalize(self.key_head(node_embeddings)),
+            "struct": self._maybe_normalize(self.struct_head(node_embeddings)),
+            "residue": self._maybe_normalize(residue),
+            "module": module_memberships,
+            "degree": degree_prediction,
+        }
+
+    @staticmethod
+    def _pad_embedding_batch(
+        embedding_tensors: Sequence[torch.Tensor],
+        *,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Pad one bounded protein batch."""
+        batch_embeddings = nn.utils.rnn.pad_sequence(
+            [embedding.to(device) for embedding in embedding_tensors],
+            batch_first=True,
+        )
+        batch_lengths = torch.tensor(
+            [embedding.size(0) for embedding in embedding_tensors],
+            dtype=torch.long,
+            device=device,
+        )
+        return batch_embeddings, batch_lengths
+
+    def _encode_residue_factor_batched(
+        self,
+        *,
+        embedding_tensors: Sequence[torch.Tensor],
+        device: torch.device,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Encode residue factors in length-sorted bounded batches."""
+        ordered_indices = sorted(
+            range(len(embedding_tensors)),
+            key=lambda index: int(embedding_tensors[index].size(0)),
+            reverse=True,
+        )
+        residue_chunks: list[torch.Tensor] = []
+        chunk_indices: list[int] = []
+        for start in range(0, len(ordered_indices), batch_size):
+            batch_indices = ordered_indices[start : start + batch_size]
+            batch_embeddings, batch_lengths = self._pad_embedding_batch(
+                [embedding_tensors[index] for index in batch_indices],
+                device=device,
+            )
+            residue_chunks.append(
+                self._encode_residue_factor(
+                    protein_embeddings=batch_embeddings,
+                    protein_lengths=batch_lengths,
+                )
+            )
+            chunk_indices.extend(batch_indices)
+        encoded = torch.cat(residue_chunks, dim=0)
+        restore_indices = torch.empty(len(chunk_indices), dtype=torch.long, device=device)
+        restore_indices[
+            torch.tensor(chunk_indices, dtype=torch.long, device=device)
+        ] = torch.arange(len(chunk_indices), dtype=torch.long, device=device)
+        return encoded.index_select(0, restore_indices)
+
     def encode_graph_nodes(
         self,
         *,

@@ -203,5 +203,6 @@ topology_evaluate:
   inference_batch_size: 128
   tccig:
     candidate_batch_size: 8192
+    node_batch_size: 64
   save_pair_predictions: true
   report_baselines: src/topology/baselines/pring_human_table2.json
