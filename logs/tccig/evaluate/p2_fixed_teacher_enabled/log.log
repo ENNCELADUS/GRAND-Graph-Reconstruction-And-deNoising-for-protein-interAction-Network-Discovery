@@ -1,0 +1,10 @@
+2026-06-01 14:40:25 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-06-01 15:44:11 INFO Stage Start | Checkpoint: models/tccig/tccig_train/p2_fixed_teacher_enabled/best_model.pth | Run Id: p2_fixed_teacher_enabled
+2026-06-01 15:44:11 INFO Checkpoint Loaded | Path: models/tccig/tccig_train/p2_fixed_teacher_enabled/best_model.pth
+2026-06-01 15:44:11 INFO Fixed Threshold Diagnostic | Mode: fixed | Value: 0.500
+2026-06-01 15:49:39 INFO Tccig Graph Assembly Evaluate | Assembly Rule: top_m_hat | Candidate Count: 2033136 | M Hat: 90649.773 | Pair Count: 2035153 | Selected Edges: 90650
+2026-06-01 15:49:39 INFO Tccig Pairwise Threshold | Threshold Mode: validation_mcc | Threshold Predicted Positive Rate: 0.313 | Threshold Target Metric: 0.254 | Threshold Validation F1: 0.530 | Threshold Validation Mcc: 0.254 | Threshold Validation Positive Rate: 0.500 | Threshold Validation Youden: 0.236 | Threshold Value: 0.997
+2026-06-01 15:49:39 INFO Graph Assembly Diagnostics Written | Path: logs/tccig/evaluate/p2_fixed_teacher_enabled/graph_assembly_diagnostics.json
+2026-06-01 15:49:39 INFO Evaluation Metrics | Accuracy: 0.947 | AUPRC: 0.083 | Auroc: 0.579 | F1: 0.083 | Mcc: 0.077 | Precision: 0.054 | Recall: 0.181 | Sensitivity: 0.181 | Specificity: 0.957 | Split: test
+2026-06-01 15:49:39 INFO CSV Written | Path: logs/tccig/evaluate/p2_fixed_teacher_enabled/evaluate.csv
+2026-06-01 15:49:39 INFO Stage Done | Run Id: p2_fixed_teacher_enabled
