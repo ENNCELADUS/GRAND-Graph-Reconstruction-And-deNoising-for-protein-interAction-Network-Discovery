@@ -4,9 +4,9 @@ run_config:
   - evaluate
   - topology_evaluate
   seed: 47
-  tccig_train_run_id: gpr_r5_hybrid_assembly_human_bfs_20260602a
-  eval_run_id: gpr_r5_hybrid_assembly_human_bfs_20260602a
-  topology_eval_run_id: gpr_r5_hybrid_assembly_human_bfs_20260602a
+  tccig_train_run_id: gpr_r5_hybrid_assembly_human_bfs_20260602b
+  eval_run_id: gpr_r5_hybrid_assembly_human_bfs_20260602b
+  topology_eval_run_id: gpr_r5_hybrid_assembly_human_bfs_20260602b
   load_checkpoint_path: null
   save_best_only: true
 device_config:
