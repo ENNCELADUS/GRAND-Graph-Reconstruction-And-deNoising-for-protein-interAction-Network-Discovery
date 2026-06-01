@@ -81,6 +81,7 @@ class TCCIGValidationReconstructionConfig:
 
     enabled: bool
     full_universe: bool
+    node_batch_size: int
     max_pairs: int | None
     recall_k_percent: tuple[float, ...]
 
@@ -351,6 +352,12 @@ def parse_validation_reconstruction_config(
         if raw_max_pairs is None
         else as_int(raw_max_pairs, "tccig_train.validation_reconstruction.max_pairs")
     )
+    node_batch_size = as_int(
+        cfg.get("node_batch_size", 64),
+        "tccig_train.validation_reconstruction.node_batch_size",
+    )
+    if node_batch_size <= 0:
+        raise ValueError("tccig_train.validation_reconstruction.node_batch_size must be > 0")
     return TCCIGValidationReconstructionConfig(
         enabled=as_bool(
             cfg.get("enabled", True),
@@ -360,6 +367,7 @@ def parse_validation_reconstruction_config(
             cfg.get("full_universe", True),
             "tccig_train.validation_reconstruction.full_universe",
         ),
+        node_batch_size=node_batch_size,
         max_pairs=max_pairs,
         recall_k_percent=recall_k_percent,
     )

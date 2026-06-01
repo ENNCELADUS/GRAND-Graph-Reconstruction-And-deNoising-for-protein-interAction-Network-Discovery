@@ -9,6 +9,7 @@ from src.topology.losses import TCCIGLossWeights, compute_tccig_losses
 from src.train.tccig.graph_prior import build_graph_prior_artifacts
 from src.train.tccig.mgae import MGAETeacher, mask_positive_edges
 from src.train.tccig.teacher import OnlineTCCIGTeacher
+from src.train.tccig.validation import _encode_validation_nodes
 from torch import nn
 
 
@@ -31,6 +32,57 @@ class _UnwrappingAccelerator:
 
     def backward(self, loss: torch.Tensor) -> None:
         loss.backward()
+
+
+class _EmbeddingRepository:
+    """Tiny validation embedding repository double."""
+
+    def __init__(self, embeddings: dict[str, torch.Tensor]) -> None:
+        self.embeddings = embeddings
+
+    def get_many(self, protein_ids: tuple[str, ...]) -> dict[str, torch.Tensor]:
+        return {protein_id: self.embeddings[protein_id] for protein_id in protein_ids}
+
+
+class _DataContext:
+    """Tiny data-context double exposing only the repository."""
+
+    def __init__(self, embeddings: dict[str, torch.Tensor]) -> None:
+        self.embedding_repository = _EmbeddingRepository(embeddings)
+
+
+def test_validation_node_encoding_batches_by_length_and_restores_order() -> None:
+    embeddings = {
+        "A": torch.full((6, 2), 1.0),
+        "B": torch.full((2, 2), 2.0),
+        "C": torch.full((5, 2), 3.0),
+        "D": torch.full((3, 2), 4.0),
+    }
+    batch_lengths: list[list[int]] = []
+
+    def encode_proteins(
+        *,
+        protein_embeddings: torch.Tensor,
+        protein_lengths: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        batch_lengths.append([int(length) for length in protein_lengths.tolist()])
+        assert protein_embeddings.size(0) <= 2
+        return {
+            "node": protein_embeddings[:, 0, :],
+            "degree": protein_lengths.float().unsqueeze(-1),
+        }
+
+    encoded = _encode_validation_nodes(
+        data_context=_DataContext(embeddings),  # type: ignore[arg-type]
+        protein_ids=("A", "B", "C", "D"),
+        device=torch.device("cpu"),
+        encode_proteins=encode_proteins,
+        node_batch_size=2,
+    )
+
+    assert batch_lengths == [[6, 5], [3, 2]]
+    assert encoded["node"][:, 0].tolist() == [1.0, 2.0, 3.0, 4.0]
+    assert encoded["degree"].squeeze(-1).tolist() == [6.0, 2.0, 5.0, 3.0]
 
 
 def test_mask_positive_edges_masks_requested_fraction_and_keeps_visible_edges() -> None:

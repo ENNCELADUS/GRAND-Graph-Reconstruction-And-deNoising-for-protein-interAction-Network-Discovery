@@ -162,6 +162,7 @@ tccig_train:
   validation_reconstruction:
     enabled: true
     full_universe: true
+    node_batch_size: 64
     max_pairs: null
     recall_k_percent:
     - 1

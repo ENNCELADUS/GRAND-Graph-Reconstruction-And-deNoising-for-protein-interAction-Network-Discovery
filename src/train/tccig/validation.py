@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import cast
 
 import torch
@@ -169,17 +169,12 @@ class TCCIGValidationRunner:
         retrieval_score_matrix = getattr(graph_model, "retrieval_score_matrix", None)
         if not callable(encode_proteins) or not callable(retrieval_score_matrix):
             return {}
-        protein_embeddings, protein_lengths = _load_validation_node_inputs(
+        encoded = _encode_validation_nodes(
             data_context=self.data_context,
             protein_ids=protein_ids,
             device=self.device,
-        )
-        encoded = cast(
-            Mapping[str, torch.Tensor],
-            encode_proteins(
-                protein_embeddings=protein_embeddings,
-                protein_lengths=protein_lengths,
-            ),
+            encode_proteins=encode_proteins,
+            node_batch_size=self.train_cfg.validation_reconstruction.node_batch_size,
         )
         scores = cast(torch.Tensor, retrieval_score_matrix(encoded))
         pair_scores = scores[candidate_pairs[0], candidate_pairs[1]].detach().float().cpu()
@@ -259,19 +254,55 @@ def _recall_at_fraction(
     return float(labels[top_indices].sum().item() / float(positive_count))
 
 
-def _load_validation_node_inputs(
+def _encode_validation_nodes(
     *,
     data_context: TCCIGDataContext,
     protein_ids: Sequence[str],
     device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Load validation protein embeddings for graph reconstruction metrics."""
+    encode_proteins: Callable[..., Mapping[str, torch.Tensor]],
+    node_batch_size: int,
+) -> dict[str, torch.Tensor]:
+    """Encode validation proteins in bounded padding batches."""
+    if not callable(encode_proteins):
+        raise ValueError("encode_proteins must be callable")
+    if node_batch_size <= 0:
+        raise ValueError("node_batch_size must be > 0")
     embeddings = data_context.embedding_repository.get_many(tuple(protein_ids))
-    embedding_tensors = [embeddings[protein_id] for protein_id in protein_ids]
-    protein_embeddings = pad_sequence(embedding_tensors, batch_first=True).to(device)
-    protein_lengths = torch.tensor(
-        [embedding.size(0) for embedding in embedding_tensors],
-        dtype=torch.long,
-        device=device,
+    lengths = [int(embeddings[protein_id].size(0)) for protein_id in protein_ids]
+    ordered_indices = sorted(
+        range(len(protein_ids)),
+        key=lambda index: lengths[index],
+        reverse=True,
     )
-    return protein_embeddings, protein_lengths
+    encoded_chunks: dict[str, list[torch.Tensor]] = {}
+    chunk_indices: list[int] = []
+    for start in range(0, len(ordered_indices), node_batch_size):
+        batch_indices = ordered_indices[start : start + node_batch_size]
+        batch_ids = [protein_ids[index] for index in batch_indices]
+        embedding_tensors = [embeddings[protein_id] for protein_id in batch_ids]
+        protein_embeddings = pad_sequence(embedding_tensors, batch_first=True).to(device)
+        protein_lengths = torch.tensor(
+            [lengths[index] for index in batch_indices],
+            dtype=torch.long,
+            device=device,
+        )
+        batch_encoded = cast(
+            Mapping[str, torch.Tensor],
+            encode_proteins(
+                protein_embeddings=protein_embeddings,
+                protein_lengths=protein_lengths,
+            ),
+        )
+        chunk_indices.extend(batch_indices)
+        for key, value in batch_encoded.items():
+            encoded_chunks.setdefault(key, []).append(value.detach())
+    if not encoded_chunks:
+        return {}
+    ordered_to_original = torch.empty(len(chunk_indices), dtype=torch.long, device=device)
+    ordered_to_original[
+        torch.tensor(chunk_indices, dtype=torch.long, device=device)
+    ] = torch.arange(len(chunk_indices), dtype=torch.long, device=device)
+    return {
+        key: torch.cat(chunks, dim=0).index_select(0, ordered_to_original)
+        for key, chunks in encoded_chunks.items()
+    }
