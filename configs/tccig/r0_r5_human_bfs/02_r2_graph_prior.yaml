@@ -155,7 +155,7 @@ tccig_train:
     adaptive_negative_temperature: 4.0
     external_teacher_enabled: false
   graph_assembly:
-    rule: hybrid_validation_density_degree_cap
+    rule: validation_density
     validation_density_budget: true
     degree_cap_enabled: false
     degree_cap_slack: 1.0

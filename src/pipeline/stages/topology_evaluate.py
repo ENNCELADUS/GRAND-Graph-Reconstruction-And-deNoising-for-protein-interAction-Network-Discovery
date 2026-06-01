@@ -508,6 +508,19 @@ def _hybrid_degree_cap_enabled(config: ConfigDict) -> bool:
     return bool(raw_enabled) if isinstance(raw_enabled, bool) else True
 
 
+def _resolved_tccig_assembly_rule(
+    *,
+    config: ConfigDict,
+    degree_cap_active: bool,
+) -> str:
+    """Return the official assembly rule name for diagnostics."""
+    graph_assembly_cfg = _tccig_graph_assembly_cfg(config)
+    raw_rule = graph_assembly_cfg.get("rule")
+    if isinstance(raw_rule, str) and raw_rule.strip():
+        return raw_rule.strip()
+    return "hybrid_validation_density_degree_cap" if degree_cap_active else "validation_density"
+
+
 def _decode_graph_candidate_batch(
     *,
     decode_graph_candidates: object,
@@ -754,7 +767,8 @@ def _predict_tccig_graph_assembly_result(
         n_nodes=n_nodes,
         candidate_count=len(scorable_records),
     )
-    if degree_predictions is not None and _hybrid_degree_cap_enabled(config):
+    degree_cap_active = degree_predictions is not None and _hybrid_degree_cap_enabled(config)
+    if degree_cap_active:
         all_candidate_pairs = _candidate_pairs_for_records(
             records=scorable_records,
             node_to_index=node_to_index,
@@ -773,6 +787,10 @@ def _predict_tccig_graph_assembly_result(
             probabilities=probabilities,
             m_hat=edge_budget,
         )
+    assembly_rule = _resolved_tccig_assembly_rule(
+        config=config,
+        degree_cap_active=degree_cap_active,
+    )
     predictions = [0] * len(records)
     full_probabilities = [0.0] * len(records)
     for index, probability, prediction in zip(
@@ -791,7 +809,7 @@ def _predict_tccig_graph_assembly_result(
         full_pair_count=_full_pair_count(n_nodes),
         candidate_count=len(scorable_records),
         selected_edges=sum(scorable_predictions),
-        assembly_rule="hybrid_validation_density_degree_cap",
+        assembly_rule=assembly_rule,
         edge_budget=edge_budget,
         logits=logits or None,
         component_scores=component_scores if any(component_scores.values()) else None,

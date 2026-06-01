@@ -350,7 +350,7 @@ def test_tccig_graph_assembly_evaluate_uses_all_test_universe_and_writes_diagnos
     assert evaluate_csv.exists()
     assert diagnostics_path.exists()
     diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
-    assert diagnostics["assembly_rule"] == "hybrid_validation_density_degree_cap"
+    assert diagnostics["assembly_rule"] == "validation_density"
     assert diagnostics["n_nodes"] == 3
     assert diagnostics["full_pair_count"] == 3
     assert diagnostics["candidate_count"] == 3
@@ -658,7 +658,7 @@ def test_tccig_topology_evaluate_writes_graph_assembly_diagnostics(tmp_path: Pat
     diagnostics_path = log_dir / "graph_assembly_diagnostics.json"
     assert diagnostics_path.exists()
     diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
-    assert diagnostics["assembly_rule"] == "hybrid_validation_density_degree_cap"
+    assert diagnostics["assembly_rule"] == "validation_density"
     assert diagnostics["n_nodes"] == 3
     assert diagnostics["full_pair_count"] == 3
     assert diagnostics["candidate_count"] == 3
@@ -668,10 +668,8 @@ def test_tccig_topology_evaluate_writes_graph_assembly_diagnostics(tmp_path: Pat
     assert diagnostics["edge_budget"] == pytest.approx(1.0)
 
     metrics_payload = json.loads((log_dir / "topology_metrics.json").read_text(encoding="utf-8"))
-    assert metrics_payload["graph_assembly"]["assembly_rule"] == (
-        "hybrid_validation_density_degree_cap"
-    )
-    assert metrics_payload["decision_rule"] == "hybrid_validation_density_degree_cap"
+    assert metrics_payload["graph_assembly"]["assembly_rule"] == "validation_density"
+    assert metrics_payload["decision_rule"] == "validation_density"
     assert metrics_payload["fixed_threshold_diagnostic"] == {
         "mode": "fixed",
         "value": 0.5,
