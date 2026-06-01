@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import networkx as nx
 import pytest
 import torch
 from src.topology.losses import TCCIGLossWeights, compute_tccig_losses
+from src.train.tccig.graph_prior import build_graph_prior_artifacts
 from src.train.tccig.mgae import MGAETeacher, mask_positive_edges
 from src.train.tccig.teacher import OnlineTCCIGTeacher
 from torch import nn
@@ -66,6 +68,37 @@ def test_mgae_teacher_training_step_returns_loss_and_logits() -> None:
     assert output.positive_logits.ndim == 1
     assert output.negative_logits.shape == output.positive_logits.shape
     output.loss.backward()
+
+
+def test_offline_graph_prior_artifacts_include_struct_degree_and_edge_priors() -> None:
+    graph = nx.Graph()
+    graph.add_nodes_from(["P1", "P2", "P3"])
+    graph.add_edges_from([("P1", "P2"), ("P2", "P3")])
+    node_features = {
+        "P1": torch.randn(8),
+        "P2": torch.randn(8),
+        "P3": torch.randn(8),
+    }
+
+    artifacts = build_graph_prior_artifacts(
+        graph=graph,
+        node_features=node_features,
+        hidden_dim=12,
+        num_layers=2,
+        decoder_hidden_dim=12,
+        dropout=0.0,
+        epochs=1,
+        mask_ratio=0.5,
+        negative_ratio=1,
+        seed=17,
+        device=torch.device("cpu"),
+    )
+
+    assert artifacts.protein_ids == ("P1", "P2", "P3")
+    assert artifacts.structural_embeddings.shape == (3, 12)
+    assert artifacts.degree_targets.tolist() == [1.0, 2.0, 1.0]
+    assert artifacts.edge_prior_pairs.shape[0] == 2
+    assert artifacts.edge_prior_probabilities.shape == (2,)
 
 
 def test_online_teacher_scores_when_prepared_teacher_is_wrapped() -> None:

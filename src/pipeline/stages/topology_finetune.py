@@ -368,6 +368,7 @@ def _resolve_monitor_value(
             ),
             "val_relative_density": -abs(internal_val_topology_stats["relative_density"] - 1.0),
             "val_auprc": float(val_pair_stats.get("val_auprc", 0.0)),
+            "val_composite_score": float(val_pair_stats.get("val_composite_score", 0.0)),
         }.get(monitor_metric, internal_val_topology_stats["graph_sim"])
     )
 

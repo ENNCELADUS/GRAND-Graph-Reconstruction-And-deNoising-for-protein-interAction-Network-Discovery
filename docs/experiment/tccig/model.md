@@ -24,19 +24,20 @@ $$
 
 ## Implementation status: 2026-06-01
 
-当前 `tccig-train-stage` 分支实现的是这个 full design 的 v1 子集：
+当前 `tccig-train-stage` 分支已经把 TCCIG 从 dense all-pairs graph generator 替换为 graph-prior retrieval + reranking model：
 
-- Public model: `src/model/tccig.py` registers `model_config.model: tccig` and exposes `forward_graph(...)` for feature-only graph scoring.
+- Public model: `src/model/tccig.py` 仍注册 `model_config.model: tccig`，保留 `forward(...)`、`forward_graph(...)`、`encode_graph_nodes(...)` 和 `decode_graph_candidates(...)`。
 - Config and launcher: canonical config is `configs/tccig/01.yaml`; canonical HPC launcher is `scripts/tccig.sh`.
-- Student path: cached protein embeddings → mean pooling/projection → set-summary conditioning → all-pairs candidate universe for sampled subgraphs, or PRING candidate records during topology evaluation.
-- Edge decoder: symmetric pair features, hub propensity, low-rank affinity, overlapping module memberships, set-level density bias, and learned `m_hat`.
-- Graph Assembly: topology evaluation encodes unique test proteins once, scores candidate records in chunks, and selects top-`m_hat` edges.
-- Train-only teacher: optional online MGAE teacher masks positive training edges and distills candidate-edge probabilities into the student.
-- Active losses: masked BCE edge loss, teacher distillation, budget, density, degree MMD, and optional clustering MMD.
+- Student path: cached residue/token embeddings → set-conditioned node state → query/key retrieval heads → SORF random Fourier residue factorization → structural/module/degree heads → candidate reranker.
+- Retrieval: exact chunkable torch top-k is the first backend; FAISS/HNSW is intentionally not a dependency in this implementation.
+- Graph-prior teacher: offline pure-PyTorch MGAE/S2-lite teacher can train only on `human_train_graph.pkl` and emit structural embeddings, degree targets, edge priors, and hard-negative seeds.
+- Training objective: InfoNCE/sampled-softmax retrieval localization, false-negative masking, adaptive reranker BCE, structural distillation, and degree/context losses replace sparse BCE as the primary signal.
+- Graph Assembly: topology evaluation scores PRING `all_test_ppi.txt` records and uses hybrid validation-density global budget plus predicted per-node degree caps as the official decision rule. Learned `m_hat` remains diagnostic only.
+- Monitoring: canonical config now uses a composite validation monitor combining retrieval recall proxy, candidate AUPRC, graph similarity, and topology penalties.
 - Probability calibration update: `src/model/tccig.py` now uses softmax module memberships with a centered module compatibility term instead of the previous `softplus(...)` + identity interaction term that added a universal positive logit offset. Scratch TCCIG training initializes the density-bias head from train-graph density rather than the supervised BCE positive rate induced by negative sampling.
-- Evaluation semantics update: TCCIG can run `evaluate.mode: graph_assembly`, which scores the `all_test_ppi.txt` candidate universe with graph-context probabilities, reports ranking metrics from those probabilities, and reports hard binary metrics from the same top-`m_hat` assembly rule used by topology evaluation.
-- Internal validation update: TCCIG topology monitoring now builds one validation-wide deduplicated candidate universe from all sampled validation subgraphs, applies one global top-`m_hat` graph assembly, and projects the hard decisions back onto sampled subgraphs. Fixed `0.5` threshold counts remain diagnostics for probability saturation, not the topology-monitor graph definition.
-- P0 fixed eval-only result: `configs/tccig/p0_fixed_eval_only.yaml`
+- Evaluation semantics update: TCCIG can run `evaluate.mode: graph_assembly`, which scores the `all_test_ppi.txt` candidate universe with graph-context probabilities, reports ranking metrics from those probabilities, and reports hard binary metrics from the hybrid validation-density/degree-cap assembly used by topology evaluation. Learned `m_hat` is retained as a diagnostic budget only.
+- Internal validation update: TCCIG topology monitoring now combines candidate AUPRC, retrieval recall proxy, graph similarity, and topology penalties into `val_composite_score`. Fixed `0.5` threshold counts remain diagnostics for probability saturation, not the topology-monitor graph definition.
+- Historical P0 fixed eval-only result: `configs/tccig/p0_fixed_eval_only.yaml`
   evaluates `models/tccig/tccig_train/p0_fixed/best_model.pth` with graph
   assembly semantics. Compared with `tccig_scratch`, topology metrics improved
   but remain weak: summary `graph_sim` `0.159 -> 0.191`, `relative_density`
@@ -49,7 +50,7 @@ $$
   `0.055`, recall `0.180`, F1 `0.084`, MCC `0.078`, and specificity `0.958`.
   Probability scores remain saturated (`mean = 0.981`, `p50 = 0.984`,
   `p95 = 0.991`), so calibration and density-prior fixes remain open.
-- P1 fixed-threshold cleanup result: `logs/tccig/{tccig_train,evaluate,topology_evaluate}/p1_fixed/`
+- Historical P1 fixed-threshold cleanup result: `logs/tccig/{tccig_train,evaluate,topology_evaluate}/p1_fixed/`
   archives the 2026-06-01 rerun after adding TCCIG-only validation-calibrated
   pairwise threshold diagnostics. The graph-assembly metrics are intentionally
   unchanged from P0 because the hard graph still uses top-`m_hat`: AUROC `0.581`,
@@ -63,7 +64,7 @@ $$
   threshold `0.5` is only a saturation diagnostic for this checkpoint; it does
   not fix graph reconstruction. The remaining blockers are density prior,
   edge-budget calibration, checkpoint monitoring, and decoder saturation.
-- P2 code update: canonical `configs/tccig/01.yaml` now uses run id `p2_fixed`,
+- Historical P2 code update: the previous canonical `configs/tccig/01.yaml` used run id `p2_fixed`,
   disables the online teacher for the Run B ablation, initializes TCCIG density
   bias from train-graph density, and records edge-budget diagnostics plus
   debug assemblies for model `m_hat`, validation-density, and oracle-test-density
@@ -85,7 +86,7 @@ $$
   0.040`. The next model-quality fix should prioritize decoder calibration and
   full-candidate ranking/localization, with checkpoint monitoring still suspect.
 
-Not implemented yet: feature kNN/anchor candidate proposer, offline S2GAE/MaskGAE/Bandana teacher pretraining, spectral/module/ranking/calibration/sparsity losses as active nonzero objectives, composite checkpoint monitoring, and decoder scale/gating.
+Current remaining limitations: feature kNN/anchor candidate proposal and ANN backends are intentionally out of scope; external pair/context teachers remain disabled; spectral/module/calibration/sparsity losses are still diagnostics or follow-up objectives rather than active R5 requirements. Full human/BFS R0-R5 HPC results must be generated after this code lands.
 
 
 # 1. Overall pipeline

@@ -89,7 +89,9 @@ class TCCIGTrainRunner:
             embedding_repository=data_context.embedding_repository,
             negative_lookup=data_context.train_negative_lookup,
             distributed_context=self.runtime.distributed,
+            model_dir=self.model_dir,
             teacher=teacher,
+            graph_prior_artifacts=data_context.graph_prior_artifacts,
             logger=self.logger,
         )
         validation_runner = TCCIGValidationRunner(

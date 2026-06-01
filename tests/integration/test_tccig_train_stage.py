@@ -247,6 +247,7 @@ def test_tccig_student_trainer_runs_online_teacher_for_padding_task(
         embedding_repository=embedding_repository,
         negative_lookup=ExplicitNegativePairLookup(frozenset(), {}),
         distributed_context=distributed_context,
+        model_dir=tmp_path / "models",
         teacher=OnlineTCCIGTeacher(
             teacher=cast(MGAETeacher, teacher),
             optimizer=torch.optim.SGD(teacher.parameters(), lr=1e-3),
@@ -298,15 +299,18 @@ def test_tccig_config_uses_top_level_train_namespace() -> None:
     train_cfg = parse_tccig_train_config(config)
 
     assert run_cfg["stages"] == ["tccig_train", "evaluate", "topology_evaluate"]
-    assert run_cfg["tccig_train_run_id"] == "p2_fixed"
-    assert run_cfg["eval_run_id"] == "p2_fixed"
-    assert run_cfg["topology_eval_run_id"] == "p2_fixed"
+    assert run_cfg["tccig_train_run_id"] == "gpr_r5_human_bfs"
+    assert run_cfg["eval_run_id"] == "gpr_r5_human_bfs"
+    assert run_cfg["topology_eval_run_id"] == "gpr_r5_human_bfs"
     assert "tccig_train" in config
     assert "topology_finetune" not in config
     raw_train_cfg = cast(Mapping[str, object], config["tccig_train"])
     teacher_cfg = cast(Mapping[str, object], raw_train_cfg["teacher"])
     loss_cfg = cast(Mapping[str, object], raw_train_cfg["losses"])
     assert teacher_cfg["enabled"] is False
+    assert "retrieval" in raw_train_cfg
+    assert "graph_prior_teacher" in raw_train_cfg
+    assert "graph_assembly" in raw_train_cfg
     assert loss_cfg["teacher"] == pytest.approx(0.0)
     assert isinstance(train_cfg.optimizer, OptimizerConfig)
 

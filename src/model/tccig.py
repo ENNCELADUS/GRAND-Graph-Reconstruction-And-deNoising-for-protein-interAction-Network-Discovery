@@ -15,20 +15,28 @@ def _to_int(value: object, field_name: str) -> int:
     """Parse an integer model configuration value."""
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be an integer")
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be an integer") from exc
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float | str):
+        try:
+            return int(value)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be an integer") from exc
+    raise ValueError(f"{field_name} must be an integer")
 
 
 def _to_float(value: object, field_name: str) -> float:
     """Parse a floating-point model configuration value."""
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be a float")
-    try:
+    if isinstance(value, int | float):
         return float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field_name} must be a float") from exc
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError as exc:
+            raise ValueError(f"{field_name} must be a float") from exc
+    raise ValueError(f"{field_name} must be a float")
 
 
 def _to_mapping(value: object, field_name: str) -> Mapping[str, object]:
@@ -43,6 +51,18 @@ def _to_string(value: object, field_name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field_name} must be a non-empty string")
     return value
+
+
+def _to_bool(value: object, field_name: str) -> bool:
+    """Parse a boolean model configuration value."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean")
+    return value
+
+
+def _is_power_of_two(value: int) -> bool:
+    """Return whether ``value`` is a positive power of two."""
+    return value > 0 and (value & (value - 1)) == 0
 
 
 def _build_mlp(
@@ -74,6 +94,22 @@ def _last_linear(module: nn.Module) -> nn.Linear | None:
     return final_linear
 
 
+def _hadamard_transform(values: torch.Tensor) -> torch.Tensor:
+    """Apply an in-place-free Walsh-Hadamard transform on the last dimension."""
+    width = values.size(-1)
+    if not _is_power_of_two(width):
+        raise ValueError("SORF random features require power-of-two rff_input_dim")
+    output = values
+    step = 1
+    while step < width:
+        reshaped = output.reshape(*output.shape[:-1], -1, step * 2)
+        left = reshaped[..., :step]
+        right = reshaped[..., step : step * 2]
+        output = torch.cat([left + right, left - right], dim=-1).reshape_as(output)
+        step *= 2
+    return output / math.sqrt(float(width))
+
+
 class TCCIG(nn.Module):
     """Topology-constrained conditional interactome generator.
 
@@ -86,22 +122,64 @@ class TCCIG(nn.Module):
 
     def __init__(self, **model_config: object) -> None:
         super().__init__()
-        self.input_dim = _to_int(model_config["input_dim"], "model_config.input_dim")
-        self.d_model = _to_int(model_config["d_model"], "model_config.d_model")
-        self.dropout = _to_float(model_config.get("dropout", 0.1), "model_config.dropout")
-        self.lowrank_dim = _to_int(
+        self.input_dim: int = _to_int(model_config["input_dim"], "model_config.input_dim")
+        self.d_model: int = _to_int(model_config["d_model"], "model_config.d_model")
+        self.dropout: float = _to_float(model_config.get("dropout", 0.1), "model_config.dropout")
+        self.lowrank_dim: int = _to_int(
             model_config.get("lowrank_dim", max(1, self.d_model // 4)),
             "model_config.lowrank_dim",
         )
-        self.decoder_structural_gate_init = _to_float(
+        retrieval_cfg = _to_mapping(
+            model_config.get("retrieval", {}),
+            "model_config.retrieval",
+        )
+        self.retrieval_dim: int = _to_int(
+            retrieval_cfg.get("dim", max(1, self.d_model // 2)),
+            "model_config.retrieval.dim",
+        )
+        self.retrieval_top_k: int = _to_int(
+            retrieval_cfg.get("top_k", 128),
+            "model_config.retrieval.top_k",
+        )
+        self.rff_features: int = _to_int(
+            retrieval_cfg.get("rff_features", max(64, self.retrieval_dim * 2)),
+            "model_config.retrieval.rff_features",
+        )
+        self.rff_input_dim: int = _to_int(
+            retrieval_cfg.get("rff_input_dim", self.d_model),
+            "model_config.retrieval.rff_input_dim",
+        )
+        self.rff_sigma: float = _to_float(
+            retrieval_cfg.get("rff_sigma", 0.5),
+            "model_config.retrieval.rff_sigma",
+        )
+        if self.rff_sigma <= 0.0:
+            raise ValueError("model_config.retrieval.rff_sigma must be > 0")
+        self.rff_backend: str = _to_string(
+            retrieval_cfg.get("rff_backend", "sorf"),
+            "model_config.retrieval.rff_backend",
+        ).lower()
+        if self.rff_backend not in {"sorf", "dense"}:
+            raise ValueError("model_config.retrieval.rff_backend must be 'sorf' or 'dense'")
+        if self.rff_backend == "sorf" and not _is_power_of_two(self.rff_input_dim):
+            raise ValueError("model_config.retrieval.rff_input_dim must be a power of two")
+        self.normalize_retrieval_embeddings: bool = _to_bool(
+            retrieval_cfg.get("normalize", True),
+            "model_config.retrieval.normalize",
+        )
+        self.retrieval_logit_gate_init: float = _to_float(
+            retrieval_cfg.get("logit_gate_init", 1.0),
+            "model_config.retrieval.logit_gate_init",
+        )
+        self.decoder_structural_gate_init: float = _to_float(
             model_config.get("decoder_structural_gate_init", 0.1),
             "model_config.decoder_structural_gate_init",
         )
-        self.num_modules = _to_int(
+        self.num_modules: int = _to_int(
             model_config.get("num_modules", 64),
             "model_config.num_modules",
         )
-        self.self_refinement_rounds = _to_int(
+        self.self_refinement_rounds: int = _to_int(
             model_config.get("self_refinement_rounds", 0),
             "model_config.self_refinement_rounds",
         )
@@ -112,7 +190,7 @@ class TCCIG(nn.Module):
             model_config.get("candidate_proposer", {"type": "all_pairs"}),
             "model_config.candidate_proposer",
         )
-        self.candidate_proposer_type = _to_string(
+        self.candidate_proposer_type: str = _to_string(
             candidate_cfg.get("type", "all_pairs"),
             "model_config.candidate_proposer.type",
         ).lower()
@@ -130,7 +208,7 @@ class TCCIG(nn.Module):
             _to_int(value, "model_config.pair_mlp.hidden_dims") for value in raw_hidden_dims
         ]
 
-        self.protein_projection = nn.Sequential(
+        self.protein_projection: nn.Sequential = nn.Sequential(
             nn.LayerNorm(self.input_dim),
             nn.Linear(self.input_dim, self.d_model),
             nn.GELU(),
@@ -138,41 +216,88 @@ class TCCIG(nn.Module):
             nn.Linear(self.d_model, self.d_model),
             nn.LayerNorm(self.d_model),
         )
-        self.set_context = nn.Sequential(
+        self.set_context: nn.Sequential = nn.Sequential(
             nn.Linear(self.d_model * 2, self.d_model),
             nn.GELU(),
             nn.Dropout(self.dropout),
             nn.Linear(self.d_model, self.d_model),
             nn.LayerNorm(self.d_model),
         )
-        self.pair_mlp = _build_mlp(
+        self.pair_mlp: nn.Sequential = _build_mlp(
             input_dim=(3 * self.d_model) + 1,
             hidden_dims=pair_hidden_dims,
             output_dim=1,
             dropout=self.dropout,
         )
-        self.hub_head = nn.Linear(self.d_model, 1)
-        self.lowrank_head = nn.Linear(self.d_model, self.lowrank_dim)
-        self.module_head = nn.Linear(self.d_model, self.num_modules)
-        self.module_interactions = nn.Parameter(torch.eye(self.num_modules))
-        self.hub_score_gate = nn.Parameter(torch.tensor(self.decoder_structural_gate_init))
-        self.lowrank_score_gate = nn.Parameter(torch.tensor(self.decoder_structural_gate_init))
-        self.module_score_gate = nn.Parameter(torch.tensor(self.decoder_structural_gate_init))
-        self.density_bias_head = _build_mlp(
+        self.hub_head: nn.Linear = nn.Linear(self.d_model, 1)
+        self.lowrank_head: nn.Linear = nn.Linear(self.d_model, self.lowrank_dim)
+        self.module_head: nn.Linear = nn.Linear(self.d_model, self.num_modules)
+        self.module_interactions: nn.Parameter = nn.Parameter(torch.eye(self.num_modules))
+        self.query_head: nn.Linear = nn.Linear(self.d_model, self.retrieval_dim)
+        self.key_head: nn.Linear = nn.Linear(self.d_model, self.retrieval_dim)
+        self.struct_head: nn.Linear = nn.Linear(self.d_model, self.retrieval_dim)
+        self.degree_head: nn.Linear = nn.Linear(self.d_model, 1)
+        self.residue_projection: nn.Sequential = nn.Sequential(
+            nn.LayerNorm(self.input_dim),
+            nn.Linear(self.input_dim, self.rff_input_dim),
+        )
+        self.residue_attention_head: nn.Linear = nn.Linear(self.rff_input_dim, 1)
+        self.retrieval_logit_gate: nn.Parameter = nn.Parameter(
+            torch.tensor(self.retrieval_logit_gate_init)
+        )
+        self.residue_score_gate: nn.Parameter = nn.Parameter(torch.tensor(1.0))
+        self.struct_score_gate: nn.Parameter = nn.Parameter(
+            torch.tensor(self.decoder_structural_gate_init)
+        )
+        self.degree_score_gate: nn.Parameter = nn.Parameter(
+            torch.tensor(self.decoder_structural_gate_init)
+        )
+        self.hub_score_gate: nn.Parameter = nn.Parameter(
+            torch.tensor(self.decoder_structural_gate_init)
+        )
+        self.lowrank_score_gate: nn.Parameter = nn.Parameter(
+            torch.tensor(self.decoder_structural_gate_init)
+        )
+        self.module_score_gate: nn.Parameter = nn.Parameter(
+            torch.tensor(self.decoder_structural_gate_init)
+        )
+        self.density_bias_head: nn.Sequential = _build_mlp(
             input_dim=self.d_model,
             hidden_dims=[self.d_model],
             output_dim=1,
             dropout=self.dropout,
         )
-        self.edge_budget_head = _build_mlp(
+        self.edge_budget_head: nn.Sequential = _build_mlp(
             input_dim=self.d_model,
             hidden_dims=[self.d_model],
             output_dim=1,
             dropout=self.dropout,
         )
+        self.message_projection: nn.Linear | None = None
+        self.refinement_cell: nn.GRUCell | None = None
         if self.self_refinement_rounds == 1:
             self.message_projection = nn.Linear(self.d_model, self.d_model)
             self.refinement_cell = nn.GRUCell(self.d_model, self.d_model)
+        phase = torch.rand(self.rff_features) * (2.0 * math.pi)
+        self.rff_phase: torch.Tensor
+        self.rff_weight: torch.Tensor
+        self.sorf_signs: torch.Tensor
+        self.register_buffer("rff_phase", phase)
+        if self.rff_backend == "dense":
+            rff_weight = torch.randn(self.rff_features, self.rff_input_dim)
+            self.register_buffer("rff_weight", rff_weight)
+            self.register_buffer("sorf_signs", torch.empty(0))
+        else:
+            block_count = math.ceil(self.rff_features / float(self.rff_input_dim))
+            signs = torch.randint(
+                low=0,
+                high=2,
+                size=(block_count, 3, self.rff_input_dim),
+                dtype=torch.float32,
+            )
+            signs = signs.mul(2.0).sub(1.0)
+            self.register_buffer("sorf_signs", signs)
+            self.register_buffer("rff_weight", torch.empty(0))
 
     @staticmethod
     def _masked_mean_pool(embeddings: torch.Tensor, lengths: torch.Tensor | None) -> torch.Tensor:
@@ -201,6 +326,105 @@ class TCCIG(nn.Module):
         set_summary = h0.mean(dim=0, keepdim=True).expand_as(h0)
         return cast(torch.Tensor, self.set_context(torch.cat([h0, set_summary], dim=-1)))
 
+    @staticmethod
+    def _token_mask(
+        *,
+        embeddings: torch.Tensor,
+        lengths: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Return a boolean token mask for residue-level pooling."""
+        if lengths is None:
+            return torch.ones(
+                embeddings.shape[:2],
+                device=embeddings.device,
+                dtype=torch.bool,
+            )
+        clipped_lengths = lengths.to(device=embeddings.device, dtype=torch.long).clamp(
+            min=1,
+            max=embeddings.size(1),
+        )
+        token_ids = torch.arange(embeddings.size(1), device=embeddings.device).unsqueeze(0)
+        return token_ids < clipped_lengths.unsqueeze(1)
+
+    def _random_fourier_features(self, projected_tokens: torch.Tensor) -> torch.Tensor:
+        """Return residue-level random Fourier features."""
+        if self.rff_backend == "dense":
+            projection = torch.matmul(projected_tokens, self.rff_weight.t()) / self.rff_sigma
+        else:
+            block_count = self.sorf_signs.size(0)
+            expanded = projected_tokens.unsqueeze(2).expand(
+                *projected_tokens.shape[:-1],
+                block_count,
+                self.rff_input_dim,
+            )
+            transformed = expanded
+            for sign_index in range(3):
+                signs = self.sorf_signs[:, sign_index, :].to(
+                    device=projected_tokens.device,
+                    dtype=projected_tokens.dtype,
+                )
+                transformed = _hadamard_transform(
+                    transformed * signs.view(1, 1, block_count, self.rff_input_dim)
+                )
+            projection = transformed.reshape(
+                *projected_tokens.shape[:-1],
+                block_count * self.rff_input_dim,
+            )[..., : self.rff_features]
+            projection = projection / self.rff_sigma
+        phase = self.rff_phase.to(device=projected_tokens.device, dtype=projected_tokens.dtype)
+        return math.sqrt(2.0 / float(self.rff_features)) * torch.cos(projection + phase)
+
+    def _encode_residue_factor(
+        self,
+        *,
+        protein_embeddings: torch.Tensor,
+        protein_lengths: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Encode token embeddings into one residue-aware retrieval vector per protein."""
+        projected_tokens = cast(torch.Tensor, self.residue_projection(protein_embeddings))
+        residue_features = self._random_fourier_features(projected_tokens)
+        attention_logits = self.residue_attention_head(projected_tokens).squeeze(-1)
+        mask = self._token_mask(embeddings=protein_embeddings, lengths=protein_lengths)
+        attention_logits = attention_logits.masked_fill(
+            ~mask,
+            torch.finfo(attention_logits.dtype).min,
+        )
+        attention = torch.softmax(attention_logits, dim=-1)
+        return (attention.unsqueeze(-1) * residue_features).sum(dim=1)
+
+    def _maybe_normalize(self, embeddings: torch.Tensor) -> torch.Tensor:
+        """Normalize retrieval embeddings when configured."""
+        if not self.normalize_retrieval_embeddings:
+            return embeddings
+        return functional.normalize(embeddings, dim=-1)
+
+    def encode_proteins(
+        self,
+        *,
+        protein_embeddings: torch.Tensor,
+        protein_lengths: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Encode proteins into retrieval, structural-prior, and reranking states."""
+        if protein_embeddings.size(-1) != self.input_dim:
+            raise ValueError("protein embedding dimension must match model_config.input_dim")
+        node_embeddings = self._encode_nodes(protein_embeddings, protein_lengths)
+        module_memberships = functional.softmax(self.module_head(node_embeddings), dim=-1)
+        degree_prediction = functional.softplus(self.degree_head(node_embeddings).squeeze(-1))
+        return {
+            "node": node_embeddings,
+            "query": self._maybe_normalize(self.query_head(node_embeddings)),
+            "key": self._maybe_normalize(self.key_head(node_embeddings)),
+            "struct": self._maybe_normalize(self.struct_head(node_embeddings)),
+            "residue": self._maybe_normalize(
+                self._encode_residue_factor(
+                    protein_embeddings=protein_embeddings,
+                    protein_lengths=protein_lengths,
+                )
+            ),
+            "module": module_memberships,
+            "degree": degree_prediction,
+        }
+
     def encode_graph_nodes(
         self,
         *,
@@ -208,9 +432,10 @@ class TCCIG(nn.Module):
         protein_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Encode a protein set for graph-level candidate scoring."""
-        if protein_embeddings.size(-1) != self.input_dim:
-            raise ValueError("protein embedding dimension must match model_config.input_dim")
-        return self._encode_nodes(protein_embeddings, protein_lengths)
+        return self.encode_proteins(
+            protein_embeddings=protein_embeddings,
+            protein_lengths=protein_lengths,
+        )["node"]
 
     @staticmethod
     def _all_pairs(num_nodes: int, device: torch.device) -> torch.Tensor:
@@ -263,6 +488,52 @@ class TCCIG(nn.Module):
         budget_fraction = torch.sigmoid(self.edge_budget_head(set_state).squeeze()).float()
         return budget_fraction * float(candidate_count)
 
+    def retrieval_score_matrix(self, encoded: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Return symmetric retrieval scores for every encoded protein pair."""
+        query = encoded["query"]
+        key = encoded["key"]
+        residue = encoded["residue"]
+        struct = encoded["struct"]
+        degree = encoded["degree"]
+        directed = torch.matmul(query, key.t()) / math.sqrt(float(self.retrieval_dim))
+        residue_score = torch.matmul(residue, residue.t()) / math.sqrt(float(self.rff_features))
+        struct_score = torch.matmul(struct, struct.t()) / math.sqrt(float(self.retrieval_dim))
+        degree_score = torch.log1p(degree).unsqueeze(0) + torch.log1p(degree).unsqueeze(1)
+        score = 0.5 * (directed + directed.t())
+        score = score + self.residue_score_gate * residue_score
+        score = score + self.struct_score_gate * struct_score
+        score = score + self.degree_score_gate * degree_score
+        return score
+
+    def retrieve_candidate_pairs(
+        self,
+        *,
+        encoded: Mapping[str, torch.Tensor],
+        top_k: int | None = None,
+    ) -> torch.Tensor:
+        """Return exact top-k undirected retrieval candidates without self edges."""
+        query = encoded["query"]
+        num_nodes = query.size(0)
+        if num_nodes < 2:
+            return torch.empty((2, 0), dtype=torch.long, device=query.device)
+        resolved_top_k = min(max(1, top_k or self.retrieval_top_k), num_nodes - 1)
+        scores = self.retrieval_score_matrix(encoded).clone()
+        scores.fill_diagonal_(torch.finfo(scores.dtype).min)
+        partners = torch.topk(scores, k=resolved_top_k, dim=1).indices
+        sources = torch.arange(num_nodes, device=query.device).unsqueeze(1).expand_as(partners)
+        raw_pairs = torch.stack([sources.reshape(-1), partners.reshape(-1)], dim=0)
+        raw_pairs = raw_pairs[:, raw_pairs[0] != raw_pairs[1]]
+        canonical = torch.stack(
+            [
+                torch.minimum(raw_pairs[0], raw_pairs[1]),
+                torch.maximum(raw_pairs[0], raw_pairs[1]),
+            ],
+            dim=0,
+        )
+        if canonical.numel() == 0:
+            return canonical
+        return cast(torch.Tensor, torch.unique(canonical.t(), dim=0).t().contiguous())
+
     def initialize_density_bias_with_prior(self, positive_edge_probability: float) -> float:
         """Initialize set-density bias to a sparse positive-edge prior."""
         final_linear = _last_linear(self.density_bias_head)
@@ -300,6 +571,7 @@ class TCCIG(nn.Module):
         self,
         node_embeddings: torch.Tensor,
         candidate_pairs: torch.Tensor,
+        encoded: Mapping[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Decode sparse candidate edge logits from feature-only node embeddings."""
         candidate_count = candidate_pairs.size(1)
@@ -309,13 +581,24 @@ class TCCIG(nn.Module):
             node_embeddings=node_embeddings,
             candidate_count=candidate_count,
         )
-        module_memberships = functional.softmax(self.module_head(node_embeddings), dim=-1)
+        module_memberships = (
+            encoded["module"]
+            if encoded is not None
+            else functional.softmax(self.module_head(node_embeddings), dim=-1)
+        )
+        degree_prediction = (
+            encoded["degree"]
+            if encoded is not None
+            else functional.softplus(self.degree_head(node_embeddings).squeeze(-1))
+        )
         if candidate_count == 0:
             return {
                 "logits": node_embeddings.new_zeros((0,)),
+                "retrieval_logits": node_embeddings.new_zeros((0,)),
                 "edge_probabilities": node_embeddings.new_zeros((0,)),
                 "m_hat": m_hat,
                 "module_memberships": module_memberships,
+                "degree_predictions": degree_prediction,
                 "density_bias": density_bias.reshape(()),
             }
 
@@ -338,18 +621,58 @@ class TCCIG(nn.Module):
             module_src,
             module_dst,
         )
-        logits = pair_score + hub_score + lowrank_score + module_score + density_bias
+        retrieval_matrix = (
+            self.retrieval_score_matrix(encoded)
+            if encoded is not None
+            else self._node_only_retrieval_score_matrix(
+                node_embeddings=node_embeddings,
+                degree_prediction=degree_prediction,
+            )
+        )
+        retrieval_logits = retrieval_matrix[src, dst]
+        logits = (
+            self.retrieval_logit_gate * retrieval_logits
+            + pair_score
+            + hub_score
+            + lowrank_score
+            + module_score
+            + density_bias
+        )
         return {
             "logits": logits,
+            "retrieval_logits": retrieval_logits,
             "edge_probabilities": torch.sigmoid(logits),
             "m_hat": m_hat.reshape(()),
             "module_memberships": module_memberships,
+            "degree_predictions": degree_prediction,
             "density_bias": density_bias.reshape(()),
             "pair_score": pair_score,
+            "retrieval_score": retrieval_logits,
             "hub_score": hub_score,
             "lowrank_score": lowrank_score,
             "module_score": module_score,
         }
+
+    def _node_only_retrieval_score_matrix(
+        self,
+        *,
+        node_embeddings: torch.Tensor,
+        degree_prediction: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return retrieval scores when only graph node embeddings are available."""
+        query = self._maybe_normalize(self.query_head(node_embeddings))
+        key = self._maybe_normalize(self.key_head(node_embeddings))
+        struct = self._maybe_normalize(self.struct_head(node_embeddings))
+        directed = torch.matmul(query, key.t()) / math.sqrt(float(self.retrieval_dim))
+        struct_score = torch.matmul(struct, struct.t()) / math.sqrt(float(self.retrieval_dim))
+        degree_score = torch.log1p(degree_prediction).unsqueeze(0) + torch.log1p(
+            degree_prediction
+        ).unsqueeze(1)
+        return (
+            0.5 * (directed + directed.t())
+            + self.struct_score_gate * struct_score
+            + self.degree_score_gate * degree_score
+        )
 
     def decode_graph_candidates(
         self,
@@ -390,7 +713,32 @@ class TCCIG(nn.Module):
         module_a = functional.softmax(self.module_head(node_a_embeddings), dim=-1)
         module_b = functional.softmax(self.module_head(node_b_embeddings), dim=-1)
         module_score = self.module_score_gate * self._centered_module_score(module_a, module_b)
-        return pair_score + hub_score + lowrank_score + module_score + density_bias
+        degree_a = functional.softplus(self.degree_head(node_a_embeddings).squeeze(-1))
+        degree_b = functional.softplus(self.degree_head(node_b_embeddings).squeeze(-1))
+        query_a = self._maybe_normalize(self.query_head(node_a_embeddings))
+        key_b = self._maybe_normalize(self.key_head(node_b_embeddings))
+        query_b = self._maybe_normalize(self.query_head(node_b_embeddings))
+        key_a = self._maybe_normalize(self.key_head(node_a_embeddings))
+        retrieval_score = 0.5 * (
+            (query_a * key_b).sum(dim=-1) + (query_b * key_a).sum(dim=-1)
+        ) / math.sqrt(float(self.retrieval_dim))
+        struct_a = self._maybe_normalize(self.struct_head(node_a_embeddings))
+        struct_b = self._maybe_normalize(self.struct_head(node_b_embeddings))
+        retrieval_score = retrieval_score + self.struct_score_gate * (
+            (struct_a * struct_b).sum(dim=-1) / math.sqrt(float(self.retrieval_dim))
+        )
+        retrieval_score = retrieval_score + self.degree_score_gate * (
+            torch.log1p(degree_a) + torch.log1p(degree_b)
+        )
+        return cast(
+            torch.Tensor,
+            self.retrieval_logit_gate * retrieval_score
+            + pair_score
+            + hub_score
+            + lowrank_score
+            + module_score
+            + density_bias,
+        )
 
     def _centered_module_score(
         self,
@@ -429,6 +777,8 @@ class TCCIG(nn.Module):
         """Run one predicted-soft-graph refinement pass."""
         if candidate_pairs.size(1) == 0:
             return node_embeddings
+        if self.message_projection is None or self.refinement_cell is None:
+            raise RuntimeError("self refinement modules are not initialized")
         src = candidate_pairs[0]
         dst = candidate_pairs[1]
         messages = node_embeddings.new_zeros(node_embeddings.shape)
@@ -440,7 +790,7 @@ class TCCIG(nn.Module):
         )
         messages.index_add_(0, dst, weighted_src)
         messages.index_add_(0, src, weighted_dst)
-        return self.refinement_cell(messages, node_embeddings)
+        return cast(torch.Tensor, self.refinement_cell(messages, node_embeddings))
 
     def forward_graph(
         self,
@@ -448,11 +798,15 @@ class TCCIG(nn.Module):
         protein_embeddings: torch.Tensor,
         protein_lengths: torch.Tensor | None = None,
         candidate_pairs: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, object]:
         """Generate candidate edge probabilities for a protein set from features only."""
         if protein_embeddings.size(-1) != self.input_dim:
             raise ValueError("protein embedding dimension must match model_config.input_dim")
-        node_embeddings = self._encode_nodes(protein_embeddings, protein_lengths)
+        encoded = self.encode_proteins(
+            protein_embeddings=protein_embeddings,
+            protein_lengths=protein_lengths,
+        )
+        node_embeddings = encoded["node"]
         pairs = (
             self._all_pairs(node_embeddings.size(0), node_embeddings.device)
             if candidate_pairs is None
@@ -462,17 +816,21 @@ class TCCIG(nn.Module):
                 device=node_embeddings.device,
             )
         )
-        decoded = self._decode_candidates(node_embeddings, pairs)
+        decoded: dict[str, object] = dict(
+            self._decode_candidates(node_embeddings, pairs, encoded=encoded)
+        )
         if self.self_refinement_rounds == 1:
             refined_embeddings = self._refine_once(
                 node_embeddings=node_embeddings,
                 candidate_pairs=pairs,
-                edge_probabilities=decoded["edge_probabilities"],
+                edge_probabilities=cast(torch.Tensor, decoded["edge_probabilities"]),
             )
-            decoded = self._decode_candidates(refined_embeddings, pairs)
+            decoded = dict(self._decode_candidates(refined_embeddings, pairs))
             node_embeddings = refined_embeddings
         decoded["candidate_pairs"] = pairs
         decoded["node_embeddings"] = node_embeddings
+        decoded["retrieval_score_matrix"] = self.retrieval_score_matrix(encoded)
+        decoded["encoded"] = encoded
         return decoded
 
     def forward(

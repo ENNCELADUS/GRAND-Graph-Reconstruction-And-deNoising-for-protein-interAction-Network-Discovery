@@ -350,11 +350,12 @@ def test_tccig_graph_assembly_evaluate_uses_all_test_universe_and_writes_diagnos
     assert evaluate_csv.exists()
     assert diagnostics_path.exists()
     diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
-    assert diagnostics["assembly_rule"] == "top_m_hat"
+    assert diagnostics["assembly_rule"] == "hybrid_validation_density_degree_cap"
     assert diagnostics["n_nodes"] == 3
     assert diagnostics["full_pair_count"] == 3
     assert diagnostics["candidate_count"] == 3
     assert diagnostics["selected_edges"] == 2
+    assert diagnostics["edge_budget"] == pytest.approx(2.0)
     assert diagnostics["m_hat"] == pytest.approx(2.0)
     assert diagnostics["m_hat_per_candidate"] == pytest.approx(2.0 / 3.0, abs=1.0e-3)
     assert diagnostics["m_hat_per_full_pair"] == pytest.approx(2.0 / 3.0, abs=1.0e-3)
@@ -657,28 +658,33 @@ def test_tccig_topology_evaluate_writes_graph_assembly_diagnostics(tmp_path: Pat
     diagnostics_path = log_dir / "graph_assembly_diagnostics.json"
     assert diagnostics_path.exists()
     diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
-    assert diagnostics["assembly_rule"] == "top_m_hat"
+    assert diagnostics["assembly_rule"] == "hybrid_validation_density_degree_cap"
     assert diagnostics["n_nodes"] == 3
     assert diagnostics["full_pair_count"] == 3
     assert diagnostics["candidate_count"] == 3
-    assert diagnostics["selected_edges"] == 2
+    assert diagnostics["selected_edges"] == 1
     assert diagnostics["m_hat_per_candidate"] == pytest.approx(2.0 / 3.0, abs=1.0e-3)
     assert diagnostics["m_hat_per_full_pair"] == pytest.approx(2.0 / 3.0, abs=1.0e-3)
+    assert diagnostics["edge_budget"] == pytest.approx(1.0)
 
     metrics_payload = json.loads((log_dir / "topology_metrics.json").read_text(encoding="utf-8"))
-    assert metrics_payload["graph_assembly"]["assembly_rule"] == "top_m_hat"
-    assert metrics_payload["decision_rule"] == "top_m_hat"
+    assert metrics_payload["graph_assembly"]["assembly_rule"] == (
+        "hybrid_validation_density_degree_cap"
+    )
+    assert metrics_payload["decision_rule"] == "hybrid_validation_density_degree_cap"
     assert metrics_payload["fixed_threshold_diagnostic"] == {
         "mode": "fixed",
         "value": 0.5,
     }
     debug_assemblies = metrics_payload["debug_assemblies"]
     assert set(debug_assemblies) == {
+        "official",
         "model_m_hat",
         "validation_density",
         "oracle_test_density",
     }
-    assert debug_assemblies["model_m_hat"]["diagnostic_only"] is False
+    assert debug_assemblies["official"]["diagnostic_only"] is False
+    assert debug_assemblies["model_m_hat"]["diagnostic_only"] is True
     assert debug_assemblies["model_m_hat"]["budget"] == pytest.approx(2.0)
     assert debug_assemblies["validation_density"]["diagnostic_only"] is True
     assert debug_assemblies["validation_density"]["source_density"] == pytest.approx(

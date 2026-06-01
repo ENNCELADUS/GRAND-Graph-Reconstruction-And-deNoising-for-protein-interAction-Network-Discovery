@@ -1,9 +1,9 @@
 run_config:
   stages: ["tccig_train", "evaluate", "topology_evaluate"]
   seed: 47
-  tccig_train_run_id: "p4_fixed"
-  eval_run_id: "p4_fixed"
-  topology_eval_run_id: "p4_fixed"
+  tccig_train_run_id: "gpr_r5_human_bfs"
+  eval_run_id: "gpr_r5_human_bfs"
+  topology_eval_run_id: "gpr_r5_human_bfs"
   load_checkpoint_path: null
   save_best_only: true
 
@@ -42,6 +42,15 @@ model_config:
   num_modules: 64
   decoder_structural_gate_init: 0.1
   self_refinement_rounds: 0
+  retrieval:
+    dim: 256
+    top_k: 256
+    rff_features: 2048
+    rff_input_dim: 512
+    rff_backend: "sorf"
+    rff_sigma: 0.5
+    normalize: true
+    logit_gate_init: 1.0
   candidate_proposer:
     type: "all_pairs"
   pair_mlp:
@@ -82,7 +91,7 @@ tccig_train:
   internal_validation_samples_per_size: 10
   compute_clustering_mmd: true
   internal_validation_compute_clustering_mmd: true
-  monitor_metric: "val_topology_loss"
+  monitor_metric: "val_composite_score"
   early_stopping_patience: 4
   optimizer:
     lr: 6.0e-6
@@ -102,6 +111,52 @@ tccig_train:
     optimizer:
       lr: 1.0e-3
       weight_decay: 0.0
+  retrieval:
+    backend: "exact"
+    top_k: 256
+    train_top_k: 128
+    temperature: 0.07
+    weight: 1.0
+  graph_prior_teacher:
+    enabled: true
+    epochs: 5
+    hidden_dim: 256
+    num_layers: 2
+    decoder_hidden_dim: 256
+    dropout: 0.10
+    mask_ratio: 0.7
+    negative_ratio: 1
+    artifact_dir: "graph_prior_teacher"
+    reuse_artifacts: true
+    struct_weight: 0.1
+    degree_weight: 0.05
+  hard_negative_mining:
+    enabled: true
+    top_k: 128
+    max_pairs_per_epoch: 100000
+    refresh_every_epochs: 1
+  reranker:
+    enabled: true
+    weight: 1.0
+    adaptive_negative_temperature: 4.0
+    external_teacher_enabled: false
+  graph_assembly:
+    rule: "hybrid_validation_density_degree_cap"
+    validation_density_budget: true
+    degree_cap_slack: 1.0
+  validation_reconstruction:
+    enabled: true
+    full_universe: true
+    max_pairs: null
+    recall_k_percent: [1, 3, 5, 10, 20]
+  monitor:
+    metric: "val_composite_score"
+    recall_weight: 0.45
+    auprc_weight: 0.25
+    graph_sim_weight: 0.20
+    relative_density_penalty: 0.05
+    degree_mmd_penalty: 0.03
+    clustering_mmd_penalty: 0.02
   losses:
     edge: 1.0
     teacher: 0.0

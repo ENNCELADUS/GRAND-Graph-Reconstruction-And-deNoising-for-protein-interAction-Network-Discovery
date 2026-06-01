@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import math
@@ -34,6 +35,7 @@ from src.topology import (
     write_human_table2_reports,
 )
 from src.topology.supervision import load_supervision_graphs
+from src.train.tccig.retrieval import hybrid_degree_capped_topk
 from src.utils.config import (
     ConfigDict,
     as_bool,
@@ -74,12 +76,13 @@ class GraphAssemblyResult:
     full_pair_count: int
     candidate_count: int
     selected_edges: int
-    assembly_rule: str = "top_m_hat"
+    assembly_rule: str = "hybrid_validation_density_degree_cap"
+    edge_budget: float | None = None
     logits: list[float] | None = None
     component_scores: Mapping[str, Sequence[float]] | None = None
 
 
-class TopologyLoaderBundle(tuple):
+class TopologyLoaderBundle(tuple[DataLoader[dict[str, object]], list[tuple[str, str]], int]):
     """Three-item loader tuple with access to the backing PRING dataset."""
 
     data_loader: DataLoader[dict[str, object]]
@@ -452,6 +455,81 @@ def _assemble_predictions_for_budget(
     return predictions
 
 
+def _tccig_graph_assembly_cfg(config: ConfigDict) -> ConfigDict:
+    """Return optional TCCIG graph-assembly config."""
+    train_cfg = config.get("tccig_train", {})
+    if not isinstance(train_cfg, dict):
+        return {}
+    graph_assembly_cfg = train_cfg.get("graph_assembly", {})
+    if not isinstance(graph_assembly_cfg, dict):
+        return {}
+    return cast(ConfigDict, graph_assembly_cfg)
+
+
+def _resolve_hybrid_edge_budget(
+    *,
+    config: ConfigDict,
+    fallback_m_hat: float,
+    n_nodes: int,
+    candidate_count: int,
+) -> float:
+    """Resolve the official TCCIG hybrid assembly edge budget."""
+    graph_assembly_cfg = _tccig_graph_assembly_cfg(config)
+    use_validation_density = bool(graph_assembly_cfg.get("validation_density_budget", True))
+    if use_validation_density:
+        validation_density = _validation_graph_density(config)
+        if validation_density is not None:
+            return _density_edge_budget(
+                density=validation_density,
+                n_nodes=n_nodes,
+                candidate_count=candidate_count,
+            )
+    return max(0.0, min(float(candidate_count), float(fallback_m_hat)))
+
+
+def _hybrid_degree_cap_slack(config: ConfigDict) -> float:
+    """Return the configured hybrid degree-cap slack."""
+    graph_assembly_cfg = _tccig_graph_assembly_cfg(config)
+    raw_slack = graph_assembly_cfg.get("degree_cap_slack", 1.0)
+    if isinstance(raw_slack, bool):
+        return 1.0
+    if isinstance(raw_slack, int | float | str):
+        try:
+            return float(raw_slack)
+        except ValueError:
+            return 1.0
+    return 1.0
+
+
+def _decode_graph_candidate_batch(
+    *,
+    decode_graph_candidates: object,
+    node_embeddings: torch.Tensor,
+    candidate_pairs: torch.Tensor,
+    encoded: Mapping[str, torch.Tensor] | None,
+) -> dict[str, torch.Tensor]:
+    """Call graph decoding with the richer encoded payload when supported."""
+    if not callable(decode_graph_candidates):
+        raise ValueError("decode_graph_candidates must be callable")
+    signature = inspect.signature(decode_graph_candidates)
+    if encoded is not None and "encoded" in signature.parameters:
+        return cast(
+            dict[str, torch.Tensor],
+            decode_graph_candidates(
+                node_embeddings=node_embeddings,
+                candidate_pairs=candidate_pairs,
+                encoded=encoded,
+            ),
+        )
+    return cast(
+        dict[str, torch.Tensor],
+        decode_graph_candidates(
+            node_embeddings=node_embeddings,
+            candidate_pairs=candidate_pairs,
+        ),
+    )
+
+
 def _validation_graph_density(config: ConfigDict) -> float | None:
     """Return supervision-validation graph density when TCCIG training config exists."""
     train_cfg = config.get("tccig_train")
@@ -504,7 +582,18 @@ def graph_assembly_diagnostics(result: GraphAssemblyResult) -> dict[str, float |
         "m_hat_per_candidate": _safe_ratio(float(result.m_hat), result.candidate_count),
         "m_hat_per_full_pair": _safe_ratio(float(result.m_hat), result.full_pair_count),
         "selected_edges": int(result.selected_edges),
-    } | _probability_stats(result.probabilities)
+    }
+    payload.update(_probability_stats(result.probabilities))
+    if result.edge_budget is not None:
+        payload["edge_budget"] = float(result.edge_budget)
+        payload["edge_budget_per_candidate"] = _safe_ratio(
+            float(result.edge_budget),
+            result.candidate_count,
+        )
+        payload["edge_budget_per_full_pair"] = _safe_ratio(
+            float(result.edge_budget),
+            result.full_pair_count,
+        )
     if result.logits is not None:
         payload.update(_sequence_stats(prefix="logit", values=result.logits))
     if result.component_scores is not None:
@@ -539,6 +628,7 @@ def _predict_tccig_graph_assembly_result(
 ) -> GraphAssemblyResult:
     """Run TCCIG Graph Assembly with top-``m_hat`` candidate selection."""
     graph_model = _unwrap_graph_model(model=model, accelerator=accelerator)
+    encode_proteins = getattr(graph_model, "encode_proteins", None)
     encode_graph_nodes = getattr(graph_model, "encode_graph_nodes", None)
     decode_graph_candidates = getattr(graph_model, "decode_graph_candidates", None)
     edge_budget_from_node_embeddings = getattr(
@@ -560,8 +650,8 @@ def _predict_tccig_graph_assembly_result(
         (index, record) for index, record in enumerate(records) if record[0] != record[1]
     ]
     if not scorable_records_with_indices:
-        protein_ids = {protein_id for record in records for protein_id in record}
-        n_nodes = len(protein_ids)
+        empty_protein_ids = {protein_id for record in records for protein_id in record}
+        n_nodes = len(empty_protein_ids)
         return GraphAssemblyResult(
             predictions=[0] * len(records),
             probabilities=[0.0] * len(records),
@@ -590,15 +680,29 @@ def _predict_tccig_graph_assembly_result(
         "lowrank_score": [],
         "module_score": [],
         "pair_score": [],
+        "retrieval_score": [],
     }
+    encoded: Mapping[str, torch.Tensor] | None = None
+    degree_predictions: torch.Tensor | None = None
     with torch.inference_mode(), accelerator.autocast():
-        node_embeddings = cast(
-            torch.Tensor,
-            encode_graph_nodes(
-                protein_embeddings=protein_embeddings,
-                protein_lengths=protein_lengths,
-            ),
-        )
+        if callable(encode_proteins):
+            encoded = cast(
+                Mapping[str, torch.Tensor],
+                encode_proteins(
+                    protein_embeddings=protein_embeddings,
+                    protein_lengths=protein_lengths,
+                ),
+            )
+            node_embeddings = encoded["node"]
+            degree_predictions = encoded.get("degree")
+        else:
+            node_embeddings = cast(
+                torch.Tensor,
+                encode_graph_nodes(
+                    protein_embeddings=protein_embeddings,
+                    protein_lengths=protein_lengths,
+                ),
+            )
         m_hat_tensor = cast(
             torch.Tensor,
             edge_budget_from_node_embeddings(
@@ -612,12 +716,11 @@ def _predict_tccig_graph_assembly_result(
                 node_to_index=node_to_index,
                 device=device,
             )
-            output = cast(
-                dict[str, torch.Tensor],
-                decode_graph_candidates(
-                    node_embeddings=node_embeddings,
-                    candidate_pairs=candidate_pairs,
-                ),
+            output = _decode_graph_candidate_batch(
+                decode_graph_candidates=decode_graph_candidates,
+                node_embeddings=node_embeddings,
+                candidate_pairs=candidate_pairs,
+                encoded=encoded,
             )
             logits_tensor = output.get("logits")
             if logits_tensor is not None:
@@ -637,10 +740,32 @@ def _predict_tccig_graph_assembly_result(
             )
     if len(probabilities) != len(scorable_records):
         raise ValueError("TCCIG graph assembly did not score every topology pair")
-    scorable_predictions = _assemble_top_m_hat_predictions(
-        probabilities=probabilities,
-        m_hat=float(m_hat_tensor.detach().cpu().item()),
+    m_hat_value = float(m_hat_tensor.detach().cpu().item())
+    edge_budget = _resolve_hybrid_edge_budget(
+        config=config,
+        fallback_m_hat=m_hat_value,
+        n_nodes=n_nodes,
+        candidate_count=len(scorable_records),
     )
+    if degree_predictions is not None:
+        all_candidate_pairs = _candidate_pairs_for_records(
+            records=scorable_records,
+            node_to_index=node_to_index,
+            device=torch.device("cpu"),
+        )
+        selected_mask = hybrid_degree_capped_topk(
+            candidate_pairs=all_candidate_pairs,
+            scores=torch.tensor(probabilities, dtype=torch.float32),
+            edge_budget=int(round(edge_budget)),
+            degree_cap=degree_predictions.detach().float().cpu(),
+            cap_slack=_hybrid_degree_cap_slack(config),
+        )
+        scorable_predictions = [int(value) for value in selected_mask.tolist()]
+    else:
+        scorable_predictions = _assemble_top_m_hat_predictions(
+            probabilities=probabilities,
+            m_hat=edge_budget,
+        )
     predictions = [0] * len(records)
     full_probabilities = [0.0] * len(records)
     for index, probability, prediction in zip(
@@ -654,11 +779,13 @@ def _predict_tccig_graph_assembly_result(
     return GraphAssemblyResult(
         predictions=predictions,
         probabilities=full_probabilities,
-        m_hat=float(m_hat_tensor.detach().cpu().item()),
+        m_hat=m_hat_value,
         n_nodes=n_nodes,
         full_pair_count=_full_pair_count(n_nodes),
         candidate_count=len(scorable_records),
         selected_edges=sum(scorable_predictions),
+        assembly_rule="hybrid_validation_density_degree_cap",
+        edge_budget=edge_budget,
         logits=logits or None,
         component_scores=component_scores if any(component_scores.values()) else None,
     )
@@ -979,14 +1106,24 @@ def _evaluate_tccig_debug_assemblies(
 ) -> dict[str, Any]:
     """Evaluate budget-control debug assemblies for TCCIG graph assembly."""
     debug_assemblies: dict[str, Any] = {
-        "model_m_hat": _debug_assembly_payload(
-            budget_source="model_m_hat",
-            budget=float(result.m_hat),
+        "official": _debug_assembly_payload(
+            budget_source=result.assembly_rule,
+            budget=float(result.edge_budget if result.edge_budget is not None else result.m_hat),
             predictions=result.predictions,
             result=result,
             topology_result=official_topology_result,
             diagnostic_only=False,
-        )
+        ),
+        "model_m_hat": _evaluate_debug_assembly(
+            budget_source="model_m_hat",
+            budget=float(result.m_hat),
+            result=result,
+            records=records,
+            gt_graph=gt_graph,
+            test_graph_nodes=test_graph_nodes,
+            distributed_context=distributed_context,
+            diagnostic_only=True,
+        ),
     }
 
     validation_density = _validation_graph_density(config)

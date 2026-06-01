@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 import torch.nn.functional as functional
@@ -46,7 +47,7 @@ def _canonical_upper_edges(edges: torch.Tensor) -> torch.Tensor:
     sort_keys = unique_pairs[:, 0] * (int(unique_pairs[:, 1].max().item()) + 1)
     sort_keys = sort_keys + unique_pairs[:, 1]
     order = torch.argsort(sort_keys)
-    return unique_pairs[order].t().contiguous()
+    return cast(torch.Tensor, unique_pairs[order].t().contiguous())
 
 
 def _undirected_with_self_loops(
@@ -226,7 +227,7 @@ class CrossLayerLinkDecoder(nn.Module):
         if edge_index.size(1) == 0:
             return representations[0].new_zeros((0,))
         features = self._cross_layer_features(representations, edge_index)
-        return self.decoder(features).squeeze(-1)
+        return cast(torch.Tensor, self.decoder(features).squeeze(-1))
 
 
 class MGAETeacher(nn.Module):
@@ -269,7 +270,7 @@ class MGAETeacher(nn.Module):
             num_nodes=node_features.size(0),
         )
         representations = self.encoder(node_features, edge_index)
-        return self.decoder(representations, candidate_edges)
+        return cast(torch.Tensor, self.decoder(representations, candidate_edges))
 
     def training_step(
         self,

@@ -29,6 +29,7 @@ from src.train.tccig.config import (
     build_tccig_optimizer,
     tccig_train_config,
 )
+from src.train.tccig.graph_prior import GraphPriorArtifacts, build_graph_prior_artifacts
 from src.train.topology import shared as topology_train
 from src.utils.config import ConfigDict, as_bool, as_int, get_section
 from src.utils.early_stop import EarlyStopping
@@ -55,6 +56,7 @@ class TCCIGDataContext:
     density_prior_probability: float
     density_prior_source: str
     density_prior_bias: float
+    graph_prior_artifacts: GraphPriorArtifacts | None
 
 
 def prepare_tccig_data_context(
@@ -133,6 +135,15 @@ def prepare_tccig_data_context(
     )
     if internal_validation_plan.protein_ids:
         embedding_repository.preload(sorted(internal_validation_plan.protein_ids))
+    graph_prior_artifacts = _prepare_graph_prior_artifacts(
+        train_cfg=train_cfg,
+        train_graph=train_graph,
+        embedding_repository=embedding_repository,
+        model_dir=model_dir,
+        device=device,
+        accelerator=accelerator,
+        distributed_context=distributed_context,
+    )
 
     density_prior_probability, density_prior_source = _tccig_density_prior(
         train_graph=train_graph,
@@ -175,7 +186,58 @@ def prepare_tccig_data_context(
         density_prior_probability=density_prior_probability,
         density_prior_source=density_prior_source,
         density_prior_bias=density_prior_bias,
+        graph_prior_artifacts=graph_prior_artifacts,
     )
+
+
+def _mean_pool_embedding(embedding: torch.Tensor) -> torch.Tensor:
+    """Return a mean-pooled cached embedding."""
+    if embedding.dim() != 2:
+        raise ValueError("cached protein embeddings must have shape (seq_len, input_dim)")
+    return embedding.float().mean(dim=0)
+
+
+def _prepare_graph_prior_artifacts(
+    *,
+    train_cfg: TCCIGTrainConfig,
+    train_graph: nx.Graph,
+    embedding_repository: EmbeddingRepository,
+    model_dir: Path,
+    device: torch.device,
+    accelerator: AcceleratorLike,
+    distributed_context: DistributedContext,
+) -> GraphPriorArtifacts | None:
+    """Build or load offline train-only graph-prior artifacts."""
+    teacher_cfg = train_cfg.graph_prior_teacher
+    if not teacher_cfg.enabled:
+        return None
+    artifact_dir = model_dir / teacher_cfg.artifact_dir
+    artifact_path = artifact_dir / "graph_prior_artifacts.pt"
+    if teacher_cfg.reuse_artifacts and artifact_path.exists():
+        return GraphPriorArtifacts.load(artifact_dir)
+    should_build = distributed_context.is_main_process
+    if should_build:
+        node_features = {
+            protein_id: _mean_pool_embedding(embedding_repository.get(protein_id))
+            for protein_id in sorted(train_graph.nodes)
+        }
+        artifacts = build_graph_prior_artifacts(
+            graph=train_graph,
+            node_features=node_features,
+            hidden_dim=teacher_cfg.hidden_dim,
+            num_layers=teacher_cfg.num_layers,
+            decoder_hidden_dim=teacher_cfg.decoder_hidden_dim,
+            dropout=teacher_cfg.dropout,
+            epochs=teacher_cfg.epochs,
+            mask_ratio=teacher_cfg.mask_ratio,
+            negative_ratio=teacher_cfg.negative_ratio,
+            seed=train_cfg.run_seed,
+            device=device,
+        )
+        artifacts.save(artifact_dir)
+    if distributed_context.is_distributed:
+        accelerator.wait_for_everyone()
+    return GraphPriorArtifacts.load(artifact_dir)
 
 
 def _graph_positive_edge_probability(graph: nx.Graph) -> float:

@@ -6,6 +6,7 @@ import logging
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+from pathlib import Path
 from typing import cast
 
 import networkx as nx
@@ -21,8 +22,10 @@ from src.topology.finetune_data import (
     ExplicitNegativePairLookup,
     sample_edge_cover_subgraphs,
 )
-from src.topology.losses import TCCIGLossWeights, compute_tccig_losses, topology_loss_scale
+from src.topology.losses import TCCIGLossWeights, topology_loss_scale
 from src.train.tccig.config import TCCIGTrainConfig
+from src.train.tccig.graph_prior import GraphPriorArtifacts
+from src.train.tccig.retrieval import compute_retrieval_losses, mine_hard_negative_pairs
 from src.train.tccig.teacher import OnlineTCCIGTeacher
 from src.train.topology import shared as topology_train
 from src.utils.config import ConfigDict
@@ -45,8 +48,10 @@ class TCCIGStudentTrainer:
         embedding_repository: EmbeddingRepository,
         negative_lookup: ExplicitNegativePairLookup,
         distributed_context: DistributedContext,
+        model_dir: Path,
         teacher: OnlineTCCIGTeacher | None,
-        logger: logging.Logger | None,
+        graph_prior_artifacts: GraphPriorArtifacts | None = None,
+        logger: logging.Logger | None = None,
     ) -> None:
         self.train_cfg = train_cfg
         self.raw_config = raw_config
@@ -58,7 +63,9 @@ class TCCIGStudentTrainer:
         self.embedding_repository = embedding_repository
         self.negative_lookup = negative_lookup
         self.distributed_context = distributed_context
+        self.model_dir = model_dir
         self.teacher = teacher
+        self.graph_prior_artifacts = graph_prior_artifacts
         self.logger = logger
 
     def fit_epoch(self, *, epoch_index: int, epoch_seed: int) -> dict[str, float]:
@@ -125,9 +132,13 @@ class TCCIGStudentTrainer:
             model=self.model,
             accelerator=self.accelerator,
         )
+        forward_graph = getattr(graph_model, "forward_graph", None)
+        if not callable(forward_graph):
+            raise ValueError("TCCIG student training requires a model with forward_graph")
         total_subgraphs = max(1, sum(1 for task in local_tasks if not task.is_padding))
         completed_real_subgraphs = 0
         train_forward_backward_seconds = 0.0
+        hard_negative_records: list[dict[str, float | int | str]] = []
         self.model.train()
         if self.teacher is not None:
             self.teacher.teacher.train()
@@ -156,14 +167,15 @@ class TCCIGStudentTrainer:
                     device=self.device,
                 )
                 output = cast(
-                    dict[str, torch.Tensor],
-                    graph_model.forward_graph(
+                    dict[str, object],
+                    forward_graph(
                         protein_embeddings=protein_embeddings,
                         protein_lengths=protein_lengths,
                     ),
                 )
-                logits = topology_train._squeeze_binary_logits(output["logits"])
-                candidate_pairs = output["candidate_pairs"]
+                encoded = cast(Mapping[str, torch.Tensor], output["encoded"])
+                logits = topology_train._squeeze_binary_logits(cast(torch.Tensor, output["logits"]))
+                candidate_pairs = cast(torch.Tensor, output["candidate_pairs"])
                 labels, bce_labels, bce_mask = _candidate_supervision(
                     graph=self.graph,
                     nodes=task.nodes,
@@ -177,8 +189,6 @@ class TCCIGStudentTrainer:
                     nodes=task.nodes,
                     device=self.device,
                 )
-                teacher_probabilities: torch.Tensor | None = None
-                effective_weights = loss_weights
                 should_distill = (
                     self.teacher is not None
                     and loss_weights.teacher != 0.0
@@ -189,7 +199,7 @@ class TCCIGStudentTrainer:
                         protein_embeddings=protein_embeddings,
                         protein_lengths=protein_lengths,
                     )
-                    teacher_probabilities = self.teacher.train_and_score(
+                    _ = self.teacher.train_and_score(
                         node_features=node_features,
                         positive_edges=positive_edges,
                         candidate_pairs=candidate_pairs,
@@ -198,20 +208,67 @@ class TCCIGStudentTrainer:
                         accelerator=self.accelerator,
                         loss_scale=0.0 if task.is_padding else 1.0,
                     )
-                else:
-                    effective_weights = replace(effective_weights, teacher=0.0)
-                losses = compute_tccig_losses(
-                    logits=logits,
-                    labels=labels,
-                    bce_labels=bce_labels,
-                    bce_mask=bce_mask,
-                    pair_index_a=candidate_pairs[0],
-                    pair_index_b=candidate_pairs[1],
-                    num_nodes=len(task.nodes),
-                    m_hat=output["m_hat"],
-                    weights=effective_weights,
-                    teacher_probabilities=teacher_probabilities,
+                supervised_mask = bce_mask > 0.0
+                supervised_logits = logits[supervised_mask]
+                supervised_labels = bce_labels[supervised_mask]
+                degree_targets = _degree_targets_for_nodes(
+                    graph=self.graph,
+                    nodes=task.nodes,
+                    device=self.device,
                 )
+                struct_targets = _struct_targets_for_nodes(
+                    artifacts=self.graph_prior_artifacts,
+                    nodes=tuple(task.nodes),
+                    device=self.device,
+                    expected_dim=encoded["struct"].size(1),
+                )
+                retrieval_score_matrix = cast(torch.Tensor, output["retrieval_score_matrix"])
+                if (
+                    not task.is_padding
+                    and self._should_refresh_hard_negative_cache(epoch_index)
+                    and len(hard_negative_records)
+                    < self.train_cfg.hard_negative_mining.max_pairs_per_epoch
+                ):
+                    remaining_cache_budget = (
+                        self.train_cfg.hard_negative_mining.max_pairs_per_epoch
+                        - len(hard_negative_records)
+                    )
+                    mined_pairs = mine_hard_negative_pairs(
+                        score_matrix=retrieval_score_matrix.detach(),
+                        known_positive_pairs=positive_edges,
+                        top_k=self.train_cfg.hard_negative_mining.top_k,
+                        max_pairs=remaining_cache_budget,
+                    )
+                    hard_negative_records.extend(
+                        _hard_negative_cache_records(
+                            nodes=task.nodes,
+                            pairs=mined_pairs,
+                            score_matrix=retrieval_score_matrix.detach(),
+                        )
+                    )
+                retrieval_losses = compute_retrieval_losses(
+                    retrieval_score_matrix=retrieval_score_matrix,
+                    positive_pairs=positive_edges,
+                    known_positive_pairs=positive_edges,
+                    candidate_logits=supervised_logits,
+                    candidate_labels=supervised_labels,
+                    degree_predictions=cast(torch.Tensor, output["degree_predictions"]),
+                    degree_targets=degree_targets,
+                    struct_predictions=encoded["struct"],
+                    struct_targets=struct_targets,
+                    retrieval_weight=self.train_cfg.retrieval.retrieval_weight,
+                    reranker_weight=(
+                        self.train_cfg.reranker.weight if self.train_cfg.reranker.enabled else 0.0
+                    ),
+                    degree_weight=self.train_cfg.graph_prior_teacher.degree_weight,
+                    struct_weight=(
+                        self.train_cfg.graph_prior_teacher.struct_weight
+                        if struct_targets is not None
+                        else 0.0
+                    ),
+                    temperature=self.train_cfg.retrieval.temperature,
+                )
+                losses = _retrieval_losses_for_legacy_aggregates(retrieval_losses)
                 total_loss = losses["total"]
                 backward_loss = total_loss * 0.0 if task.is_padding else total_loss
                 topology_losses = _topology_losses_for_aggregates(
@@ -239,7 +296,44 @@ class TCCIGStudentTrainer:
                     total_steps=total_subgraphs,
                     loss=aggregates["total"] / float(completed_real_subgraphs),
                 )
+        self._write_hard_negative_cache(
+            epoch_index=epoch_index,
+            records=hard_negative_records,
+        )
         return train_forward_backward_seconds
+
+    def _should_refresh_hard_negative_cache(self, epoch_index: int) -> bool:
+        """Return whether this epoch should emit hard-negative mining artifacts."""
+        cfg = self.train_cfg.hard_negative_mining
+        if not cfg.enabled:
+            return False
+        refresh_every = max(1, cfg.refresh_every_epochs)
+        return epoch_index % refresh_every == 0
+
+    def _write_hard_negative_cache(
+        self,
+        *,
+        epoch_index: int,
+        records: Sequence[Mapping[str, float | int | str]],
+    ) -> None:
+        """Persist rank-local mined hard negatives for audit/reuse."""
+        if not records:
+            return
+        cache_dir = self.model_dir / "hard_negative_caches"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = (
+            cache_dir
+            / f"epoch_{epoch_index + 1:04d}_rank_{self.distributed_context.rank:03d}.pt"
+        )
+        torch.save(
+            {
+                "epoch": epoch_index + 1,
+                "rank": self.distributed_context.rank,
+                "world_size": self.distributed_context.world_size,
+                "records": list(records),
+            },
+            cache_path,
+        )
 
 
 def _load_graph_inputs(
@@ -327,6 +421,35 @@ def _candidate_supervision(
     )
 
 
+def _hard_negative_cache_records(
+    *,
+    nodes: Sequence[str],
+    pairs: torch.Tensor,
+    score_matrix: torch.Tensor,
+) -> list[dict[str, float | int | str]]:
+    """Convert mined local-index pairs into stable cache records."""
+    if pairs.numel() == 0:
+        return []
+    node_tuple = tuple(nodes)
+    local_pairs = pairs.detach().cpu().long()
+    local_scores = score_matrix.detach().float().cpu()
+    records: list[dict[str, float | int | str]] = []
+    for rank, (source_index, target_index) in enumerate(local_pairs.t().tolist()):
+        source = int(source_index)
+        target = int(target_index)
+        if source >= len(node_tuple) or target >= len(node_tuple):
+            continue
+        records.append(
+            {
+                "rank": rank,
+                "protein_a": node_tuple[source],
+                "protein_b": node_tuple[target],
+                "score": float(local_scores[source, target].item()),
+            }
+        )
+    return records
+
+
 def _positive_edge_index_for_nodes(
     *,
     graph: nx.Graph,
@@ -345,6 +468,63 @@ def _positive_edge_index_for_nodes(
     if not edges:
         return torch.empty((2, 0), dtype=torch.long, device=device)
     return torch.tensor(sorted(set(edges)), dtype=torch.long, device=device).t().contiguous()
+
+
+def _degree_targets_for_nodes(
+    *,
+    graph: nx.Graph,
+    nodes: Sequence[str],
+    device: torch.device,
+) -> torch.Tensor:
+    """Return train-graph degree targets for a sampled protein set."""
+    return torch.tensor(
+        [float(graph.degree(node)) for node in nodes],
+        dtype=torch.float32,
+        device=device,
+    )
+
+
+def _struct_targets_for_nodes(
+    *,
+    artifacts: GraphPriorArtifacts | None,
+    nodes: tuple[str, ...],
+    device: torch.device,
+    expected_dim: int,
+) -> torch.Tensor | None:
+    """Return structural distillation targets when artifact dimensions match."""
+    if artifacts is None:
+        return None
+    artifact_index = {protein_id: row for row, protein_id in enumerate(artifacts.protein_ids)}
+    if any(node not in artifact_index for node in nodes):
+        return None
+    targets = artifacts.structural_embeddings[
+        torch.tensor([artifact_index[node] for node in nodes], dtype=torch.long)
+    ]
+    if targets.size(1) != expected_dim:
+        return None
+    return targets.to(device=device)
+
+
+def _retrieval_losses_for_legacy_aggregates(
+    retrieval_losses: Mapping[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Expose retrieval losses through the existing TCCIG CSV aggregate keys."""
+    reference = retrieval_losses["total"]
+    zero = reference.sum() * 0.0
+    return {
+        "edge": retrieval_losses["reranker"],
+        "teacher": zero,
+        "budget": zero,
+        "relative_density": zero,
+        "degree_mmd": retrieval_losses["degree"],
+        "clustering_mmd": zero,
+        "rank": retrieval_losses["retrieval"],
+        "module": zero,
+        "spectral": zero,
+        "calibration": zero,
+        "sparse": zero,
+        "total": retrieval_losses["total"],
+    }
 
 
 def _topology_losses_for_aggregates(

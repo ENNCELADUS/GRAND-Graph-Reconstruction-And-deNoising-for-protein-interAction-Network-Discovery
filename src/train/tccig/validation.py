@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 
 import torch
 from torch import nn
@@ -58,6 +59,7 @@ class TCCIGValidationRunner:
                 average_loss=average_loss,
                 prefix="val",
             )
+            val_pair_stats = dict(val_pair_stats)
             val_pair_pass_seconds = time.perf_counter() - val_pair_start
         threshold_start = time.perf_counter()
         decision_threshold, _ = topology_train._resolve_internal_validation_threshold(
@@ -103,6 +105,13 @@ class TCCIGValidationRunner:
             internal_val_topology_stats=internal_val_topology_stats,
             include_clustering_mmd=self.train_cfg.internal_validation_compute_clustering_mmd,
         )
+        val_pair_stats.update(
+            _composite_monitor_stats(
+                train_cfg=self.train_cfg,
+                val_pair_stats=val_pair_stats,
+                internal_val_topology_stats=internal_val_topology_stats,
+            )
+        )
         return topology_train.ValidationEpochResult(
             decision_threshold=decision_threshold,
             val_pair_stats=val_pair_stats,
@@ -113,3 +122,34 @@ class TCCIGValidationRunner:
             val_topology_loss=val_topology_loss,
             val_total_loss=val_pair_loss + val_topology_loss,
         )
+
+
+def _composite_monitor_stats(
+    *,
+    train_cfg: TCCIGTrainConfig,
+    val_pair_stats: dict[str, float],
+    internal_val_topology_stats: Mapping[str, float],
+) -> dict[str, float]:
+    """Return graph-prior retrieval monitor metrics."""
+    monitor_cfg = train_cfg.monitor
+    retrieval_recall = float(
+        val_pair_stats.get("val_recall", val_pair_stats.get("val_sensitivity", 0.0))
+    )
+    candidate_auprc = float(val_pair_stats.get("val_auprc", 0.0))
+    graph_sim = float(internal_val_topology_stats.get("graph_sim", 0.0))
+    relative_density = float(internal_val_topology_stats.get("relative_density", 0.0))
+    degree_mmd = float(internal_val_topology_stats.get("deg_dist_mmd", 0.0))
+    clustering_mmd = float(internal_val_topology_stats.get("cc_mmd", 0.0))
+    composite = (
+        monitor_cfg.recall_weight * retrieval_recall
+        + monitor_cfg.auprc_weight * candidate_auprc
+        + monitor_cfg.graph_sim_weight * graph_sim
+        - monitor_cfg.relative_density_penalty * abs(relative_density - 1.0)
+        - monitor_cfg.degree_mmd_penalty * degree_mmd
+        - monitor_cfg.clustering_mmd_penalty * clustering_mmd
+    )
+    return {
+        "val_retrieval_recall_at_20": retrieval_recall,
+        "val_candidate_auprc": candidate_auprc,
+        "val_composite_score": float(composite),
+    }

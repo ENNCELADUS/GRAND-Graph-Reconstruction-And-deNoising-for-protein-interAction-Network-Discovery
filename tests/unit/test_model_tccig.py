@@ -22,7 +22,74 @@ def _tccig_config() -> dict[str, object]:
         "self_refinement_rounds": 0,
         "candidate_proposer": {"type": "all_pairs"},
         "pair_mlp": {"hidden_dims": [16]},
+        "retrieval": {
+            "dim": 8,
+            "rff_features": 16,
+            "rff_input_dim": 16,
+            "rff_backend": "sorf",
+            "rff_sigma": 0.5,
+            "top_k": 2,
+            "logit_gate_init": 0.0,
+        },
     }
+
+
+def test_tccig_encodes_query_key_struct_degree_and_residue_factors() -> None:
+    torch.manual_seed(41)
+    model = TCCIG(**_tccig_config())
+    embeddings = torch.randn(4, 5, 8)
+    lengths = torch.tensor([5, 4, 3, 2], dtype=torch.long)
+
+    encoded = model.encode_proteins(
+        protein_embeddings=embeddings,
+        protein_lengths=lengths,
+    )
+
+    assert encoded["node"].shape == (4, 16)
+    assert encoded["query"].shape == (4, 8)
+    assert encoded["key"].shape == (4, 8)
+    assert encoded["struct"].shape == (4, 8)
+    assert encoded["residue"].shape == (4, 16)
+    assert encoded["module"].shape == (4, 3)
+    assert encoded["degree"].shape == (4,)
+    assert torch.all(encoded["degree"] >= 0.0)
+
+
+def test_tccig_sorf_residue_factorization_is_deterministic() -> None:
+    torch.manual_seed(43)
+    model = TCCIG(**_tccig_config())
+    embeddings = torch.randn(3, 4, 8)
+    lengths = torch.tensor([4, 3, 2], dtype=torch.long)
+
+    first = model.encode_proteins(
+        protein_embeddings=embeddings,
+        protein_lengths=lengths,
+    )["residue"]
+    second = model.encode_proteins(
+        protein_embeddings=embeddings,
+        protein_lengths=lengths,
+    )["residue"]
+
+    assert torch.allclose(first, second)
+    assert torch.isfinite(first).all()
+
+
+def test_tccig_exact_retrieval_excludes_self_edges_and_symmetrizes_pairs() -> None:
+    torch.manual_seed(47)
+    model = TCCIG(**_tccig_config())
+    embeddings = torch.randn(5, 4, 8)
+
+    output = model.forward_graph(protein_embeddings=embeddings)
+    retrieved_pairs = model.retrieve_candidate_pairs(
+        encoded=output["encoded"],
+        top_k=2,
+    )
+
+    assert retrieved_pairs.shape[0] == 2
+    assert retrieved_pairs.size(1) > 0
+    assert not torch.any(retrieved_pairs[0] == retrieved_pairs[1])
+    assert torch.all(retrieved_pairs[0] < retrieved_pairs[1])
+    assert retrieved_pairs.unique(dim=1).size(1) == retrieved_pairs.size(1)
 
 
 def test_tccig_lowrank_score_is_scaled_by_dimension() -> None:
