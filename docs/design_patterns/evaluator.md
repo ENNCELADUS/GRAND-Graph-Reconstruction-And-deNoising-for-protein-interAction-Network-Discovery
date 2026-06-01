@@ -104,7 +104,9 @@ When `run_config.stages` contains `"evaluate"`, the stage:
 3.  Instantiates the Evaluator with the runtime's accelerator.
 4.  Runs either pairwise test-set evaluation or TCCIG graph assembly evaluation on `all_test_ppi.txt`.
 5.  Writes the result to `logs/{model}/evaluate/{run_id}/evaluate.csv`.
-6.  For TCCIG graph assembly, also writes `graph_assembly_diagnostics.json`.
+6.  For TCCIG graph assembly, also writes `graph_assembly_diagnostics.json`
+    with edge-budget ratios and probability quantiles. Topology evaluation also
+    records non-official debug assemblies in `topology_metrics.json`.
 
 ## Output Format
 

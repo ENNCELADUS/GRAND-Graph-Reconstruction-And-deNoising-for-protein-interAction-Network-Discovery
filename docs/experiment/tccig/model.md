@@ -68,6 +68,22 @@ $$
   bias from train-graph density, and records edge-budget diagnostics plus
   debug assemblies for model `m_hat`, validation-density, and oracle-test-density
   budgets in topology evaluation.
+- P2 fixed result: `logs/tccig/{tccig_train,evaluate,topology_evaluate}/p2_fixed/`
+  archives Slurm job `920857`, committed as `49c78d4`. The graph-density prior
+  code path was active (`source = graph_density`, positive edge probability
+  `0.001`, density-bias `-6.502`), and training early-stopped at epoch 12. The
+  run reduced the learned edge budget from P1's `88,478` selected edges to
+  `53,701`, but official graph quality declined: AUROC `0.549`, AUPRC `0.049`,
+  precision `0.069`, recall `0.136`, F1 `0.091`, MCC `0.079`, `graph_sim =
+  0.160`, `relative_density = 0.364`, `deg_dist_mmd = 38.883`, `cc_mmd =
+  17.277`, and `laplacian_eigen_mmd = 35.020`.
+- P2 interpretation: graph-density initialization plus teacher disabling is not
+  sufficient. Probability scores saturated harder than P1 (`mean = 0.999`,
+  p50/p90/p95 all `1.000`). Debug assemblies show that changing only the edge
+  budget does not rescue the graph: oracle-test-density top-K reaches only
+  `graph_sim = 0.135`, while validation-density top-K collapses to `graph_sim =
+  0.040`. The next model-quality fix should prioritize decoder calibration and
+  full-candidate ranking/localization, with checkpoint monitoring still suspect.
 
 Not implemented yet: feature kNN/anchor candidate proposer, offline S2GAE/MaskGAE/Bandana teacher pretraining, spectral/module/ranking/calibration/sparsity losses as active nonzero objectives, composite checkpoint monitoring, and decoder scale/gating.
 
