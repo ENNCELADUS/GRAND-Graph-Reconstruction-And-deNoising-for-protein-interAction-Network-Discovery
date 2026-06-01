@@ -158,6 +158,25 @@ def adaptive_weighted_bce(
     return (per_pair * weights).mean() if per_pair.numel() else loss_logits.sum() * 0.0
 
 
+def hard_negative_margin_loss(
+    *,
+    score_matrix: torch.Tensor,
+    positive_pairs: torch.Tensor,
+    hard_negative_pairs: torch.Tensor,
+    margin: float = 0.1,
+) -> torch.Tensor:
+    """Push mined hard negatives below observed positives in retrieval space."""
+    reference = score_matrix.float()
+    positives = _normalize_pair_tensor(positive_pairs).to(device=score_matrix.device)
+    negatives = _normalize_pair_tensor(hard_negative_pairs).to(device=score_matrix.device)
+    if positives.numel() == 0 or negatives.numel() == 0:
+        return reference.sum() * 0.0
+    positive_scores = reference[positives[0], positives[1]]
+    negative_scores = reference[negatives[0], negatives[1]]
+    positive_anchor = positive_scores.mean()
+    return functional.softplus(negative_scores - positive_anchor + float(margin)).mean()
+
+
 def compute_retrieval_losses(
     *,
     retrieval_score_matrix: torch.Tensor,
@@ -169,11 +188,14 @@ def compute_retrieval_losses(
     degree_targets: torch.Tensor | None = None,
     struct_predictions: torch.Tensor | None = None,
     struct_targets: torch.Tensor | None = None,
+    hard_negative_pairs: torch.Tensor | None = None,
     retrieval_weight: float = 1.0,
     reranker_weight: float = 1.0,
     degree_weight: float = 0.0,
     struct_weight: float = 0.0,
+    hard_negative_weight: float = 0.0,
     temperature: float = 0.07,
+    reranker_negative_temperature: float = 4.0,
 ) -> dict[str, torch.Tensor]:
     """Compute enabled graph-prior retrieval TCCIG training losses."""
     reference = candidate_logits.float()
@@ -189,8 +211,21 @@ def compute_retrieval_losses(
         else zero
     )
     reranker = (
-        adaptive_weighted_bce(logits=reference, labels=candidate_labels)
+        adaptive_weighted_bce(
+            logits=reference,
+            labels=candidate_labels,
+            negative_temperature=reranker_negative_temperature,
+        )
         if reranker_weight != 0.0
+        else zero
+    )
+    hard_negative = (
+        hard_negative_margin_loss(
+            score_matrix=retrieval_score_matrix,
+            positive_pairs=positive_pairs,
+            hard_negative_pairs=hard_negative_pairs,
+        )
+        if hard_negative_weight != 0.0 and hard_negative_pairs is not None
         else zero
     )
     if degree_weight != 0.0:
@@ -216,12 +251,14 @@ def compute_retrieval_losses(
         + reranker_weight * reranker
         + degree_weight * degree
         + struct_weight * struct
+        + hard_negative_weight * hard_negative
     )
     return {
         "retrieval": retrieval,
         "reranker": reranker,
         "degree": degree,
         "struct": struct,
+        "hard_negative": hard_negative,
         "total": total,
     }
 

@@ -92,6 +92,55 @@ def test_tccig_exact_retrieval_excludes_self_edges_and_symmetrizes_pairs() -> No
     assert retrieved_pairs.unique(dim=1).size(1) == retrieved_pairs.size(1)
 
 
+def test_tccig_decode_graph_candidates_accepts_encoded_retrieval_state() -> None:
+    torch.manual_seed(53)
+    model = TCCIG(**_tccig_config())
+    embeddings = torch.randn(4, 5, 8)
+    encoded = model.encode_proteins(protein_embeddings=embeddings)
+    node_embeddings = encoded["node"]
+    candidate_pairs = torch.tensor([[0, 1], [2, 3]], dtype=torch.long)
+
+    output = model.decode_graph_candidates(
+        node_embeddings=node_embeddings,
+        candidate_pairs=candidate_pairs,
+        encoded=encoded,
+    )
+
+    assert "encoded" in inspect.signature(model.decode_graph_candidates).parameters
+    assert torch.allclose(
+        output["retrieval_score"],
+        model.retrieval_score_matrix(encoded)[candidate_pairs[0], candidate_pairs[1]],
+    )
+
+
+def test_tccig_pooled_input_retrieval_only_matches_esm_cosine_baseline() -> None:
+    config = _tccig_config() | {
+        "decoder_mode": "retrieval_only",
+        "decoder_structural_gate_init": 0.0,
+        "retrieval": {
+            "dim": 8,
+            "rff_features": 8,
+            "rff_input_dim": 8,
+            "rff_backend": "dense",
+            "rff_sigma": 0.5,
+            "feature_source": "pooled_input",
+            "normalize": True,
+            "top_k": 2,
+            "logit_gate_init": 1.0,
+        },
+    }
+    model = TCCIG(**config)
+    embeddings = torch.randn(3, 4, 8)
+    pooled = embeddings.mean(dim=1)
+    normalized = torch.nn.functional.normalize(pooled, dim=-1)
+
+    encoded = model.encode_proteins(protein_embeddings=embeddings)
+    scores = model.retrieval_score_matrix(encoded)
+
+    expected = 2.0 * (normalized @ normalized.t()) / math.sqrt(8.0)
+    assert torch.allclose(scores, expected, atol=1.0e-6)
+
+
 def test_tccig_lowrank_score_is_scaled_by_dimension() -> None:
     config = _tccig_config() | {"decoder_structural_gate_init": 1.0}
     model = TCCIG(**config)

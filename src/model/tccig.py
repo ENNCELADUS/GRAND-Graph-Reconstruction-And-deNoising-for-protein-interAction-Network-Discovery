@@ -167,10 +167,24 @@ class TCCIG(nn.Module):
             retrieval_cfg.get("normalize", True),
             "model_config.retrieval.normalize",
         )
+        self.retrieval_feature_source: str = _to_string(
+            retrieval_cfg.get("feature_source", "learned"),
+            "model_config.retrieval.feature_source",
+        ).lower()
+        if self.retrieval_feature_source not in {"learned", "pooled_input"}:
+            raise ValueError(
+                "model_config.retrieval.feature_source must be 'learned' or 'pooled_input'"
+            )
         self.retrieval_logit_gate_init: float = _to_float(
             retrieval_cfg.get("logit_gate_init", 1.0),
             "model_config.retrieval.logit_gate_init",
         )
+        self.decoder_mode: str = _to_string(
+            model_config.get("decoder_mode", "rerank"),
+            "model_config.decoder_mode",
+        ).lower()
+        if self.decoder_mode not in {"rerank", "retrieval_only"}:
+            raise ValueError("model_config.decoder_mode must be 'rerank' or 'retrieval_only'")
         self.decoder_structural_gate_init: float = _to_float(
             model_config.get("decoder_structural_gate_init", 0.1),
             "model_config.decoder_structural_gate_init",
@@ -398,6 +412,16 @@ class TCCIG(nn.Module):
             return embeddings
         return functional.normalize(embeddings, dim=-1)
 
+    @staticmethod
+    def _resize_feature_vector(features: torch.Tensor, output_dim: int) -> torch.Tensor:
+        """Deterministically truncate or pad feature vectors to ``output_dim``."""
+        input_dim = features.size(-1)
+        if input_dim == output_dim:
+            return features
+        if input_dim > output_dim:
+            return features[..., :output_dim]
+        return functional.pad(features, (0, output_dim - input_dim))
+
     def encode_proteins(
         self,
         *,
@@ -407,9 +431,26 @@ class TCCIG(nn.Module):
         """Encode proteins into retrieval, structural-prior, and reranking states."""
         if protein_embeddings.size(-1) != self.input_dim:
             raise ValueError("protein embedding dimension must match model_config.input_dim")
+        pooled_input = self._masked_mean_pool(protein_embeddings, protein_lengths)
         node_embeddings = self._encode_nodes(protein_embeddings, protein_lengths)
         module_memberships = functional.softmax(self.module_head(node_embeddings), dim=-1)
         degree_prediction = functional.softplus(self.degree_head(node_embeddings).squeeze(-1))
+        if self.retrieval_feature_source == "pooled_input":
+            retrieval_features = self._maybe_normalize(
+                self._resize_feature_vector(pooled_input, self.retrieval_dim)
+            )
+            residue_features = self._maybe_normalize(
+                self._resize_feature_vector(pooled_input, self.rff_features)
+            )
+            return {
+                "node": node_embeddings,
+                "query": retrieval_features,
+                "key": retrieval_features,
+                "struct": retrieval_features,
+                "residue": residue_features,
+                "module": module_memberships,
+                "degree": degree_prediction,
+            }
         return {
             "node": node_embeddings,
             "query": self._maybe_normalize(self.query_head(node_embeddings)),
@@ -630,6 +671,23 @@ class TCCIG(nn.Module):
             )
         )
         retrieval_logits = retrieval_matrix[src, dst]
+        zero_component = retrieval_logits * 0.0
+        if self.decoder_mode == "retrieval_only":
+            logits = self.retrieval_logit_gate * retrieval_logits + density_bias
+            return {
+                "logits": logits,
+                "retrieval_logits": retrieval_logits,
+                "edge_probabilities": torch.sigmoid(logits),
+                "m_hat": m_hat.reshape(()),
+                "module_memberships": module_memberships,
+                "degree_predictions": degree_prediction,
+                "density_bias": density_bias.reshape(()),
+                "pair_score": zero_component,
+                "retrieval_score": retrieval_logits,
+                "hub_score": zero_component,
+                "lowrank_score": zero_component,
+                "module_score": zero_component,
+            }
         logits = (
             self.retrieval_logit_gate * retrieval_logits
             + pair_score
@@ -679,6 +737,7 @@ class TCCIG(nn.Module):
         *,
         node_embeddings: torch.Tensor,
         candidate_pairs: torch.Tensor,
+        encoded: Mapping[str, torch.Tensor] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Decode graph candidate edges from precomputed node embeddings."""
         pairs = self._validate_candidate_pairs(
@@ -686,7 +745,7 @@ class TCCIG(nn.Module):
             num_nodes=node_embeddings.size(0),
             device=node_embeddings.device,
         )
-        decoded = self._decode_candidates(node_embeddings, pairs)
+        decoded = self._decode_candidates(node_embeddings, pairs, encoded=encoded)
         decoded["candidate_pairs"] = pairs
         return decoded
 

@@ -501,6 +501,13 @@ def _hybrid_degree_cap_slack(config: ConfigDict) -> float:
     return 1.0
 
 
+def _hybrid_degree_cap_enabled(config: ConfigDict) -> bool:
+    """Return whether official TCCIG assembly should enforce degree caps."""
+    graph_assembly_cfg = _tccig_graph_assembly_cfg(config)
+    raw_enabled = graph_assembly_cfg.get("degree_cap_enabled", True)
+    return bool(raw_enabled) if isinstance(raw_enabled, bool) else True
+
+
 def _decode_graph_candidate_batch(
     *,
     decode_graph_candidates: object,
@@ -747,7 +754,7 @@ def _predict_tccig_graph_assembly_result(
         n_nodes=n_nodes,
         candidate_count=len(scorable_records),
     )
-    if degree_predictions is not None:
+    if degree_predictions is not None and _hybrid_degree_cap_enabled(config):
         all_candidate_pairs = _candidate_pairs_for_records(
             records=scorable_records,
             node_to_index=node_to_index,

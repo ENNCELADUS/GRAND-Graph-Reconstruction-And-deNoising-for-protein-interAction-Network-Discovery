@@ -208,9 +208,6 @@ class TCCIGStudentTrainer:
                         accelerator=self.accelerator,
                         loss_scale=0.0 if task.is_padding else 1.0,
                     )
-                supervised_mask = bce_mask > 0.0
-                supervised_logits = logits[supervised_mask]
-                supervised_labels = bce_labels[supervised_mask]
                 degree_targets = _degree_targets_for_nodes(
                     graph=self.graph,
                     nodes=task.nodes,
@@ -223,6 +220,7 @@ class TCCIGStudentTrainer:
                     expected_dim=encoded["struct"].size(1),
                 )
                 retrieval_score_matrix = cast(torch.Tensor, output["retrieval_score_matrix"])
+                mined_pairs = torch.empty((2, 0), dtype=torch.long, device=self.device)
                 if (
                     not task.is_padding
                     and self._should_refresh_hard_negative_cache(epoch_index)
@@ -246,6 +244,16 @@ class TCCIGStudentTrainer:
                             score_matrix=retrieval_score_matrix.detach(),
                         )
                     )
+                supervised_mask = bce_mask > 0.0
+                if mined_pairs.numel() > 0:
+                    hard_negative_mask = _candidate_pair_membership_mask(
+                        candidate_pairs=candidate_pairs,
+                        selected_pairs=mined_pairs,
+                    )
+                    supervised_mask = supervised_mask | hard_negative_mask
+                    bce_labels = bce_labels.masked_fill(hard_negative_mask, 0.0)
+                supervised_logits = logits[supervised_mask]
+                supervised_labels = bce_labels[supervised_mask]
                 retrieval_losses = compute_retrieval_losses(
                     retrieval_score_matrix=retrieval_score_matrix,
                     positive_pairs=positive_edges,
@@ -256,6 +264,7 @@ class TCCIGStudentTrainer:
                     degree_targets=degree_targets,
                     struct_predictions=encoded["struct"],
                     struct_targets=struct_targets,
+                    hard_negative_pairs=mined_pairs,
                     retrieval_weight=self.train_cfg.retrieval.retrieval_weight,
                     reranker_weight=(
                         self.train_cfg.reranker.weight if self.train_cfg.reranker.enabled else 0.0
@@ -266,7 +275,15 @@ class TCCIGStudentTrainer:
                         if struct_targets is not None
                         else 0.0
                     ),
+                    hard_negative_weight=(
+                        self.train_cfg.hard_negative_mining.weight
+                        if self.train_cfg.hard_negative_mining.enabled
+                        else 0.0
+                    ),
                     temperature=self.train_cfg.retrieval.temperature,
+                    reranker_negative_temperature=(
+                        self.train_cfg.reranker.adaptive_negative_temperature
+                    ),
                 )
                 losses = _retrieval_losses_for_legacy_aggregates(retrieval_losses)
                 total_loss = losses["total"]
@@ -450,6 +467,28 @@ def _hard_negative_cache_records(
     return records
 
 
+def _candidate_pair_membership_mask(
+    *,
+    candidate_pairs: torch.Tensor,
+    selected_pairs: torch.Tensor,
+) -> torch.Tensor:
+    """Return a mask for candidate pairs that match selected upper-triangle pairs."""
+    mask = torch.zeros(candidate_pairs.size(1), dtype=torch.bool, device=candidate_pairs.device)
+    if selected_pairs.numel() == 0 or candidate_pairs.numel() == 0:
+        return mask
+    selected = {
+        (int(source), int(target))
+        for source, target in selected_pairs.detach().cpu().long().t().tolist()
+    }
+    if not selected:
+        return mask
+    values = [
+        (int(min(source, target)), int(max(source, target))) in selected
+        for source, target in candidate_pairs.detach().cpu().long().t().tolist()
+    ]
+    return torch.tensor(values, dtype=torch.bool, device=candidate_pairs.device)
+
+
 def _positive_edge_index_for_nodes(
     *,
     graph: nx.Graph,
@@ -522,7 +561,7 @@ def _retrieval_losses_for_legacy_aggregates(
         "module": zero,
         "spectral": zero,
         "calibration": zero,
-        "sparse": zero,
+        "sparse": retrieval_losses["hard_negative"],
         "total": retrieval_losses["total"],
     }
 

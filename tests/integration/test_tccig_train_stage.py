@@ -70,6 +70,29 @@ def _build_tccig_train_config(tmp_path: Path) -> ConfigDict:
     return config
 
 
+def test_tccig_r0_r5_human_bfs_queue_configs_are_code_backed() -> None:
+    config_paths = sorted(Path("configs/tccig/r0_r5_human_bfs").glob("*.yaml"))
+
+    assert [path.name for path in config_paths] == [
+        "00_r0_esm_cosine.yaml",
+        "01_r1_sorf_dual.yaml",
+        "02_r2_graph_prior.yaml",
+        "03_r3_hard_negative.yaml",
+        "04_r4_reranker.yaml",
+        "05_r5_hybrid_assembly.yaml",
+    ]
+    for config_path in config_paths:
+        config = load_config(config_path)
+        train_cfg = parse_tccig_train_config(config)
+        model = build_model(config)
+
+        assert cast(ConfigDict, config["model_config"])["model"] == "tccig"
+        assert train_cfg.retrieval.backend == "exact"
+        assert train_cfg.validation_reconstruction.enabled
+        assert hasattr(model, "forward_graph")
+        assert hasattr(model, "decode_graph_candidates")
+
+
 def test_run_tccig_train_stage_writes_scratch_artifacts(tmp_path: Path) -> None:
     config = _build_tccig_train_config(tmp_path)
     model = build_model(config)

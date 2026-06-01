@@ -84,6 +84,36 @@ def test_retrieval_losses_include_infonce_degree_and_reranker_terms() -> None:
     losses["total"].backward()
 
 
+def test_retrieval_losses_include_mined_hard_negative_margin() -> None:
+    score_matrix = torch.tensor(
+        [
+            [0.0, 0.9, 1.1],
+            [0.9, 0.0, 0.2],
+            [1.1, 0.2, 0.0],
+        ],
+        requires_grad=True,
+    )
+    positive_pairs = torch.tensor([[0, 1]], dtype=torch.long)
+    hard_negative_pairs = torch.tensor([[0, 2]], dtype=torch.long)
+    candidate_logits = torch.tensor([0.0], requires_grad=True)
+    candidate_labels = torch.tensor([0.0])
+
+    losses = compute_retrieval_losses(
+        retrieval_score_matrix=score_matrix,
+        positive_pairs=positive_pairs,
+        known_positive_pairs=positive_pairs,
+        candidate_logits=candidate_logits,
+        candidate_labels=candidate_labels,
+        hard_negative_pairs=hard_negative_pairs,
+        retrieval_weight=0.0,
+        reranker_weight=0.0,
+        hard_negative_weight=1.0,
+    )
+
+    assert losses["hard_negative"].item() > 0.0
+    losses["total"].backward()
+
+
 def test_hybrid_degree_capped_topk_respects_global_budget_and_degree_cap() -> None:
     pairs = torch.tensor(
         [

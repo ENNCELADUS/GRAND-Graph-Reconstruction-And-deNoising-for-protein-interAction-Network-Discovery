@@ -52,6 +52,7 @@ class TCCIGHardNegativeMiningConfig:
     top_k: int
     max_pairs_per_epoch: int
     refresh_every_epochs: int
+    weight: float
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,7 @@ class TCCIGGraphAssemblyConfig:
 
     rule: str
     validation_density_budget: bool
+    degree_cap_enabled: bool
     degree_cap_slack: float
 
 
@@ -286,6 +288,7 @@ def parse_hard_negative_mining_config(train_cfg: ConfigDict) -> TCCIGHardNegativ
             cfg.get("refresh_every_epochs", 1),
             "tccig_train.hard_negative_mining.refresh_every_epochs",
         ),
+        weight=as_float(cfg.get("weight", 0.1), "tccig_train.hard_negative_mining.weight"),
     )
 
 
@@ -318,6 +321,10 @@ def parse_graph_assembly_config(train_cfg: ConfigDict) -> TCCIGGraphAssemblyConf
         validation_density_budget=as_bool(
             cfg.get("validation_density_budget", True),
             "tccig_train.graph_assembly.validation_density_budget",
+        ),
+        degree_cap_enabled=as_bool(
+            cfg.get("degree_cap_enabled", True),
+            "tccig_train.graph_assembly.degree_cap_enabled",
         ),
         degree_cap_slack=as_float(
             cfg.get("degree_cap_slack", 1.0),

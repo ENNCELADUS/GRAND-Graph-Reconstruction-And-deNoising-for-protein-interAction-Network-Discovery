@@ -28,6 +28,7 @@ $$
 
 - Public model: `src/model/tccig.py` 仍注册 `model_config.model: tccig`，保留 `forward(...)`、`forward_graph(...)`、`encode_graph_nodes(...)` 和 `decode_graph_candidates(...)`。
 - Config and launcher: canonical config is `configs/tccig/01.yaml`; canonical HPC launcher is `scripts/tccig.sh`.
+- Experiment queue: `configs/tccig/r0_r5_human_bfs/` contains R0-R5 runnable human/BFS configs for `sbatch scripts/tccig.sh configs/tccig/r0_r5_human_bfs`.
 - Student path: cached residue/token embeddings → set-conditioned node state → query/key retrieval heads → SORF random Fourier residue factorization → structural/module/degree heads → candidate reranker.
 - Retrieval: exact chunkable torch top-k is the first backend; FAISS/HNSW is intentionally not a dependency in this implementation.
 - Graph-prior teacher: offline pure-PyTorch MGAE/S2-lite teacher can train only on `human_train_graph.pkl` and emit structural embeddings, degree targets, edge priors, and hard-negative seeds.
@@ -87,6 +88,15 @@ $$
   full-candidate ranking/localization, with checkpoint monitoring still suspect.
 
 Current remaining limitations: feature kNN/anchor candidate proposal and ANN backends are intentionally out of scope; external pair/context teachers remain disabled; spectral/module/calibration/sparsity losses are still diagnostics or follow-up objectives rather than active R5 requirements. Full human/BFS R0-R5 HPC results must be generated after this code lands.
+
+## R0-R5 queue
+
+- R0 `gpr_r0_esm_cosine_human_bfs`: pooled ESM cosine retrieval-only baseline with validation-density assembly.
+- R1 `gpr_r1_sorf_dual_human_bfs`: SORF residue-factorized dual retriever.
+- R2 `gpr_r2_graph_prior_human_bfs`: adds offline graph-prior structural and degree targets.
+- R3 `gpr_r3_hard_negative_human_bfs`: adds exact top-k hard-negative mining plus margin loss/cache artifacts.
+- R4 `gpr_r4_reranker_human_bfs`: adds local candidate reranker; external pair/context teacher remains disabled.
+- R5 `gpr_r5_hybrid_assembly_human_bfs`: enables hybrid validation-density plus predicted degree-cap assembly while keeping validation-density-only and model-`m_hat` debug assemblies.
 
 
 # 1. Overall pipeline
