@@ -800,6 +800,7 @@ def _predict_tccig_graph_assembly_result(
         "lowrank_score": [],
         "module_score": [],
         "pair_score": [],
+        "reranker_residual": [],
         "retrieval_score": [],
     }
     encoded: Mapping[str, torch.Tensor] | None = None

@@ -42,6 +42,7 @@ model_config:
   num_modules: 64
   decoder_structural_gate_init: 0.1
   decoder_mode: rerank
+  reranker_residual_scale: 0.1
   self_refinement_rounds: 0
   retrieval:
     dim: 256

@@ -189,6 +189,12 @@ class TCCIG(nn.Module):
             model_config.get("decoder_structural_gate_init", 0.1),
             "model_config.decoder_structural_gate_init",
         )
+        self.reranker_residual_scale: float = _to_float(
+            model_config.get("reranker_residual_scale", 0.1),
+            "model_config.reranker_residual_scale",
+        )
+        if self.reranker_residual_scale < 0.0:
+            raise ValueError("model_config.reranker_residual_scale must be >= 0")
         self.num_modules: int = _to_int(
             model_config.get("num_modules", 64),
             "model_config.num_modules",
@@ -811,10 +817,9 @@ class TCCIG(nn.Module):
             }
         logits = (
             self.retrieval_logit_gate * retrieval_logits
-            + pair_score
-            + hub_score
-            + lowrank_score
-            + module_score
+            + self._bounded_reranker_residual(
+                pair_score + hub_score + lowrank_score + module_score
+            )
             + density_bias
         )
         return {
@@ -830,6 +835,9 @@ class TCCIG(nn.Module):
             "hub_score": hub_score,
             "lowrank_score": lowrank_score,
             "module_score": module_score,
+            "reranker_residual": self._bounded_reranker_residual(
+                pair_score + hub_score + lowrank_score + module_score
+            ),
         }
 
     def _node_only_retrieval_score_matrix(
@@ -913,12 +921,17 @@ class TCCIG(nn.Module):
         return cast(
             torch.Tensor,
             self.retrieval_logit_gate * retrieval_score
-            + pair_score
-            + hub_score
-            + lowrank_score
-            + module_score
+            + self._bounded_reranker_residual(
+                pair_score + hub_score + lowrank_score + module_score
+            )
             + density_bias,
         )
+
+    def _bounded_reranker_residual(self, raw_residual: torch.Tensor) -> torch.Tensor:
+        """Return a bounded local reranker adjustment around retrieval logits."""
+        if self.reranker_residual_scale == 0.0:
+            return raw_residual * 0.0
+        return torch.tanh(raw_residual) * float(self.reranker_residual_scale)
 
     def _centered_module_score(
         self,

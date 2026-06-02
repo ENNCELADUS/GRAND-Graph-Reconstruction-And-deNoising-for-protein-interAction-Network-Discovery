@@ -144,6 +144,48 @@ def test_tccig_reranker_pair_head_starts_as_neutral_residual() -> None:
     assert torch.allclose(output["logits"], expected_logits)
 
 
+def test_tccig_reranker_residual_is_bounded_relative_to_retrieval_score() -> None:
+    config = _tccig_config() | {
+        "decoder_mode": "rerank",
+        "decoder_structural_gate_init": 1.0,
+        "reranker_residual_scale": 0.1,
+        "retrieval": {
+            "dim": 8,
+            "rff_features": 16,
+            "rff_input_dim": 16,
+            "rff_backend": "sorf",
+            "rff_sigma": 0.5,
+            "top_k": 2,
+            "logit_gate_init": 1.0,
+        },
+    }
+    model = TCCIG(**config)
+    with torch.no_grad():
+        for parameter in model.pair_mlp.parameters():
+            parameter.zero_()
+        pair_output = model.pair_mlp[-1]
+        assert isinstance(pair_output, torch.nn.Linear)
+        pair_output.bias.fill_(25.0)
+        model.hub_head.weight.zero_()
+        model.hub_head.bias.fill_(25.0)
+        model.lowrank_head.weight.zero_()
+        model.lowrank_head.bias.fill_(25.0)
+        model.module_head.weight.zero_()
+        model.module_head.bias.zero_()
+        model.density_bias_head[-1].weight.zero_()
+        model.density_bias_head[-1].bias.zero_()
+    embeddings = torch.randn(3, 5, 8)
+    encoded = model.encode_proteins(protein_embeddings=embeddings)
+    output = model.decode_graph_candidates(
+        node_embeddings=encoded["node"],
+        candidate_pairs=torch.tensor([[0, 1], [1, 2]], dtype=torch.long),
+        encoded=encoded,
+    )
+
+    residual = output["logits"] - output["retrieval_score"] - output["density_bias"]
+    assert torch.max(torch.abs(residual)).item() <= 0.1 + 1.0e-6
+
+
 def test_tccig_encode_graph_nodes_does_not_compute_residue_retrieval_factor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -232,7 +274,9 @@ def test_tccig_lowrank_score_is_scaled_by_dimension() -> None:
     )
 
     assert output["lowrank_score"].item() == pytest.approx(15.0)
-    assert output["logits"].item() == pytest.approx(15.0)
+    expected_residual = math.tanh(15.0) * 0.1
+    assert output["reranker_residual"].item() == pytest.approx(expected_residual)
+    assert output["logits"].item() == pytest.approx(expected_residual)
 
 
 def test_tccig_structural_scores_are_gated_at_initialization() -> None:
@@ -262,7 +306,9 @@ def test_tccig_structural_scores_are_gated_at_initialization() -> None:
     assert output["hub_score"].item() == pytest.approx(1.0)
     assert output["lowrank_score"].item() == pytest.approx(2.25)
     assert output["module_score"].item() == pytest.approx(0.5)
-    assert output["logits"].item() == pytest.approx(3.75)
+    expected_residual = math.tanh(3.75) * 0.1
+    assert output["reranker_residual"].item() == pytest.approx(expected_residual)
+    assert output["logits"].item() == pytest.approx(expected_residual)
 
 
 def test_tccig_forward_graph_is_feature_only_and_returns_graph_outputs() -> None:
