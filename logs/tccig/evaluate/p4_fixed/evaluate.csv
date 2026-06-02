@@ -1,2 +1,0 @@
-split,auroc,auprc,accuracy,sensitivity,specificity,precision,recall,f1,mcc
-test,0.363,0.010,0.955,0.016,0.968,0.007,0.016,0.010,-0.010
