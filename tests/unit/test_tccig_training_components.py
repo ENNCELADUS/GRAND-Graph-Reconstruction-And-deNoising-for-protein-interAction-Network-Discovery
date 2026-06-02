@@ -8,8 +8,15 @@ import torch
 from src.topology.losses import TCCIGLossWeights, compute_tccig_losses
 from src.train.tccig.graph_prior import build_graph_prior_artifacts
 from src.train.tccig.mgae import MGAETeacher, mask_positive_edges
+from src.train.tccig.runner import (
+    TCCIG_TRAIN_CSV_COLUMNS,
+    _build_tccig_epoch_csv_row,
+    _tccig_reconstruction_metrics_payload,
+)
 from src.train.tccig.teacher import OnlineTCCIGTeacher
+from src.train.tccig.trainer import _candidate_reranker_training_logits
 from src.train.tccig.validation import _encode_validation_nodes
+from src.train.topology import shared as topology_train
 from torch import nn
 
 
@@ -83,6 +90,93 @@ def test_validation_node_encoding_batches_by_length_and_restores_order() -> None
     assert batch_lengths == [[6, 5], [3, 2]]
     assert encoded["node"][:, 0].tolist() == [1.0, 2.0, 3.0, 4.0]
     assert encoded["degree"].squeeze(-1).tolist() == [6.0, 2.0, 5.0, 3.0]
+
+
+def test_tccig_epoch_csv_row_persists_reconstruction_retrieval_metrics() -> None:
+    model = nn.Linear(1, 1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    validation_result = topology_train.ValidationEpochResult(
+        decision_threshold=0.5,
+        val_pair_stats={
+            "val_loss": 0.7,
+            "val_auprc": 0.4,
+            "val_candidate_auprc": 0.31,
+            "val_retrieval_recall_at_20": 0.62,
+            "val_reconstruction_candidate_count": 20.0,
+            "val_reconstruction_positive_count": 5.0,
+            "val_composite_score": 0.27,
+        },
+        internal_val_topology_stats={
+            "graph_sim": 0.2,
+            "relative_density": 1.0,
+            "deg_dist_mmd": 0.3,
+            "cc_mmd": 0.4,
+        },
+        val_pair_pass_seconds=1.0,
+        threshold_resolution_seconds=0.0,
+        internal_validation_seconds=2.0,
+        val_topology_loss=0.1,
+        val_total_loss=0.8,
+    )
+    train_stats = {
+        "bce": 1.0,
+        "graph_similarity": 0.0,
+        "relative_density": 0.0,
+        "degree_mmd": 0.0,
+        "clustering_mmd": 0.0,
+        "total": 1.0,
+        "planned_subgraphs": 2.0,
+        "covered_positive_edges": 3.0,
+        "total_positive_edges": 3.0,
+        "positive_edge_coverage_ratio": 1.0,
+        "mean_positive_edge_reuse": 1.0,
+        "all_subgraph_pairs": 12.0,
+        "supervised_pairs": 8.0,
+        "bce_positive_pairs": 3.0,
+        "bce_target_negative_pairs": 6.0,
+        "bce_negative_pairs": 5.0,
+        "bce_negative_ratio": 1.67,
+        "bce_supervised_fraction": 0.67,
+        "edge_cover_sampling_s": 0.1,
+        "train_forward_backward_s": 0.2,
+        "topology_loss_scale": 1.0,
+    }
+
+    row = _build_tccig_epoch_csv_row(
+        epoch=1,
+        epoch_seconds=3.0,
+        train_stats=train_stats,
+        validation_result=validation_result,
+        optimizer=optimizer,
+        peak_gpu_mem_mb=0.0,
+    )
+
+    assert "Val Candidate AUPRC" in TCCIG_TRAIN_CSV_COLUMNS
+    assert "Val Retrieval Recall@20%" in TCCIG_TRAIN_CSV_COLUMNS
+    assert "Val Composite Score" in TCCIG_TRAIN_CSV_COLUMNS
+    assert row["Val Candidate AUPRC"] == pytest.approx(0.31)
+    assert row["Val Retrieval Recall@20%"] == pytest.approx(0.62)
+    assert row["Val Composite Score"] == pytest.approx(0.27)
+    payload = _tccig_reconstruction_metrics_payload(validation_result.val_pair_stats)
+    assert payload["val_candidate_auprc"] == pytest.approx(0.31)
+    assert payload["val_retrieval_recall_at_20"] == pytest.approx(0.62)
+    assert payload["val_composite_score"] == pytest.approx(0.27)
+
+
+def test_candidate_reranker_training_logits_ignore_density_calibration() -> None:
+    calibrated_logits = torch.tensor([-5.0, -4.0])
+    reranker_logits = torch.tensor([0.2, -0.3])
+
+    selected = _candidate_reranker_training_logits(
+        {
+            "logits": calibrated_logits,
+            "reranker_logits": reranker_logits,
+        }
+    )
+
+    assert torch.equal(selected, reranker_logits)
+    fallback = _candidate_reranker_training_logits({"logits": calibrated_logits})
+    assert torch.equal(fallback, calibrated_logits)
 
 
 def test_mask_positive_edges_masks_requested_fraction_and_keeps_visible_edges() -> None:

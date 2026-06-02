@@ -174,7 +174,9 @@ class TCCIGStudentTrainer:
                     ),
                 )
                 encoded = cast(Mapping[str, torch.Tensor], output["encoded"])
-                logits = topology_train._squeeze_binary_logits(cast(torch.Tensor, output["logits"]))
+                logits = topology_train._squeeze_binary_logits(
+                    _candidate_reranker_training_logits(output)
+                )
                 candidate_pairs = cast(torch.Tensor, output["candidate_pairs"])
                 labels, bce_labels, bce_mask = _candidate_supervision(
                     graph=self.graph,
@@ -487,6 +489,12 @@ def _candidate_pair_membership_mask(
         for source, target in candidate_pairs.detach().cpu().long().t().tolist()
     ]
     return torch.tensor(values, dtype=torch.bool, device=candidate_pairs.device)
+
+
+def _candidate_reranker_training_logits(output: Mapping[str, object]) -> torch.Tensor:
+    """Return local reranker logits without graph-density calibration when available."""
+    logits = output.get("reranker_logits", output["logits"])
+    return cast(torch.Tensor, logits)
 
 
 def _positive_edge_index_for_nodes(

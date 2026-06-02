@@ -763,6 +763,7 @@ class TCCIG(nn.Module):
             return {
                 "logits": node_embeddings.new_zeros((0,)),
                 "retrieval_logits": node_embeddings.new_zeros((0,)),
+                "reranker_logits": node_embeddings.new_zeros((0,)),
                 "edge_probabilities": node_embeddings.new_zeros((0,)),
                 "m_hat": m_hat,
                 "module_memberships": module_memberships,
@@ -800,10 +801,12 @@ class TCCIG(nn.Module):
         retrieval_logits = retrieval_matrix[src, dst]
         zero_component = retrieval_logits * 0.0
         if self.decoder_mode == "retrieval_only":
-            logits = self.retrieval_logit_gate * retrieval_logits + density_bias
+            reranker_logits = self.retrieval_logit_gate * retrieval_logits
+            logits = reranker_logits + density_bias
             return {
                 "logits": logits,
                 "retrieval_logits": retrieval_logits,
+                "reranker_logits": reranker_logits,
                 "edge_probabilities": torch.sigmoid(logits),
                 "m_hat": m_hat.reshape(()),
                 "module_memberships": module_memberships,
@@ -815,16 +818,15 @@ class TCCIG(nn.Module):
                 "lowrank_score": zero_component,
                 "module_score": zero_component,
             }
-        logits = (
-            self.retrieval_logit_gate * retrieval_logits
-            + self._bounded_reranker_residual(
-                pair_score + hub_score + lowrank_score + module_score
-            )
-            + density_bias
+        reranker_residual = self._bounded_reranker_residual(
+            pair_score + hub_score + lowrank_score + module_score
         )
+        reranker_logits = self.retrieval_logit_gate * retrieval_logits + reranker_residual
+        logits = reranker_logits + density_bias
         return {
             "logits": logits,
             "retrieval_logits": retrieval_logits,
+            "reranker_logits": reranker_logits,
             "edge_probabilities": torch.sigmoid(logits),
             "m_hat": m_hat.reshape(()),
             "module_memberships": module_memberships,
@@ -835,9 +837,7 @@ class TCCIG(nn.Module):
             "hub_score": hub_score,
             "lowrank_score": lowrank_score,
             "module_score": module_score,
-            "reranker_residual": self._bounded_reranker_residual(
-                pair_score + hub_score + lowrank_score + module_score
-            ),
+            "reranker_residual": reranker_residual,
         }
 
     def _node_only_retrieval_score_matrix(

@@ -24,7 +24,17 @@ from src.train.tccig.validation import TCCIGValidationRunner
 from src.train.topology import shared as topology_train
 from src.utils.logging import append_csv_row, format_result_payload, log_stage_event
 
-TCCIG_TRAIN_CSV_COLUMNS = topology_train.TOPOLOGY_FINETUNE_CSV_COLUMNS
+TCCIG_RECONSTRUCTION_CSV_COLUMNS = [
+    "Val Candidate AUPRC",
+    "Val Retrieval Recall@20%",
+    "Val Reconstruction Candidate Count",
+    "Val Reconstruction Positive Count",
+    "Val Composite Score",
+]
+TCCIG_TRAIN_CSV_COLUMNS = [
+    *topology_train.TOPOLOGY_FINETUNE_CSV_COLUMNS,
+    *TCCIG_RECONSTRUCTION_CSV_COLUMNS,
+]
 
 
 class TCCIGTrainRunner:
@@ -249,7 +259,7 @@ class TCCIGTrainRunner:
         if self.runtime.is_main_process:
             append_csv_row(
                 csv_path=data_context.csv_path,
-                row=topology_train._build_epoch_csv_row(
+                row=_build_tccig_epoch_csv_row(
                     epoch=epoch + 1,
                     epoch_seconds=epoch_seconds,
                     train_stats=train_stats,
@@ -283,6 +293,9 @@ class TCCIGTrainRunner:
                         "best_auprc_epoch": float(best_auprc_epoch),
                         "best_auprc": float(best_auprc_value),
                     }
+                )
+                saved_metrics.update(
+                    _tccig_reconstruction_metrics_payload(validation_result.val_pair_stats)
                 )
                 data_context.metrics_path.write_text(
                     json.dumps(format_result_payload(saved_metrics), indent=2, sort_keys=True),
@@ -347,6 +360,15 @@ class TCCIGTrainRunner:
             epoch=epoch + 1,
             train_loss=train_stats["total"],
             val_auprc=float(validation_result.val_pair_stats.get("val_auprc", 0.0)),
+            val_candidate_auprc=float(
+                validation_result.val_pair_stats.get("val_candidate_auprc", 0.0)
+            ),
+            val_retrieval_recall_at_20=float(
+                validation_result.val_pair_stats.get("val_retrieval_recall_at_20", 0.0)
+            ),
+            val_composite_score=float(
+                validation_result.val_pair_stats.get("val_composite_score", 0.0)
+            ),
             internal_val_graph_sim=validation_result.internal_val_topology_stats["graph_sim"],
             planned_subgraphs=int(train_stats["planned_subgraphs"]),
             covered_positive_edges=int(train_stats["covered_positive_edges"]),
@@ -403,3 +425,63 @@ class TCCIGTrainRunner:
                 ),
                 encoding="utf-8",
             )
+
+
+def _build_tccig_epoch_csv_row(
+    *,
+    epoch: int,
+    epoch_seconds: float,
+    train_stats: dict[str, float],
+    validation_result: topology_train.ValidationEpochResult,
+    optimizer: Optimizer,
+    peak_gpu_mem_mb: float,
+) -> dict[str, float | int | str]:
+    """Build the persisted CSV row for one graph-prior retrieval TCCIG epoch."""
+    row = topology_train._build_epoch_csv_row(
+        epoch=epoch,
+        epoch_seconds=epoch_seconds,
+        train_stats=train_stats,
+        validation_result=validation_result,
+        optimizer=optimizer,
+        peak_gpu_mem_mb=peak_gpu_mem_mb,
+    )
+    row.update(_tccig_reconstruction_csv_fields(validation_result.val_pair_stats))
+    return row
+
+
+def _tccig_reconstruction_csv_fields(
+    val_pair_stats: dict[str, float],
+) -> dict[str, float]:
+    """Return reconstruction retrieval metrics for TCCIG training CSV artifacts."""
+    return {
+        "Val Candidate AUPRC": float(val_pair_stats.get("val_candidate_auprc", 0.0)),
+        "Val Retrieval Recall@20%": float(
+            val_pair_stats.get("val_retrieval_recall_at_20", 0.0)
+        ),
+        "Val Reconstruction Candidate Count": float(
+            val_pair_stats.get("val_reconstruction_candidate_count", 0.0)
+        ),
+        "Val Reconstruction Positive Count": float(
+            val_pair_stats.get("val_reconstruction_positive_count", 0.0)
+        ),
+        "Val Composite Score": float(val_pair_stats.get("val_composite_score", 0.0)),
+    }
+
+
+def _tccig_reconstruction_metrics_payload(
+    val_pair_stats: dict[str, float],
+) -> dict[str, float]:
+    """Return reconstruction retrieval metrics for TCCIG best-checkpoint JSON."""
+    return {
+        "val_candidate_auprc": float(val_pair_stats.get("val_candidate_auprc", 0.0)),
+        "val_retrieval_recall_at_20": float(
+            val_pair_stats.get("val_retrieval_recall_at_20", 0.0)
+        ),
+        "val_reconstruction_candidate_count": float(
+            val_pair_stats.get("val_reconstruction_candidate_count", 0.0)
+        ),
+        "val_reconstruction_positive_count": float(
+            val_pair_stats.get("val_reconstruction_positive_count", 0.0)
+        ),
+        "val_composite_score": float(val_pair_stats.get("val_composite_score", 0.0)),
+    }

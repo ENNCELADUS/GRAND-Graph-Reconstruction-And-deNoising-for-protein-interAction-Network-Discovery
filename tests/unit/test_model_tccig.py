@@ -142,6 +142,7 @@ def test_tccig_reranker_pair_head_starts_as_neutral_residual() -> None:
     expected_logits = output["retrieval_score"] + output["density_bias"]
     assert torch.allclose(output["pair_score"], torch.zeros_like(output["pair_score"]))
     assert torch.allclose(output["logits"], expected_logits)
+    assert torch.allclose(output["reranker_logits"], output["retrieval_score"])
 
 
 def test_tccig_reranker_residual_is_bounded_relative_to_retrieval_score() -> None:
@@ -182,8 +183,9 @@ def test_tccig_reranker_residual_is_bounded_relative_to_retrieval_score() -> Non
         encoded=encoded,
     )
 
-    residual = output["logits"] - output["retrieval_score"] - output["density_bias"]
+    residual = output["reranker_logits"] - output["retrieval_score"]
     assert torch.max(torch.abs(residual)).item() <= 0.1 + 1.0e-6
+    assert torch.allclose(output["logits"], output["reranker_logits"] + output["density_bias"])
 
 
 def test_tccig_encode_graph_nodes_does_not_compute_residue_retrieval_factor(
