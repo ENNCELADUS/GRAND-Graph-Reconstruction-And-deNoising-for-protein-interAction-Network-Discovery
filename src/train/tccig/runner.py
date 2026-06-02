@@ -26,6 +26,7 @@ from src.utils.logging import append_csv_row, format_result_payload, log_stage_e
 
 TCCIG_RECONSTRUCTION_CSV_COLUMNS = [
     "Val Candidate AUPRC",
+    "Val Retrieval Candidate AUPRC",
     "Val Retrieval Recall@20%",
     "Val Reconstruction Candidate Count",
     "Val Reconstruction Positive Count",
@@ -455,6 +456,9 @@ def _tccig_reconstruction_csv_fields(
     """Return reconstruction retrieval metrics for TCCIG training CSV artifacts."""
     return {
         "Val Candidate AUPRC": float(val_pair_stats.get("val_candidate_auprc", 0.0)),
+        "Val Retrieval Candidate AUPRC": float(
+            val_pair_stats.get("val_retrieval_candidate_auprc", 0.0)
+        ),
         "Val Retrieval Recall@20%": float(
             val_pair_stats.get("val_retrieval_recall_at_20", 0.0)
         ),
@@ -474,6 +478,9 @@ def _tccig_reconstruction_metrics_payload(
     """Return reconstruction retrieval metrics for TCCIG best-checkpoint JSON."""
     return {
         "val_candidate_auprc": float(val_pair_stats.get("val_candidate_auprc", 0.0)),
+        "val_retrieval_candidate_auprc": float(
+            val_pair_stats.get("val_retrieval_candidate_auprc", 0.0)
+        ),
         "val_retrieval_recall_at_20": float(
             val_pair_stats.get("val_retrieval_recall_at_20", 0.0)
         ),

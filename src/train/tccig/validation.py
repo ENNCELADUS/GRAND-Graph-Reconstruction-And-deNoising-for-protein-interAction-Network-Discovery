@@ -167,6 +167,7 @@ class TCCIGValidationRunner:
             graph_model = cast(nn.Module, unwrap_model(model))
         encode_proteins = getattr(graph_model, "encode_proteins", None)
         retrieval_score_matrix = getattr(graph_model, "retrieval_score_matrix", None)
+        decode_graph_candidates = getattr(graph_model, "decode_graph_candidates", None)
         if not callable(encode_proteins) or not callable(retrieval_score_matrix):
             return {}
         encoded = _encode_validation_nodes(
@@ -177,18 +178,31 @@ class TCCIGValidationRunner:
             node_batch_size=self.train_cfg.validation_reconstruction.node_batch_size,
         )
         scores = cast(torch.Tensor, retrieval_score_matrix(encoded))
-        pair_scores = scores[candidate_pairs[0], candidate_pairs[1]].detach().float().cpu()
+        retrieval_pair_scores = (
+            scores[candidate_pairs[0], candidate_pairs[1]].detach().float().cpu()
+        )
+        candidate_pair_scores = _validation_candidate_scores(
+            encoded=encoded,
+            candidate_pairs=candidate_pairs,
+            retrieval_pair_scores=retrieval_pair_scores,
+            decode_graph_candidates=decode_graph_candidates,
+            batch_size=self.train_cfg.internal_validation_inference_batch_size,
+        )
         labels = labels.detach().float().cpu()
         stats = {
             "val_reconstruction_candidate_count": float(labels.numel()),
             "val_reconstruction_positive_count": float(labels.sum().item()),
-            "val_candidate_auprc": _safe_average_precision(labels, pair_scores),
+            "val_candidate_auprc": _safe_average_precision(labels, candidate_pair_scores),
+            "val_retrieval_candidate_auprc": _safe_average_precision(
+                labels,
+                retrieval_pair_scores,
+            ),
         }
         for fraction in self.train_cfg.validation_reconstruction.recall_k_percent:
             key = f"val_retrieval_recall_at_{int(fraction)}"
             stats[key] = _recall_at_fraction(
                 labels=labels,
-                scores=pair_scores,
+                scores=retrieval_pair_scores,
                 fraction_percent=fraction,
             )
         stats.setdefault("val_retrieval_recall_at_20", 0.0)
@@ -236,6 +250,44 @@ def _safe_average_precision(labels: torch.Tensor, scores: torch.Tensor) -> float
     if labels.numel() == 0 or torch.unique(labels).numel() < 2:
         return 0.0
     return float(average_precision_score(labels.cpu().numpy(), scores.cpu().numpy()))
+
+
+def _validation_candidate_scores(
+    *,
+    encoded: Mapping[str, torch.Tensor],
+    candidate_pairs: torch.Tensor,
+    retrieval_pair_scores: torch.Tensor,
+    decode_graph_candidates: object,
+    batch_size: int,
+) -> torch.Tensor:
+    """Return reranker-aware validation scores, falling back to retrieval scores."""
+    if not callable(decode_graph_candidates) or "node" not in encoded:
+        return retrieval_pair_scores
+    if batch_size <= 0:
+        raise ValueError("batch_size must be > 0")
+    node_embeddings = encoded["node"]
+    score_chunks: list[torch.Tensor] = []
+    for start in range(0, candidate_pairs.size(1), batch_size):
+        chunk = candidate_pairs[:, start : start + batch_size]
+        output = cast(
+            Mapping[str, torch.Tensor],
+            decode_graph_candidates(
+                node_embeddings=node_embeddings,
+                candidate_pairs=chunk,
+                encoded=encoded,
+            ),
+        )
+        score_tensor = (
+            output.get("reranker_logits")
+            if "reranker_logits" in output
+            else output.get("logits", output.get("edge_probabilities"))
+        )
+        if score_tensor is None:
+            return retrieval_pair_scores
+        score_chunks.append(score_tensor.detach().float().cpu().reshape(-1))
+    if not score_chunks:
+        return retrieval_pair_scores
+    return torch.cat(score_chunks, dim=0)
 
 
 def _recall_at_fraction(

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import networkx as nx
 import pytest
 import torch
@@ -15,7 +17,7 @@ from src.train.tccig.runner import (
 )
 from src.train.tccig.teacher import OnlineTCCIGTeacher
 from src.train.tccig.trainer import _candidate_reranker_training_logits
-from src.train.tccig.validation import _encode_validation_nodes
+from src.train.tccig.validation import TCCIGValidationRunner, _encode_validation_nodes
 from src.train.topology import shared as topology_train
 from torch import nn
 
@@ -58,6 +60,49 @@ class _DataContext:
         self.embedding_repository = _EmbeddingRepository(embeddings)
 
 
+class _ValidationScoringModel(nn.Module):
+    """Tiny graph-forward model with intentionally different retrieval/reranker ranks."""
+
+    def encode_proteins(
+        self,
+        *,
+        protein_embeddings: torch.Tensor,
+        protein_lengths: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        del protein_lengths
+        return {"node": protein_embeddings[:, 0, :]}
+
+    def retrieval_score_matrix(self, encoded: dict[str, torch.Tensor]) -> torch.Tensor:
+        node_count = encoded["node"].size(0)
+        scores = torch.zeros((node_count, node_count), dtype=torch.float32)
+        scores[0, 1] = scores[1, 0] = 0.1
+        scores[0, 2] = scores[2, 0] = 0.9
+        scores[1, 2] = scores[2, 1] = 0.8
+        return scores
+
+    def decode_graph_candidates(
+        self,
+        *,
+        node_embeddings: torch.Tensor,
+        candidate_pairs: torch.Tensor,
+        encoded: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        del node_embeddings, encoded
+        pair_scores = {
+            (0, 1): 3.0,
+            (0, 2): -1.0,
+            (1, 2): -2.0,
+        }
+        scores = torch.tensor(
+            [
+                pair_scores[tuple(sorted((int(src), int(dst))))]
+                for src, dst in candidate_pairs.t().tolist()
+            ],
+            dtype=torch.float32,
+        )
+        return {"reranker_logits": scores}
+
+
 def test_validation_node_encoding_batches_by_length_and_restores_order() -> None:
     embeddings = {
         "A": torch.full((6, 2), 1.0),
@@ -92,6 +137,43 @@ def test_validation_node_encoding_batches_by_length_and_restores_order() -> None
     assert encoded["degree"].squeeze(-1).tolist() == [6.0, 2.0, 5.0, 3.0]
 
 
+def test_validation_reconstruction_auprc_uses_reranker_candidate_scores() -> None:
+    graph = nx.Graph()
+    graph.add_nodes_from(["A", "B", "C"])
+    graph.add_edge("A", "B")
+    data_context = _DataContext(
+        {
+            "A": torch.tensor([[1.0]]),
+            "B": torch.tensor([[2.0]]),
+            "C": torch.tensor([[3.0]]),
+        }
+    )
+    data_context.internal_val_graph = graph  # type: ignore[attr-defined]
+    data_context.evaluator = SimpleNamespace(accelerator=SimpleNamespace())  # type: ignore[attr-defined]
+    train_cfg = SimpleNamespace(
+        run_seed=17,
+        internal_validation_inference_batch_size=2,
+        validation_reconstruction=SimpleNamespace(
+            enabled=True,
+            max_pairs=None,
+            node_batch_size=3,
+            recall_k_percent=(20.0,),
+        ),
+    )
+    runner = TCCIGValidationRunner(
+        raw_config={},
+        train_cfg=train_cfg,  # type: ignore[arg-type]
+        data_context=data_context,  # type: ignore[arg-type]
+        dataloaders={},
+        device=torch.device("cpu"),
+    )
+
+    stats = runner._validation_reconstruction_stats(model=_ValidationScoringModel())
+
+    assert stats["val_candidate_auprc"] == pytest.approx(1.0)
+    assert stats["val_retrieval_recall_at_20"] == pytest.approx(0.0)
+
+
 def test_tccig_epoch_csv_row_persists_reconstruction_retrieval_metrics() -> None:
     model = nn.Linear(1, 1)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
@@ -101,6 +183,7 @@ def test_tccig_epoch_csv_row_persists_reconstruction_retrieval_metrics() -> None
             "val_loss": 0.7,
             "val_auprc": 0.4,
             "val_candidate_auprc": 0.31,
+            "val_retrieval_candidate_auprc": 0.11,
             "val_retrieval_recall_at_20": 0.62,
             "val_reconstruction_candidate_count": 20.0,
             "val_reconstruction_positive_count": 5.0,
@@ -152,13 +235,16 @@ def test_tccig_epoch_csv_row_persists_reconstruction_retrieval_metrics() -> None
     )
 
     assert "Val Candidate AUPRC" in TCCIG_TRAIN_CSV_COLUMNS
+    assert "Val Retrieval Candidate AUPRC" in TCCIG_TRAIN_CSV_COLUMNS
     assert "Val Retrieval Recall@20%" in TCCIG_TRAIN_CSV_COLUMNS
     assert "Val Composite Score" in TCCIG_TRAIN_CSV_COLUMNS
     assert row["Val Candidate AUPRC"] == pytest.approx(0.31)
+    assert row["Val Retrieval Candidate AUPRC"] == pytest.approx(0.11)
     assert row["Val Retrieval Recall@20%"] == pytest.approx(0.62)
     assert row["Val Composite Score"] == pytest.approx(0.27)
     payload = _tccig_reconstruction_metrics_payload(validation_result.val_pair_stats)
     assert payload["val_candidate_auprc"] == pytest.approx(0.31)
+    assert payload["val_retrieval_candidate_auprc"] == pytest.approx(0.11)
     assert payload["val_retrieval_recall_at_20"] == pytest.approx(0.62)
     assert payload["val_composite_score"] == pytest.approx(0.27)
 
