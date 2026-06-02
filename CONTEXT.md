@@ -84,9 +84,10 @@ evaluates on PRING `all_test_ppi.txt`.
 
 ## Retrieval Candidate
 
-A candidate edge proposed by exact top-k retrieval from feature-derived query/key and
-residue-factorized embeddings before reranking.
-_Avoid_: ANN edge, dense pair
+A candidate edge proposed by Top-R retrieval from feature-derived query/key and
+residue-factorized embeddings before reranking. The current P1 backend is exact
+retrieval; future ANN backends should preserve the same candidate semantics.
+_Avoid_: dense pair, full-universe rerank candidate
 
 ## Hybrid Assembly
 

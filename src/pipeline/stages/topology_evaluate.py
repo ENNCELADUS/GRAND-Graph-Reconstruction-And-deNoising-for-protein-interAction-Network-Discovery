@@ -80,6 +80,12 @@ class GraphAssemblyResult:
     edge_budget: float | None = None
     logits: list[float] | None = None
     component_scores: Mapping[str, Sequence[float]] | None = None
+    retrieval_backend: str | None = None
+    retrieval_top_k: int | None = None
+    retrieval_candidate_count: int | None = None
+    reranked_candidate_count: int | None = None
+    background_zero_count: int | None = None
+    reranked_record_indices: tuple[int, ...] | None = None
 
 
 class TopologyLoaderBundle(tuple[DataLoader[dict[str, object]], list[tuple[str, str]], int]):
@@ -352,6 +358,32 @@ def _resolve_tccig_node_batch_size(config: ConfigDict) -> int:
     return batch_size
 
 
+def _resolve_tccig_retrieval_top_k(config: ConfigDict, graph_model: torch.nn.Module) -> int:
+    """Return exact retrieval depth for TCCIG graph assembly."""
+    tccig_cfg = _tccig_topology_eval_config(config)
+    if "retrieval_top_k" in tccig_cfg:
+        top_k = as_int(
+            tccig_cfg["retrieval_top_k"],
+            "topology_evaluate.tccig.retrieval_top_k",
+        )
+    else:
+        train_cfg = config.get("tccig_train", {})
+        train_retrieval_cfg = (
+            train_cfg.get("retrieval", {}) if isinstance(train_cfg, dict) else {}
+        )
+        if isinstance(train_retrieval_cfg, dict) and "top_k" in train_retrieval_cfg:
+            top_k = as_int(
+                train_retrieval_cfg["top_k"],
+                "tccig_train.retrieval.top_k",
+            )
+        else:
+            model_top_k = getattr(graph_model, "retrieval_top_k", 128)
+            top_k = as_int(model_top_k, "model.retrieval_top_k")
+    if top_k <= 0:
+        raise ValueError("topology_evaluate.tccig.retrieval_top_k must be > 0")
+    return top_k
+
+
 def _load_tccig_node_inputs(
     *,
     dataset: PRINGPairDataset,
@@ -452,12 +484,15 @@ def _assemble_predictions_for_budget(
     records: Sequence[tuple[str, str]],
     probabilities: Sequence[float],
     edge_budget: float,
+    allowed_indices: set[int] | None = None,
 ) -> list[int]:
     """Assemble non-self records with a fixed top-K budget."""
     if len(records) != len(probabilities):
         raise ValueError("records and probabilities must have the same length")
     scorable_indices = [
-        index for index, (protein_a, protein_b) in enumerate(records) if protein_a != protein_b
+        index
+        for index, (protein_a, protein_b) in enumerate(records)
+        if protein_a != protein_b and (allowed_indices is None or index in allowed_indices)
     ]
     scorable_predictions = _assemble_top_m_hat_predictions(
         probabilities=[float(probabilities[index]) for index in scorable_indices],
@@ -564,6 +599,38 @@ def _decode_graph_candidate_batch(
     )
 
 
+def _normalize_retrieval_candidate_pairs(
+    *,
+    candidate_pairs: torch.Tensor,
+    num_nodes: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Validate exact retrieval output and return canonical local pairs."""
+    pairs = candidate_pairs.to(device=device, dtype=torch.long)
+    if pairs.dim() != 2:
+        raise ValueError("retrieval candidate pairs must have shape (2, e) or (e, 2)")
+    if pairs.size(0) == 2:
+        normalized = pairs
+    elif pairs.size(1) == 2:
+        normalized = pairs.t().contiguous()
+    else:
+        raise ValueError("retrieval candidate pairs must have shape (2, e) or (e, 2)")
+    if normalized.numel() == 0:
+        return torch.empty((2, 0), dtype=torch.long, device=device)
+    if int(normalized.min().item()) < 0 or int(normalized.max().item()) >= num_nodes:
+        raise ValueError("retrieval candidate pairs contain node indices outside the protein set")
+    if torch.any(normalized[0] == normalized[1]):
+        raise ValueError("retrieval candidate pairs must not contain self edges")
+    canonical = torch.stack(
+        (
+            torch.minimum(normalized[0], normalized[1]),
+            torch.maximum(normalized[0], normalized[1]),
+        ),
+        dim=0,
+    )
+    return cast(torch.Tensor, torch.unique(canonical.t(), dim=0).t().contiguous())
+
+
 def _validation_graph_density(config: ConfigDict) -> float | None:
     """Return supervision-validation graph density when TCCIG training config exists."""
     train_cfg = config.get("tccig_train")
@@ -633,6 +700,16 @@ def graph_assembly_diagnostics(result: GraphAssemblyResult) -> dict[str, float |
     if result.component_scores is not None:
         for name, values in sorted(result.component_scores.items()):
             payload.update(_sequence_stats(prefix=f"component_{name}", values=values))
+    if result.retrieval_backend is not None:
+        payload["retrieval_backend"] = result.retrieval_backend
+    if result.retrieval_top_k is not None:
+        payload["retrieval_top_k"] = int(result.retrieval_top_k)
+    if result.retrieval_candidate_count is not None:
+        payload["retrieval_candidate_count"] = int(result.retrieval_candidate_count)
+    if result.reranked_candidate_count is not None:
+        payload["reranked_candidate_count"] = int(result.reranked_candidate_count)
+    if result.background_zero_count is not None:
+        payload["background_zero_count"] = int(result.background_zero_count)
     return payload
 
 
@@ -662,8 +739,10 @@ def _predict_tccig_graph_assembly_result(
 ) -> GraphAssemblyResult:
     """Run TCCIG Graph Assembly with top-``m_hat`` candidate selection."""
     graph_model = _unwrap_graph_model(model=model, accelerator=accelerator)
+    encode_proteins_batched = getattr(graph_model, "encode_proteins_batched", None)
     encode_proteins = getattr(graph_model, "encode_proteins", None)
     encode_graph_nodes = getattr(graph_model, "encode_graph_nodes", None)
+    retrieve_candidate_pairs = getattr(graph_model, "retrieve_candidate_pairs", None)
     decode_graph_candidates = getattr(graph_model, "decode_graph_candidates", None)
     edge_budget_from_node_embeddings = getattr(
         graph_model,
@@ -671,13 +750,19 @@ def _predict_tccig_graph_assembly_result(
         None,
     )
     if not (
-        callable(encode_graph_nodes)
+        (
+            callable(encode_proteins_batched)
+            or callable(encode_proteins)
+            or callable(encode_graph_nodes)
+        )
+        and callable(retrieve_candidate_pairs)
         and callable(decode_graph_candidates)
         and callable(edge_budget_from_node_embeddings)
     ):
         raise ValueError(
-            "TCCIG topology evaluation requires encode_graph_nodes, "
-            "decode_graph_candidates, and edge_budget_from_node_embeddings"
+            "TCCIG topology evaluation requires a protein encoder, "
+            "retrieve_candidate_pairs, decode_graph_candidates, and "
+            "edge_budget_from_node_embeddings"
         )
 
     scorable_records_with_indices = [
@@ -706,7 +791,8 @@ def _predict_tccig_graph_assembly_result(
     node_to_index = {protein_id: index for index, protein_id in enumerate(protein_ids)}
     candidate_batch_size = _resolve_tccig_candidate_batch_size(config)
     node_batch_size = _resolve_tccig_node_batch_size(config)
-    probabilities: list[float] = []
+    retrieval_top_k = _resolve_tccig_retrieval_top_k(config, graph_model)
+    probabilities = [0.0 for _ in scorable_records]
     logits: list[float] = []
     component_scores: dict[str, list[float]] = {
         "density_bias": [],
@@ -718,7 +804,6 @@ def _predict_tccig_graph_assembly_result(
     }
     encoded: Mapping[str, torch.Tensor] | None = None
     degree_predictions: torch.Tensor | None = None
-    encode_proteins_batched = getattr(graph_model, "encode_proteins_batched", None)
     with torch.inference_mode(), accelerator.autocast():
         if callable(encode_proteins_batched):
             encoded = cast(
@@ -768,9 +853,42 @@ def _predict_tccig_graph_assembly_result(
                 candidate_count=len(scorable_records),
             ),
         )
-        for start in range(0, len(scorable_records), candidate_batch_size):
+        retrieval_pairs = _normalize_retrieval_candidate_pairs(
+            candidate_pairs=cast(
+                torch.Tensor,
+                retrieve_candidate_pairs(
+                    encoded=encoded if encoded is not None else {"node": node_embeddings},
+                    top_k=retrieval_top_k,
+                ),
+            ),
+            num_nodes=n_nodes,
+            device=device,
+        )
+        retrieved_pair_set = {
+            (int(source), int(target))
+            for source, target in retrieval_pairs.detach().cpu().t().tolist()
+        }
+        reranked_positions = [
+            position
+            for position, (protein_a, protein_b) in enumerate(scorable_records)
+            if (
+                min(node_to_index[protein_a], node_to_index[protein_b]),
+                max(node_to_index[protein_a], node_to_index[protein_b]),
+            )
+            in retrieved_pair_set
+        ]
+        reranked_records = [scorable_records[position] for position in reranked_positions]
+        reranked_probabilities: list[float] = []
+        reranked_candidate_pairs_cpu = torch.empty((2, 0), dtype=torch.long)
+        if reranked_records:
+            reranked_candidate_pairs_cpu = _candidate_pairs_for_records(
+                records=reranked_records,
+                node_to_index=node_to_index,
+                device=torch.device("cpu"),
+            )
+        for start in range(0, len(reranked_records), candidate_batch_size):
             candidate_pairs = _candidate_pairs_for_records(
-                records=scorable_records[start : start + candidate_batch_size],
+                records=reranked_records[start : start + candidate_batch_size],
                 node_to_index=node_to_index,
                 device=device,
             )
@@ -793,11 +911,15 @@ def _predict_tccig_graph_assembly_result(
                     float(value)
                     for value in component_tensor.detach().float().cpu().reshape(-1)
                 )
-            probabilities.extend(
+            batch_probabilities = [
                 float(value) for value in output["edge_probabilities"].detach().cpu().tolist()
-            )
-    if len(probabilities) != len(scorable_records):
-        raise ValueError("TCCIG graph assembly did not score every topology pair")
+            ]
+            for offset, probability in enumerate(batch_probabilities):
+                scorable_position = reranked_positions[start + offset]
+                probabilities[scorable_position] = probability
+            reranked_probabilities.extend(batch_probabilities)
+    if len(reranked_probabilities) != len(reranked_records):
+        raise ValueError("TCCIG graph assembly did not score every retrieved topology pair")
     m_hat_value = float(m_hat_tensor.detach().cpu().item())
     edge_budget = _resolve_hybrid_edge_budget(
         config=config,
@@ -806,25 +928,24 @@ def _predict_tccig_graph_assembly_result(
         candidate_count=len(scorable_records),
     )
     degree_cap_active = degree_predictions is not None and _hybrid_degree_cap_enabled(config)
+    scorable_predictions = [0 for _ in scorable_records]
     if degree_cap_active:
-        all_candidate_pairs = _candidate_pairs_for_records(
-            records=scorable_records,
-            node_to_index=node_to_index,
-            device=torch.device("cpu"),
-        )
         selected_mask = hybrid_degree_capped_topk(
-            candidate_pairs=all_candidate_pairs,
-            scores=torch.tensor(probabilities, dtype=torch.float32),
+            candidate_pairs=reranked_candidate_pairs_cpu,
+            scores=torch.tensor(reranked_probabilities, dtype=torch.float32),
             edge_budget=int(round(edge_budget)),
             degree_cap=degree_predictions.detach().float().cpu(),
             cap_slack=_hybrid_degree_cap_slack(config),
         )
-        scorable_predictions = [int(value) for value in selected_mask.tolist()]
+        for position, selected in zip(reranked_positions, selected_mask.tolist(), strict=True):
+            scorable_predictions[position] = int(selected)
     else:
-        scorable_predictions = _assemble_top_m_hat_predictions(
-            probabilities=probabilities,
+        reranked_predictions = _assemble_top_m_hat_predictions(
+            probabilities=reranked_probabilities,
             m_hat=edge_budget,
         )
+        for position, prediction in zip(reranked_positions, reranked_predictions, strict=True):
+            scorable_predictions[position] = prediction
     assembly_rule = _resolved_tccig_assembly_rule(
         config=config,
         degree_cap_active=degree_cap_active,
@@ -851,6 +972,14 @@ def _predict_tccig_graph_assembly_result(
         edge_budget=edge_budget,
         logits=logits or None,
         component_scores=component_scores if any(component_scores.values()) else None,
+        retrieval_backend="exact",
+        retrieval_top_k=retrieval_top_k,
+        retrieval_candidate_count=len(retrieved_pair_set),
+        reranked_candidate_count=len(reranked_records),
+        background_zero_count=len(scorable_records) - len(reranked_records),
+        reranked_record_indices=tuple(
+            scorable_indices[position] for position in reranked_positions
+        ),
     )
 
 
@@ -1134,6 +1263,11 @@ def _evaluate_debug_assembly(
         records=records,
         probabilities=result.probabilities,
         edge_budget=budget,
+        allowed_indices=(
+            set(result.reranked_record_indices)
+            if result.reranked_record_indices is not None
+            else None
+        ),
     )
     predicted_edges = [
         (protein_a, protein_b)

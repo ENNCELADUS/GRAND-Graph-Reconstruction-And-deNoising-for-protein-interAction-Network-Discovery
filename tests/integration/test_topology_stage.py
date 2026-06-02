@@ -58,6 +58,11 @@ def _write_embedding_cache(
     )
 
 
+def _all_retrieval_pairs(encoded: Mapping[str, torch.Tensor]) -> torch.Tensor:
+    node_count = int(encoded["node"].size(0))
+    return torch.triu_indices(node_count, node_count, offset=1)
+
+
 def _build_topology_config(tmp_path: Path) -> ConfigDict:
     benchmark_root = tmp_path / "benchmark"
     processed_dir = benchmark_root / "human" / "BFS"
@@ -298,6 +303,15 @@ def test_tccig_graph_assembly_evaluate_uses_all_test_universe_and_writes_diagnos
             del node_embeddings, candidate_count
             return torch.tensor(2.0)
 
+        def retrieve_candidate_pairs(
+            self,
+            *,
+            encoded: Mapping[str, torch.Tensor],
+            top_k: int | None = None,
+        ) -> torch.Tensor:
+            del top_k
+            return _all_retrieval_pairs(encoded)
+
         def decode_graph_candidates(
             self,
             *,
@@ -362,6 +376,132 @@ def test_tccig_graph_assembly_evaluate_uses_all_test_universe_and_writes_diagnos
     assert diagnostics["m_hat_per_full_pair"] == pytest.approx(2.0 / 3.0, abs=1.0e-3)
     assert diagnostics["threshold_mode"] == "validation_mcc"
     assert diagnostics["threshold_value"] == pytest.approx(0.7)
+
+
+def test_tccig_graph_assembly_evaluate_reranks_only_retrieved_candidates(
+    tmp_path: Path,
+) -> None:
+    config = _build_topology_config(tmp_path)
+    cast(ConfigDict, config["run_config"])["stages"] = ["evaluate"]
+    cast(ConfigDict, config["run_config"])["eval_run_id"] = "graph_eval_retrieval_gated"
+    cast(ConfigDict, config["model_config"])["model"] = "tccig"
+    cast(ConfigDict, config["evaluate"])["mode"] = "graph_assembly"
+    cast(ConfigDict, config["topology_evaluate"])["tccig"] = {
+        "candidate_batch_size": 8,
+        "node_batch_size": 2,
+        "retrieval_top_k": 1,
+    }
+    processed_dir = Path(str(cast(ConfigDict, config["data_config"])["benchmark"]["processed_dir"]))
+    config["tccig_train"] = {
+        "supervision_train_dataset": str(processed_dir / "human_train_ppi.txt"),
+        "supervision_valid_dataset": str(processed_dir / "human_val_ppi.txt"),
+    }
+
+    class _RetrievalGatedEvaluateModel(torch.nn.Module):
+        def forward(
+            self,
+            emb_a: torch.Tensor,
+            emb_b: torch.Tensor,
+            **_: object,
+        ) -> dict[str, torch.Tensor]:
+            pair_sum = emb_a.mean(dim=(1, 2)) + emb_b.mean(dim=(1, 2))
+            probabilities = torch.where(
+                pair_sum <= 3.5,
+                torch.full_like(pair_sum, 0.7),
+                torch.full_like(pair_sum, 0.2),
+            )
+            return {"logits": torch.logit(probabilities)}
+
+        def forward_graph(self, **_: object) -> dict[str, torch.Tensor]:
+            return {}
+
+        def encode_graph_nodes(self, **_: object) -> torch.Tensor:
+            raise AssertionError("graph assembly should use the richer batched encoder")
+
+        def encode_proteins_batched(
+            self,
+            *,
+            protein_embeddings: Sequence[torch.Tensor],
+            device: torch.device,
+            batch_size: int,
+        ) -> dict[str, torch.Tensor]:
+            del batch_size
+            return {
+                "node": torch.stack(
+                    [embedding.to(device).mean(dim=0) for embedding in protein_embeddings],
+                    dim=0,
+                )
+            }
+
+        def retrieve_candidate_pairs(
+            self,
+            *,
+            encoded: Mapping[str, torch.Tensor],
+            top_k: int | None = None,
+        ) -> torch.Tensor:
+            del encoded
+            assert top_k == 1
+            return torch.tensor([[0], [1]], dtype=torch.long)
+
+        def edge_budget_from_node_embeddings(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_count: int,
+        ) -> torch.Tensor:
+            del node_embeddings, candidate_count
+            return torch.tensor(2.0)
+
+        def decode_graph_candidates(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_pairs: torch.Tensor,
+            encoded: Mapping[str, torch.Tensor] | None = None,
+        ) -> dict[str, torch.Tensor]:
+            del node_embeddings, encoded
+            decoded_pairs = {
+                (int(source), int(target)) for source, target in candidate_pairs.t().tolist()
+            }
+            assert decoded_pairs == {(0, 1)}
+            return {"edge_probabilities": torch.tensor([0.9], dtype=torch.float32)}
+
+    model = _RetrievalGatedEvaluateModel()
+    checkpoint_path = Path(str(cast(ConfigDict, config["run_config"])["load_checkpoint_path"]))
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), checkpoint_path)
+    dataloaders = build_dataloaders(config=config)
+
+    previous_cwd = Path.cwd()
+    try:
+        __import__("os").chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"evaluate": "graph_eval_retrieval_gated"},
+        )
+        run_evaluation_stage(
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
+        )
+    finally:
+        __import__("os").chdir(previous_cwd)
+
+    diagnostics_path = (
+        tmp_path
+        / "logs"
+        / "tccig"
+        / "evaluate"
+        / "graph_eval_retrieval_gated"
+        / "graph_assembly_diagnostics.json"
+    )
+    diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+    assert diagnostics["candidate_count"] == 3
+    assert diagnostics["retrieval_backend"] == "exact"
+    assert diagnostics["retrieval_top_k"] == 1
+    assert diagnostics["reranked_candidate_count"] == 1
+    assert diagnostics["background_zero_count"] == 2
 
 
 def test_tccig_pairwise_evaluate_uses_validation_calibrated_threshold(
@@ -483,6 +623,15 @@ def test_tccig_graph_assembly_evaluate_clamps_infinite_edge_budget(
             del node_embeddings, candidate_count
             return torch.tensor(float("inf"))
 
+        def retrieve_candidate_pairs(
+            self,
+            *,
+            encoded: Mapping[str, torch.Tensor],
+            top_k: int | None = None,
+        ) -> torch.Tensor:
+            del top_k
+            return _all_retrieval_pairs(encoded)
+
         def decode_graph_candidates(
             self,
             *,
@@ -559,6 +708,15 @@ def test_tccig_graph_assembly_scores_candidates_and_selects_top_budget(
             del node_embeddings, candidate_count
             return torch.tensor(2.0)
 
+        def retrieve_candidate_pairs(
+            self,
+            *,
+            encoded: Mapping[str, torch.Tensor],
+            top_k: int | None = None,
+        ) -> torch.Tensor:
+            del top_k
+            return _all_retrieval_pairs(encoded)
+
         def decode_graph_candidates(
             self,
             *,
@@ -590,6 +748,195 @@ def test_tccig_graph_assembly_scores_candidates_and_selects_top_budget(
     )
 
     assert predictions == [1, 0, 1]
+
+
+def test_tccig_topology_evaluate_reranks_only_retrieved_candidates(
+    tmp_path: Path,
+) -> None:
+    config = _build_topology_config(tmp_path)
+    cast(ConfigDict, config["model_config"])["model"] = "tccig"
+    processed_dir = Path(str(cast(ConfigDict, config["data_config"])["benchmark"]["processed_dir"]))
+    config["tccig_train"] = {
+        "supervision_train_dataset": str(processed_dir / "human_train_ppi.txt"),
+        "supervision_valid_dataset": str(processed_dir / "human_val_ppi.txt"),
+        "retrieval": {"top_k": 2},
+    }
+    cast(ConfigDict, config["topology_evaluate"])["tccig"] = {
+        "candidate_batch_size": 8,
+        "node_batch_size": 2,
+        "retrieval_top_k": 1,
+    }
+
+    class _RetrievalGatedGraphAssemblyModel(torch.nn.Module):
+        def forward_graph(self, **_: object) -> dict[str, torch.Tensor]:
+            return {}
+
+        def encode_graph_nodes(self, **_: object) -> torch.Tensor:
+            raise AssertionError("graph assembly should use the richer batched encoder")
+
+        def encode_proteins_batched(
+            self,
+            *,
+            protein_embeddings: Sequence[torch.Tensor],
+            device: torch.device,
+            batch_size: int,
+        ) -> dict[str, torch.Tensor]:
+            del batch_size
+            return {
+                "node": torch.stack(
+                    [embedding.to(device).mean(dim=0) for embedding in protein_embeddings],
+                    dim=0,
+                )
+            }
+
+        def retrieve_candidate_pairs(
+            self,
+            *,
+            encoded: Mapping[str, torch.Tensor],
+            top_k: int | None = None,
+        ) -> torch.Tensor:
+            del encoded
+            assert top_k == 1
+            return torch.tensor([[0], [1]], dtype=torch.long)
+
+        def edge_budget_from_node_embeddings(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_count: int,
+        ) -> torch.Tensor:
+            del node_embeddings
+            assert candidate_count == 3
+            return torch.tensor(2.0)
+
+        def decode_graph_candidates(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_pairs: torch.Tensor,
+            encoded: Mapping[str, torch.Tensor] | None = None,
+        ) -> dict[str, torch.Tensor]:
+            del node_embeddings, encoded
+            decoded_pairs = {
+                (int(source), int(target)) for source, target in candidate_pairs.t().tolist()
+            }
+            assert decoded_pairs == {(0, 1)}
+            return {"edge_probabilities": torch.tensor([0.9], dtype=torch.float32)}
+
+    model = _RetrievalGatedGraphAssemblyModel()
+    checkpoint_path = Path(str(cast(ConfigDict, config["run_config"])["load_checkpoint_path"]))
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), checkpoint_path)
+    dataloaders = build_dataloaders(config=config)
+
+    previous_cwd = Path.cwd()
+    try:
+        __import__("os").chdir(tmp_path)
+        runtime = build_stage_runtime(
+            config,
+            stage_run_ids={"topology_evaluate": "retrieval_gated_case"},
+        )
+        run_topology_evaluation_stage(
+            runtime,
+            model,
+            cast(dict[str, DataLoader[dict[str, object]]], dataloaders),
+            checkpoint_path=checkpoint_path,
+        )
+    finally:
+        __import__("os").chdir(previous_cwd)
+
+    log_dir = tmp_path / "logs" / "tccig" / "topology_evaluate" / "retrieval_gated_case"
+    prediction_lines = (log_dir / "all_test_ppi_pred.txt").read_text(encoding="utf-8").splitlines()
+    assert prediction_lines == ["P1\tP2\t1", "P1\tP3\t0", "P2\tP3\t0"]
+
+    diagnostics = json.loads(
+        (log_dir / "graph_assembly_diagnostics.json").read_text(encoding="utf-8")
+    )
+    assert diagnostics["candidate_count"] == 3
+    assert diagnostics["retrieval_backend"] == "exact"
+    assert diagnostics["retrieval_top_k"] == 1
+    assert diagnostics["retrieval_candidate_count"] == 1
+    assert diagnostics["reranked_candidate_count"] == 1
+    assert diagnostics["background_zero_count"] == 2
+
+
+def test_tccig_graph_assembly_retrieval_top_k_falls_back_to_train_config(
+    tmp_path: Path,
+) -> None:
+    config = _build_topology_config(tmp_path)
+    processed_dir = Path(str(cast(ConfigDict, config["data_config"])["benchmark"]["processed_dir"]))
+    config["tccig_train"] = {
+        "supervision_train_dataset": str(processed_dir / "human_train_ppi.txt"),
+        "supervision_valid_dataset": str(processed_dir / "human_val_ppi.txt"),
+        "retrieval": {"top_k": 1},
+    }
+    processed_dir = Path(str(config["data_config"]["benchmark"]["processed_dir"]))  # type: ignore[index]
+    bundle = topology_stage._build_topology_loader(
+        config=config,
+        split_path=processed_dir / "all_test_ppi.txt",
+    )
+
+    class _TrainFallbackRetrievalModel(torch.nn.Module):
+        retrieval_top_k = 3
+
+        def forward_graph(self, **_: object) -> dict[str, torch.Tensor]:
+            return {}
+
+        def encode_graph_nodes(
+            self,
+            *,
+            protein_embeddings: torch.Tensor,
+            protein_lengths: torch.Tensor,
+        ) -> torch.Tensor:
+            del protein_lengths
+            return protein_embeddings.mean(dim=1)
+
+        def retrieve_candidate_pairs(
+            self,
+            *,
+            encoded: Mapping[str, torch.Tensor],
+            top_k: int | None = None,
+        ) -> torch.Tensor:
+            del encoded
+            assert top_k == 1
+            return torch.tensor([[1], [2]], dtype=torch.long)
+
+        def edge_budget_from_node_embeddings(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_count: int,
+        ) -> torch.Tensor:
+            del node_embeddings, candidate_count
+            return torch.tensor(2.0)
+
+        def decode_graph_candidates(
+            self,
+            *,
+            node_embeddings: torch.Tensor,
+            candidate_pairs: torch.Tensor,
+        ) -> dict[str, torch.Tensor]:
+            del node_embeddings
+            decoded_pairs = {
+                (int(source), int(target)) for source, target in candidate_pairs.t().tolist()
+            }
+            assert decoded_pairs == {(1, 2)}
+            return {"edge_probabilities": torch.tensor([0.8], dtype=torch.float32)}
+
+    result = topology_stage._predict_tccig_graph_assembly_result(
+        config=config,
+        model=_TrainFallbackRetrievalModel(),
+        dataset=bundle.dataset,
+        records=bundle.records,
+        device=torch.device("cpu"),
+        accelerator=build_stage_runtime(config).accelerator,
+    )
+
+    assert result.predictions == [0, 0, 1]
+    assert result.retrieval_top_k == 1
+    assert result.retrieval_candidate_count == 1
+    assert result.reranked_candidate_count == 1
+    assert result.background_zero_count == 2
 
 
 def test_tccig_graph_assembly_uses_batched_protein_encoder(tmp_path: Path) -> None:
@@ -640,6 +987,15 @@ def test_tccig_graph_assembly_uses_batched_protein_encoder(tmp_path: Path) -> No
         ) -> torch.Tensor:
             del node_embeddings, candidate_count
             return torch.tensor(2.0)
+
+        def retrieve_candidate_pairs(
+            self,
+            *,
+            encoded: Mapping[str, torch.Tensor],
+            top_k: int | None = None,
+        ) -> torch.Tensor:
+            del top_k
+            return _all_retrieval_pairs(encoded)
 
         def decode_graph_candidates(
             self,
@@ -707,6 +1063,15 @@ def test_tccig_topology_evaluate_writes_graph_assembly_diagnostics(tmp_path: Pat
         ) -> torch.Tensor:
             del node_embeddings, candidate_count
             return torch.tensor(2.0)
+
+        def retrieve_candidate_pairs(
+            self,
+            *,
+            encoded: Mapping[str, torch.Tensor],
+            top_k: int | None = None,
+        ) -> torch.Tensor:
+            del top_k
+            return _all_retrieval_pairs(encoded)
 
         def decode_graph_candidates(
             self,
@@ -817,6 +1182,15 @@ def test_tccig_graph_forward_topology_metrics_skip_non_main_distributed_rank(
             del node_embeddings, candidate_count
             return torch.tensor(2.0)
 
+        def retrieve_candidate_pairs(
+            self,
+            *,
+            encoded: Mapping[str, torch.Tensor],
+            top_k: int | None = None,
+        ) -> torch.Tensor:
+            del top_k
+            return _all_retrieval_pairs(encoded)
+
         def decode_graph_candidates(
             self,
             *,
@@ -892,6 +1266,15 @@ def test_tccig_graph_assembly_preserves_self_edge_records_as_negatives(
             del node_embeddings
             assert candidate_count == 2
             return torch.tensor(1.0)
+
+        def retrieve_candidate_pairs(
+            self,
+            *,
+            encoded: Mapping[str, torch.Tensor],
+            top_k: int | None = None,
+        ) -> torch.Tensor:
+            del top_k
+            return _all_retrieval_pairs(encoded)
 
         def decode_graph_candidates(
             self,
