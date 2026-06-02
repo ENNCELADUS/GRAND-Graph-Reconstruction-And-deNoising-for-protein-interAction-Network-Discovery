@@ -113,6 +113,37 @@ def test_tccig_decode_graph_candidates_accepts_encoded_retrieval_state() -> None
     )
 
 
+def test_tccig_reranker_pair_head_starts_as_neutral_residual() -> None:
+    torch.manual_seed(54)
+    config = _tccig_config() | {
+        "decoder_mode": "rerank",
+        "decoder_structural_gate_init": 0.0,
+        "retrieval": {
+            "dim": 8,
+            "rff_features": 16,
+            "rff_input_dim": 16,
+            "rff_backend": "sorf",
+            "rff_sigma": 0.5,
+            "top_k": 2,
+            "logit_gate_init": 1.0,
+        },
+    }
+    model = TCCIG(**config)
+    embeddings = torch.randn(4, 5, 8)
+    encoded = model.encode_proteins(protein_embeddings=embeddings)
+    candidate_pairs = torch.tensor([[0, 1], [2, 3]], dtype=torch.long)
+
+    output = model.decode_graph_candidates(
+        node_embeddings=encoded["node"],
+        candidate_pairs=candidate_pairs,
+        encoded=encoded,
+    )
+
+    expected_logits = output["retrieval_score"] + output["density_bias"]
+    assert torch.allclose(output["pair_score"], torch.zeros_like(output["pair_score"]))
+    assert torch.allclose(output["logits"], expected_logits)
+
+
 def test_tccig_encode_graph_nodes_does_not_compute_residue_retrieval_factor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

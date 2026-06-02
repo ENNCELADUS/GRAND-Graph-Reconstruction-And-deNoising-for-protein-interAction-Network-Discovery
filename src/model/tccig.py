@@ -243,6 +243,11 @@ class TCCIG(nn.Module):
             output_dim=1,
             dropout=self.dropout,
         )
+        pair_mlp_output = _last_linear(self.pair_mlp)
+        if pair_mlp_output is not None:
+            nn.init.zeros_(pair_mlp_output.weight)
+            if pair_mlp_output.bias is not None:
+                nn.init.zeros_(pair_mlp_output.bias)
         self.hub_head: nn.Linear = nn.Linear(self.d_model, 1)
         self.lowrank_head: nn.Linear = nn.Linear(self.d_model, self.lowrank_dim)
         self.module_head: nn.Linear = nn.Linear(self.d_model, self.num_modules)
