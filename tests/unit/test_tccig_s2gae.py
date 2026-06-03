@@ -13,6 +13,7 @@ from tccig.s2gae import (
     CrossLayerDecoder,
     S2GAERefiner,
     _parse_config,
+    apply_gradient_clipping,
     load_mean_pooled_node_features,
     residual_refined_logits,
     s2gae_loss_terms,
@@ -77,10 +78,26 @@ def test_refiner_preserves_pairwise_probability_when_delta_is_zero() -> None:
     assert torch.sigmoid(refined_logits).item() == pytest.approx(0.7)
 
 
+def _base_refiner_config(tmp_path: Path) -> dict[str, object]:
+    return {
+        "embedding_cache_dir": str(tmp_path / "cache"),
+        "optimizer": {
+            "type": "adamw",
+            "lr": 0.001,
+            "weight_decay": 0.01,
+            "beta1": 0.8,
+            "beta2": 0.9,
+            "eps": 1.0e-7,
+        },
+        "scheduler": {"type": "none"},
+        "optimization": {"gradient_clip_norm": 1.0},
+    }
+
+
 def test_parse_config_reads_nested_loss_config(tmp_path: Path) -> None:
-    cfg = _parse_config(
+    config = _base_refiner_config(tmp_path)
+    config.update(
         {
-            "embedding_cache_dir": str(tmp_path / "cache"),
             "loss": {
                 "type": "bce_with_logits",
                 "pos_weight": 3.0,
@@ -90,12 +107,94 @@ def test_parse_config_reads_nested_loss_config(tmp_path: Path) -> None:
         }
     )
 
+    cfg = _parse_config(config)
+
+    assert cfg.optimizer.optimizer_type == "adamw"
+    assert cfg.optimizer.lr == pytest.approx(0.001)
+    assert cfg.optimizer.weight_decay == pytest.approx(0.01)
+    assert cfg.optimizer.beta1 == pytest.approx(0.8)
+    assert cfg.optimizer.beta2 == pytest.approx(0.9)
+    assert cfg.optimizer.eps == pytest.approx(1.0e-7)
+    assert cfg.scheduler.scheduler_type == "none"
+    assert cfg.optimization.gradient_clip_norm == pytest.approx(1.0)
     assert cfg.loss_config == LossConfig(
         loss_type="bce_with_logits",
         pos_weight=3.0,
         label_smoothing=0.1,
     )
     assert cfg.residual_weight == pytest.approx(0.25)
+
+
+def test_parse_config_rejects_removed_learning_rate(tmp_path: Path) -> None:
+    config = _base_refiner_config(tmp_path)
+    config["learning_rate"] = 0.001
+
+    with pytest.raises(ValueError, match="refiner.learning_rate is no longer supported"):
+        _parse_config(config)
+
+
+def test_parse_config_rejects_unsupported_optimizer(tmp_path: Path) -> None:
+    config = _base_refiner_config(tmp_path)
+    optimizer = dict(config["optimizer"])
+    optimizer["type"] = "adam"
+    config["optimizer"] = optimizer
+
+    with pytest.raises(ValueError, match="refiner.optimizer.type must be 'adamw'"):
+        _parse_config(config)
+
+
+def test_parse_config_rejects_unsupported_scheduler(tmp_path: Path) -> None:
+    config = _base_refiner_config(tmp_path)
+    config["scheduler"] = {"type": "onecycle"}
+
+    with pytest.raises(ValueError, match="refiner.scheduler.type must be 'none'"):
+        _parse_config(config)
+
+
+def test_parse_config_allows_disabled_gradient_clipping(tmp_path: Path) -> None:
+    cfg = _parse_config(
+        {
+            **_base_refiner_config(tmp_path),
+            "optimization": {"gradient_clip_norm": 0.0},
+        }
+    )
+
+    assert cfg.optimization.gradient_clip_norm is None
+
+
+def test_apply_gradient_clipping_returns_observed_norm_when_disabled() -> None:
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.tensor([[3.0, 4.0]], dtype=torch.float32)
+
+    observed_norm = apply_gradient_clipping(model=model, gradient_clip_norm=None)
+
+    assert observed_norm == pytest.approx(5.0)
+    assert model.weight.grad.tolist() == [[3.0, 4.0]]
+
+
+def test_apply_gradient_clipping_clips_to_configured_norm() -> None:
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.tensor([[3.0, 4.0]], dtype=torch.float32)
+
+    observed_norm = apply_gradient_clipping(model=model, gradient_clip_norm=1.0)
+
+    assert observed_norm == pytest.approx(5.0)
+    assert model.weight.grad.norm().item() == pytest.approx(1.0)
+
+
+def test_parse_config_requires_optimizer_block(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="refiner.optimizer must be a mapping"):
+        _parse_config(
+            {
+                "embedding_cache_dir": str(tmp_path / "cache"),
+                "loss": {
+                    "type": "bce_with_logits",
+                    "pos_weight": 3.0,
+                    "label_smoothing": 0.1,
+                },
+                "residual_weight": 0.25,
+            }
+        )
 
 
 def test_s2gae_loss_terms_use_weighted_bce_and_all_pair_residual_anchor() -> None:

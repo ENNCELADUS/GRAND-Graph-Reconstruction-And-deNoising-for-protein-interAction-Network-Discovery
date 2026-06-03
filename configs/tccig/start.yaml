@@ -30,12 +30,22 @@ refiner:
   decoder_layers: 2
   dropout: 0.5
   epochs: 20
-  learning_rate: 0.001
   batch_size: 4096
   loss:
     type: bce_with_logits
     pos_weight: 1.0
     label_smoothing: 0.0
+  optimizer:
+    type: adamw
+    lr: 0.001
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+  scheduler:
+    type: none
+  optimization:
+    gradient_clip_norm: 1.0
   residual_weight: 0.001
   embedding_cache_dir: data/embeddings/esm3_1024
   embedding_index_path: data/embeddings/esm3_1024/index.json

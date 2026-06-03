@@ -207,12 +207,16 @@ L_distill = BCE(p_ij_refined, stopgrad(s_ij_pairwise))
 
 ### Stage 4 — Backward / optimization
 
-第一版保持最稳：
+第一版保持最稳，已经按 standalone `tccig.s2gae:train_refiner`
+实现为 refiner-only optimization：
 
 ```text
 freeze Cφ
 train θ only
 ```
+
+`Cφ` 是 pairwise scorer hook，只在进入 refiner 前生成 pairwise probabilities
+和 `G_pairwise`。它不进入 autograd graph，也不会被 optimizer 持有。
 
 每个 batch：
 
@@ -221,11 +225,31 @@ train θ only
 2. forward S2GAE-style encoder on G_pairwise
 3. decode Ω_batch candidate pairs with cross-correlation decoder
 4. compute BCE + residual anchor losses
-5. backward on θ
-6. update θ
+5. accelerator.backward(loss) on θ
+6. optionally clip θ gradients
+7. AdamW update on θ
 ```
 
-不要 end-to-end 更新 pairwise classifier；否则 refinement gain 很难解释。只有在 denoiser 稳定提升后，才做 optional joint fine-tune，而且要用 very small LR，并保留 frozen-pairwise baseline。
+当前 config 明确使用 fixed-LR AdamW，不启用 scheduler：
+
+```yaml
+refiner:
+  optimizer:
+    type: adamw
+    lr: 0.001
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+  scheduler:
+    type: none
+  optimization:
+    gradient_clip_norm: 1.0
+```
+
+不要 end-to-end 更新 pairwise classifier；否则 refinement gain 很难解释。只有在
+denoiser 稳定提升后，才做 optional joint fine-tune，而且要用 very small LR，
+并保留 frozen-pairwise baseline。
 
 ---
 

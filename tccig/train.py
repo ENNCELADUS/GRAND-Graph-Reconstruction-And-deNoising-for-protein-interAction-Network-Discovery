@@ -38,6 +38,14 @@ class AcceleratorLike(Protocol):
 
     device: object
 
+    def prepare(self, *args: object) -> object:
+        """Prepare trainable objects for the configured runtime."""
+        ...
+
+    def backward(self, loss: torch.Tensor) -> None:
+        """Backpropagate a loss tensor through the configured runtime."""
+        ...
+
 
 class PairwiseScorer(Protocol):
     """Callable pairwise scorer hook."""

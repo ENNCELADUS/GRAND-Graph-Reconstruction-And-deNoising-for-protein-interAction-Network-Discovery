@@ -73,6 +73,17 @@ refiner:
   predict_target: tccig.s2gae:predict_refined
   embedding_cache_dir: data/embeddings/esm3_1024
   embedding_index_path: data/embeddings/esm3_1024/index.json
+  optimizer:
+    type: adamw
+    lr: 0.001
+    weight_decay: 0.0
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-8
+  scheduler:
+    type: none
+  optimization:
+    gradient_clip_norm: 1.0
 
 graph_selection:
   rules:
@@ -103,6 +114,11 @@ construction. Dropped counts are persisted in the run manifest.
 The pairwise scorer hook receives label-free candidate pairs only. The refiner
 training/prediction hooks receive pairwise-generated graph inputs and may see
 train/validation targets only where the PRING contract allows them.
+
+The concrete S2GAE refiner trains only refiner parameters with fixed-LR AdamW.
+It prepares the refiner model and optimizer through the configured accelerator,
+then routes backward through `accelerator.backward`. The pairwise scorer remains
+a frozen scoring boundary and is never updated by the refiner training loop.
 
 If refiner hooks are omitted, the scaffold raises `NotImplementedError`; this is
 intentional until concrete model and training code are added.

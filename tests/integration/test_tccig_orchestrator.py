@@ -321,6 +321,26 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
     _write_tiny_pring_fixture(processed_dir)
     _, _, cache_dir = _write_tiny_v3_1_pairwise_assets(tmp_path)
     HOOK_EVENTS.clear()
+    accelerator_events: list[tuple[str, int]] = []
+
+    class FakeAccelerator:
+        device = "cpu"
+
+        def prepare(self, *args: object) -> tuple[object, ...]:
+            accelerator_events.append(("prepare", len(args)))
+            return args
+
+        def backward(self, loss: torch.Tensor) -> None:
+            accelerator_events.append(("backward", 1))
+            loss.backward()
+
+        def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
+            accelerator_events.append(("unwrap_model", 1))
+            return model
+
+    def fake_build_accelerator(**kwargs: object) -> FakeAccelerator:
+        del kwargs
+        return FakeAccelerator()
 
     result = run_tccig_pipeline(
         {
@@ -339,13 +359,22 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
                 "decoder_layers": 1,
                 "dropout": 0.0,
                 "epochs": 2,
-                "learning_rate": 0.01,
                 "batch_size": 2,
                 "loss": {
                     "type": "bce_with_logits",
                     "pos_weight": 1.5,
                     "label_smoothing": 0.1,
                 },
+                "optimizer": {
+                    "type": "adamw",
+                    "lr": 0.01,
+                    "weight_decay": 0.0,
+                    "beta1": 0.9,
+                    "beta2": 0.999,
+                    "eps": 1.0e-8,
+                },
+                "scheduler": {"type": "none"},
+                "optimization": {"gradient_clip_norm": 1.0},
                 "residual_weight": 0.001,
                 "embedding_cache_dir": str(cache_dir),
                 "embedding_index_path": str(cache_dir / "index.json"),
@@ -358,9 +387,12 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
                     {"type": "top_m", "m": 1},
                 ]
             },
-        }
+        },
+        build_accelerator_fn=fake_build_accelerator,
     )
 
+    assert ("prepare", 2) in accelerator_events
+    assert ("backward", 1) in accelerator_events
     assert result.selected_rule["type"] in {"threshold", "top_m"}
     assert result.manifest["pair_counts"]["topology_test"] == 2
     assert (tmp_path / "models" / "s2gae" / "best_model.pt").exists()
@@ -375,7 +407,20 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
     assert "train_bce_loss" in first_epoch
     assert "train_residual_anchor_loss" in first_epoch
     assert "train_weighted_residual_anchor_loss" in first_epoch
+    assert "train_gradient_norm" in first_epoch
+    assert first_epoch["learning_rate"] == 0.01
     assert "val_auprc" in first_epoch
+    assert training_summary["optimizer"] == {
+        "type": "adamw",
+        "lr": 0.01,
+        "weight_decay": 0.0,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "eps": 1.0e-8,
+    }
+    assert training_summary["scheduler"] == {"type": "none"}
+    assert training_summary["optimization"] == {"gradient_clip_norm": 1.0}
+    assert training_summary["current_learning_rate"] == 0.01
 
     checkpoint = torch.load(tmp_path / "models" / "s2gae" / "best_model.pt")
     assert checkpoint["config"]["loss"] == {
@@ -383,3 +428,14 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
         "pos_weight": 1.5,
         "label_smoothing": 0.1,
     }
+    assert checkpoint["config"]["optimizer"] == {
+        "type": "adamw",
+        "lr": 0.01,
+        "weight_decay": 0.0,
+        "beta1": 0.9,
+        "beta2": 0.999,
+        "eps": 1.0e-8,
+    }
+    assert checkpoint["config"]["scheduler"] == {"type": "none"}
+    assert checkpoint["config"]["optimization"] == {"gradient_clip_norm": 1.0}
+    assert "learning_rate" not in checkpoint["config"]

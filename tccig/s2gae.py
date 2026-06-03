@@ -16,6 +16,7 @@ from src.embed import load_cached_embedding
 from src.train.config import LossConfig
 from src.utils.losses import binary_classification_loss
 from torch import nn
+from torch.optim import Optimizer
 
 from tccig.io import CandidatePair, canonical_edge, write_json
 
@@ -35,10 +36,12 @@ class S2GAEConfig:
     decoder_layers: int
     dropout: float
     epochs: int
-    learning_rate: float
     batch_size: int
     loss_config: LossConfig
     residual_weight: float
+    optimizer: S2GAEOptimizerConfig
+    scheduler: S2GAESchedulerConfig
+    optimization: S2GAEOptimizationConfig
     embedding_cache_dir: Path
     embedding_index_path: Path
     max_sequence_length: int | None
@@ -54,6 +57,32 @@ class S2GAERefinerState:
     config: S2GAEConfig
     best_validation_auprc: float
     epochs_trained: int
+
+
+@dataclass(frozen=True)
+class S2GAEOptimizerConfig:
+    """Optimizer hyperparameters for the S2GAE refiner."""
+
+    optimizer_type: str
+    lr: float
+    weight_decay: float
+    beta1: float
+    beta2: float
+    eps: float
+
+
+@dataclass(frozen=True)
+class S2GAESchedulerConfig:
+    """Scheduler configuration for the S2GAE refiner."""
+
+    scheduler_type: str
+
+
+@dataclass(frozen=True)
+class S2GAEOptimizationConfig:
+    """Backward and optimization-loop controls."""
+
+    gradient_clip_norm: float | None
 
 
 @dataclass(frozen=True)
@@ -218,6 +247,38 @@ def s2gae_loss_terms(
     )
 
 
+def build_s2gae_optimizer(
+    *,
+    model: nn.Module,
+    config: S2GAEOptimizerConfig,
+) -> Optimizer:
+    """Build the configured optimizer over refiner parameters only."""
+    if config.optimizer_type != "adamw":
+        raise ValueError("refiner.optimizer.type must be 'adamw'")
+    return torch.optim.AdamW(
+        model.parameters(),
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+        betas=(config.beta1, config.beta2),
+        eps=config.eps,
+    )
+
+
+def apply_gradient_clipping(
+    *,
+    model: nn.Module,
+    gradient_clip_norm: float | None,
+) -> float:
+    """Clip gradients when configured and return the observed norm."""
+    parameters = [parameter for parameter in model.parameters() if parameter.grad is not None]
+    if not parameters:
+        return 0.0
+    if gradient_clip_norm is None:
+        return _gradient_norm(parameters)
+    total_norm = torch.nn.utils.clip_grad_norm_(parameters, gradient_clip_norm)
+    return float(total_norm.detach().cpu().item())
+
+
 def load_mean_pooled_node_features(
     *,
     protein_ids: Sequence[str],
@@ -255,7 +316,9 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         decoder_layers=cfg.decoder_layers,
         dropout=cfg.dropout,
     ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
+    optimizer = build_s2gae_optimizer(model=model, config=cfg.optimizer)
+    prepared = request.runtime.accelerator.prepare(model, optimizer)
+    model, optimizer = _prepared_model_and_optimizer(prepared)
 
     train_graph = _build_split_graph(request.train, cfg=cfg, device=device)
     validation_graph = _build_split_graph(request.validation, cfg=cfg, device=device)
@@ -279,9 +342,10 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         total_bce_loss = 0.0
         total_residual_anchor_loss = 0.0
         total_weighted_residual_anchor_loss = 0.0
+        total_gradient_norm = 0.0
         total_examples = 0
         for batch_indices in _batch_indices(len(request.train.pairs), cfg.batch_size, device):
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             refined_logits, delta = model(
                 node_features=train_graph.node_features,
                 edge_index=train_graph.edge_index,
@@ -296,8 +360,11 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 loss_config=cfg.loss_config,
                 residual_weight=cfg.residual_weight,
             )
-            loss_terms.total.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            request.runtime.accelerator.backward(loss_terms.total)
+            gradient_norm = apply_gradient_clipping(
+                model=model,
+                gradient_clip_norm=cfg.optimization.gradient_clip_norm,
+            )
             optimizer.step()
             batch_count = int(batch_indices.numel())
             total_loss += float(loss_terms.total.detach().item()) * batch_count
@@ -308,6 +375,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             total_weighted_residual_anchor_loss += (
                 float(loss_terms.weighted_residual_anchor.detach().item()) * batch_count
             )
+            total_gradient_norm += gradient_norm * batch_count
             total_examples += batch_count
 
         validation_auprc = _validation_auprc(
@@ -326,19 +394,23 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 "train_weighted_residual_anchor_loss": (
                     total_weighted_residual_anchor_loss / epoch_denominator
                 ),
+                "train_gradient_norm": total_gradient_norm / epoch_denominator,
+                "learning_rate": _current_learning_rate(optimizer),
                 "val_auprc": validation_auprc,
             }
         )
         if validation_auprc > best_validation_auprc:
             best_validation_auprc = validation_auprc
+            checkpoint_model = _unwrap_model(model, request.runtime.accelerator)
             best_state_dict = {
                 name: tensor.detach().cpu().clone()
-                for name, tensor in model.state_dict().items()
+                for name, tensor in checkpoint_model.state_dict().items()
             }
 
     if best_state_dict is None:
         raise RuntimeError("S2GAE training did not produce a checkpoint")
-    model.load_state_dict(best_state_dict)
+    checkpoint_model = _unwrap_model(model, request.runtime.accelerator)
+    checkpoint_model.load_state_dict(best_state_dict)
     cfg.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -355,11 +427,15 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             "best_validation_auprc": best_validation_auprc,
             "epochs_trained": cfg.epochs,
             "checkpoint_path": str(cfg.checkpoint_path),
+            "optimizer": _optimizer_config_to_json(cfg.optimizer),
+            "scheduler": {"type": cfg.scheduler.scheduler_type},
+            "optimization": _optimization_config_to_json(cfg.optimization),
+            "current_learning_rate": _current_learning_rate(optimizer),
             "history": history,
         },
     )
     return S2GAERefinerState(
-        model=model,
+        model=cast(S2GAERefiner, checkpoint_model),
         config=cfg,
         best_validation_auprc=best_validation_auprc,
         epochs_trained=cfg.epochs,
@@ -566,7 +642,29 @@ def _required_float_tensor(
     return torch.tensor([float(value) for value in values], dtype=torch.float32, device=device)
 
 
+def _prepared_model_and_optimizer(prepared: object) -> tuple[nn.Module, Optimizer]:
+    if not isinstance(prepared, tuple) or len(prepared) != 2:
+        raise TypeError("accelerator.prepare(model, optimizer) must return a two-item tuple")
+    model, optimizer = prepared
+    if not isinstance(model, nn.Module):
+        raise TypeError("accelerator.prepare returned a non-module model")
+    if not all(hasattr(optimizer, name) for name in ("zero_grad", "step", "param_groups")):
+        raise TypeError("accelerator.prepare returned a non-optimizer optimizer")
+    return model, cast(Optimizer, optimizer)
+
+
+def _unwrap_model(model: nn.Module, accelerator: object) -> nn.Module:
+    unwrap_model = getattr(accelerator, "unwrap_model", None)
+    if callable(unwrap_model):
+        unwrapped = unwrap_model(model)
+        if isinstance(unwrapped, nn.Module):
+            return unwrapped
+    return model
+
+
 def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
+    if "learning_rate" in config:
+        raise ValueError("refiner.learning_rate is no longer supported; use refiner.optimizer.lr")
     run_id = str(config.get("_run_id", "tccig_run"))
     log_root = Path(str(config.get("_log_root", "logs")))
     log_dir = _path(config.get("log_dir"), log_root / "tccig" / "refiner" / run_id)
@@ -600,16 +698,15 @@ def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
         ),
         dropout=_probability(config.get("dropout", 0.5), "refiner.dropout"),
         epochs=_positive_int(config.get("epochs", 20), "refiner.epochs"),
-        learning_rate=_positive_float(
-            config.get("learning_rate", 0.001),
-            "refiner.learning_rate",
-        ),
         batch_size=_positive_int(config.get("batch_size", 4096), "refiner.batch_size"),
         loss_config=_parse_loss_config(config.get("loss", {})),
         residual_weight=_non_negative_float(
             config.get("residual_weight", 0.001),
             "refiner.residual_weight",
         ),
+        optimizer=_parse_optimizer_config(config.get("optimizer")),
+        scheduler=_parse_scheduler_config(config.get("scheduler")),
+        optimization=_parse_optimization_config(config.get("optimization")),
         embedding_cache_dir=embedding_cache_dir,
         embedding_index_path=embedding_index_path,
         max_sequence_length=max_sequence_length,
@@ -628,7 +725,6 @@ def _config_to_json(cfg: S2GAEConfig) -> dict[str, object]:
         "decoder_layers": cfg.decoder_layers,
         "dropout": cfg.dropout,
         "epochs": cfg.epochs,
-        "learning_rate": cfg.learning_rate,
         "batch_size": cfg.batch_size,
         "loss": {
             "type": cfg.loss_config.loss_type,
@@ -636,6 +732,9 @@ def _config_to_json(cfg: S2GAEConfig) -> dict[str, object]:
             "label_smoothing": cfg.loss_config.label_smoothing,
         },
         "residual_weight": cfg.residual_weight,
+        "optimizer": _optimizer_config_to_json(cfg.optimizer),
+        "scheduler": {"type": cfg.scheduler.scheduler_type},
+        "optimization": _optimization_config_to_json(cfg.optimization),
         "embedding_cache_dir": str(cfg.embedding_cache_dir),
         "embedding_index_path": str(cfg.embedding_index_path),
         "max_sequence_length": cfg.max_sequence_length,
@@ -709,6 +808,66 @@ def _parse_loss_config(raw_loss: object) -> LossConfig:
     )
 
 
+def _parse_optimizer_config(raw_optimizer: object) -> S2GAEOptimizerConfig:
+    if not isinstance(raw_optimizer, Mapping):
+        raise ValueError("refiner.optimizer must be a mapping")
+    optimizer_type = str(raw_optimizer.get("type", "")).lower()
+    if optimizer_type != "adamw":
+        raise ValueError("refiner.optimizer.type must be 'adamw'")
+    return S2GAEOptimizerConfig(
+        optimizer_type=optimizer_type,
+        lr=_positive_float(raw_optimizer.get("lr"), "refiner.optimizer.lr"),
+        weight_decay=_non_negative_float(
+            raw_optimizer.get("weight_decay", 0.0),
+            "refiner.optimizer.weight_decay",
+        ),
+        beta1=_exclusive_probability(
+            raw_optimizer.get("beta1", 0.9),
+            "refiner.optimizer.beta1",
+        ),
+        beta2=_exclusive_probability(
+            raw_optimizer.get("beta2", 0.999),
+            "refiner.optimizer.beta2",
+        ),
+        eps=_positive_float(raw_optimizer.get("eps", 1e-8), "refiner.optimizer.eps"),
+    )
+
+
+def _parse_scheduler_config(raw_scheduler: object) -> S2GAESchedulerConfig:
+    if not isinstance(raw_scheduler, Mapping):
+        raise ValueError("refiner.scheduler must be a mapping")
+    scheduler_type = str(raw_scheduler.get("type", "")).lower()
+    if scheduler_type != "none":
+        raise ValueError("refiner.scheduler.type must be 'none'")
+    return S2GAESchedulerConfig(scheduler_type=scheduler_type)
+
+
+def _parse_optimization_config(raw_optimization: object) -> S2GAEOptimizationConfig:
+    if not isinstance(raw_optimization, Mapping):
+        raise ValueError("refiner.optimization must be a mapping")
+    return S2GAEOptimizationConfig(
+        gradient_clip_norm=_optional_positive_float(
+            raw_optimization.get("gradient_clip_norm", 1.0),
+            "refiner.optimization.gradient_clip_norm",
+        )
+    )
+
+
+def _optimizer_config_to_json(config: S2GAEOptimizerConfig) -> dict[str, object]:
+    return {
+        "type": config.optimizer_type,
+        "lr": config.lr,
+        "weight_decay": config.weight_decay,
+        "beta1": config.beta1,
+        "beta2": config.beta2,
+        "eps": config.eps,
+    }
+
+
+def _optimization_config_to_json(config: S2GAEOptimizationConfig) -> dict[str, object]:
+    return {"gradient_clip_norm": config.gradient_clip_norm}
+
+
 def _positive_int(value: object, field_name: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{field_name} must be a positive integer")
@@ -731,6 +890,13 @@ def _positive_float(value: object, field_name: str) -> float:
     return parsed
 
 
+def _optional_positive_float(value: object, field_name: str) -> float | None:
+    if value is None:
+        return None
+    parsed = _non_negative_float(value, field_name)
+    return None if parsed == 0.0 else parsed
+
+
 def _non_negative_float(value: object, field_name: str) -> float:
     try:
         parsed = float(cast(float | str, value))
@@ -746,3 +912,20 @@ def _probability(value: object, field_name: str) -> float:
     if parsed >= 1.0:
         raise ValueError(f"{field_name} must be in [0, 1)")
     return parsed
+
+
+def _exclusive_probability(value: object, field_name: str) -> float:
+    parsed = _positive_float(value, field_name)
+    if parsed >= 1.0:
+        raise ValueError(f"{field_name} must be in (0, 1)")
+    return parsed
+
+
+def _gradient_norm(parameters: Sequence[torch.nn.Parameter]) -> float:
+    device = parameters[0].grad.device
+    norms = [parameter.grad.detach().norm(2).to(device) for parameter in parameters]
+    return float(torch.norm(torch.stack(norms), 2).detach().cpu().item())
+
+
+def _current_learning_rate(optimizer: Optimizer) -> float:
+    return float(optimizer.param_groups[0]["lr"])
