@@ -11,10 +11,11 @@ import pickle
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 import networkx as nx
 import torch
+import torch.distributed as _dist
 import yaml  # type: ignore[import-untyped]
 from sklearn.metrics import (
     accuracy_score,
@@ -39,6 +40,20 @@ from torch.nn.utils.rnn import pad_sequence
 
 from tccig.io import CandidatePair, PairTable, canonical_edge, read_pair_table, write_json
 from tccig.rules import GraphRule, edges_from_rule, parse_rules, select_rule
+
+TOPOLOGY_METRIC_NAMES = [
+    "graph_sim",
+    "relative_density",
+    "deg_dist_mmd",
+    "cc_mmd",
+    "laplacian_eigen_mmd",
+]
+TOPOLOGY_CSV_COLUMNS = [
+    "scope",
+    "node_size",
+    "graph_count",
+    *TOPOLOGY_METRIC_NAMES,
+]
 
 
 class AcceleratorLike(Protocol):
@@ -84,6 +99,11 @@ class TCCIGRuntime:
     backend: str
     mixed_precision: bool
     accelerator: AcceleratorLike
+    is_distributed: bool = False
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+    is_main_process: bool = True
 
 
 @dataclass(frozen=True)
@@ -463,6 +483,7 @@ def run_tccig_pipeline(
         predict_refined=cast(PredictRefined, predict_refined),
         refiner_state=refiner_state,
         selected_rule=selected_rule,
+        pairwise_graph_rule=pairwise_graph_rule,
         runtime=runtime,
         refiner_cfg=refiner_cfg,
         output_dir=log_root / "tccig" / "topology_test" / run_id,
@@ -538,23 +559,24 @@ def _score_pairs(
     scorer_cfg: Mapping[str, object],
     pairwise_graph_rule: GraphRule,
 ) -> SplitBundle:
+    candidate_pairs = list(pairs)
     raw_scores = scorer(
         PairwiseScoreRequest(
             split=split,
-            pairs=pairs,
+            pairs=candidate_pairs,
             runtime=runtime,
             config=scorer_cfg,
         )
     )
     probabilities = _normalize_probabilities(raw_scores)
     graph_edges = edges_from_rule(
-        pairs=pairs,
+        pairs=candidate_pairs,
         probabilities=probabilities,
         rule=pairwise_graph_rule,
     )
     return SplitBundle(
         split=split,
-        pairs=list(pairs),
+        pairs=candidate_pairs,
         pairwise_probabilities=probabilities,
         pairwise_graph_edges=graph_edges,
     )
@@ -760,6 +782,7 @@ def _run_topology_test(
     predict_refined: PredictRefined,
     refiner_state: object,
     selected_rule: GraphRule,
+    pairwise_graph_rule: GraphRule,
     runtime: TCCIGRuntime,
     refiner_cfg: Mapping[str, object],
     output_dir: Path,
@@ -779,27 +802,182 @@ def _run_topology_test(
             rule=selected_rule,
         )
     )
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "all_test_ppi_pred.txt").open("w", encoding="utf-8") as handle:
-        for pair in bundle.pairs:
-            edge = tuple(sorted((pair.protein_a, pair.protein_b)))
-            handle.write(f"{pair.protein_a}\t{pair.protein_b}\t{int(edge in selected_edges)}\n")
-
     data_cfg = _mapping_section(config, "data")
     processed_dir = Path(str(data_cfg["processed_dir"]))
     with (processed_dir / "human_test_graph.pkl").open("rb") as handle:
         gt_graph = cast(nx.Graph, pickle.load(handle))
     with (processed_dir / "test_sampled_nodes.pkl").open("rb") as handle:
         test_sampled_nodes = cast(dict[int, list[list[str]]], pickle.load(handle))
-    topology_result = _evaluate_predicted_graph(
+    topology_result = _evaluate_predicted_graph_sharded(
         pred_graph=_reconstruct_graph(selected_edges),
         gt_graph=gt_graph,
         test_graph_nodes=test_sampled_nodes,
+        runtime=runtime,
     )
     raw_summary = cast(Mapping[str, object], topology_result["summary"])
     summary = {name: _object_to_float(value) for name, value in raw_summary.items()}
-    write_json(output_dir / "topology_metrics.json", {"summary": summary})
+    if runtime.is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _write_topology_predictions(
+            output_path=output_dir / "all_test_ppi_pred.txt",
+            pairs=bundle.pairs,
+            selected_edges=selected_edges,
+        )
+        write_json(
+            output_dir / "topology_metrics.json",
+            {
+                "summary": summary,
+                "per_node_size": topology_result["per_node_size"],
+                "details": topology_result["details"],
+                "selected_rule": selected_rule.to_dict(),
+                "pairwise_graph_rule": pairwise_graph_rule.to_dict(),
+                "pair_counts": {
+                    "candidate_pairs": len(bundle.pairs),
+                    "pairwise_graph_edges": len(bundle.pairwise_graph_edges),
+                    "refined_positive_edges": len(selected_edges),
+                },
+                "protocol": {
+                    "candidate_universe": "all_test_ppi.txt",
+                    "ground_truth_graph": "human_test_graph.pkl",
+                    "sampled_nodes": "test_sampled_nodes.pkl",
+                    "test_labels_visible_to_model": False,
+                },
+                "runtime": {
+                    "is_distributed": runtime.is_distributed,
+                    "rank": runtime.rank,
+                    "world_size": runtime.world_size,
+                },
+            },
+        )
+        _write_topology_metrics_csv(
+            csv_path=output_dir / "topology_metrics.csv",
+            per_node_size=cast(dict[int, dict[str, float | int]], topology_result["per_node_size"]),
+            summary=summary,
+        )
+    _runtime_barrier(runtime)
     return summary
+
+
+def _write_topology_predictions(
+    *,
+    output_path: Path,
+    pairs: Sequence[CandidatePair],
+    selected_edges: set[tuple[str, str]],
+) -> None:
+    """Write PRING hard-label topology predictions."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        for pair in pairs:
+            edge = canonical_edge(pair.protein_a, pair.protein_b)
+            handle.write(f"{pair.protein_a}\t{pair.protein_b}\t{int(edge in selected_edges)}\n")
+
+
+def _write_topology_metrics_csv(
+    *,
+    csv_path: Path,
+    per_node_size: Mapping[int, Mapping[str, float | int]],
+    summary: Mapping[str, float],
+) -> None:
+    """Persist official per-node-size and summary PRING topology metrics."""
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=TOPOLOGY_CSV_COLUMNS)
+        writer.writeheader()
+        for node_size in sorted(int(node_size) for node_size in per_node_size):
+            values = per_node_size[node_size]
+            writer.writerow(
+                {
+                    "scope": "node_size",
+                    "node_size": node_size,
+                    **{name: values.get(name, "") for name in TOPOLOGY_METRIC_NAMES},
+                    "graph_count": int(values.get("graph_count", 0)),
+                }
+            )
+        writer.writerow(
+            {
+                "scope": "summary",
+                "node_size": "all",
+                "graph_count": sum(
+                    int(values.get("graph_count", 0)) for values in per_node_size.values()
+                ),
+                **{name: summary.get(name, "") for name in TOPOLOGY_METRIC_NAMES},
+            }
+        )
+
+
+def _empty_graph_evaluation_result() -> dict[str, Any]:
+    """Return an empty graph-evaluation payload for ranks with no node-size buckets."""
+    return {"details": {}, "summary": {}, "per_node_size": {}}
+
+
+def _shard_test_graph_nodes_for_rank(
+    *,
+    test_graph_nodes: Mapping[int, list[list[str]]],
+    runtime: TCCIGRuntime,
+) -> dict[int, list[list[str]]]:
+    """Return topology-test node-size buckets assigned to the current TCCIG rank."""
+    normalized = {
+        int(node_size): list(node_lists) for node_size, node_lists in test_graph_nodes.items()
+    }
+    if not runtime.is_distributed:
+        return normalized
+    ordered_node_sizes = sorted(normalized, reverse=True)
+    local_node_sizes = ordered_node_sizes[runtime.rank :: runtime.world_size]
+    return {node_size: normalized[node_size] for node_size in sorted(local_node_sizes)}
+
+
+def _evaluate_predicted_graph_sharded(
+    *,
+    pred_graph: nx.Graph,
+    gt_graph: nx.Graph,
+    test_graph_nodes: Mapping[int, list[list[str]]],
+    runtime: TCCIGRuntime,
+    gather_fn: Callable[[dict[str, Any]], Sequence[Mapping[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Evaluate PRING topology metrics on rank-local node-size buckets and merge them."""
+    if not runtime.is_distributed:
+        return dict(
+            _evaluate_predicted_graph(
+                pred_graph=pred_graph,
+                gt_graph=gt_graph,
+                test_graph_nodes=test_graph_nodes,
+            )
+        )
+    if gather_fn is None and (not _dist.is_available() or not _dist.is_initialized()):
+        return dict(
+            _evaluate_predicted_graph(
+                pred_graph=pred_graph,
+                gt_graph=gt_graph,
+                test_graph_nodes=test_graph_nodes,
+            )
+        )
+
+    local_test_graph_nodes = _shard_test_graph_nodes_for_rank(
+        test_graph_nodes=test_graph_nodes,
+        runtime=runtime,
+    )
+    local_result = (
+        dict(
+            _evaluate_predicted_graph(
+                pred_graph=pred_graph,
+                gt_graph=gt_graph,
+                test_graph_nodes=local_test_graph_nodes,
+            )
+        )
+        if local_test_graph_nodes
+        else _empty_graph_evaluation_result()
+    )
+    if gather_fn is not None:
+        gathered_results = list(gather_fn(local_result))
+    else:
+        gathered_payloads: list[dict[str, Any] | None] = [None] * runtime.world_size
+        _dist.all_gather_object(gathered_payloads, local_result)
+        gathered_results = [
+            cast(Mapping[str, Any], payload)
+            for payload in gathered_payloads
+            if payload is not None
+        ]
+    return _merge_graph_sample_evaluations(shard_results=gathered_results)
 
 
 def _binary_metrics(*, labels: list[int], probabilities: list[float]) -> dict[str, float]:
@@ -889,11 +1067,26 @@ def _build_runtime(
         use_mixed_precision=mixed_precision,
         find_unused_parameters=bool(device_cfg.get("find_unused_parameters", False)),
     )
+    is_distributed = bool(getattr(accelerator, "use_distributed", False))
+    rank = _non_negative_int(getattr(accelerator, "process_index", 0), "accelerator.rank")
+    local_rank = _non_negative_int(
+        getattr(accelerator, "local_process_index", rank),
+        "accelerator.local_rank",
+    )
+    world_size = _positive_int(
+        getattr(accelerator, "num_processes", 1),
+        "accelerator.world_size",
+    )
     return TCCIGRuntime(
         device=str(accelerator.device),
         backend=backend,
         mixed_precision=mixed_precision,
         accelerator=accelerator,
+        is_distributed=is_distributed,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        is_main_process=bool(getattr(accelerator, "is_main_process", rank == 0)),
     )
 
 
@@ -916,18 +1109,35 @@ def _evaluate_predicted_graph(
     pred_graph: nx.Graph,
     gt_graph: nx.Graph,
     test_graph_nodes: Mapping[int, list[list[str]]],
-) -> Mapping[str, object]:
+) -> Mapping[str, Any]:
     """Lazy-load the repo PRING topology metric helper."""
     metrics_module = importlib.import_module("src.topology.metrics")
     evaluate_fn = metrics_module.evaluate_predicted_graph
     return cast(
-        Mapping[str, object],
+        Mapping[str, Any],
         evaluate_fn(
             pred_graph=pred_graph,
             gt_graph=gt_graph,
             test_graph_nodes=test_graph_nodes,
         ),
     )
+
+
+def _merge_graph_sample_evaluations(
+    *,
+    shard_results: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Lazy-load the repo PRING graph-sample merge helper."""
+    metrics_module = importlib.import_module("src.topology.metrics")
+    merge_fn = metrics_module.merge_graph_sample_evaluations
+    return cast(dict[str, Any], merge_fn(shard_results=shard_results))
+
+
+def _runtime_barrier(runtime: TCCIGRuntime) -> None:
+    """Synchronize TCCIG ranks when the accelerator exposes a barrier."""
+    wait_for_everyone = getattr(runtime.accelerator, "wait_for_everyone", None)
+    if callable(wait_for_everyone):
+        wait_for_everyone()
 
 
 def _pairwise_graph_rule(config: Mapping[str, object]) -> GraphRule:

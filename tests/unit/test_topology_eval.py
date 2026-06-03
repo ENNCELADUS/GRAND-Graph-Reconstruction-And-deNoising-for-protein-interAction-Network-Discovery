@@ -30,6 +30,7 @@ from src.topology.report import (
     load_human_table2_baselines,
     write_human_table2_reports,
 )
+from tccig import train as tccig_train
 
 
 def test_compute_graph_similarity_matches_official_formula() -> None:
@@ -281,6 +282,87 @@ def test_gather_ordered_predictions_uses_accelerator_collectives() -> None:
 
     assert ordered_predictions == [1, 0, 0, 1]
     assert accelerator.gather_for_metrics_calls == 2
+
+
+class _TCCIGFakeAccelerator:
+    device = torch.device("cpu")
+
+
+def _tccig_runtime(*, rank: int, world_size: int) -> tccig_train.TCCIGRuntime:
+    return tccig_train.TCCIGRuntime(
+        device="cpu",
+        backend="ddp",
+        mixed_precision=False,
+        accelerator=_TCCIGFakeAccelerator(),
+        is_distributed=True,
+        rank=rank,
+        local_rank=rank,
+        world_size=world_size,
+        is_main_process=rank == 0,
+    )
+
+
+def test_tccig_sharded_topology_metrics_merge_to_unsharded_result() -> None:
+    gt_graph = nx.Graph()
+    gt_graph.add_edges_from([("A", "B"), ("B", "C"), ("C", "D")])
+    pred_graph = nx.Graph()
+    pred_graph.add_edges_from([("A", "B"), ("C", "D")])
+    sampled_nodes = {
+        2: [["A", "B"], ["C", "D"]],
+        3: [["A", "B", "C"]],
+        4: [["A", "B", "C", "D"]],
+    }
+    expected = evaluate_predicted_graph(
+        pred_graph=pred_graph.copy(),
+        gt_graph=gt_graph,
+        test_graph_nodes=sampled_nodes,
+    )
+    rank0_runtime = _tccig_runtime(rank=0, world_size=2)
+    rank1_runtime = _tccig_runtime(rank=1, world_size=2)
+
+    def fake_gather(local_result: dict[str, object]) -> list[dict[str, object]]:
+        rank1_nodes = tccig_train._shard_test_graph_nodes_for_rank(
+            test_graph_nodes=sampled_nodes,
+            runtime=rank1_runtime,
+        )
+        rank1_result = tccig_train._evaluate_predicted_graph_sharded(
+            pred_graph=pred_graph.copy(),
+            gt_graph=gt_graph,
+            test_graph_nodes=rank1_nodes,
+            runtime=_tccig_runtime(rank=0, world_size=1),
+        )
+        return [local_result, rank1_result]
+
+    observed = tccig_train._evaluate_predicted_graph_sharded(
+        pred_graph=pred_graph.copy(),
+        gt_graph=gt_graph,
+        test_graph_nodes=sampled_nodes,
+        runtime=rank0_runtime,
+        gather_fn=fake_gather,
+    )
+
+    assert observed["summary"] == pytest.approx(expected["summary"])
+    assert set(observed["per_node_size"]) == {2, 3, 4}
+    assert set(observed["details"]) == set(expected["details"])
+
+
+def test_tccig_sharded_topology_metrics_keep_keys_for_empty_rank() -> None:
+    gt_graph = nx.Graph()
+    gt_graph.add_edges_from([("A", "B")])
+    pred_graph = nx.Graph()
+    pred_graph.add_edge("A", "B")
+    sampled_nodes = {2: [["A", "B"]]}
+    runtime = _tccig_runtime(rank=3, world_size=4)
+
+    observed = tccig_train._evaluate_predicted_graph_sharded(
+        pred_graph=pred_graph,
+        gt_graph=gt_graph,
+        test_graph_nodes=sampled_nodes,
+        runtime=runtime,
+        gather_fn=lambda local_result: [local_result],
+    )
+
+    assert observed == {"details": {}, "summary": {}, "per_node_size": {}}
 
 
 def test_build_human_table2_rows_merges_baselines_and_v3() -> None:

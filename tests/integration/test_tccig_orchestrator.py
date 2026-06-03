@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import pickle
 from pathlib import Path
@@ -183,7 +184,33 @@ def test_tccig_orchestrator_keeps_pring_truth_out_of_model_inputs(tmp_path: Path
 
     topology_log_dir = tmp_path / "logs" / "tccig" / "topology_test" / "tiny"
     assert (topology_log_dir / "all_test_ppi_pred.txt").exists()
-    assert (topology_log_dir / "topology_metrics.json").exists()
+    metrics_path = topology_log_dir / "topology_metrics.json"
+    metrics_csv_path = topology_log_dir / "topology_metrics.csv"
+    assert metrics_path.exists()
+    assert metrics_csv_path.exists()
+    metrics_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    assert set(metrics_payload["summary"]) == {
+        "graph_sim",
+        "relative_density",
+        "deg_dist_mmd",
+        "cc_mmd",
+        "laplacian_eigen_mmd",
+    }
+    assert "2" in metrics_payload["per_node_size"]
+    assert set(metrics_payload["details"]) == set(metrics_payload["summary"])
+    assert metrics_payload["selected_rule"]["type"] in {"threshold", "top_k", "top_m"}
+    assert metrics_payload["pairwise_graph_rule"] == {"type": "threshold", "value": 0.5}
+    assert metrics_payload["protocol"] == {
+        "candidate_universe": "all_test_ppi.txt",
+        "ground_truth_graph": "human_test_graph.pkl",
+        "sampled_nodes": "test_sampled_nodes.pkl",
+        "test_labels_visible_to_model": False,
+    }
+    with metrics_csv_path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert [row["scope"] for row in rows] == ["node_size", "summary"]
+    assert rows[-1]["node_size"] == "all"
+    assert rows[-1]["graph_count"] == "2"
 
     scoring_manifest = tmp_path / "logs" / "tccig" / "score" / "tiny" / "train.json"
     assert scoring_manifest.exists()
@@ -230,6 +257,23 @@ def test_validation_selected_rule_is_reused_for_topology_test(tmp_path: Path) ->
     )
     predicted_rows = prediction_path.read_text(encoding="utf-8").strip().splitlines()
     assert predicted_rows == ["T1\tT2\t1", "T1\tT3\t0"]
+
+    metrics_payload = json.loads(
+        (
+            tmp_path
+            / "logs"
+            / "tccig"
+            / "topology_test"
+            / "top_m_case"
+            / "topology_metrics.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert metrics_payload["selected_rule"] == {"type": "top_m", "m": 1}
+    assert metrics_payload["pair_counts"] == {
+        "candidate_pairs": 2,
+        "pairwise_graph_edges": 1,
+        "refined_positive_edges": 1,
+    }
 
 
 def test_tccig_builds_validation_topology_bucket_all_pairs(tmp_path: Path) -> None:
