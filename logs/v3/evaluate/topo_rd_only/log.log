@@ -1,0 +1,7 @@
+2026-05-30 23:48:21 INFO Pipeline Runtime | Device: cuda:0 | Distributed: True | Test Batches: 1691 | Train Batches: 762 | Valid Batches: 762 | World Size: 4
+2026-06-02 22:28:43 INFO Stage Start | Checkpoint: models/v3/topology_finetune/topo_rd_only/best_model.pth | Run Id: topo_rd_only
+2026-06-02 22:28:43 INFO Checkpoint Loaded | Path: models/v3/topology_finetune/topo_rd_only/best_model.pth
+2026-06-02 22:28:43 INFO Decision Threshold | Mode: fixed | Value: 0.500
+2026-06-02 22:36:12 INFO Evaluation Metrics | Accuracy: 0.614 | AUPRC: 0.703 | Auroc: 0.685 | F1: 0.474 | Mcc: 0.269 | Precision: 0.743 | Recall: 0.347 | Sensitivity: 0.347 | Specificity: 0.880 | Split: test
+2026-06-02 22:36:12 INFO CSV Written | Path: logs/v3/evaluate/topo_rd_only/evaluate.csv
+2026-06-02 22:36:12 INFO Stage Done | Run Id: topo_rd_only

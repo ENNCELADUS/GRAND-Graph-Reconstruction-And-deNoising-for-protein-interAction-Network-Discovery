@@ -1,0 +1,2 @@
+split,auroc,auprc,accuracy,sensitivity,specificity,precision,recall,f1,mcc
+test,0.685,0.703,0.614,0.347,0.880,0.743,0.347,0.474,0.269
