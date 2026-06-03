@@ -9,19 +9,34 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import networkx as nx
 import torch
 import torch.nn.functional as functional
 from sklearn.metrics import average_precision_score
 from src.embed import load_cached_embedding
+from src.topology.metrics import evaluate_graph_samples
 from src.train.config import LossConfig
 from src.utils.losses import binary_classification_loss
 from torch import nn
 from torch.optim import Optimizer
 
 from tccig.io import CandidatePair, canonical_edge, write_json
+from tccig.rules import GraphRule, edges_from_rule
 
 if TYPE_CHECKING:
+    from src.topology.finetune_data import InternalValidationPlan
+
     from tccig.train import RefineRequest, SplitBundle, TrainRefinerRequest
+
+SUPPORTED_MONITOR_METRICS = {
+    "val_topology_loss",
+    "internal_val_graph_sim",
+    "val_graph_sim",
+    "internal_val_relative_density",
+    "val_relative_density",
+    "val_auprc",
+}
+INTERNAL_VALIDATION_SUMMARY_KEYS = ("graph_sim", "relative_density", "deg_dist_mmd", "cc_mmd")
 
 
 @dataclass(frozen=True)
@@ -39,6 +54,8 @@ class S2GAEConfig:
     batch_size: int
     loss_config: LossConfig
     residual_weight: float
+    monitor_metric: str
+    topology_validation: S2GAETopologyValidationConfig
     optimizer: S2GAEOptimizerConfig
     scheduler: S2GAESchedulerConfig
     optimization: S2GAEOptimizationConfig
@@ -56,6 +73,9 @@ class S2GAERefinerState:
     model: S2GAERefiner
     config: S2GAEConfig
     best_validation_auprc: float
+    best_monitor_value: float
+    selected_rule: GraphRule | None
+    selected_rule_payload: dict[str, object] | None
     epochs_trained: int
 
 
@@ -86,6 +106,26 @@ class S2GAEOptimizationConfig:
 
 
 @dataclass(frozen=True)
+class S2GAETopologyLossWeights:
+    """Weights for hard-metric validation topology loss."""
+
+    alpha: float
+    beta: float
+    gamma: float
+    delta: float
+
+
+@dataclass(frozen=True)
+class S2GAETopologyValidationConfig:
+    """Controls for validation-time hard topology evaluation."""
+
+    enabled: bool
+    inference_batch_size: int
+    compute_clustering_mmd: bool
+    losses: S2GAETopologyLossWeights
+
+
+@dataclass(frozen=True)
 class S2GAELossTerms:
     """S2GAE training loss components."""
 
@@ -93,6 +133,15 @@ class S2GAELossTerms:
     residual_anchor: torch.Tensor
     weighted_residual_anchor: torch.Tensor
     total: torch.Tensor
+
+
+@dataclass(frozen=True)
+class ValidationTopologyRuleEvaluation:
+    """Topology validation result for one selected hard-graph rule."""
+
+    rule: GraphRule
+    validation_metrics: dict[str, float | int]
+    payload: dict[str, object]
 
 
 class S2GAERefiner(nn.Module):
@@ -322,6 +371,23 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
 
     train_graph = _build_split_graph(request.train, cfg=cfg, device=device)
     validation_graph = _build_split_graph(request.validation, cfg=cfg, device=device)
+    validation_topology_graph: _SplitGraph | None = None
+    if cfg.topology_validation.enabled:
+        if request.validation_topology is None or request.validation_topology_plan is None:
+            raise ValueError(
+                "refiner.topology_validation.enabled requires validation_topology inputs"
+            )
+        if not request.graph_rules:
+            raise ValueError("refiner topology validation requires graph_selection.rules")
+        validation_topology_graph = _build_split_graph(
+            request.validation_topology,
+            cfg=cfg,
+            device=device,
+        )
+    elif cfg.monitor_metric != "val_auprc":
+        raise ValueError(
+            f"refiner.monitor_metric={cfg.monitor_metric!r} requires topology_validation.enabled"
+        )
     train_labels = _required_float_tensor(
         request.train.loss_targets,
         "request.train.loss_targets",
@@ -334,7 +400,10 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
     )
 
     best_state_dict: dict[str, torch.Tensor] | None = None
+    best_selected_rule: GraphRule | None = None
+    best_selected_rule_payload: dict[str, object] | None = None
     best_validation_auprc = -math.inf
+    best_monitor_value = _initial_monitor_value(cfg.monitor_metric)
     history: list[dict[str, float | int]] = []
     for epoch in range(1, cfg.epochs + 1):
         model.train()
@@ -384,23 +453,76 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             labels=validation_labels,
             batch_size=cfg.batch_size,
         )
+        best_validation_auprc = max(best_validation_auprc, validation_auprc)
+        selected_epoch_rule: GraphRule | None = None
+        selected_epoch_rule_payload: dict[str, object] | None = None
+        if cfg.topology_validation.enabled:
+            if (
+                validation_topology_graph is None
+                or request.validation_topology is None
+                or request.validation_topology_plan is None
+            ):
+                raise RuntimeError("Validation topology graph was not initialized")
+            topology_evaluation = _evaluate_validation_topology_rules(
+                model=model,
+                graph=validation_topology_graph,
+                pairs=request.validation_topology.pairs,
+                validation_plan=request.validation_topology_plan,
+                rules=request.graph_rules,
+                validation_auprc=validation_auprc,
+                cfg=cfg,
+            )
+            selected_epoch_rule = topology_evaluation.rule
+            selected_epoch_rule_payload = _with_validation_epoch(
+                payload=topology_evaluation.payload,
+                epoch=epoch,
+            )
+            monitor_value = _resolve_monitor_value(
+                monitor_metric=cfg.monitor_metric,
+                validation_auprc=validation_auprc,
+                topology_metrics=topology_evaluation.validation_metrics,
+            )
+        else:
+            monitor_value = validation_auprc
         epoch_denominator = max(1, total_examples)
-        history.append(
-            {
-                "epoch": epoch,
-                "train_loss": total_loss / epoch_denominator,
-                "train_bce_loss": total_bce_loss / epoch_denominator,
-                "train_residual_anchor_loss": total_residual_anchor_loss / epoch_denominator,
-                "train_weighted_residual_anchor_loss": (
-                    total_weighted_residual_anchor_loss / epoch_denominator
-                ),
-                "train_gradient_norm": total_gradient_norm / epoch_denominator,
-                "learning_rate": _current_learning_rate(optimizer),
-                "val_auprc": validation_auprc,
-            }
-        )
-        if validation_auprc > best_validation_auprc:
-            best_validation_auprc = validation_auprc
+        epoch_history: dict[str, float | int] = {
+            "epoch": epoch,
+            "train_loss": total_loss / epoch_denominator,
+            "train_bce_loss": total_bce_loss / epoch_denominator,
+            "train_residual_anchor_loss": total_residual_anchor_loss / epoch_denominator,
+            "train_weighted_residual_anchor_loss": (
+                total_weighted_residual_anchor_loss / epoch_denominator
+            ),
+            "train_gradient_norm": total_gradient_norm / epoch_denominator,
+            "learning_rate": _current_learning_rate(optimizer),
+            "val_auprc": validation_auprc,
+            "monitor_value": monitor_value,
+        }
+        if selected_epoch_rule_payload is not None:
+            metrics = cast(
+                Mapping[str, float],
+                selected_epoch_rule_payload["validation_metrics"],
+            )
+            epoch_history.update(
+                {
+                    "val_topology_loss": float(metrics["val_topology_loss"]),
+                    "internal_val_graph_sim": float(metrics["graph_sim"]),
+                    "internal_val_relative_density": float(metrics["relative_density"]),
+                    "internal_val_deg_dist_mmd": float(metrics["deg_dist_mmd"]),
+                    "internal_val_cc_mmd": float(metrics["cc_mmd"]),
+                    "selected_rule_positive_edges": float(metrics["positive_edges"]),
+                }
+            )
+        history.append(epoch_history)
+
+        if best_state_dict is None or _is_better_monitor(
+            value=monitor_value,
+            best_value=best_monitor_value,
+            monitor_metric=cfg.monitor_metric,
+        ):
+            best_monitor_value = monitor_value
+            best_selected_rule = selected_epoch_rule
+            best_selected_rule_payload = selected_epoch_rule_payload
             checkpoint_model = _unwrap_model(model, request.runtime.accelerator)
             best_state_dict = {
                 name: tensor.detach().cpu().clone()
@@ -417,14 +539,21 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             "model_state_dict": best_state_dict,
             "config": _config_to_json(cfg),
             "best_validation_auprc": best_validation_auprc,
+            "monitor_metric": cfg.monitor_metric,
+            "best_monitor_value": best_monitor_value,
+            "selected_rule": (
+                None if best_selected_rule_payload is None else best_selected_rule_payload
+            ),
         },
         cfg.checkpoint_path,
     )
     write_json(
         cfg.log_dir / "training_summary.json",
         {
-            "monitor_metric": "val_auprc",
+            "monitor_metric": cfg.monitor_metric,
+            "best_monitor_value": best_monitor_value,
             "best_validation_auprc": best_validation_auprc,
+            "selected_rule": best_selected_rule_payload,
             "epochs_trained": cfg.epochs,
             "checkpoint_path": str(cfg.checkpoint_path),
             "optimizer": _optimizer_config_to_json(cfg.optimizer),
@@ -438,6 +567,9 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         model=cast(S2GAERefiner, checkpoint_model),
         config=cfg,
         best_validation_auprc=best_validation_auprc,
+        best_monitor_value=best_monitor_value,
+        selected_rule=best_selected_rule,
+        selected_rule_payload=best_selected_rule_payload,
         epochs_trained=cfg.epochs,
     )
 
@@ -625,6 +757,219 @@ def _validation_auprc(
     return float(average_precision_score(all_labels, all_predictions))
 
 
+def _prediction_probabilities(
+    *,
+    model: S2GAERefiner,
+    graph: _SplitGraph,
+    batch_size: int,
+) -> list[float]:
+    model.eval()
+    probabilities: list[float] = []
+    with torch.inference_mode():
+        for batch_indices in _batch_indices(
+            graph.pairwise_probabilities.numel(),
+            batch_size,
+            graph.pairwise_probabilities.device,
+        ):
+            refined_logits, _ = model(
+                node_features=graph.node_features,
+                edge_index=graph.edge_index,
+                pair_index=graph.pair_index[:, batch_indices],
+                pairwise_probabilities=graph.pairwise_probabilities[batch_indices],
+            )
+            probabilities.extend(torch.sigmoid(refined_logits).detach().cpu().tolist())
+    return [float(probability) for probability in probabilities]
+
+
+def _evaluate_validation_topology_rules(
+    *,
+    model: S2GAERefiner,
+    graph: _SplitGraph,
+    pairs: Sequence[CandidatePair],
+    validation_plan: InternalValidationPlan,
+    rules: Sequence[GraphRule],
+    validation_auprc: float,
+    cfg: S2GAEConfig,
+) -> ValidationTopologyRuleEvaluation:
+    refined_probabilities = _prediction_probabilities(
+        model=model,
+        graph=graph,
+        batch_size=cfg.topology_validation.inference_batch_size,
+    )
+    if len(refined_probabilities) != len(pairs):
+        raise ValueError("validation topology probabilities must match candidate pairs")
+
+    best_evaluation: ValidationTopologyRuleEvaluation | None = None
+    for rule in rules:
+        metrics = _validation_topology_metrics(
+            validation_plan=validation_plan,
+            pairs=pairs,
+            probabilities=refined_probabilities,
+            rule=rule,
+            validation_auprc=validation_auprc,
+            cfg=cfg,
+        )
+        payload: dict[str, object] = {
+            **rule.to_dict(),
+            "monitor_metric": cfg.monitor_metric,
+            "monitor_value": _resolve_monitor_value(
+                monitor_metric=cfg.monitor_metric,
+                validation_auprc=validation_auprc,
+                topology_metrics=metrics,
+            ),
+            "validation_metrics": metrics,
+        }
+        evaluation = ValidationTopologyRuleEvaluation(
+            rule=rule,
+            validation_metrics=metrics,
+            payload=payload,
+        )
+        if best_evaluation is None or _is_better_rule_evaluation(
+            candidate=evaluation,
+            incumbent=best_evaluation,
+            monitor_metric=cfg.monitor_metric,
+        ):
+            best_evaluation = evaluation
+
+    if best_evaluation is None:
+        raise ValueError("No validation topology graph rules were evaluated")
+    return best_evaluation
+
+
+def _validation_topology_metrics(
+    *,
+    validation_plan: InternalValidationPlan,
+    pairs: Sequence[CandidatePair],
+    probabilities: Sequence[float],
+    rule: GraphRule,
+    validation_auprc: float,
+    cfg: S2GAEConfig,
+) -> dict[str, float | int]:
+    selected_edges = set(
+        edges_from_rule(
+            pairs=list(pairs),
+            probabilities=list(probabilities),
+            rule=rule,
+        )
+    )
+    pred_graphs_by_size: dict[int, list[nx.Graph]] = {}
+    target_graphs_by_size: dict[int, list[nx.Graph]] = {}
+
+    for bucket in validation_plan.buckets:
+        pred_subgraphs = [nx.Graph() for _ in bucket.sampled_subgraphs]
+        for subgraph, nodes in zip(pred_subgraphs, bucket.sampled_subgraphs, strict=True):
+            subgraph.add_nodes_from(nodes)
+        for record in bucket.pair_records:
+            edge = canonical_edge(record.protein_a, record.protein_b)
+            if edge not in selected_edges:
+                continue
+            pred_subgraphs[record.subgraph_index].add_edge(record.protein_a, record.protein_b)
+        pred_graphs_by_size[bucket.node_size] = pred_subgraphs
+        target_graphs_by_size[bucket.node_size] = list(bucket.target_subgraphs)
+
+    result = evaluate_graph_samples(
+        pred_graphs_by_size=pred_graphs_by_size,
+        gt_graphs_by_size=target_graphs_by_size,
+        include_spectral_stats=False,
+        include_clustering_stats=cfg.topology_validation.compute_clustering_mmd,
+    )
+    summary = cast(Mapping[str, object], result["summary"])
+    metrics = {name: float(summary[name]) for name in INTERNAL_VALIDATION_SUMMARY_KEYS}
+    metrics["val_topology_loss"] = _validation_topology_loss(
+        internal_val_topology_stats=metrics,
+        weights=cfg.topology_validation.losses,
+        include_clustering_mmd=cfg.topology_validation.compute_clustering_mmd,
+    )
+    metrics["val_auprc"] = float(validation_auprc)
+    metrics["positive_edges"] = int(len(selected_edges))
+    return metrics
+
+
+def _with_validation_epoch(*, payload: dict[str, object], epoch: int) -> dict[str, object]:
+    metrics = dict(cast(Mapping[str, object], payload["validation_metrics"]))
+    metrics["epoch"] = int(epoch)
+    return {**payload, "validation_metrics": metrics}
+
+
+def _validation_topology_loss(
+    *,
+    internal_val_topology_stats: Mapping[str, float],
+    weights: S2GAETopologyLossWeights,
+    include_clustering_mmd: bool,
+) -> float:
+    graph_similarity_loss = 1.0 - float(internal_val_topology_stats["graph_sim"])
+    relative_density_loss = (float(internal_val_topology_stats["relative_density"]) - 1.0) ** 2
+    degree_mmd = float(internal_val_topology_stats["deg_dist_mmd"])
+    clustering_mmd = (
+        float(internal_val_topology_stats["cc_mmd"]) if include_clustering_mmd else 0.0
+    )
+    return (
+        weights.alpha * graph_similarity_loss
+        + weights.beta * relative_density_loss
+        + weights.gamma * degree_mmd
+        + weights.delta * clustering_mmd
+    )
+
+
+def _resolve_monitor_value(
+    *,
+    monitor_metric: str,
+    validation_auprc: float,
+    topology_metrics: Mapping[str, float | int],
+) -> float:
+    if monitor_metric == "val_auprc":
+        return float(validation_auprc)
+    if monitor_metric == "val_topology_loss":
+        return float(topology_metrics["val_topology_loss"])
+    if monitor_metric in {"internal_val_graph_sim", "val_graph_sim"}:
+        return float(topology_metrics["graph_sim"])
+    if monitor_metric in {"internal_val_relative_density", "val_relative_density"}:
+        return -abs(float(topology_metrics["relative_density"]) - 1.0)
+    raise ValueError(f"Unsupported refiner.monitor_metric: {monitor_metric}")
+
+
+def _initial_monitor_value(monitor_metric: str) -> float:
+    return math.inf if _resolve_monitor_mode(monitor_metric) == "min" else -math.inf
+
+
+def _resolve_monitor_mode(monitor_metric: str) -> str:
+    return "min" if monitor_metric == "val_topology_loss" else "max"
+
+
+def _is_better_monitor(
+    *,
+    value: float,
+    best_value: float,
+    monitor_metric: str,
+) -> bool:
+    if _resolve_monitor_mode(monitor_metric) == "min":
+        return value < best_value
+    return value > best_value
+
+
+def _is_better_rule_evaluation(
+    *,
+    candidate: ValidationTopologyRuleEvaluation,
+    incumbent: ValidationTopologyRuleEvaluation,
+    monitor_metric: str,
+) -> bool:
+    candidate_value = float(candidate.payload["monitor_value"])
+    incumbent_value = float(incumbent.payload["monitor_value"])
+    if candidate_value != incumbent_value:
+        return _is_better_monitor(
+            value=candidate_value,
+            best_value=incumbent_value,
+            monitor_metric=monitor_metric,
+        )
+    return (
+        -float(candidate.validation_metrics["val_topology_loss"]),
+        -int(candidate.validation_metrics["positive_edges"]),
+    ) > (
+        -float(incumbent.validation_metrics["val_topology_loss"]),
+        -int(incumbent.validation_metrics["positive_edges"]),
+    )
+
+
 def _batch_indices(total: int, batch_size: int, device: torch.device) -> Iterator[torch.Tensor]:
     for start in range(0, total, batch_size):
         stop = min(total, start + batch_size)
@@ -683,6 +1028,12 @@ def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
         if max_sequence_length_raw is None
         else _positive_int(max_sequence_length_raw, "refiner.max_sequence_length")
     )
+    monitor_metric = str(config.get("monitor_metric", "val_auprc"))
+    if monitor_metric not in SUPPORTED_MONITOR_METRICS:
+        raise ValueError(
+            "refiner.monitor_metric must be one of "
+            f"{sorted(SUPPORTED_MONITOR_METRICS)}"
+        )
     return S2GAEConfig(
         encoder=str(config.get("encoder", "sage")).lower(),
         input_dim=_positive_int(config.get("input_dim", 1024), "refiner.input_dim"),
@@ -703,6 +1054,12 @@ def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
         residual_weight=_non_negative_float(
             config.get("residual_weight", 0.001),
             "refiner.residual_weight",
+        ),
+        monitor_metric=monitor_metric,
+        topology_validation=_parse_topology_validation_config(
+            raw_topology_validation=config.get("topology_validation", {}),
+            monitor_metric=monitor_metric,
+            default_inference_batch_size=config.get("batch_size", 4096),
         ),
         optimizer=_parse_optimizer_config(config.get("optimizer")),
         scheduler=_parse_scheduler_config(config.get("scheduler")),
@@ -732,6 +1089,18 @@ def _config_to_json(cfg: S2GAEConfig) -> dict[str, object]:
             "label_smoothing": cfg.loss_config.label_smoothing,
         },
         "residual_weight": cfg.residual_weight,
+        "monitor_metric": cfg.monitor_metric,
+        "topology_validation": {
+            "enabled": cfg.topology_validation.enabled,
+            "inference_batch_size": cfg.topology_validation.inference_batch_size,
+            "compute_clustering_mmd": cfg.topology_validation.compute_clustering_mmd,
+            "losses": {
+                "alpha": cfg.topology_validation.losses.alpha,
+                "beta": cfg.topology_validation.losses.beta,
+                "gamma": cfg.topology_validation.losses.gamma,
+                "delta": cfg.topology_validation.losses.delta,
+            },
+        },
         "optimizer": _optimizer_config_to_json(cfg.optimizer),
         "scheduler": {"type": cfg.scheduler.scheduler_type},
         "optimization": _optimization_config_to_json(cfg.optimization),
@@ -804,6 +1173,53 @@ def _parse_loss_config(raw_loss: object) -> LossConfig:
         label_smoothing=_probability(
             raw_loss.get("label_smoothing", 0.0),
             "refiner.loss.label_smoothing",
+        ),
+    )
+
+
+def _parse_topology_validation_config(
+    *,
+    raw_topology_validation: object,
+    monitor_metric: str,
+    default_inference_batch_size: object,
+) -> S2GAETopologyValidationConfig:
+    if not isinstance(raw_topology_validation, Mapping):
+        raise ValueError("refiner.topology_validation must be a mapping")
+    enabled = (
+        _bool(raw_topology_validation.get("enabled"), "refiner.topology_validation.enabled")
+        if "enabled" in raw_topology_validation
+        else monitor_metric != "val_auprc"
+    )
+    raw_losses = raw_topology_validation.get("losses", {})
+    if not isinstance(raw_losses, Mapping):
+        raise ValueError("refiner.topology_validation.losses must be a mapping")
+    return S2GAETopologyValidationConfig(
+        enabled=enabled,
+        inference_batch_size=_positive_int(
+            raw_topology_validation.get("inference_batch_size", default_inference_batch_size),
+            "refiner.topology_validation.inference_batch_size",
+        ),
+        compute_clustering_mmd=_bool(
+            raw_topology_validation.get("compute_clustering_mmd", True),
+            "refiner.topology_validation.compute_clustering_mmd",
+        ),
+        losses=S2GAETopologyLossWeights(
+            alpha=_non_negative_float(
+                raw_losses.get("alpha", 0.5),
+                "refiner.topology_validation.losses.alpha",
+            ),
+            beta=_non_negative_float(
+                raw_losses.get("beta", 1.0),
+                "refiner.topology_validation.losses.beta",
+            ),
+            gamma=_non_negative_float(
+                raw_losses.get("gamma", 0.3),
+                "refiner.topology_validation.losses.gamma",
+            ),
+            delta=_non_negative_float(
+                raw_losses.get("delta", 0.3),
+                "refiner.topology_validation.losses.delta",
+            ),
         ),
     )
 
@@ -919,6 +1335,12 @@ def _exclusive_probability(value: object, field_name: str) -> float:
     if parsed >= 1.0:
         raise ValueError(f"{field_name} must be in (0, 1)")
     return parsed
+
+
+def _bool(value: object, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    raise ValueError(f"{field_name} must be a boolean")
 
 
 def _gradient_norm(parameters: Sequence[torch.nn.Parameter]) -> float:

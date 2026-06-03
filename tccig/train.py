@@ -27,9 +27,17 @@ from sklearn.metrics import (
 )
 from src.embed import load_cached_embedding
 from src.pipeline.stages.train import build_model
+from src.topology.finetune_data import (
+    TOPOLOGY_EVAL_NODE_SIZES,
+    InternalValidationPlan,
+    build_internal_validation_plan,
+    build_pair_supervision_graph,
+    load_split_node_ids,
+    sample_topology_evaluation_subgraphs,
+)
 from torch.nn.utils.rnn import pad_sequence
 
-from tccig.io import CandidatePair, PairTable, read_pair_table, write_json
+from tccig.io import CandidatePair, PairTable, canonical_edge, read_pair_table, write_json
 from tccig.rules import GraphRule, edges_from_rule, parse_rules, select_rule
 
 
@@ -109,6 +117,9 @@ class TrainRefinerRequest:
     validation: SplitBundle
     runtime: TCCIGRuntime
     config: Mapping[str, object]
+    graph_rules: tuple[GraphRule, ...] = ()
+    validation_topology: SplitBundle | None = None
+    validation_topology_plan: InternalValidationPlan | None = None
 
 
 @dataclass(frozen=True)
@@ -257,6 +268,18 @@ def _positive_int(value: object, field_name: str) -> int:
     return parsed
 
 
+def _non_negative_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    try:
+        parsed = int(cast(int | str, value))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field_name} must be a non-negative integer") from error
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return parsed
+
+
 def _load_embedding_index(index_path: Path) -> dict[str, str]:
     if not index_path.exists():
         raise FileNotFoundError(f"pairwise_scorer.embedding_cache_dir missing index: {index_path}")
@@ -337,6 +360,7 @@ def run_tccig_pipeline(
     pairwise_scorer = _load_pairwise_scorer(config)
     pairwise_graph_rule = _pairwise_graph_rule(config)
     scorer_cfg = _mapping_section(config, "pairwise_scorer")
+    rules = tuple(parse_rules(_mapping_section(config, "graph_selection").get("rules")))
     bundles = {
         split: _score_table(
             table=table,
@@ -366,6 +390,32 @@ def run_tccig_pipeline(
         run_id=run_id,
         log_root=log_root,
     )
+    validation_topology_bundle: SplitBundle | None = None
+    validation_topology_plan: InternalValidationPlan | None = None
+    if _topology_validation_enabled(refiner_cfg):
+        validation_topology_bundle, validation_topology_plan = _build_validation_topology_bundle(
+            config=config,
+            refiner_cfg=refiner_cfg,
+            scorer=pairwise_scorer,
+            runtime=runtime,
+            scorer_cfg=scorer_cfg,
+            pairwise_graph_rule=pairwise_graph_rule,
+        )
+        write_json(
+            log_root / "tccig" / "score" / run_id / "validation_topology.json",
+            {
+                "split": "validation_topology",
+                "pair_count": len(validation_topology_bundle.pairs),
+                "pairwise_graph_edge_count": len(
+                    validation_topology_bundle.pairwise_graph_edges
+                ),
+                "validation_topology_subgraphs": validation_topology_plan.total_subgraphs,
+                "validation_topology_pairs": validation_topology_plan.total_pairs,
+                "validation_topology_node_sizes": [
+                    bucket.node_size for bucket in validation_topology_plan.buckets
+                ],
+            },
+        )
     train_refiner = _load_optional_callable(
         refiner_cfg.get("train_target"),
         _not_implemented_train_refiner,
@@ -380,28 +430,25 @@ def run_tccig_pipeline(
             validation=validation_bundle,
             runtime=runtime,
             config=refiner_cfg,
+            graph_rules=rules,
+            validation_topology=validation_topology_bundle,
+            validation_topology_plan=validation_topology_plan,
         )
     )
 
-    validation_refined = _predict_refined_probabilities(
-        predict_refined=cast(PredictRefined, predict_refined),
-        split="validation",
-        bundle=validation_bundle,
+    selected_rule, selected_rule_payload = _selected_rule_from_refiner_state(
         refiner_state=refiner_state,
-        runtime=runtime,
-        refiner_cfg=refiner_cfg,
     )
-    rules = parse_rules(_mapping_section(config, "graph_selection").get("rules"))
-    selected_rule, selected_rule_metrics = select_rule(
-        pairs=validation_bundle.pairs,
-        probabilities=validation_refined,
-        labels=tables["validation"].labels,
-        rules=rules,
-    )
-    selected_rule_payload: dict[str, object] = {
-        **selected_rule.to_dict(),
-        "validation_metrics": selected_rule_metrics,
-    }
+    if selected_rule is None or selected_rule_payload is None:
+        selected_rule, selected_rule_payload = _fallback_select_validation_rule(
+            validation_bundle=validation_bundle,
+            validation_labels=tables["validation"].labels,
+            predict_refined=cast(PredictRefined, predict_refined),
+            refiner_state=refiner_state,
+            runtime=runtime,
+            refiner_cfg=refiner_cfg,
+            rules=rules,
+        )
     selected_rule_path = log_root / "tccig" / "validation" / run_id / "selected_rule.json"
     write_json(selected_rule_path, selected_rule_payload)
 
@@ -472,7 +519,25 @@ def _score_table(
     scorer_cfg: Mapping[str, object],
     pairwise_graph_rule: GraphRule,
 ) -> SplitBundle:
-    pairs = table.pairs
+    return _score_pairs(
+        pairs=table.pairs,
+        split=split,
+        scorer=scorer,
+        runtime=runtime,
+        scorer_cfg=scorer_cfg,
+        pairwise_graph_rule=pairwise_graph_rule,
+    )
+
+
+def _score_pairs(
+    *,
+    pairs: Sequence[CandidatePair],
+    split: str,
+    scorer: PairwiseScorer,
+    runtime: TCCIGRuntime,
+    scorer_cfg: Mapping[str, object],
+    pairwise_graph_rule: GraphRule,
+) -> SplitBundle:
     raw_scores = scorer(
         PairwiseScoreRequest(
             split=split,
@@ -489,10 +554,125 @@ def _score_table(
     )
     return SplitBundle(
         split=split,
-        pairs=pairs,
+        pairs=list(pairs),
         pairwise_probabilities=probabilities,
         pairwise_graph_edges=graph_edges,
     )
+
+
+def _build_validation_topology_bundle(
+    *,
+    config: Mapping[str, object],
+    refiner_cfg: Mapping[str, object],
+    scorer: PairwiseScorer,
+    runtime: TCCIGRuntime,
+    scorer_cfg: Mapping[str, object],
+    pairwise_graph_rule: GraphRule,
+) -> tuple[SplitBundle, InternalValidationPlan]:
+    data_cfg = _mapping_section(config, "data")
+    processed_dir = Path(str(data_cfg["processed_dir"]))
+    train_nodes = load_split_node_ids(
+        split_path=processed_dir / "human_BFS_split.pkl",
+        split_name="train",
+    )
+    validation_graph = build_pair_supervision_graph(
+        pair_path=processed_dir / "human_val_ppi_ratio5_exclusive.txt",
+        node_ids=train_nodes,
+    )
+    topology_cfg = _mapping_section(refiner_cfg, "topology_validation")
+    sampled_subgraphs = sample_topology_evaluation_subgraphs(
+        graph=validation_graph,
+        seed=_non_negative_int(topology_cfg.get("seed", 0), "refiner.topology_validation.seed"),
+        strategy=str(topology_cfg.get("strategy", "mixed")),
+        node_sizes=_topology_validation_node_sizes(topology_cfg),
+        samples_per_size=_positive_int(
+            topology_cfg.get("samples_per_size", 20),
+            "refiner.topology_validation.samples_per_size",
+        ),
+    )
+    validation_plan = build_internal_validation_plan(
+        graph=validation_graph,
+        sampled_subgraphs=sampled_subgraphs,
+    )
+    bundle = _score_pairs(
+        pairs=_unique_validation_topology_pairs(validation_plan),
+        split="validation_topology",
+        scorer=scorer,
+        runtime=runtime,
+        scorer_cfg=scorer_cfg,
+        pairwise_graph_rule=pairwise_graph_rule,
+    )
+    return bundle, validation_plan
+
+
+def _topology_validation_enabled(refiner_cfg: Mapping[str, object]) -> bool:
+    monitor_metric = str(refiner_cfg.get("monitor_metric", "val_auprc"))
+    topology_cfg = refiner_cfg.get("topology_validation")
+    if isinstance(topology_cfg, Mapping) and "enabled" in topology_cfg:
+        return bool(topology_cfg["enabled"])
+    return monitor_metric != "val_auprc"
+
+
+def _topology_validation_node_sizes(topology_cfg: Mapping[str, object]) -> tuple[int, ...]:
+    raw_node_sizes = topology_cfg.get("node_sizes", TOPOLOGY_EVAL_NODE_SIZES)
+    if not isinstance(raw_node_sizes, Sequence) or isinstance(raw_node_sizes, (str, bytes)):
+        raise ValueError("refiner.topology_validation.node_sizes must be a sequence")
+    node_sizes = [
+        _positive_int(node_size, "refiner.topology_validation.node_sizes")
+        for node_size in raw_node_sizes
+    ]
+    if not node_sizes:
+        raise ValueError("refiner.topology_validation.node_sizes must not be empty")
+    return tuple(dict.fromkeys(node_sizes))
+
+
+def _unique_validation_topology_pairs(plan: InternalValidationPlan) -> list[CandidatePair]:
+    edges: set[tuple[str, str]] = set()
+    for bucket in plan.buckets:
+        for record in bucket.pair_records:
+            edges.add(canonical_edge(record.protein_a, record.protein_b))
+    return [CandidatePair(protein_a=edge[0], protein_b=edge[1]) for edge in sorted(edges)]
+
+
+def _selected_rule_from_refiner_state(
+    *,
+    refiner_state: object,
+) -> tuple[GraphRule | None, dict[str, object] | None]:
+    selected_rule = getattr(refiner_state, "selected_rule", None)
+    selected_rule_payload = getattr(refiner_state, "selected_rule_payload", None)
+    if isinstance(selected_rule, GraphRule) and isinstance(selected_rule_payload, dict):
+        return selected_rule, selected_rule_payload
+    return None, None
+
+
+def _fallback_select_validation_rule(
+    *,
+    validation_bundle: SplitBundle,
+    validation_labels: list[int],
+    predict_refined: PredictRefined,
+    refiner_state: object,
+    runtime: TCCIGRuntime,
+    refiner_cfg: Mapping[str, object],
+    rules: Sequence[GraphRule],
+) -> tuple[GraphRule, dict[str, object]]:
+    validation_refined = _predict_refined_probabilities(
+        predict_refined=predict_refined,
+        split="validation",
+        bundle=validation_bundle,
+        refiner_state=refiner_state,
+        runtime=runtime,
+        refiner_cfg=refiner_cfg,
+    )
+    selected_rule, selected_rule_metrics = select_rule(
+        pairs=validation_bundle.pairs,
+        probabilities=validation_refined,
+        labels=validation_labels,
+        rules=list(rules),
+    )
+    return selected_rule, {
+        **selected_rule.to_dict(),
+        "validation_metrics": selected_rule_metrics,
+    }
 
 
 def _write_scoring_manifests(

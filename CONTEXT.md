@@ -42,3 +42,10 @@ The validation-selected rule that converts refined pair scores into a hard
 predicted graph. Supported rule families are probability threshold, per-node
 top-k, and global top-M. Test evaluation must reuse the validation-selected
 rule without reselecting on test data.
+
+### Validation topology candidate universe
+
+The set of protein pairs materialized inside fixed validation topology buckets.
+For TCCIG, these are all non-self pairs inside PRING-style validation node
+buckets sampled from the validation true topology target, not only the ratio5
+validation supervision rows.

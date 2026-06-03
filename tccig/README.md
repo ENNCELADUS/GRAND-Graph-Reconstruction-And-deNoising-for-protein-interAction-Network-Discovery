@@ -84,6 +84,20 @@ refiner:
     type: none
   optimization:
     gradient_clip_norm: 1.0
+  monitor_metric: val_topology_loss
+  topology_validation:
+    enabled: true
+    node_sizes: [20, 40, 60, 80, 100, 120, 140, 160, 180, 200]
+    samples_per_size: 20
+    strategy: mixed
+    seed: 0
+    inference_batch_size: 4096
+    compute_clustering_mmd: true
+    losses:
+      alpha: 0.5
+      beta: 1.0
+      gamma: 0.3
+      delta: 0.3
 
 graph_selection:
   rules:
@@ -101,6 +115,11 @@ graph_selection:
   outputs and train loss targets from labels.
 - `human_val_ppi_ratio5_exclusive.txt` builds `G_pairwise_val` from scorer
   outputs and selects checkpoint/rule from validation labels.
+- Validation topology builds a true topology graph from positive rows in
+  `human_val_ppi_ratio5_exclusive.txt`, samples PRING-style validation node
+  buckets, scores every non-self pair inside those buckets, and selects the
+  checkpoint/rule pair from configured hard topology metrics when
+  `refiner.topology_validation.enabled` is true.
 - `human_test_ppi.txt` is only for ordinary pairwise metrics.
 - `all_test_ppi.txt` is the topology candidate universe; its labels are ignored.
 - `human_test_graph.pkl` and `test_sampled_nodes.pkl` are loaded only after

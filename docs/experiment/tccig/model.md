@@ -258,23 +258,47 @@ denoiser 稳定提升后，才做 optional joint fine-tune，而且要用 very s
 Validation 必须模拟 test：
 
 ```text
-1. 用 pairwise classifier 对 validation candidate pairs 打分
-2. 构造 G_pairwise_val
-3. 输入 G_pairwise_val + X_val 到 denoiser
-4. 输出 refined scores
-5. 用 validation 选 τ_refine / top-k / top-M
-6. 重建 hard refined graph
-7. 和 validation true topology 比较
+1. 从 human_val_ppi_ratio5_exclusive.txt 的正例构造 validation true topology
+2. 在 validation true topology 上采样 PRING-style node buckets: 20, 40, ..., 200
+3. 对每个 validation bucket materialize bucket 内所有 non-self protein pairs
+4. 用 pairwise classifier 对这些 label-free bucket all-pairs 打分
+5. 构造 G_pairwise_val_topology
+6. 输入 G_pairwise_val_topology + X_val_topology 到 denoiser
+7. 输出 refined scores
+8. 对每个 configured graph rule 重建 hard refined bucket graphs
+9. 和 validation true topology bucket subgraphs 比较，计算 graph_sim / relative_density / MMD metrics
 ```
 
-v1 选择 checkpoint 的主指标：
+注意这里的 validation topology candidate universe 不是
+`human_val_ppi_ratio5_exclusive.txt` 本身。ratio5 文件只定义 validation true
+topology target；真正用于 topology validation 的候选边是 bucket 内 all-pairs，
+这样 validation 才和 test-time `all_test_ppi.txt` graph reconstruction 语义对齐。
+
+v1 选择 checkpoint 和 hard graph rule 的主指标由 config 控制：
 
 ```text
-primary = val_auprc
-secondary = validation rule metrics
+refiner.monitor_metric =
+    val_topology_loss
+  | internal_val_graph_sim
+  | val_graph_sim
+  | internal_val_relative_density
+  | val_relative_density
+  | val_auprc
 ```
 
-附件里 internal topology validation 本身就是用 validation target graph、固定 node buckets、hard predicted subgraphs，并计算 graph metrics；monitor metric 支持 `val_topology_loss`、`internal_val_graph_sim`、`internal_val_relative_density`、`val_auprc` 等。
+当 monitor 是 topology 指标时，同一次 validation epoch/rule evaluation 同时决定
+best checkpoint 和 selected refined graph decision rule。selected rule 会在 test
+time 原样复用；test 不能重新根据 `human_test_graph.pkl` 选 threshold/top-k/top-M。
+
+`val_topology_loss` 使用和 topology fine-tune validation 一致的 hard-metric
+penalty：
+
+```text
+alpha * (1 - graph_sim)
++ beta * (relative_density - 1)^2
++ gamma * deg_dist_mmd
++ delta * cc_mmd
+```
 
 ---
 

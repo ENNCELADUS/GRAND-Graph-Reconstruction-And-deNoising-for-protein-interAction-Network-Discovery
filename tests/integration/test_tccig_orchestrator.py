@@ -18,6 +18,7 @@ from tccig.train import (
 )
 
 HOOK_EVENTS: list[tuple[str, object]] = []
+SCORE_PAIR_COUNTS: list[tuple[str, int]] = []
 
 
 def _write_pairs(path: Path, rows: list[tuple[str, str, int]]) -> None:
@@ -52,6 +53,8 @@ def _write_tiny_pring_fixture(processed_dir: Path) -> None:
         pickle.dump(graph, handle)
     with (processed_dir / "test_sampled_nodes.pkl").open("wb") as handle:
         pickle.dump({2: [["T1", "T2"], ["T1", "T3"]]}, handle)
+    with (processed_dir / "human_BFS_split.pkl").open("wb") as handle:
+        pickle.dump({"train": {"A", "B", "C"}, "val": {"A", "B", "C"}}, handle)
 
 
 def _tiny_v3_1_config() -> dict[str, object]:
@@ -112,6 +115,7 @@ def fake_score_pairs(request: PairwiseScoreRequest) -> list[float]:
     assert not hasattr(request, "human_test_graph")
     assert not hasattr(request, "test_sampled_nodes")
     HOOK_EVENTS.append(("score", request.split))
+    SCORE_PAIR_COUNTS.append((request.split, len(request.pairs)))
     return [0.9 if pair.protein_b in {"B", "T2"} else 0.1 for pair in request.pairs]
 
 
@@ -226,6 +230,52 @@ def test_validation_selected_rule_is_reused_for_topology_test(tmp_path: Path) ->
     )
     predicted_rows = prediction_path.read_text(encoding="utf-8").strip().splitlines()
     assert predicted_rows == ["T1\tT2\t1", "T1\tT3\t0"]
+
+
+def test_tccig_builds_validation_topology_bucket_all_pairs(tmp_path: Path) -> None:
+    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
+    _write_tiny_pring_fixture(processed_dir)
+    HOOK_EVENTS.clear()
+    SCORE_PAIR_COUNTS.clear()
+
+    run_tccig_pipeline(
+        {
+            "run": {"run_id": "validation_topology", "log_root": str(tmp_path / "logs")},
+            "data": {"processed_dir": str(processed_dir)},
+            "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
+            "pairwise_scorer": {"target": f"{__name__}:fake_score_pairs"},
+            "refiner": {
+                "train_target": f"{__name__}:fake_train_refiner",
+                "predict_target": f"{__name__}:fake_predict_refined",
+                "monitor_metric": "val_auprc",
+                "topology_validation": {
+                    "enabled": True,
+                    "node_sizes": [3],
+                    "samples_per_size": 1,
+                    "strategy": "mixed",
+                    "seed": 7,
+                    "inference_batch_size": 4,
+                    "compute_clustering_mmd": False,
+                },
+            },
+            "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
+        }
+    )
+
+    assert ("score", "validation_topology") in HOOK_EVENTS
+    assert ("validation_topology", 3) in SCORE_PAIR_COUNTS
+    validation_topology_manifest = (
+        tmp_path
+        / "logs"
+        / "tccig"
+        / "score"
+        / "validation_topology"
+        / "validation_topology.json"
+    )
+    manifest = json.loads(validation_topology_manifest.read_text(encoding="utf-8"))
+    assert manifest["pair_count"] == 3
+    assert manifest["validation_topology_pairs"] == 3
+    assert manifest["validation_topology_node_sizes"] == [3]
 
 
 def test_tccig_orchestrator_runs_v3_1_pairwise_scorer_with_fake_refiner(
@@ -376,6 +426,22 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
                 "scheduler": {"type": "none"},
                 "optimization": {"gradient_clip_norm": 1.0},
                 "residual_weight": 0.001,
+                "monitor_metric": "val_topology_loss",
+                "topology_validation": {
+                    "enabled": True,
+                    "node_sizes": [3],
+                    "samples_per_size": 1,
+                    "strategy": "mixed",
+                    "seed": 7,
+                    "inference_batch_size": 2,
+                    "compute_clustering_mmd": False,
+                    "losses": {
+                        "alpha": 0.5,
+                        "beta": 1.0,
+                        "gamma": 0.3,
+                        "delta": 0.3,
+                    },
+                },
                 "embedding_cache_dir": str(cache_dir),
                 "embedding_index_path": str(cache_dir / "index.json"),
                 "max_sequence_length": 8,
@@ -400,8 +466,11 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
         tmp_path / "logs" / "tccig" / "refiner" / "s2gae_tiny" / "training_summary.json"
     )
     training_summary = json.loads(training_summary_path.read_text(encoding="utf-8"))
-    assert training_summary["monitor_metric"] == "val_auprc"
+    assert training_summary["monitor_metric"] == "val_topology_loss"
     assert training_summary["epochs_trained"] == 2
+    assert "best_monitor_value" in training_summary
+    assert training_summary["selected_rule"]["validation_metrics"]["epoch"] in {1, 2}
+    assert "val_topology_loss" in training_summary["selected_rule"]["validation_metrics"]
     first_epoch = training_summary["history"][0]
     assert "train_loss" in first_epoch
     assert "train_bce_loss" in first_epoch
@@ -410,6 +479,8 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
     assert "train_gradient_norm" in first_epoch
     assert first_epoch["learning_rate"] == 0.01
     assert "val_auprc" in first_epoch
+    assert "val_topology_loss" in first_epoch
+    assert "internal_val_graph_sim" in first_epoch
     assert training_summary["optimizer"] == {
         "type": "adamw",
         "lr": 0.01,
@@ -438,4 +509,6 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
     }
     assert checkpoint["config"]["scheduler"] == {"type": "none"}
     assert checkpoint["config"]["optimization"] == {"gradient_clip_norm": 1.0}
+    assert checkpoint["monitor_metric"] == "val_topology_loss"
+    assert checkpoint["selected_rule"]["validation_metrics"]["epoch"] in {1, 2}
     assert "learning_rate" not in checkpoint["config"]
