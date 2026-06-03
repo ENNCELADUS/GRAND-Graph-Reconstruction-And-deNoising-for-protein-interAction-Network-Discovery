@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH -J TCCIG
-#SBATCH -p hexm_l40
+#SBATCH -p hexm
 #SBATCH -A hexm
 #SBATCH -N 1
 #SBATCH -t 4-00:00:00
 #SBATCH --mem=300G
 #SBATCH --cpus-per-task=32
-#SBATCH --gres=gpu:NVIDIAL40:4
+#SBATCH --gres=gpu:NVIDIAA40:4
 #SBATCH --output=logs/tccig/slurm_%j.out
 #SBATCH --error=logs/tccig/slurm_%j.err
 #SBATCH --mail-type=ALL
@@ -15,7 +15,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+REPO_ROOT="${GRAND_REPO_ROOT:-${SLURM_SUBMIT_DIR:-$(cd "${SCRIPT_DIR}/.." && pwd)}}"
 cd "$REPO_ROOT"
 
 if [ -f "$HOME/.bashrc" ]; then
