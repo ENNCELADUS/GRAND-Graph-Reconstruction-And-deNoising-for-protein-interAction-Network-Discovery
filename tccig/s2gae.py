@@ -13,6 +13,8 @@ import torch
 import torch.nn.functional as functional
 from sklearn.metrics import average_precision_score
 from src.embed import load_cached_embedding
+from src.train.config import LossConfig
+from src.utils.losses import binary_classification_loss
 from torch import nn
 
 from tccig.io import CandidatePair, canonical_edge, write_json
@@ -35,6 +37,7 @@ class S2GAEConfig:
     epochs: int
     learning_rate: float
     batch_size: int
+    loss_config: LossConfig
     residual_weight: float
     embedding_cache_dir: Path
     embedding_index_path: Path
@@ -51,6 +54,16 @@ class S2GAERefinerState:
     config: S2GAEConfig
     best_validation_auprc: float
     epochs_trained: int
+
+
+@dataclass(frozen=True)
+class S2GAELossTerms:
+    """S2GAE training loss components."""
+
+    bce: torch.Tensor
+    residual_anchor: torch.Tensor
+    weighted_residual_anchor: torch.Tensor
+    total: torch.Tensor
 
 
 class S2GAERefiner(nn.Module):
@@ -181,6 +194,30 @@ def residual_refined_logits(
     return torch.logit(clamped) + delta_logits
 
 
+def s2gae_loss_terms(
+    *,
+    refined_logits: torch.Tensor,
+    labels: torch.Tensor,
+    delta_logits: torch.Tensor,
+    loss_config: LossConfig,
+    residual_weight: float,
+) -> S2GAELossTerms:
+    """Compute supervised denoising BCE plus all-pair residual anchor."""
+    bce = binary_classification_loss(
+        logits=refined_logits,
+        labels=labels,
+        loss_config=loss_config,
+    )
+    residual_anchor = delta_logits.pow(2).mean()
+    weighted_residual_anchor = residual_weight * residual_anchor
+    return S2GAELossTerms(
+        bce=bce,
+        residual_anchor=residual_anchor,
+        weighted_residual_anchor=weighted_residual_anchor,
+        total=bce + weighted_residual_anchor,
+    )
+
+
 def load_mean_pooled_node_features(
     *,
     protein_ids: Sequence[str],
@@ -239,6 +276,9 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         total_loss = 0.0
+        total_bce_loss = 0.0
+        total_residual_anchor_loss = 0.0
+        total_weighted_residual_anchor_loss = 0.0
         total_examples = 0
         for batch_indices in _batch_indices(len(request.train.pairs), cfg.batch_size, device):
             optimizer.zero_grad()
@@ -249,14 +289,25 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 pairwise_probabilities=train_graph.pairwise_probabilities[batch_indices],
             )
             labels = train_labels[batch_indices]
-            bce_loss = functional.binary_cross_entropy_with_logits(refined_logits, labels)
-            residual_loss = delta.pow(2).mean()
-            loss = bce_loss + cfg.residual_weight * residual_loss
-            loss.backward()
+            loss_terms = s2gae_loss_terms(
+                refined_logits=refined_logits,
+                labels=labels,
+                delta_logits=delta,
+                loss_config=cfg.loss_config,
+                residual_weight=cfg.residual_weight,
+            )
+            loss_terms.total.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             batch_count = int(batch_indices.numel())
-            total_loss += float(loss.detach().item()) * batch_count
+            total_loss += float(loss_terms.total.detach().item()) * batch_count
+            total_bce_loss += float(loss_terms.bce.detach().item()) * batch_count
+            total_residual_anchor_loss += (
+                float(loss_terms.residual_anchor.detach().item()) * batch_count
+            )
+            total_weighted_residual_anchor_loss += (
+                float(loss_terms.weighted_residual_anchor.detach().item()) * batch_count
+            )
             total_examples += batch_count
 
         validation_auprc = _validation_auprc(
@@ -265,11 +316,16 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             labels=validation_labels,
             batch_size=cfg.batch_size,
         )
-        epoch_loss = total_loss / max(1, total_examples)
+        epoch_denominator = max(1, total_examples)
         history.append(
             {
                 "epoch": epoch,
-                "train_loss": epoch_loss,
+                "train_loss": total_loss / epoch_denominator,
+                "train_bce_loss": total_bce_loss / epoch_denominator,
+                "train_residual_anchor_loss": total_residual_anchor_loss / epoch_denominator,
+                "train_weighted_residual_anchor_loss": (
+                    total_weighted_residual_anchor_loss / epoch_denominator
+                ),
                 "val_auprc": validation_auprc,
             }
         )
@@ -549,6 +605,7 @@ def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
             "refiner.learning_rate",
         ),
         batch_size=_positive_int(config.get("batch_size", 4096), "refiner.batch_size"),
+        loss_config=_parse_loss_config(config.get("loss", {})),
         residual_weight=_non_negative_float(
             config.get("residual_weight", 0.001),
             "refiner.residual_weight",
@@ -573,6 +630,11 @@ def _config_to_json(cfg: S2GAEConfig) -> dict[str, object]:
         "epochs": cfg.epochs,
         "learning_rate": cfg.learning_rate,
         "batch_size": cfg.batch_size,
+        "loss": {
+            "type": cfg.loss_config.loss_type,
+            "pos_weight": cfg.loss_config.pos_weight,
+            "label_smoothing": cfg.loss_config.label_smoothing,
+        },
         "residual_weight": cfg.residual_weight,
         "embedding_cache_dir": str(cfg.embedding_cache_dir),
         "embedding_index_path": str(cfg.embedding_index_path),
@@ -632,6 +694,19 @@ def _path(value: object, default: Path) -> Path:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("Path config values must be non-empty strings")
     return Path(value)
+
+
+def _parse_loss_config(raw_loss: object) -> LossConfig:
+    if not isinstance(raw_loss, Mapping):
+        raise ValueError("refiner.loss must be a mapping")
+    return LossConfig(
+        loss_type=str(raw_loss.get("type", "bce_with_logits")),
+        pos_weight=_positive_float(raw_loss.get("pos_weight", 1.0), "refiner.loss.pos_weight"),
+        label_smoothing=_probability(
+            raw_loss.get("label_smoothing", 0.0),
+            "refiner.loss.label_smoothing",
+        ),
+    )
 
 
 def _positive_int(value: object, field_name: str) -> int:

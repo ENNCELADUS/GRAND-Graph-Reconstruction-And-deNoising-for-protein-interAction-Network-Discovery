@@ -143,7 +143,8 @@ A_true   = adjacency(train positive PPI graph)
 p_refine = Dθ(X_train, G_input, Ω_train)
 ```
 
-v1 总 loss：
+v1 总 loss 已接入 `tccig.s2gae:train_refiner`。当前实现只做 supervised
+link denoising，不把 topology metric loss 放进 backward：
 
 ```text
 L = L_bce
@@ -153,22 +154,36 @@ L = L_bce
 #### 1. BCE denoise loss
 
 ```text
-L_bce = weighted_BCE(p_ij_refined, y_ij)
+L_bce = BCEWithLogits(l_ij_refined, y_ij; pos_weight, label_smoothing)
+```
+
+其中 `y_ij` 来自 train candidate rows 的真实 PRING labels。权重通过
+`refiner.loss` 显式配置，默认保持 ratio5 采样语义不变：
+
+```yaml
+refiner:
+  loss:
+    type: bce_with_logits
+    pos_weight: 1.0
+    label_smoothing: 0.0
 ```
 
 #### 2. Residual anchor loss
 
-防止 denoiser 过度 hallucinate：
+防止 denoiser 过度 hallucinate。该项对 train batch 里的全部 candidate
+pairs 计算，不只约束 negatives：
 
 ```text
-L_residual_anchor = mean(Δ_ij^2)
+L_residual_anchor = mean_{(i,j) in Ω_batch}(Δ_ij^2)
 ```
 
 权重要小，只是约束 refined score 不要脱离 pairwise evidence。
 
 #### Future: Topology loss
 
-用 soft adjacency `P_refined` 对齐 `A_true`：
+当前 v1 不训练这个 loss；topology metrics 只用于 validation/test 侧的 graph
+decision rule 和结果解释。后续如果要加入训练目标，可以再用 soft adjacency
+`P_refined` 对齐 `A_true`：
 
 ```text
 L_topology =

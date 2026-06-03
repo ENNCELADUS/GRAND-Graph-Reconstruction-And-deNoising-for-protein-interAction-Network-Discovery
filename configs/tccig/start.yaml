@@ -32,6 +32,10 @@ refiner:
   epochs: 20
   learning_rate: 0.001
   batch_size: 4096
+  loss:
+    type: bce_with_logits
+    pos_weight: 1.0
+    label_smoothing: 0.0
   residual_weight: 0.001
   embedding_cache_dir: data/embeddings/esm3_1024
   embedding_index_path: data/embeddings/esm3_1024/index.json

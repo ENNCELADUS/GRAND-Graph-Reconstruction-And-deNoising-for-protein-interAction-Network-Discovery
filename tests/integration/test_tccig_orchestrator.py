@@ -341,6 +341,11 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
                 "epochs": 2,
                 "learning_rate": 0.01,
                 "batch_size": 2,
+                "loss": {
+                    "type": "bce_with_logits",
+                    "pos_weight": 1.5,
+                    "label_smoothing": 0.1,
+                },
                 "residual_weight": 0.001,
                 "embedding_cache_dir": str(cache_dir),
                 "embedding_index_path": str(cache_dir / "index.json"),
@@ -365,3 +370,16 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
     training_summary = json.loads(training_summary_path.read_text(encoding="utf-8"))
     assert training_summary["monitor_metric"] == "val_auprc"
     assert training_summary["epochs_trained"] == 2
+    first_epoch = training_summary["history"][0]
+    assert "train_loss" in first_epoch
+    assert "train_bce_loss" in first_epoch
+    assert "train_residual_anchor_loss" in first_epoch
+    assert "train_weighted_residual_anchor_loss" in first_epoch
+    assert "val_auprc" in first_epoch
+
+    checkpoint = torch.load(tmp_path / "models" / "s2gae" / "best_model.pt")
+    assert checkpoint["config"]["loss"] == {
+        "type": "bce_with_logits",
+        "pos_weight": 1.5,
+        "label_smoothing": 0.1,
+    }
