@@ -1,0 +1,51 @@
+run:
+  run_id: start
+  log_root: logs
+
+data:
+  processed_dir: data/PRING/human/BFS
+
+device:
+  device: cuda
+  backend: ddp
+  mixed_precision: false
+  find_unused_parameters: false
+
+pairwise_scorer:
+  target: tccig.train:score_pairs_with_v3_1
+  model_config_path: configs/v3-1/0517/pair_context_gated_abba_no_cross_s47.yaml
+  checkpoint_path: models/v3.1/train/pair_context_gated_abba_no_cross_s47/best_model.pth
+  embedding_cache_dir: data/embeddings/esm3_1024
+  batch_size: 32
+  max_sequence_length: 1024
+
+refiner:
+  train_target: tccig.s2gae:train_refiner
+  predict_target: tccig.s2gae:predict_refined
+  encoder: sage
+  input_dim: 1024
+  hidden_dim: 128
+  num_layers: 2
+  decoder_hidden_dim: 256
+  decoder_layers: 2
+  dropout: 0.5
+  epochs: 20
+  learning_rate: 0.001
+  batch_size: 4096
+  residual_weight: 0.001
+  embedding_cache_dir: data/embeddings/esm3_1024
+  embedding_index_path: data/embeddings/esm3_1024/index.json
+  max_sequence_length: 1024
+  checkpoint_path: models/tccig/s2gae/start/best_model.pt
+
+graph_selection:
+  pairwise_graph_rule:
+    type: threshold
+    value: 0.5
+  rules:
+    - type: threshold
+      value: 0.5
+    - type: top_k
+      k: 10
+    - type: top_m
+      m: 32019

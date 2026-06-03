@@ -5,14 +5,16 @@ from __future__ import annotations
 import argparse
 import csv
 import importlib
+import json
 import math
 import pickle
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 
 import networkx as nx
+import torch
 import yaml  # type: ignore[import-untyped]
 from sklearn.metrics import (
     accuracy_score,
@@ -23,6 +25,9 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
+from src.embed import load_cached_embedding
+from src.pipeline.stages.train import build_model
+from torch.nn.utils.rnn import pad_sequence
 
 from tccig.io import CandidatePair, PairTable, read_pair_table, write_json
 from tccig.rules import GraphRule, edges_from_rule, parse_rules, select_rule
@@ -121,6 +126,191 @@ class TCCIGPipelineResult:
     topology_metrics: dict[str, float]
 
 
+def score_pairs_with_v3_1(request: PairwiseScoreRequest) -> list[float]:
+    """Score TCCIG candidate pairs with a checkpoint-backed v3.1 pairwise model."""
+    model_config_path = _required_path(request.config, "model_config_path", "pairwise_scorer")
+    checkpoint_path = _required_path(request.config, "checkpoint_path", "pairwise_scorer")
+    embedding_cache_dir = _required_path(
+        request.config,
+        "embedding_cache_dir",
+        "pairwise_scorer",
+    )
+    batch_size = _positive_int(
+        request.config.get("batch_size", 32),
+        "pairwise_scorer.batch_size",
+    )
+    max_sequence_length = _positive_int(
+        request.config.get("max_sequence_length"),
+        "pairwise_scorer.max_sequence_length",
+    )
+
+    model_config = _load_v3_1_abba_no_cross_model_config(model_config_path)
+    input_dim = _positive_int(model_config.get("input_dim"), "model_config.input_dim")
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(
+            f"pairwise_scorer.checkpoint_path does not exist: {checkpoint_path}"
+        )
+
+    embedding_index = _load_embedding_index(embedding_cache_dir / "index.json")
+    device = torch.device(request.runtime.device)
+    model = build_model({"model_config": model_config})
+    state_dict = torch.load(checkpoint_path, map_location="cpu")
+    if not isinstance(state_dict, dict):
+        raise ValueError("pairwise_scorer.checkpoint_path must contain a model state dict")
+    model.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+
+    probabilities: list[float] = []
+    with torch.inference_mode():
+        for batch_pairs in _chunk_pairs(request.pairs, batch_size):
+            batch = _build_v3_1_pair_batch(
+                pairs=batch_pairs,
+                cache_dir=embedding_cache_dir,
+                embedding_index=embedding_index,
+                input_dim=input_dim,
+                max_sequence_length=max_sequence_length,
+                device=device,
+            )
+            output = model(batch)
+            logits = cast(torch.Tensor, output["logits"])
+            reduced_logits = (
+                logits.squeeze(-1) if logits.dim() > 1 and logits.size(-1) == 1 else logits
+            )
+            probabilities.extend(torch.sigmoid(reduced_logits).detach().cpu().tolist())
+    return [float(probability) for probability in probabilities]
+
+
+def _load_v3_1_abba_no_cross_model_config(model_config_path: Path) -> dict[str, object]:
+    """Load and validate the v3.1 abba-no-cross pairwise architecture config."""
+    payload = _load_yaml_config(model_config_path)
+    model_config_raw = payload.get("model_config")
+    if not isinstance(model_config_raw, Mapping):
+        raise ValueError("pairwise_scorer.model_config_path must contain model_config")
+    model_config = dict(model_config_raw)
+
+    _require_config_value(
+        model_config.get("model"),
+        "v3.1",
+        "model_config.model",
+    )
+    pair_readout = _required_mapping(model_config, "pair_readout", "model_config")
+    _require_config_value(
+        pair_readout.get("mode"),
+        "pair_context_gated",
+        "model_config.pair_readout.mode",
+    )
+    _require_config_value(
+        pair_readout.get("order_aggregation"),
+        "abba_max",
+        "model_config.pair_readout.order_aggregation",
+    )
+    interaction = _required_mapping(model_config, "interaction", "model_config")
+    _require_config_value(
+        interaction.get("mode"),
+        "none",
+        "model_config.interaction.mode",
+    )
+    return model_config
+
+
+def _required_mapping(
+    config: Mapping[str, object],
+    key: str,
+    namespace: str,
+) -> Mapping[str, object]:
+    value = config.get(key)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{namespace}.{key} must be a mapping")
+    return value
+
+
+def _require_config_value(value: object, expected: str, field_name: str) -> None:
+    if str(value).lower() != expected:
+        raise ValueError(f"{field_name} must be {expected!r} for the TCCIG v3.1 scorer")
+
+
+def _required_path(config: Mapping[str, object], key: str, namespace: str) -> Path:
+    value = config.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{namespace}.{key} is required")
+    return Path(value)
+
+
+def _positive_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a positive integer")
+    try:
+        parsed = int(cast(int | str, value))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field_name} must be a positive integer") from error
+    if parsed <= 0:
+        raise ValueError(f"{field_name} must be a positive integer")
+    return parsed
+
+
+def _load_embedding_index(index_path: Path) -> dict[str, str]:
+    if not index_path.exists():
+        raise FileNotFoundError(f"pairwise_scorer.embedding_cache_dir missing index: {index_path}")
+    with index_path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError("Embedding index must be a JSON object")
+    index: dict[str, str] = {}
+    for protein_id, relative_path in payload.items():
+        if not isinstance(protein_id, str) or not isinstance(relative_path, str):
+            raise ValueError("Embedding index must map protein IDs to relative paths")
+        index[protein_id] = relative_path
+    return index
+
+
+def _chunk_pairs(
+    pairs: Sequence[CandidatePair],
+    batch_size: int,
+) -> Iterator[Sequence[CandidatePair]]:
+    for start in range(0, len(pairs), batch_size):
+        yield pairs[start : start + batch_size]
+
+
+def _build_v3_1_pair_batch(
+    *,
+    pairs: Sequence[CandidatePair],
+    cache_dir: Path,
+    embedding_index: Mapping[str, str],
+    input_dim: int,
+    max_sequence_length: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    embeddings: dict[str, torch.Tensor] = {}
+    for pair in pairs:
+        for protein_id in (pair.protein_a, pair.protein_b):
+            if protein_id not in embeddings:
+                embeddings[protein_id] = load_cached_embedding(
+                    cache_dir=cache_dir,
+                    index=embedding_index,
+                    protein_id=protein_id,
+                    expected_input_dim=input_dim,
+                    max_sequence_length=max_sequence_length,
+                )
+
+    emb_a = pad_sequence([embeddings[pair.protein_a] for pair in pairs], batch_first=True)
+    emb_b = pad_sequence([embeddings[pair.protein_b] for pair in pairs], batch_first=True)
+    len_a = torch.tensor(
+        [embeddings[pair.protein_a].size(0) for pair in pairs],
+        dtype=torch.long,
+    )
+    len_b = torch.tensor(
+        [embeddings[pair.protein_b].size(0) for pair in pairs],
+        dtype=torch.long,
+    )
+    return {
+        "emb_a": emb_a.to(device),
+        "emb_b": emb_b.to(device),
+        "len_a": len_a.to(device),
+        "len_b": len_b.to(device),
+    }
+
+
 def run_tccig_pipeline(
     config: Mapping[str, object],
     *,
@@ -163,7 +353,11 @@ def run_tccig_pipeline(
         include_loss=False,
     )
 
-    refiner_cfg = _mapping_section(config, "refiner")
+    refiner_cfg = _refiner_runtime_config(
+        config=_mapping_section(config, "refiner"),
+        run_id=run_id,
+        log_root=log_root,
+    )
     train_refiner = _load_optional_callable(
         refiner_cfg.get("train_target"),
         _not_implemented_train_refiner,
@@ -347,7 +541,12 @@ def _predict_refined_probabilities(
             config=refiner_cfg,
         )
     )
-    return _normalize_probabilities(raw_scores)
+    probabilities = _normalize_probabilities(raw_scores)
+    if len(probabilities) != len(bundle.pairs):
+        raise ValueError(
+            f"refiner returned {len(probabilities)} scores for {len(bundle.pairs)} pairs"
+        )
+    return probabilities
 
 
 def _run_pairwise_test(
@@ -547,6 +746,20 @@ def _pairwise_graph_rule(config: Mapping[str, object]) -> GraphRule:
     graph_cfg = _mapping_section(config, "graph_selection")
     raw_rule = graph_cfg.get("pairwise_graph_rule", {"type": "threshold", "value": 0.5})
     return parse_rules([raw_rule])[0]
+
+
+def _refiner_runtime_config(
+    *,
+    config: Mapping[str, object],
+    run_id: str,
+    log_root: Path,
+) -> Mapping[str, object]:
+    """Add orchestrator-owned run context to refiner hook config."""
+    return {
+        **config,
+        "_run_id": run_id,
+        "_log_root": str(log_root),
+    }
 
 
 def _mapping_section(config: Mapping[str, object], key: str) -> Mapping[str, object]:

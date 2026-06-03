@@ -2,10 +2,8 @@
 
 This directory contains the standalone TCCIG scaffold for the PRING-aligned
 pipeline contract. It is intentionally limited to data IO, pairwise-score
-orchestration, graph decision rules, metrics, and fakeable model boundaries.
-
-It does not implement the concrete pairwise classifier, refiner model, or
-training loop.
+orchestration, graph decision rules, metrics, and fakeable model boundaries,
+plus the concrete S2GAE residual denoiser used by the current TCCIG path.
 
 ## Sandbox Requirements
 
@@ -15,7 +13,7 @@ Keep it small, reviewable, and tied to the GRAND repository environment.
 ## Hard Rules
 
 1. Keep the editable surface tiny.
-   - The agent only touches `train.py` and config files.
+   - The agent only touches `train.py`, `s2gae.py`, and config files.
    - Do not spread experimental logic across extra modules unless the code is no longer reviewable in one file.
    - Do not modify `prepare.py` unless the data or metric contract is intentionally being changed.
 
@@ -26,16 +24,22 @@ Keep it small, reviewable, and tied to the GRAND repository environment.
 
 ## Design Choices
 
-### Single File to Modify
+### Small Concrete Refiner Module
 
-The agent only touches `train.py` and config files. This keeps the scope
-manageable and diffs reviewable.
+The orchestrator stays in `train.py`. The concrete S2GAE residual denoiser lives
+in `s2gae.py` so model, feature, and optimization code stays reviewable without
+turning the orchestrator into the training implementation.
 
 ### Self-Contained
 
 This path should not become a second project inside GRAND. It should depend on
 the root `pyproject.toml`, the root `uv` workflow, PyTorch, and only the small
 set of dependencies already accepted by the main repository.
+
+The S2GAE refiner intentionally depends on PyG and its Torch-version-specific
+extension wheels. Use `uv sync --group dev --find-links
+https://data.pyg.org/whl/torch-2.10.0+cpu.html` for local CPU setup, and the
+CUDA 12.8 wheel page `https://data.pyg.org/whl/torch-2.10.0+cu128.html` on HPC.
 
 ## Public Entry Point
 
@@ -65,8 +69,10 @@ pairwise_scorer:
   target: some.module:score_pairs
 
 refiner:
-  train_target: some.module:train_refiner
-  predict_target: some.module:predict_refined
+  train_target: tccig.s2gae:train_refiner
+  predict_target: tccig.s2gae:predict_refined
+  embedding_cache_dir: data/embeddings/esm3_1024
+  embedding_index_path: data/embeddings/esm3_1024/index.json
 
 graph_selection:
   rules:

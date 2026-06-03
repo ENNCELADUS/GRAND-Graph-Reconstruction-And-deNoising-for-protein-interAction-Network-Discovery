@@ -6,12 +6,33 @@
 
 ### Stage 0 — Pairwise classifier 准备
 
-已有 mature pairwise classifier `Cφ(x_i, x_j)`，输入是 protein sequence/features/ESM embeddings，输出：
+第一版具体 pairwise 模块是 checkpoint-backed v3.1
+`pair_context_gated_abba_no_cross` scorer。它通过
+`pairwise_scorer.target: tccig.train:score_pairs_with_v3_1` 接入
+`tccig/train.py`，从配置加载 v3.1 architecture config、single checkpoint 和
+ESM3 embedding cache，对 TCCIG scaffold 传入的 label-free candidate pairs 输出：
 
 ```text
 s_ij = sigmoid(Cφ(x_i, x_j))
 l_ij = logit(s_ij)
 ```
+
+这个 scorer 的固定 architecture contract 是：
+
+```yaml
+model_config:
+  model: v3.1
+  pair_readout:
+    mode: pair_context_gated
+    order_aggregation: abba_max
+  interaction:
+    mode: none
+```
+
+当前实现保留 frozen pairwise scorer，并通过 `refiner.train_target:
+tccig.s2gae:train_refiner` / `refiner.predict_target:
+tccig.s2gae:predict_refined` 接入 S2GAE residual denoiser。TCCIG run 内不训练
+pairwise model；pairwise scorer 只负责生成 `G_pairwise` 和 residual baseline。
 
 训练 denoiser 时不要直接用“在同一批 train labels 上训练过的 pairwise model”给 train graph 打分，否则 noisy graph 会过于干净。建议用 **K-fold out-of-fold pairwise predictions**：
 
@@ -122,13 +143,11 @@ A_true   = adjacency(train positive PPI graph)
 p_refine = Dθ(X_train, G_input, Ω_train)
 ```
 
-总 loss：
+v1 总 loss：
 
 ```text
 L = L_bce
-  + λ_topo * L_topology
   + λ_resid * L_residual_anchor
-  + λ_smooth * L_edge_weight_smooth   # optional
 ```
 
 #### 1. BCE denoise loss
@@ -137,7 +156,17 @@ L = L_bce
 L_bce = weighted_BCE(p_ij_refined, y_ij)
 ```
 
-#### 2. Topology loss
+#### 2. Residual anchor loss
+
+防止 denoiser 过度 hallucinate：
+
+```text
+L_residual_anchor = mean(Δ_ij^2)
+```
+
+权重要小，只是约束 refined score 不要脱离 pairwise evidence。
+
+#### Future: Topology loss
 
 用 soft adjacency `P_refined` 对齐 `A_true`：
 
@@ -149,23 +178,13 @@ L_topology =
   + δ * clustering_mmd
 ```
 
-#### 3. Residual anchor loss
-
-防止 denoiser 过度 hallucinate：
-
-```text
-L_residual_anchor = mean(Δ_ij^2)
-```
-
-或 soft distillation：
+或后续加入 soft distillation：
 
 ```text
 L_distill = BCE(p_ij_refined, stopgrad(s_ij_pairwise))
 ```
 
-权重要小，只是约束 refined score 不要脱离 pairwise evidence。
-
-#### 4. Optional Bandana-style weighted message objective
+#### Future: Optional Bandana-style weighted message objective
 
 如果 `G_pairwise` 的 edge weights 很有信息，不建议立刻二值化丢掉。Bandana 的优势正是把 Bernoulli edge mask 换成 continuous bandwidth mask，并做 layer-wise bandwidth prediction；它适合作为 **weighted message-passing / edge-confidence refinement variant**，但比 S2GAE/MGAE 更 experimental。
 
@@ -186,7 +205,7 @@ train θ only
 1. construct/load G_pairwise subgraph
 2. forward S2GAE-style encoder on G_pairwise
 3. decode Ω_batch candidate pairs with cross-correlation decoder
-4. compute BCE + topology + residual losses
+4. compute BCE + residual anchor losses
 5. backward on θ
 6. update θ
 ```
@@ -209,12 +228,11 @@ Validation 必须模拟 test：
 7. 和 validation true topology 比较
 ```
 
-选择 checkpoint 的主指标建议：
+v1 选择 checkpoint 的主指标：
 
 ```text
-primary = val_topology_loss
-secondary = internal_val_graph_sim
-constraint = relative_density close to 1
+primary = val_auprc
+secondary = validation rule metrics
 ```
 
 附件里 internal topology validation 本身就是用 validation target graph、固定 node buckets、hard predicted subgraphs，并计算 graph metrics；monitor metric 支持 `val_topology_loss`、`internal_val_graph_sim`、`internal_val_relative_density`、`val_auprc` 等。
@@ -269,4 +287,10 @@ Bandana 适合处理你的 `G_pairwise`，因为 pairwise graph 天然有 soft c
 
 ```text
 We convert a mature pairwise PPI classifier into an inductive graph reconstruction system by using its predictions to construct an input graph, then training an S2GAE-style residual topology denoiser to refine that noisy graph under validation-calibrated graph-level objectives.
+```
+
+v1 的实现性 claim 应收窄为：
+
+```text
+We convert a mature pairwise PPI classifier into an inductive graph reconstruction system by using its predictions to construct an input graph, then training an S2GAE-style residual denoiser with supervised link reconstruction and validation-calibrated graph decision rules.
 ```

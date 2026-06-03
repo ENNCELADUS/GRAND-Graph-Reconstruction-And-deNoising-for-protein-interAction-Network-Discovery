@@ -33,6 +33,13 @@ dependencies = [
     "scikit-learn==1.8.0",
     "scipy==1.17.0",
     "torch==2.10.0",
+    "torch-geometric==2.7.0",
+    "pyg-lib==0.6.0+pt210 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "pyg-lib==0.6.0+pt210cu128 ; sys_platform == 'linux'",
+    "torch-scatter==2.1.2 ; sys_platform == 'darwin'",
+    "torch-scatter==2.1.2+pt210cu128 ; sys_platform == 'linux'",
+    "torch-sparse==0.6.18 ; sys_platform == 'darwin'",
+    "torch-sparse==0.6.18+pt210cu128 ; sys_platform == 'linux'",
 ]
 
 [dependency-groups]
