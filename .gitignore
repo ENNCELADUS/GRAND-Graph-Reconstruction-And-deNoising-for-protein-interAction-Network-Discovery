@@ -28,12 +28,6 @@ legacy/
 # External Codebases
 PRING/
 
-# Research & Report Files
-docs/research/
-docs/report/
-.reports/
-docs/agent/
-
 # LaTeX Cache & Auxiliary Files
 *.aux
 *.out
