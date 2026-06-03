@@ -164,22 +164,12 @@ class S2GAERefiner(nn.Module):
         self.dropout = dropout
         self.encoder_name = encoder.lower()
         self.convs = nn.ModuleList()
-        sage_conv, gcn_conv = _load_pyg_convs()
+        graph_conv = _load_graph_conv()
         for layer_index in range(num_layers):
             in_channels = input_dim if layer_index == 0 else hidden_dim
-            if self.encoder_name == "sage":
-                self.convs.append(sage_conv(in_channels, hidden_dim))
-            elif self.encoder_name == "gcn":
-                self.convs.append(
-                    gcn_conv(
-                        in_channels,
-                        hidden_dim,
-                        cached=False,
-                        add_self_loops=False,
-                    )
-                )
-            else:
-                raise ValueError("refiner.encoder must be 'sage' or 'gcn'")
+            if self.encoder_name != "graphconv":
+                raise ValueError("refiner.encoder must be 'graphconv'")
+            self.convs.append(graph_conv(in_channels, hidden_dim))
         self.decoder = CrossLayerDecoder(
             hidden_dim=hidden_dim,
             num_layers=num_layers,
@@ -188,12 +178,17 @@ class S2GAERefiner(nn.Module):
             dropout=dropout,
         )
 
-    def encode(self, node_features: torch.Tensor, edge_index: torch.Tensor) -> list[torch.Tensor]:
+    def encode(
+        self,
+        node_features: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: torch.Tensor,
+    ) -> list[torch.Tensor]:
         """Return one hidden representation per GNN layer."""
         hidden_states: list[torch.Tensor] = []
         x = node_features
         for layer_index, conv in enumerate(self.convs):
-            x = conv(x, edge_index)
+            x = conv(x, edge_index, edge_weight)
             if layer_index < len(self.convs) - 1:
                 x = functional.relu(x)
                 x = functional.dropout(x, p=self.dropout, training=self.training)
@@ -205,11 +200,16 @@ class S2GAERefiner(nn.Module):
         *,
         node_features: torch.Tensor,
         edge_index: torch.Tensor,
+        edge_weight: torch.Tensor,
         pair_index: torch.Tensor,
         pairwise_probabilities: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return refined logits and residual deltas for candidate pairs."""
-        hidden_states = self.encode(node_features=node_features, edge_index=edge_index)
+        hidden_states = self.encode(
+            node_features=node_features,
+            edge_index=edge_index,
+            edge_weight=edge_weight,
+        )
         delta = self.decoder(hidden_states=hidden_states, pair_index=pair_index)
         return residual_refined_logits(pairwise_probabilities, delta), delta
 
@@ -230,7 +230,7 @@ class CrossLayerDecoder(nn.Module):
         if decoder_layers <= 0:
             raise ValueError("decoder_layers must be positive")
         self.dropout = dropout
-        input_dim = hidden_dim * num_layers * num_layers
+        input_dim = hidden_dim * num_layers * num_layers + hidden_dim
         layers: list[nn.Linear] = []
         if decoder_layers == 1:
             layers.append(nn.Linear(input_dim, 1))
@@ -255,6 +255,9 @@ class CrossLayerDecoder(nn.Module):
             src_values = src_hidden[src_index]
             for dst_hidden in hidden_states:
                 products.append(src_values * dst_hidden[dst_index])
+        final_src_values = hidden_states[-1][src_index]
+        final_dst_values = hidden_states[-1][dst_index]
+        products.append(torch.abs(final_src_values - final_dst_values))
         x = torch.cat(products, dim=1)
         for layer in self.layers[:-1]:
             x = layer(x)
@@ -418,6 +421,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             refined_logits, delta = model(
                 node_features=train_graph.node_features,
                 edge_index=train_graph.edge_index,
+                edge_weight=train_graph.edge_weight,
                 pair_index=train_graph.pair_index[:, batch_indices],
                 pairwise_probabilities=train_graph.pairwise_probabilities[batch_indices],
             )
@@ -589,6 +593,7 @@ def predict_refined(request: RefineRequest) -> list[float]:
         refined_logits, _ = state.model(
             node_features=graph.node_features,
             edge_index=graph.edge_index,
+            edge_weight=graph.edge_weight,
             pair_index=graph.pair_index[:, batch_indices],
             pairwise_probabilities=graph.pairwise_probabilities[batch_indices],
         )
@@ -600,6 +605,7 @@ def predict_refined(request: RefineRequest) -> list[float]:
 class _SplitGraph:
     node_features: torch.Tensor
     edge_index: torch.Tensor
+    edge_weight: torch.Tensor
     pair_index: torch.Tensor
     pairwise_probabilities: torch.Tensor
 
@@ -654,14 +660,17 @@ def _build_graph(
         max_sequence_length=cfg.max_sequence_length,
         device=device,
     )
+    edge_index, edge_weight = _edge_index_and_weight_from_edges(
+        pairs=pairs,
+        pairwise_probabilities=pairwise_probabilities,
+        edges=pairwise_graph_edges,
+        node_to_index=node_to_index,
+        device=device,
+    )
     return _SplitGraph(
         node_features=node_features,
-        edge_index=_edge_index_from_edges(
-            edges=pairwise_graph_edges,
-            node_to_index=node_to_index,
-            num_nodes=len(node_ids),
-            device=device,
-        ),
+        edge_index=edge_index,
+        edge_weight=edge_weight,
         pair_index=_pair_index_from_pairs(pairs=pairs, node_to_index=node_to_index, device=device),
         pairwise_probabilities=torch.tensor(
             [float(value) for value in pairwise_probabilities],
@@ -688,14 +697,20 @@ def _collect_node_ids(
     return sorted(protein_ids)
 
 
-def _edge_index_from_edges(
+def _edge_index_and_weight_from_edges(
     *,
+    pairs: Sequence[CandidatePair],
+    pairwise_probabilities: Sequence[float],
     edges: Sequence[tuple[str, str]],
     node_to_index: Mapping[str, int],
-    num_nodes: int,
     device: torch.device,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
+    edge_weights_by_pair = _edge_weights_by_pair(
+        pairs=pairs,
+        pairwise_probabilities=pairwise_probabilities,
+    )
     edge_columns: list[tuple[int, int]] = []
+    edge_weights: list[float] = []
     seen: set[tuple[str, str]] = set()
     for protein_a, protein_b in edges:
         edge = canonical_edge(protein_a, protein_b)
@@ -704,19 +719,37 @@ def _edge_index_from_edges(
         seen.add(edge)
         if protein_a not in node_to_index or protein_b not in node_to_index:
             raise ValueError("pairwise_graph_edges contain proteins outside candidate pairs")
+        if edge not in edge_weights_by_pair:
+            raise ValueError("pairwise_graph_edges contain edges outside candidate pairs")
         src = node_to_index[protein_a]
         dst = node_to_index[protein_b]
         if src == dst:
             continue
+        weight = edge_weights_by_pair[edge]
         edge_columns.append((src, dst))
+        edge_weights.append(weight)
         edge_columns.append((dst, src))
+        edge_weights.append(weight)
     if edge_columns:
         edge_index = torch.tensor(edge_columns, dtype=torch.long, device=device).t().contiguous()
+        edge_weight = torch.tensor(edge_weights, dtype=torch.float32, device=device)
     else:
         edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
-    add_self_loops = _load_add_self_loops()
-    edge_index, _ = add_self_loops(edge_index, num_nodes=num_nodes)
-    return cast(torch.Tensor, edge_index)
+        edge_weight = torch.empty((0,), dtype=torch.float32, device=device)
+    return edge_index, edge_weight
+
+
+def _edge_weights_by_pair(
+    *,
+    pairs: Sequence[CandidatePair],
+    pairwise_probabilities: Sequence[float],
+) -> dict[tuple[str, str], float]:
+    weights: dict[tuple[str, str], float] = {}
+    for pair, probability in zip(pairs, pairwise_probabilities, strict=True):
+        edge = canonical_edge(pair.protein_a, pair.protein_b)
+        value = float(probability)
+        weights[edge] = max(value, weights.get(edge, value))
+    return weights
 
 
 def _pair_index_from_pairs(
@@ -725,10 +758,7 @@ def _pair_index_from_pairs(
     node_to_index: Mapping[str, int],
     device: torch.device,
 ) -> torch.Tensor:
-    indices = [
-        (node_to_index[pair.protein_a], node_to_index[pair.protein_b])
-        for pair in pairs
-    ]
+    indices = [(node_to_index[pair.protein_a], node_to_index[pair.protein_b]) for pair in pairs]
     return torch.tensor(indices, dtype=torch.long, device=device).t().contiguous()
 
 
@@ -746,6 +776,7 @@ def _validation_auprc(
             refined_logits, _ = model(
                 node_features=graph.node_features,
                 edge_index=graph.edge_index,
+                edge_weight=graph.edge_weight,
                 pair_index=graph.pair_index[:, batch_indices],
                 pairwise_probabilities=graph.pairwise_probabilities[batch_indices],
             )
@@ -774,6 +805,7 @@ def _prediction_probabilities(
             refined_logits, _ = model(
                 node_features=graph.node_features,
                 edge_index=graph.edge_index,
+                edge_weight=graph.edge_weight,
                 pair_index=graph.pair_index[:, batch_indices],
                 pairwise_probabilities=graph.pairwise_probabilities[batch_indices],
             )
@@ -900,9 +932,7 @@ def _validation_topology_loss(
     graph_similarity_loss = 1.0 - float(internal_val_topology_stats["graph_sim"])
     relative_density_loss = (float(internal_val_topology_stats["relative_density"]) - 1.0) ** 2
     degree_mmd = float(internal_val_topology_stats["deg_dist_mmd"])
-    clustering_mmd = (
-        float(internal_val_topology_stats["cc_mmd"]) if include_clustering_mmd else 0.0
-    )
+    clustering_mmd = float(internal_val_topology_stats["cc_mmd"]) if include_clustering_mmd else 0.0
     return (
         weights.alpha * graph_similarity_loss
         + weights.beta * relative_density_loss
@@ -1031,11 +1061,13 @@ def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
     monitor_metric = str(config.get("monitor_metric", "val_auprc"))
     if monitor_metric not in SUPPORTED_MONITOR_METRICS:
         raise ValueError(
-            "refiner.monitor_metric must be one of "
-            f"{sorted(SUPPORTED_MONITOR_METRICS)}"
+            f"refiner.monitor_metric must be one of {sorted(SUPPORTED_MONITOR_METRICS)}"
         )
+    encoder = str(config.get("encoder", "graphconv")).lower()
+    if encoder != "graphconv":
+        raise ValueError("refiner.encoder must be 'graphconv'")
     return S2GAEConfig(
-        encoder=str(config.get("encoder", "sage")).lower(),
+        encoder=encoder,
         input_dim=_positive_int(config.get("input_dim", 1024), "refiner.input_dim"),
         hidden_dim=_positive_int(config.get("hidden_dim", 128), "refiner.hidden_dim"),
         num_layers=_positive_int(config.get("num_layers", 2), "refiner.num_layers"),
@@ -1127,26 +1159,16 @@ def _load_embedding_index(index_path: Path) -> dict[str, str]:
     return index
 
 
-def _load_pyg_convs() -> tuple[type[nn.Module], type[nn.Module]]:
+def _load_graph_conv() -> type[nn.Module]:
     try:
-        from torch_geometric.nn import GCNConv, SAGEConv
+        from torch_geometric.nn import GraphConv
     except ImportError as error:
         raise ImportError(
-            "S2GAE refiner requires PyG. Run `uv sync --group dev --find-links "
+            "S2GAE refiner requires PyG GraphConv. Run `uv sync --group dev --find-links "
             "https://data.pyg.org/whl/torch-2.10.0+cpu.html` locally, or use the "
             "matching CUDA wheel page on HPC."
         ) from error
-    return cast(tuple[type[nn.Module], type[nn.Module]], (SAGEConv, GCNConv))
-
-
-def _load_add_self_loops() -> object:
-    try:
-        from torch_geometric.utils import add_self_loops
-    except ImportError as error:
-        raise ImportError(
-            "S2GAE refiner requires torch_geometric.utils.add_self_loops"
-        ) from error
-    return add_self_loops
+    return cast(type[nn.Module], GraphConv)
 
 
 def _required_path(config: Mapping[str, object], key: str) -> Path:

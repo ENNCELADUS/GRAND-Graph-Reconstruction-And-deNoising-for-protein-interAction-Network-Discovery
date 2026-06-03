@@ -260,12 +260,7 @@ def test_validation_selected_rule_is_reused_for_topology_test(tmp_path: Path) ->
 
     metrics_payload = json.loads(
         (
-            tmp_path
-            / "logs"
-            / "tccig"
-            / "topology_test"
-            / "top_m_case"
-            / "topology_metrics.json"
+            tmp_path / "logs" / "tccig" / "topology_test" / "top_m_case" / "topology_metrics.json"
         ).read_text(encoding="utf-8")
     )
     assert metrics_payload["selected_rule"] == {"type": "top_m", "m": 1}
@@ -309,12 +304,7 @@ def test_tccig_builds_validation_topology_bucket_all_pairs(tmp_path: Path) -> No
     assert ("score", "validation_topology") in HOOK_EVENTS
     assert ("validation_topology", 3) in SCORE_PAIR_COUNTS
     validation_topology_manifest = (
-        tmp_path
-        / "logs"
-        / "tccig"
-        / "score"
-        / "validation_topology"
-        / "validation_topology.json"
+        tmp_path / "logs" / "tccig" / "score" / "validation_topology" / "validation_topology.json"
     )
     manifest = json.loads(validation_topology_manifest.read_text(encoding="utf-8"))
     assert manifest["pair_count"] == 3
@@ -445,7 +435,7 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
             "refiner": {
                 "train_target": "tccig.s2gae:train_refiner",
                 "predict_target": "tccig.s2gae:predict_refined",
-                "encoder": "sage",
+                "encoder": "graphconv",
                 "input_dim": 8,
                 "hidden_dim": 8,
                 "num_layers": 1,

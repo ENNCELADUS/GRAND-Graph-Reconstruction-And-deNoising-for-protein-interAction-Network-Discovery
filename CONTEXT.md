@@ -10,9 +10,10 @@ not a source of topology truth.
 
 ### Pairwise-generated graph
 
-The graph built from pairwise classifier scores over a split's candidate
-universe. This graph is a model input for TCCIG. It must be derived from
-pairwise predictions, not from PRING true labels or ground-truth graph pickles.
+The weighted graph built from pairwise classifier scores over a split's
+candidate universe. This graph is a model input for TCCIG, including pairwise
+confidence weights on selected edges. It must be derived from pairwise
+predictions, not from PRING true labels or ground-truth graph pickles.
 
 ### TCCIG pairwise scorer
 

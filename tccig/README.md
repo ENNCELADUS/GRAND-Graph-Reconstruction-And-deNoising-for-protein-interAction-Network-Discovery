@@ -71,6 +71,7 @@ pairwise_scorer:
 refiner:
   train_target: tccig.s2gae:train_refiner
   predict_target: tccig.s2gae:predict_refined
+  encoder: graphconv
   embedding_cache_dir: data/embeddings/esm3_1024
   embedding_index_path: data/embeddings/esm3_1024/index.json
   optimizer:
@@ -112,9 +113,11 @@ graph_selection:
 ## PRING Contract
 
 - `human_train_ppi_ratio5_exclusive.txt` builds `G_pairwise_train` from scorer
-  outputs and train loss targets from labels.
+  outputs, preserving scorer probabilities as graph edge weights, and train loss
+  targets from labels.
 - `human_val_ppi_ratio5_exclusive.txt` builds `G_pairwise_val` from scorer
-  outputs and selects checkpoint/rule from validation labels.
+  outputs, preserving scorer probabilities as graph edge weights, and selects
+  checkpoint/rule from validation labels.
 - Validation topology builds a true topology graph from positive rows in
   `human_val_ppi_ratio5_exclusive.txt`, samples PRING-style validation node
   buckets, scores every non-self pair inside those buckets, and selects the
@@ -134,10 +137,12 @@ The pairwise scorer hook receives label-free candidate pairs only. The refiner
 training/prediction hooks receive pairwise-generated graph inputs and may see
 train/validation targets only where the PRING contract allows them.
 
-The concrete S2GAE refiner trains only refiner parameters with fixed-LR AdamW.
-It prepares the refiner model and optimizer through the configured accelerator,
-then routes backward through `accelerator.backward`. The pairwise scorer remains
-a frozen scoring boundary and is never updated by the refiner training loop.
+The concrete S2GAE refiner uses weighted PyG `GraphConv` over pairwise-generated
+edges, without explicit self-loops, and trains only refiner parameters with
+fixed-LR AdamW. It prepares the refiner model and optimizer through the
+configured accelerator, then routes backward through `accelerator.backward`. The
+pairwise scorer remains a frozen scoring boundary and is never updated by the
+refiner training loop.
 
 If refiner hooks are omitted, the scaffold raises `NotImplementedError`; this is
 intentional until concrete model and training code are added.

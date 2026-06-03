@@ -22,7 +22,7 @@ pairwise_scorer:
 refiner:
   train_target: tccig.s2gae:train_refiner
   predict_target: tccig.s2gae:predict_refined
-  encoder: sage
+  encoder: graphconv
   input_dim: 1024
   hidden_dim: 128
   num_layers: 2

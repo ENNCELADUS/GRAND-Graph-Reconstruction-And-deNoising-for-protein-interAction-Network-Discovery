@@ -99,7 +99,7 @@ G_pairwise = predicted graph from pairwise classifier
 Ω_batch = candidate pairs to score
 ```
 
-Encoder 采用 S2GAE-style GNN backbone。它必须是 **feature-based inductive encoder**，不能是 transductive node embedding table；backbone 可以是 GraphSAGE、GIN、GATv2，或者显式使用 `edge_weight=s_ij` 的 weighted message passing。
+Encoder 采用 S2GAE-style GNN backbone。它必须是 **feature-based inductive encoder**，不能是 transductive node embedding table。v1 实现使用 PyG `GraphConv`，并把 `G_pairwise` 中的 pairwise score confidence 作为 `edge_weight=s_ij` 输入 weighted message passing。
 
 ```text
 G_input = G_pairwise
@@ -108,13 +108,12 @@ G_input = G_pairwise
 
 h_i^0 = MLP_x(x_i)
 for k = 1..K:
-    h_i^k = COM_k(
-        h_i^{k-1},
-        AGG_k({edge_weight_ij * h_j^{k-1}: j in N_input(i)})
-    )
+    h_i^k =
+        W_self h_i^{k-1}
+        + W_neigh AGG_k({edge_weight_ij * h_j^{k-1}: j in N_input(i)})
 ```
 
-这里的 `G_input` 对应 S2GAE 的 perturbed graph input；区别是 perturbation 主来源不是从真实图里人工 mask，而是 pairwise classifier 的 imperfect predictions。这样 test 时也能用同一套流程：`X_test + G_pairwise_test -> H_test`，不需要也不允许访问 `human_test_graph.pkl`。
+这里的 `G_input` 对应 S2GAE 的 perturbed graph input；区别是 perturbation 主来源不是从真实图里人工 mask，而是 pairwise classifier 的 imperfect predictions。当前 `GraphConv` 路径不显式加入 self-loop；node self-information 来自 root/self transform `W_self h_i`。这样 test 时也能用同一套流程：`X_test + G_pairwise_test -> H_test`，不需要也不允许访问 `human_test_graph.pkl`。
 
 Decoder 用 S2GAE 的 cross-correlation 思路，显式利用多层 node representations 的交叉粒度信息：
 
