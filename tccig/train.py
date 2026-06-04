@@ -6,8 +6,10 @@ import argparse
 import csv
 import importlib
 import json
+import logging
 import math
 import pickle
+import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +43,8 @@ from torch.nn.utils.rnn import pad_sequence
 from tccig.io import CandidatePair, PairTable, canonical_edge, read_pair_table, write_json
 from tccig.rules import GraphRule, edges_from_rule, parse_rules, select_rule
 
+LOGGER = logging.getLogger(__name__)
+
 TOPOLOGY_METRIC_NAMES = [
     "graph_sim",
     "relative_density",
@@ -54,6 +58,18 @@ TOPOLOGY_CSV_COLUMNS = [
     "graph_count",
     *TOPOLOGY_METRIC_NAMES,
 ]
+SCORE_PROGRESS_COLUMNS = [
+    "split",
+    "rank",
+    "world_size",
+    "batch_index",
+    "processed_pairs",
+    "local_pair_count",
+    "global_pair_count",
+    "elapsed_s",
+]
+SPLIT_ORDER = ("train", "validation", "pairwise_test", "topology_test")
+ProgressCallback = Callable[[Mapping[str, object]], None]
 
 
 class AcceleratorLike(Protocol):
@@ -114,6 +130,7 @@ class PairwiseScoreRequest:
     pairs: Sequence[CandidatePair]
     runtime: TCCIGRuntime
     config: Mapping[str, object]
+    progress_callback: ProgressCallback | None = None
 
 
 @dataclass(frozen=True)
@@ -182,6 +199,10 @@ def score_pairs_with_v3_1(request: PairwiseScoreRequest) -> list[float]:
         request.config.get("max_sequence_length"),
         "pairwise_scorer.max_sequence_length",
     )
+    progress_every_batches = _positive_int(
+        request.config.get("progress_every_batches", 1),
+        "pairwise_scorer.progress_every_batches",
+    )
 
     model_config = _load_v3_1_abba_no_cross_model_config(model_config_path)
     input_dim = _positive_int(model_config.get("input_dim"), "model_config.input_dim")
@@ -202,7 +223,10 @@ def score_pairs_with_v3_1(request: PairwiseScoreRequest) -> list[float]:
 
     probabilities: list[float] = []
     with torch.inference_mode():
-        for batch_pairs in _chunk_pairs(request.pairs, batch_size):
+        for batch_index, batch_pairs in enumerate(
+            _chunk_pairs(request.pairs, batch_size),
+            start=1,
+        ):
             batch = _build_v3_1_pair_batch(
                 pairs=batch_pairs,
                 cache_dir=embedding_cache_dir,
@@ -217,6 +241,17 @@ def score_pairs_with_v3_1(request: PairwiseScoreRequest) -> list[float]:
                 logits.squeeze(-1) if logits.dim() > 1 and logits.size(-1) == 1 else logits
             )
             probabilities.extend(torch.sigmoid(reduced_logits).detach().cpu().tolist())
+            if request.progress_callback is not None and (
+                batch_index % progress_every_batches == 0
+                or len(probabilities) == len(request.pairs)
+            ):
+                request.progress_callback(
+                    {
+                        "batch_index": batch_index,
+                        "processed_pairs": len(probabilities),
+                        "local_pair_count": len(request.pairs),
+                    }
+                )
     return [float(probability) for probability in probabilities]
 
 
@@ -372,6 +407,7 @@ def run_tccig_pipeline(
         config=config,
         build_accelerator_fn=build_accelerator_fn or _default_build_accelerator,
     )
+    _configure_tccig_logging(runtime)
     run_id = _run_id(config)
     log_root = _log_root(config)
     tables = _load_tables(config)
@@ -381,22 +417,24 @@ def run_tccig_pipeline(
     pairwise_graph_rule = _pairwise_graph_rule(config)
     scorer_cfg = _mapping_section(config, "pairwise_scorer")
     rules = tuple(parse_rules(_mapping_section(config, "graph_selection").get("rules")))
-    bundles = {
-        split: _score_table(
+    score_dir = log_root / "tccig" / "score" / run_id
+    _prepare_score_progress_log(output_dir=score_dir, runtime=runtime)
+    bundles: dict[str, SplitBundle] = {}
+    for split in SPLIT_ORDER:
+        table = tables[split]
+        bundle = _score_table(
             table=table,
             split=split,
             scorer=pairwise_scorer,
             runtime=runtime,
             scorer_cfg=scorer_cfg,
             pairwise_graph_rule=pairwise_graph_rule,
+            output_dir=score_dir,
         )
-        for split, table in tables.items()
-    }
-    _write_scoring_manifests(
-        output_dir=log_root / "tccig" / "score" / run_id,
-        tables=tables,
-        bundles=bundles,
-    )
+        bundles[split] = bundle
+        if runtime.is_main_process:
+            _write_scoring_manifest(output_dir=score_dir, table=table, bundle=bundle)
+        _runtime_barrier(runtime)
 
     train_bundle = _with_targets(bundles["train"], tables["train"], include_loss=True)
     validation_bundle = _with_targets(
@@ -420,22 +458,25 @@ def run_tccig_pipeline(
             runtime=runtime,
             scorer_cfg=scorer_cfg,
             pairwise_graph_rule=pairwise_graph_rule,
+            output_dir=score_dir,
         )
-        write_json(
-            log_root / "tccig" / "score" / run_id / "validation_topology.json",
-            {
-                "split": "validation_topology",
-                "pair_count": len(validation_topology_bundle.pairs),
-                "pairwise_graph_edge_count": len(
-                    validation_topology_bundle.pairwise_graph_edges
-                ),
-                "validation_topology_subgraphs": validation_topology_plan.total_subgraphs,
-                "validation_topology_pairs": validation_topology_plan.total_pairs,
-                "validation_topology_node_sizes": [
-                    bucket.node_size for bucket in validation_topology_plan.buckets
-                ],
-            },
-        )
+        if runtime.is_main_process:
+            write_json(
+                score_dir / "validation_topology.json",
+                {
+                    "split": "validation_topology",
+                    "pair_count": len(validation_topology_bundle.pairs),
+                    "pairwise_graph_edge_count": len(
+                        validation_topology_bundle.pairwise_graph_edges
+                    ),
+                    "validation_topology_subgraphs": validation_topology_plan.total_subgraphs,
+                    "validation_topology_pairs": validation_topology_plan.total_pairs,
+                    "validation_topology_node_sizes": [
+                        bucket.node_size for bucket in validation_topology_plan.buckets
+                    ],
+                },
+            )
+        _runtime_barrier(runtime)
     train_refiner = _load_optional_callable(
         refiner_cfg.get("train_target"),
         _not_implemented_train_refiner,
@@ -539,6 +580,7 @@ def _score_table(
     runtime: TCCIGRuntime,
     scorer_cfg: Mapping[str, object],
     pairwise_graph_rule: GraphRule,
+    output_dir: Path,
 ) -> SplitBundle:
     return _score_pairs(
         pairs=table.pairs,
@@ -547,6 +589,7 @@ def _score_table(
         runtime=runtime,
         scorer_cfg=scorer_cfg,
         pairwise_graph_rule=pairwise_graph_rule,
+        output_dir=output_dir,
     )
 
 
@@ -558,21 +601,86 @@ def _score_pairs(
     runtime: TCCIGRuntime,
     scorer_cfg: Mapping[str, object],
     pairwise_graph_rule: GraphRule,
+    output_dir: Path,
 ) -> SplitBundle:
     candidate_pairs = list(pairs)
+    start_time = time.perf_counter()
+    local_indexed_pairs = _rank_local_indexed_pairs(
+        pairs=candidate_pairs,
+        runtime=runtime,
+    )
+    local_pairs = [pair for _, pair in local_indexed_pairs]
+    _write_score_shard_manifest(
+        output_dir=output_dir,
+        split=split,
+        runtime=runtime,
+        global_pair_count=len(candidate_pairs),
+        local_pair_count=len(local_pairs),
+        processed_pair_count=0,
+        status="running",
+        elapsed_s=0.0,
+    )
+
+    def progress_callback(progress: Mapping[str, object]) -> None:
+        _append_score_progress_row(
+            output_dir=output_dir,
+            split=split,
+            runtime=runtime,
+            batch_index=_non_negative_int(
+                progress.get("batch_index", 0),
+                "pairwise_scorer.progress.batch_index",
+            ),
+            processed_pairs=_non_negative_int(
+                progress.get("processed_pairs", 0),
+                "pairwise_scorer.progress.processed_pairs",
+            ),
+            local_pair_count=len(local_pairs),
+            global_pair_count=len(candidate_pairs),
+            elapsed_s=time.perf_counter() - start_time,
+        )
+
     raw_scores = scorer(
         PairwiseScoreRequest(
             split=split,
-            pairs=candidate_pairs,
+            pairs=local_pairs,
             runtime=runtime,
             config=scorer_cfg,
+            progress_callback=progress_callback,
         )
     )
-    probabilities = _normalize_probabilities(raw_scores)
+    local_probabilities = _normalize_probabilities(raw_scores)
+    if len(local_probabilities) != len(local_pairs):
+        raise ValueError(
+            f"pairwise scorer returned {len(local_probabilities)} scores for "
+            f"{len(local_pairs)} rank-local {split} pairs"
+        )
+    indexed_scores = [
+        (pair_index, probability)
+        for (pair_index, _), probability in zip(
+            local_indexed_pairs,
+            local_probabilities,
+            strict=True,
+        )
+    ]
+    probabilities = _ordered_scores_from_rank_shards(
+        total_pairs=len(candidate_pairs),
+        local_indexed_scores=indexed_scores,
+        runtime=runtime,
+    )
     graph_edges = edges_from_rule(
         pairs=candidate_pairs,
         probabilities=probabilities,
         rule=pairwise_graph_rule,
+    )
+    _write_score_shard_manifest(
+        output_dir=output_dir,
+        split=split,
+        runtime=runtime,
+        global_pair_count=len(candidate_pairs),
+        local_pair_count=len(local_pairs),
+        processed_pair_count=len(local_pairs),
+        status="completed",
+        elapsed_s=time.perf_counter() - start_time,
     )
     return SplitBundle(
         split=split,
@@ -590,6 +698,7 @@ def _build_validation_topology_bundle(
     runtime: TCCIGRuntime,
     scorer_cfg: Mapping[str, object],
     pairwise_graph_rule: GraphRule,
+    output_dir: Path,
 ) -> tuple[SplitBundle, InternalValidationPlan]:
     data_cfg = _mapping_section(config, "data")
     processed_dir = Path(str(data_cfg["processed_dir"]))
@@ -623,6 +732,7 @@ def _build_validation_topology_bundle(
         runtime=runtime,
         scorer_cfg=scorer_cfg,
         pairwise_graph_rule=pairwise_graph_rule,
+        output_dir=output_dir,
     )
     return bundle, validation_plan
 
@@ -667,6 +777,71 @@ def _selected_rule_from_refiner_state(
     return None, None
 
 
+def _rank_local_indexed_pairs(
+    *,
+    pairs: Sequence[CandidatePair],
+    runtime: TCCIGRuntime,
+) -> list[tuple[int, CandidatePair]]:
+    """Return candidate pairs owned by the current rank in stable file order."""
+    if not runtime.is_distributed:
+        return list(enumerate(pairs))
+    return [
+        (pair_index, pair)
+        for pair_index, pair in enumerate(pairs)
+        if pair_index % runtime.world_size == runtime.rank
+    ]
+
+
+def _ordered_scores_from_rank_shards(
+    *,
+    total_pairs: int,
+    local_indexed_scores: Sequence[tuple[int, float]],
+    runtime: TCCIGRuntime,
+    gather_fn: Callable[
+        [Sequence[tuple[int, float]]],
+        Sequence[Sequence[tuple[int, float]]],
+    ]
+    | None = None,
+) -> list[float]:
+    """Gather rank-local scores and restore original candidate-pair order."""
+    if not runtime.is_distributed:
+        return _ordered_scores_from_shards(
+            total_pairs=total_pairs,
+            shard_payloads=[local_indexed_scores],
+        )
+    if gather_fn is not None:
+        gathered_scores = list(gather_fn(local_indexed_scores))
+    elif _dist.is_available() and _dist.is_initialized():
+        gathered_payloads: list[list[tuple[int, float]] | None] = [None] * runtime.world_size
+        _dist.all_gather_object(gathered_payloads, list(local_indexed_scores))
+        gathered_scores = [payload for payload in gathered_payloads if payload is not None]
+    else:
+        gathered_scores = [local_indexed_scores]
+    return _ordered_scores_from_shards(
+        total_pairs=total_pairs,
+        shard_payloads=gathered_scores,
+    )
+
+
+def _ordered_scores_from_shards(
+    *,
+    total_pairs: int,
+    shard_payloads: Sequence[Sequence[tuple[int, float]]],
+) -> list[float]:
+    ordered: list[float | None] = [None] * total_pairs
+    for shard in shard_payloads:
+        for pair_index, score in shard:
+            if pair_index < 0 or pair_index >= total_pairs:
+                raise ValueError(f"Rank score index out of range: {pair_index}")
+            if ordered[pair_index] is not None:
+                raise ValueError(f"Duplicate rank score for pair index {pair_index}")
+            ordered[pair_index] = float(score)
+    missing = [index for index, score in enumerate(ordered) if score is None]
+    if missing:
+        raise ValueError(f"Missing rank scores for pair indices: {missing[:10]}")
+    return [float(score) for score in ordered]
+
+
 def _fallback_select_validation_rule(
     *,
     validation_bundle: SplitBundle,
@@ -697,6 +872,88 @@ def _fallback_select_validation_rule(
     }
 
 
+def _prepare_score_progress_log(*, output_dir: Path, runtime: TCCIGRuntime) -> None:
+    if runtime.is_main_process:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        progress_path = output_dir / "progress.csv"
+        with progress_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=SCORE_PROGRESS_COLUMNS)
+            writer.writeheader()
+    _runtime_barrier(runtime)
+
+
+def _append_score_progress_row(
+    *,
+    output_dir: Path,
+    split: str,
+    runtime: TCCIGRuntime,
+    batch_index: int,
+    processed_pairs: int,
+    local_pair_count: int,
+    global_pair_count: int,
+    elapsed_s: float,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    with (output_dir / "progress.csv").open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SCORE_PROGRESS_COLUMNS)
+        writer.writerow(
+            {
+                "split": split,
+                "rank": runtime.rank,
+                "world_size": runtime.world_size,
+                "batch_index": batch_index,
+                "processed_pairs": processed_pairs,
+                "local_pair_count": local_pair_count,
+                "global_pair_count": global_pair_count,
+                "elapsed_s": elapsed_s,
+            }
+        )
+
+
+def _write_score_shard_manifest(
+    *,
+    output_dir: Path,
+    split: str,
+    runtime: TCCIGRuntime,
+    global_pair_count: int,
+    local_pair_count: int,
+    processed_pair_count: int,
+    status: str,
+    elapsed_s: float,
+) -> None:
+    write_json(
+        output_dir / "shards" / split / f"rank_{runtime.rank}.json",
+        {
+            "split": split,
+            "rank": runtime.rank,
+            "world_size": runtime.world_size,
+            "global_pair_count": global_pair_count,
+            "local_pair_count": local_pair_count,
+            "processed_pair_count": processed_pair_count,
+            "status": status,
+            "elapsed_s": elapsed_s,
+        },
+    )
+
+
+def _write_scoring_manifest(
+    *,
+    output_dir: Path,
+    table: PairTable,
+    bundle: SplitBundle,
+) -> None:
+    write_json(
+        output_dir / f"{bundle.split}.json",
+        {
+            "split": bundle.split,
+            "path": str(table.path),
+            "pair_count": len(bundle.pairs),
+            "self_pair_rows_dropped": table.self_pair_rows,
+            "pairwise_graph_edge_count": len(bundle.pairwise_graph_edges),
+        },
+    )
+
+
 def _write_scoring_manifests(
     *,
     output_dir: Path,
@@ -705,17 +962,7 @@ def _write_scoring_manifests(
 ) -> None:
     """Persist one label-safe scoring manifest per split."""
     for split, table in tables.items():
-        bundle = bundles[split]
-        write_json(
-            output_dir / f"{split}.json",
-            {
-                "split": split,
-                "path": str(table.path),
-                "pair_count": len(bundle.pairs),
-                "self_pair_rows_dropped": table.self_pair_rows,
-                "pairwise_graph_edge_count": len(bundle.pairwise_graph_edges),
-            },
-        )
+        _write_scoring_manifest(output_dir=output_dir, table=table, bundle=bundles[split])
 
 
 def _with_targets(bundle: SplitBundle, table: PairTable, *, include_loss: bool) -> SplitBundle:
@@ -1138,6 +1385,24 @@ def _runtime_barrier(runtime: TCCIGRuntime) -> None:
     wait_for_everyone = getattr(runtime.accelerator, "wait_for_everyone", None)
     if callable(wait_for_everyone):
         wait_for_everyone()
+
+
+def _configure_tccig_logging(runtime: TCCIGRuntime) -> None:
+    """Configure standalone TCCIG logging for Slurm stdout/stderr."""
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(
+            level=logging.INFO if runtime.is_main_process else logging.CRITICAL,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+    LOGGER.info(
+        "TCCIG runtime initialized: backend=%s distributed=%s rank=%s world_size=%s device=%s",
+        runtime.backend,
+        runtime.is_distributed,
+        runtime.rank,
+        runtime.world_size,
+        runtime.device,
+    )
 
 
 def _pairwise_graph_rule(config: Mapping[str, object]) -> GraphRule:

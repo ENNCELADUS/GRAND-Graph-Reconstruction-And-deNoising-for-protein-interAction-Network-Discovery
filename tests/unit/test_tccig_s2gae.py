@@ -15,11 +15,20 @@ from tccig.s2gae import (
     S2GAERefiner,
     _build_graph,
     _parse_config,
+    _prediction_probabilities,
+    _SplitGraph,
     apply_gradient_clipping,
     load_mean_pooled_node_features,
     residual_refined_logits,
     s2gae_loss_terms,
 )
+
+
+class _FakeRuntime:
+    is_distributed = False
+    rank = 0
+    world_size = 1
+    accelerator = object()
 
 
 def test_cross_layer_decoder_returns_one_finite_delta_per_pair() -> None:
@@ -102,6 +111,46 @@ def test_refiner_preserves_pairwise_probability_when_delta_is_zero() -> None:
 
     assert delta.item() == pytest.approx(0.0)
     assert torch.sigmoid(refined_logits).item() == pytest.approx(0.7)
+
+
+def test_prediction_probabilities_encode_graph_once_across_decoder_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = S2GAERefiner(
+        encoder="graphconv",
+        input_dim=4,
+        hidden_dim=4,
+        num_layers=1,
+        decoder_hidden_dim=4,
+        decoder_layers=1,
+        dropout=0.0,
+    )
+    encode_calls = 0
+
+    def fake_encode(**kwargs: torch.Tensor) -> list[torch.Tensor]:
+        nonlocal encode_calls
+        node_features = kwargs["node_features"]
+        encode_calls += 1
+        return [torch.ones((node_features.size(0), 4), dtype=torch.float32)]
+
+    monkeypatch.setattr(model, "encode", fake_encode)
+    graph = _SplitGraph(
+        node_features=torch.ones((3, 4), dtype=torch.float32),
+        edge_index=torch.empty((2, 0), dtype=torch.long),
+        edge_weight=torch.empty((0,), dtype=torch.float32),
+        pair_index=torch.tensor([[0, 1, 0], [1, 2, 2]], dtype=torch.long),
+        pairwise_probabilities=torch.tensor([0.2, 0.4, 0.6], dtype=torch.float32),
+    )
+
+    probabilities = _prediction_probabilities(
+        model=model,
+        graph=graph,
+        batch_size=1,
+        runtime=_FakeRuntime(),
+    )
+
+    assert len(probabilities) == 3
+    assert encode_calls == 1
 
 
 def test_refiner_passes_edge_weight_to_graphconv() -> None:

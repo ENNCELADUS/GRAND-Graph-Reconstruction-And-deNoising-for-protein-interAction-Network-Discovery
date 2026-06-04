@@ -116,6 +116,33 @@ def test_score_pairs_with_v3_1_returns_one_probability_per_candidate(tmp_path: P
     assert all(0.0 <= probability <= 1.0 for probability in probabilities)
 
 
+def test_score_pairs_with_v3_1_reports_batch_progress(tmp_path: Path) -> None:
+    checkpoint_path = tmp_path / "best_model.pth"
+    _write_checkpoint(checkpoint_path)
+    progress_events: list[dict[str, object]] = []
+    config = _request_config(tmp_path, checkpoint_path)
+    config["batch_size"] = 2
+    request = PairwiseScoreRequest(
+        split="validation",
+        pairs=[
+            CandidatePair("P1", "P2"),
+            CandidatePair("P2", "P3"),
+            CandidatePair("P1", "P3"),
+        ],
+        runtime=_runtime(),
+        config=config,
+        progress_callback=lambda event: progress_events.append(dict(event)),
+    )
+
+    probabilities = score_pairs_with_v3_1(request)
+
+    assert len(probabilities) == 3
+    assert progress_events == [
+        {"batch_index": 1, "processed_pairs": 2, "local_pair_count": 3},
+        {"batch_index": 2, "processed_pairs": 3, "local_pair_count": 3},
+    ]
+
+
 def test_score_pairs_with_v3_1_does_not_filter_self_pairs(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "best_model.pth"
     _write_checkpoint(checkpoint_path)

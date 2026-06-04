@@ -217,17 +217,30 @@ train θ only
 `Cφ` 是 pairwise scorer hook，只在进入 refiner 前生成 pairwise probabilities
 和 `G_pairwise`。它不进入 autograd graph，也不会被 optimizer 持有。
 
-每个 batch：
+当前 standalone S2GAE 路径使用 **full-batch epoch update**，避免在同一
+epoch 内对同一个 `G_pairwise` 重复运行 GraphConv encoder。每个 epoch：
 
 ```text
 1. construct/load G_pairwise subgraph
-2. forward S2GAE-style encoder on G_pairwise
-3. decode Ω_batch candidate pairs with cross-correlation decoder
-4. compute BCE + residual anchor losses
-5. accelerator.backward(loss) on θ
-6. optionally clip θ gradients
-7. AdamW update on θ
+2. encode full graph once: H = Encoderθ(X, G_pairwise)
+3. shard Ω by distributed rank with original pair indices
+4. decode rank-local Ω chunks from cached H
+5. reduce rank-local BCE + residual-anchor losses to the global mean objective
+6. accelerator.backward(loss) on θ
+7. optionally clip θ gradients
+8. one AdamW update on θ
 ```
+
+Validation and test refined prediction follow the same operational rule: encode the
+split graph once per eval pass, decode only rank-local candidate pairs, gather
+scores back into original candidate-file order, then apply the validation-selected
+hard graph rule globally. Initial pairwise scoring is also rank-sharded by original
+candidate row index, with progress evidence under
+`logs/tccig/score/<run_id>/`.
+
+Training progress is written after every completed epoch to
+`logs/tccig/refiner/<run_id>/tccig_train_step.csv`, alongside
+`training_summary.json` and per-epoch manifests.
 
 当前 config 明确使用 fixed-LR AdamW，不启用 scheduler：
 

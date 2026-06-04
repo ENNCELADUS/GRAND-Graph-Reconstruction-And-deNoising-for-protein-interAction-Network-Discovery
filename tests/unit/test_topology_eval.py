@@ -302,6 +302,42 @@ def _tccig_runtime(*, rank: int, world_size: int) -> tccig_train.TCCIGRuntime:
     )
 
 
+def test_tccig_rank_local_pair_sharding_uses_round_robin_indices() -> None:
+    pairs = [
+        tccig_train.CandidatePair("P0", "Q0"),
+        tccig_train.CandidatePair("P1", "Q1"),
+        tccig_train.CandidatePair("P2", "Q2"),
+        tccig_train.CandidatePair("P3", "Q3"),
+        tccig_train.CandidatePair("P4", "Q4"),
+    ]
+
+    observed = tccig_train._rank_local_indexed_pairs(
+        pairs=pairs,
+        runtime=_tccig_runtime(rank=1, world_size=2),
+    )
+
+    assert [(index, pair.protein_a) for index, pair in observed] == [(1, "P1"), (3, "P3")]
+
+
+def test_tccig_ordered_scores_from_rank_shards_restores_file_order() -> None:
+    observed = tccig_train._ordered_scores_from_rank_shards(
+        total_pairs=5,
+        local_indexed_scores=[(0, 0.1), (2, 0.3), (4, 0.5)],
+        runtime=_tccig_runtime(rank=0, world_size=2),
+        gather_fn=lambda local_scores: [local_scores, [(1, 0.2), (3, 0.4)]],
+    )
+
+    assert observed == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5])
+
+
+def test_tccig_ordered_scores_rejects_empty_missing_rank_results() -> None:
+    with pytest.raises(ValueError, match="Missing rank scores"):
+        tccig_train._ordered_scores_from_shards(
+            total_pairs=2,
+            shard_payloads=[[]],
+        )
+
+
 def test_tccig_sharded_topology_metrics_merge_to_unsharded_result() -> None:
     gt_graph = nx.Graph()
     gt_graph.add_edges_from([("A", "B"), ("B", "C"), ("C", "D")])

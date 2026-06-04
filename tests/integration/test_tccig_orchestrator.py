@@ -215,6 +215,26 @@ def test_tccig_orchestrator_keeps_pring_truth_out_of_model_inputs(tmp_path: Path
     scoring_manifest = tmp_path / "logs" / "tccig" / "score" / "tiny" / "train.json"
     assert scoring_manifest.exists()
     assert '"pair_count": 2' in scoring_manifest.read_text(encoding="utf-8")
+    score_dir = tmp_path / "logs" / "tccig" / "score" / "tiny"
+    assert (score_dir / "validation.json").exists()
+    shard_manifest = score_dir / "shards" / "train" / "rank_0.json"
+    assert shard_manifest.exists()
+    shard_payload = json.loads(shard_manifest.read_text(encoding="utf-8"))
+    assert shard_payload["status"] == "completed"
+    assert shard_payload["local_pair_count"] == 2
+    progress_path = score_dir / "progress.csv"
+    assert progress_path.exists()
+    with progress_path.open("r", encoding="utf-8", newline="") as handle:
+        assert csv.DictReader(handle).fieldnames == [
+            "split",
+            "rank",
+            "world_size",
+            "batch_index",
+            "processed_pairs",
+            "local_pair_count",
+            "global_pair_count",
+            "elapsed_s",
+        ]
 
 
 def test_validation_selected_rule_is_reused_for_topology_test(tmp_path: Path) -> None:
@@ -355,6 +375,10 @@ def test_tccig_orchestrator_runs_v3_1_pairwise_scorer_with_fake_refiner(
     assert scoring_manifest.exists()
     manifest = json.loads(scoring_manifest.read_text(encoding="utf-8"))
     assert manifest["pair_count"] == 2
+    progress_path = tmp_path / "logs" / "tccig" / "score" / "v3_1_pairwise" / "progress.csv"
+    with progress_path.open("r", encoding="utf-8", newline="") as handle:
+        progress_rows = list(csv.DictReader(handle))
+    assert any(row["split"] == "train" and row["processed_pairs"] == "2" for row in progress_rows)
 
 
 def test_tccig_runtime_wires_deepspeed_backend_without_launching_it(tmp_path: Path) -> None:
@@ -526,6 +550,14 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
     assert training_summary["scheduler"] == {"type": "none"}
     assert training_summary["optimization"] == {"gradient_clip_norm": 1.0}
     assert training_summary["current_learning_rate"] == 0.01
+    step_csv_path = (
+        tmp_path / "logs" / "tccig" / "refiner" / "s2gae_tiny" / "tccig_train_step.csv"
+    )
+    with step_csv_path.open("r", encoding="utf-8", newline="") as handle:
+        step_rows = list(csv.DictReader(handle))
+    assert [row["Epoch"] for row in step_rows] == ["1", "2"]
+    assert all(row["Global Train Pairs"] == "2" for row in step_rows)
+    assert all(row["Monitor Metric"] == "val_topology_loss" for row in step_rows)
 
     checkpoint = torch.load(tmp_path / "models" / "s2gae" / "best_model.pt")
     assert checkpoint["config"]["loss"] == {
