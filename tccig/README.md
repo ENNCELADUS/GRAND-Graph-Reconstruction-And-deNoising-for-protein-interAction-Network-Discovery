@@ -104,10 +104,6 @@ graph_selection:
   rules:
     - type: threshold
       value: 0.5
-    - type: top_k
-      k: 10
-    - type: top_m
-      m: 32019
 ```
 
 ## PRING Contract
@@ -116,14 +112,20 @@ graph_selection:
   outputs, preserving scorer probabilities as graph edge weights, and train loss
   targets from labels.
 - `human_val_ppi_ratio5_exclusive.txt` builds `G_pairwise_val` from scorer
-  outputs, preserving scorer probabilities as graph edge weights, and selects
-  checkpoint/rule from validation labels.
+  outputs, preserving scorer probabilities as graph edge weights, and provides
+  validation supervision for checkpoint/calibration selection.
 - Validation topology builds a true topology graph from positive rows in
   `human_val_ppi_ratio5_exclusive.txt`, samples PRING-style validation node
   buckets, scores every non-self pair inside those buckets, and selects the
-  checkpoint/rule pair from configured hard topology metrics when
-  `refiner.topology_validation.enabled` is true.
-- `human_test_ppi.txt` is only for ordinary pairwise metrics.
+  checkpoint plus one global logit-bias calibration from configured hard
+  topology metrics when `refiner.topology_validation.enabled` is true. The
+  hard graph rule remains `threshold=0.5`; per-node top-k and global top-M are
+  not supported.
+- `human_test_ppi.txt` is the binary pairwise test set. The raw frozen v3.1
+  scorer baseline is a pinned historical artifact under
+  `logs/tccig/pairwise_baseline`; the pipeline does not regenerate it. The
+  full v3.1-plus-refiner pairwise metrics are written to
+  `logs/tccig/pairwise_test/{run_id}`.
 - `all_test_ppi.txt` is the topology candidate universe; its labels are ignored.
 - `human_test_graph.pkl` and `test_sampled_nodes.pkl` are loaded only after
   topology predictions exist, for metrics only.

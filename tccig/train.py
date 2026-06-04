@@ -41,7 +41,15 @@ from src.topology.finetune_data import (
 from torch.nn.utils.rnn import pad_sequence
 
 from tccig.io import CandidatePair, PairTable, canonical_edge, read_pair_table, write_json
-from tccig.rules import GraphRule, edges_from_rule, parse_rules, select_rule
+from tccig.rules import (
+    DEFAULT_GRAPH_THRESHOLD,
+    GraphRule,
+    apply_logit_bias,
+    edges_from_rule,
+    identity_calibration_payload,
+    parse_rules,
+    select_rule,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -167,6 +175,7 @@ class TCCIGPipelineResult:
 
     manifest: dict[str, object]
     selected_rule: dict[str, object]
+    selected_calibration: dict[str, object]
     pairwise_metrics: dict[str, float]
     topology_metrics: dict[str, float]
 
@@ -407,6 +416,7 @@ def run_tccig_pipeline(
     pairwise_graph_rule = _pairwise_graph_rule(config)
     scorer_cfg = _mapping_section(config, "pairwise_scorer")
     rules = tuple(parse_rules(_mapping_section(config, "graph_selection").get("rules")))
+    _validate_refined_graph_rules(rules)
     score_dir = log_root / "tccig" / "score" / run_id
     train_scored = _score_table_stage(
         table=tables["train"],
@@ -501,8 +511,16 @@ def run_tccig_pipeline(
             refiner_cfg=refiner_cfg,
             rules=rules,
         )
+    _validate_selected_rule(selected_rule, selected_rule_payload)
+    selected_calibration_payload = _selected_calibration_from_refiner_state(
+        refiner_state=refiner_state,
+    )
     selected_rule_path = log_root / "tccig" / "validation" / run_id / "selected_rule.json"
+    selected_calibration_path = (
+        log_root / "tccig" / "validation" / run_id / "selected_calibration.json"
+    )
     write_json(selected_rule_path, selected_rule_payload)
+    write_json(selected_calibration_path, selected_calibration_payload)
 
     pairwise_test_bundle = _score_table_stage(
         table=tables["pairwise_test"],
@@ -513,10 +531,20 @@ def run_tccig_pipeline(
         pairwise_graph_rule=pairwise_graph_rule,
         output_dir=score_dir,
     )
-    pairwise_metrics = _run_pairwise_test(
+    refined_pairwise_probabilities = _predict_refined_probabilities(
+        predict_refined=cast(PredictRefined, predict_refined),
+        split="pairwise_test",
         bundle=pairwise_test_bundle,
+        refiner_state=refiner_state,
+        runtime=runtime,
+        refiner_cfg=refiner_cfg,
+    )
+    pairwise_metrics = _run_pairwise_test(
         labels=tables["pairwise_test"].labels,
+        probabilities=refined_pairwise_probabilities,
+        selected_calibration=selected_calibration_payload,
         output_dir=log_root / "tccig" / "pairwise_test" / run_id,
+        split="pairwise_test",
     )
     topology_test_bundle = _score_table_stage(
         table=tables["topology_test"],
@@ -533,6 +561,7 @@ def run_tccig_pipeline(
         predict_refined=cast(PredictRefined, predict_refined),
         refiner_state=refiner_state,
         selected_rule=selected_rule,
+        selected_calibration=selected_calibration_payload,
         pairwise_graph_rule=pairwise_graph_rule,
         runtime=runtime,
         refiner_cfg=refiner_cfg,
@@ -544,11 +573,13 @@ def run_tccig_pipeline(
         "self_pair_rows_dropped": self_pair_rows,
         "pair_counts": {split: len(table.records) for split, table in tables.items()},
         "selected_rule_path": str(selected_rule_path),
+        "selected_calibration_path": str(selected_calibration_path),
     }
     write_json(log_root / "tccig" / "run" / run_id / "manifest.json", manifest)
     return TCCIGPipelineResult(
         manifest=manifest,
         selected_rule=selected_rule_payload,
+        selected_calibration=selected_calibration_payload,
         pairwise_metrics=pairwise_metrics,
         topology_metrics=topology_metrics,
     )
@@ -919,8 +950,67 @@ def _selected_rule_from_refiner_state(
     selected_rule = getattr(refiner_state, "selected_rule", None)
     selected_rule_payload = getattr(refiner_state, "selected_rule_payload", None)
     if isinstance(selected_rule, GraphRule) and isinstance(selected_rule_payload, dict):
+        _validate_selected_rule(selected_rule, selected_rule_payload)
         return selected_rule, selected_rule_payload
+    if isinstance(selected_rule_payload, dict):
+        rule = GraphRule(
+            type=str(selected_rule_payload.get("type", "")),
+            value=float(selected_rule_payload.get("value", DEFAULT_GRAPH_THRESHOLD)),
+        )
+        _validate_selected_rule(rule, selected_rule_payload)
+        return rule, selected_rule_payload
     return None, None
+
+
+def _selected_calibration_from_refiner_state(*, refiner_state: object) -> dict[str, object]:
+    selected_calibration = getattr(refiner_state, "selected_calibration_payload", None)
+    if selected_calibration is None:
+        return identity_calibration_payload()
+    if not isinstance(selected_calibration, dict):
+        raise ValueError("refiner selected_calibration must be a mapping")
+    _calibration_bias(selected_calibration)
+    if str(selected_calibration.get("type", "")) != "logit_bias":
+        raise ValueError("refiner selected_calibration.type must be 'logit_bias'")
+    return selected_calibration
+
+
+def _validate_refined_graph_rules(rules: Sequence[GraphRule]) -> None:
+    if not rules:
+        raise ValueError("graph_selection.rules must be a non-empty list")
+    for rule in rules:
+        _validate_selected_rule(rule, rule.to_dict())
+
+
+def _validate_selected_rule(rule: GraphRule, payload: Mapping[str, object]) -> None:
+    payload_type = str(payload.get("type", rule.type))
+    payload_value = float(payload.get("value", rule.value))
+    if (
+        rule.type != "threshold"
+        or payload_type != "threshold"
+        or not math.isclose(float(rule.value), DEFAULT_GRAPH_THRESHOLD)
+        or not math.isclose(payload_value, DEFAULT_GRAPH_THRESHOLD)
+    ):
+        raise ValueError(
+            "TCCIG refined graph rules must be exactly threshold=0.5; "
+            "top_m/top_k artifacts are invalid and must be rerun"
+        )
+
+
+def _calibrated_probabilities(
+    *,
+    probabilities: list[float],
+    selected_calibration: Mapping[str, object],
+) -> list[float]:
+    return apply_logit_bias(probabilities, _calibration_bias(selected_calibration))
+
+
+def _calibration_bias(selected_calibration: Mapping[str, object]) -> float:
+    if str(selected_calibration.get("type", "")) != "logit_bias":
+        raise ValueError("selected_calibration.type must be 'logit_bias'")
+    raw_bias = selected_calibration.get("bias")
+    if not isinstance(raw_bias, (int, float)):
+        raise ValueError("selected_calibration.bias must be numeric")
+    return float(raw_bias)
 
 
 def _rank_local_indexed_pairs(
@@ -1006,16 +1096,13 @@ def _fallback_select_validation_rule(
         runtime=runtime,
         refiner_cfg=refiner_cfg,
     )
-    selected_rule, selected_rule_metrics = select_rule(
+    selected_rule, _ = select_rule(
         pairs=validation_bundle.pairs,
         probabilities=validation_refined,
         labels=validation_labels,
         rules=list(rules),
     )
-    return selected_rule, {
-        **selected_rule.to_dict(),
-        "validation_metrics": selected_rule_metrics,
-    }
+    return selected_rule, selected_rule.to_dict()
 
 
 def _write_scoring_manifest(
@@ -1090,17 +1177,23 @@ def _predict_refined_probabilities(
 
 def _run_pairwise_test(
     *,
-    bundle: SplitBundle,
     labels: list[int],
+    probabilities: list[float],
+    selected_calibration: Mapping[str, object],
     output_dir: Path,
+    split: str,
 ) -> dict[str, float]:
-    metrics = _binary_metrics(labels=labels, probabilities=bundle.pairwise_probabilities)
+    calibrated_probabilities = _calibrated_probabilities(
+        probabilities=probabilities,
+        selected_calibration=selected_calibration,
+    )
+    metrics = _binary_metrics(labels=labels, probabilities=calibrated_probabilities)
     output_dir.mkdir(parents=True, exist_ok=True)
     write_json(output_dir / "pairwise_metrics.json", metrics)
     with (output_dir / "pairwise_metrics.csv").open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=["split", *metrics.keys()])
         writer.writeheader()
-        writer.writerow({"split": "pairwise_test", **metrics})
+        writer.writerow({"split": split, **metrics})
     return metrics
 
 
@@ -1111,6 +1204,7 @@ def _run_topology_test(
     predict_refined: PredictRefined,
     refiner_state: object,
     selected_rule: GraphRule,
+    selected_calibration: Mapping[str, object],
     pairwise_graph_rule: GraphRule,
     runtime: TCCIGRuntime,
     refiner_cfg: Mapping[str, object],
@@ -1124,10 +1218,14 @@ def _run_topology_test(
         runtime=runtime,
         refiner_cfg=refiner_cfg,
     )
+    calibrated_probabilities = _calibrated_probabilities(
+        probabilities=refined_probabilities,
+        selected_calibration=selected_calibration,
+    )
     selected_edges = set(
         edges_from_rule(
             pairs=bundle.pairs,
-            probabilities=refined_probabilities,
+            probabilities=calibrated_probabilities,
             rule=selected_rule,
         )
     )
@@ -1159,6 +1257,7 @@ def _run_topology_test(
                 "per_node_size": topology_result["per_node_size"],
                 "details": topology_result["details"],
                 "selected_rule": selected_rule.to_dict(),
+                "selected_calibration": dict(selected_calibration),
                 "pairwise_graph_rule": pairwise_graph_rule.to_dict(),
                 "pair_counts": {
                     "candidate_pairs": len(bundle.pairs),

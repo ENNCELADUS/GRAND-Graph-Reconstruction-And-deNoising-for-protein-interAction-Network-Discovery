@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import pickle
 from pathlib import Path
+from types import SimpleNamespace
 
 import networkx as nx
 import pytest
 import torch
 import yaml
 from src.pipeline.stages.train import build_model
+from tccig.rules import GraphRule, calibration_payload
 from tccig.train import (
     PairwiseScoreRequest,
     RefineRequest,
@@ -126,6 +129,16 @@ def fake_score_pairs_alias(request: PairwiseScoreRequest) -> list[float]:
     return fake_score_pairs(request)
 
 
+def fake_score_pairs_with_wrong_pairwise_baseline(request: PairwiseScoreRequest) -> list[float]:
+    """Fake scorer that makes raw pairwise-test scores distinguishable from refined scores."""
+    if request.split != "pairwise_test":
+        return fake_score_pairs(request)
+    assert all(pair.protein_a != pair.protein_b for pair in request.pairs)
+    HOOK_EVENTS.append(("score", request.split))
+    SCORE_PAIR_COUNTS.append((request.split, len(request.pairs)))
+    return [0.1 if pair.protein_b == "T2" else 0.9 for pair in request.pairs]
+
+
 def fake_train_refiner(request: TrainRefinerRequest) -> dict[str, str]:
     """Fake trainer that sees train targets but no test graph artifacts."""
     assert request.train.loss_targets == [1, 0]
@@ -137,6 +150,37 @@ def fake_train_refiner(request: TrainRefinerRequest) -> dict[str, str]:
     return {"state": "fake"}
 
 
+def fake_train_refiner_with_selected_calibration(
+    request: TrainRefinerRequest,
+) -> SimpleNamespace:
+    """Fake trainer that supplies validation-selected 0.5 calibration metadata."""
+    del request
+    bias = -math.log(0.35 / 0.65)
+    metrics = {
+        "f1": 1.0,
+        "mcc": 1.0,
+        "positive_edges": 1,
+        "graph_sim": 1.0,
+        "relative_density": 1.0,
+        "deg_dist_mmd": 0.0,
+        "cc_mmd": 0.0,
+        "val_topology_loss": 0.0,
+        "val_auprc": 1.0,
+    }
+    selected_rule = GraphRule(type="threshold", value=0.5)
+    return SimpleNamespace(
+        selected_rule=selected_rule,
+        selected_rule_payload=selected_rule.to_dict(),
+        selected_calibration_payload=calibration_payload(
+            bias=bias,
+            objective="val_topology_loss",
+            validation_metrics=metrics,
+            monitor_metric="val_topology_loss",
+            monitor_value=0.0,
+        ),
+    )
+
+
 def fake_predict_refined(request: RefineRequest) -> list[float]:
     """Fake refiner that receives pairwise graph inputs but not ground truth graphs."""
     assert all(not hasattr(pair, "label") for pair in request.pairs)
@@ -144,6 +188,22 @@ def fake_predict_refined(request: RefineRequest) -> list[float]:
     assert not hasattr(request, "test_sampled_nodes")
     HOOK_EVENTS.append(("predict_refined", request.split))
     return list(request.pairwise_probabilities)
+
+
+def fake_predict_refined_corrects_pairwise_test(request: RefineRequest) -> list[float]:
+    """Fake refiner whose pairwise-test scores intentionally differ from the baseline."""
+    assert all(not hasattr(pair, "label") for pair in request.pairs)
+    HOOK_EVENTS.append(("predict_refined", request.split))
+    if request.split == "pairwise_test":
+        return [0.9 if pair.protein_b == "T2" else 0.1 for pair in request.pairs]
+    return list(request.pairwise_probabilities)
+
+
+def fake_predict_refined_requires_calibration(request: RefineRequest) -> list[float]:
+    """Fake refiner whose correct hard graph requires selected logit calibration."""
+    assert all(not hasattr(pair, "label") for pair in request.pairs)
+    HOOK_EVENTS.append(("predict_refined", request.split))
+    return [0.4 if pair.protein_b in {"B", "T2"} else 0.3 for pair in request.pairs]
 
 
 def test_tccig_orchestrator_keeps_pring_truth_out_of_model_inputs(tmp_path: Path) -> None:
@@ -170,8 +230,6 @@ def test_tccig_orchestrator_keeps_pring_truth_out_of_model_inputs(tmp_path: Path
             "graph_selection": {
                 "rules": [
                     {"type": "threshold", "value": 0.5},
-                    {"type": "top_k", "k": 1},
-                    {"type": "top_m", "m": 1},
                 ]
             },
         }
@@ -179,6 +237,7 @@ def test_tccig_orchestrator_keeps_pring_truth_out_of_model_inputs(tmp_path: Path
 
     assert ("score", "train") in HOOK_EVENTS
     assert ("score", "topology_test") in HOOK_EVENTS
+    assert ("predict_refined", "pairwise_test") in HOOK_EVENTS
     assert ("predict_refined", "topology_test") in HOOK_EVENTS
     assert HOOK_EVENTS.index(("train_refiner", 2)) < HOOK_EVENTS.index(("score", "pairwise_test"))
     assert HOOK_EVENTS.index(("train_refiner", 2)) < HOOK_EVENTS.index(("score", "topology_test"))
@@ -188,7 +247,8 @@ def test_tccig_orchestrator_keeps_pring_truth_out_of_model_inputs(tmp_path: Path
         "pairwise_test": 1,
         "topology_test": 1,
     }
-    assert result.selected_rule["type"] in {"threshold", "top_k", "top_m"}
+    assert result.selected_rule == {"type": "threshold", "value": 0.5}
+    assert result.selected_calibration["type"] == "logit_bias"
 
     topology_log_dir = tmp_path / "logs" / "tccig" / "topology_test" / "tiny"
     assert (topology_log_dir / "all_test_ppi_pred.txt").exists()
@@ -206,7 +266,8 @@ def test_tccig_orchestrator_keeps_pring_truth_out_of_model_inputs(tmp_path: Path
     }
     assert "2" in metrics_payload["per_node_size"]
     assert set(metrics_payload["details"]) == set(metrics_payload["summary"])
-    assert metrics_payload["selected_rule"]["type"] in {"threshold", "top_k", "top_m"}
+    assert metrics_payload["selected_rule"] == {"type": "threshold", "value": 0.5}
+    assert metrics_payload["selected_calibration"]["type"] == "logit_bias"
     assert metrics_payload["pairwise_graph_rule"] == {"type": "threshold", "value": 0.5}
     assert metrics_payload["protocol"] == {
         "candidate_universe": "all_test_ppi.txt",
@@ -227,6 +288,80 @@ def test_tccig_orchestrator_keeps_pring_truth_out_of_model_inputs(tmp_path: Path
     assert (score_dir / "validation.json").exists()
     assert not (score_dir / "shards").exists()
     assert not (score_dir / "progress.csv").exists()
+
+
+def test_pairwise_test_metrics_use_refined_probabilities_without_baseline_logs(
+    tmp_path: Path,
+) -> None:
+    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
+    _write_tiny_pring_fixture(processed_dir)
+    HOOK_EVENTS.clear()
+
+    result = run_tccig_pipeline(
+        {
+            "run": {"run_id": "refined_pairwise", "log_root": str(tmp_path / "logs")},
+            "data": {"processed_dir": str(processed_dir)},
+            "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
+            "pairwise_scorer": {
+                "target": f"{__name__}:fake_score_pairs_with_wrong_pairwise_baseline",
+            },
+            "refiner": {
+                "train_target": f"{__name__}:fake_train_refiner",
+                "predict_target": f"{__name__}:fake_predict_refined_corrects_pairwise_test",
+            },
+            "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
+        }
+    )
+
+    assert ("predict_refined", "pairwise_test") in HOOK_EVENTS
+    assert result.pairwise_metrics["f1"] == 1.0
+    assert result.pairwise_metrics["mcc"] == 1.0
+
+    baseline_dir = (
+        tmp_path
+        / "logs"
+        / "tccig"
+        / "pairwise_baseline"
+    )
+    pairwise_metrics_path = (
+        tmp_path
+        / "logs"
+        / "tccig"
+        / "pairwise_test"
+        / "refined_pairwise"
+        / "pairwise_metrics.json"
+    )
+    pairwise_metrics = json.loads(pairwise_metrics_path.read_text(encoding="utf-8"))
+    assert not baseline_dir.exists()
+    assert pairwise_metrics["f1"] == 1.0
+    assert pairwise_metrics["mcc"] == 1.0
+
+
+def test_tccig_orchestrator_rejects_removed_top_m_and_top_k_rules(tmp_path: Path) -> None:
+    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
+    _write_tiny_pring_fixture(processed_dir)
+
+    base_config = {
+        "run": {"run_id": "removed_rule", "log_root": str(tmp_path / "logs")},
+        "data": {"processed_dir": str(processed_dir)},
+        "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
+        "pairwise_scorer": {"target": f"{__name__}:fake_score_pairs"},
+        "refiner": {
+            "train_target": f"{__name__}:fake_train_refiner",
+            "predict_target": f"{__name__}:fake_predict_refined",
+        },
+    }
+
+    for removed_rule in ({"type": "top_m", "m": 1}, {"type": "top_k", "k": 1}):
+        with pytest.raises(ValueError, match="only support threshold"):
+            run_tccig_pipeline(
+                {
+                    **base_config,
+                    "graph_selection": {
+                        "rules": [{"type": "threshold", "value": 0.5}, removed_rule]
+                    },
+                }
+            )
 
 
 def test_tccig_pairwise_score_cache_reuses_strict_split_scores(tmp_path: Path) -> None:
@@ -332,53 +467,72 @@ def test_tccig_score_cache_rescores_when_scorer_fingerprint_changes(tmp_path: Pa
     ]
 
 
-def test_validation_selected_rule_is_reused_for_topology_test(tmp_path: Path) -> None:
+def test_validation_selected_calibration_is_reused_for_topology_test(tmp_path: Path) -> None:
     processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
     _write_tiny_pring_fixture(processed_dir)
     HOOK_EVENTS.clear()
 
     result = run_tccig_pipeline(
         {
-            "run": {"run_id": "top_m_case", "log_root": str(tmp_path / "logs")},
+            "run": {"run_id": "calibrated_case", "log_root": str(tmp_path / "logs")},
             "data": {"processed_dir": str(processed_dir)},
             "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
             "pairwise_scorer": {"target": f"{__name__}:fake_score_pairs"},
             "refiner": {
-                "train_target": f"{__name__}:fake_train_refiner",
-                "predict_target": f"{__name__}:fake_predict_refined",
+                "train_target": f"{__name__}:fake_train_refiner_with_selected_calibration",
+                "predict_target": f"{__name__}:fake_predict_refined_requires_calibration",
             },
-            "graph_selection": {
-                "rules": [
-                    {"type": "threshold", "value": 0.95},
-                    {"type": "top_m", "m": 1},
-                ]
-            },
+            "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
         }
     )
 
-    assert result.selected_rule["type"] == "top_m"
+    assert result.selected_rule == {"type": "threshold", "value": 0.5}
+    assert result.selected_calibration["type"] == "logit_bias"
+    assert result.selected_calibration["equivalent_probability_threshold"] == pytest.approx(0.35)
     assert result.pairwise_metrics["f1"] == 1.0
     assert result.pairwise_metrics["mcc"] == 1.0
 
     selected_rule_path = (
-        tmp_path / "logs" / "tccig" / "validation" / "top_m_case" / "selected_rule.json"
+        tmp_path / "logs" / "tccig" / "validation" / "calibrated_case" / "selected_rule.json"
     )
     selected_rule = json.loads(selected_rule_path.read_text(encoding="utf-8"))
-    assert selected_rule["type"] == "top_m"
-    assert selected_rule["m"] == 1
+    assert selected_rule == {"type": "threshold", "value": 0.5}
+
+    selected_calibration_path = (
+        tmp_path
+        / "logs"
+        / "tccig"
+        / "validation"
+        / "calibrated_case"
+        / "selected_calibration.json"
+    )
+    selected_calibration = json.loads(selected_calibration_path.read_text(encoding="utf-8"))
+    assert selected_calibration["type"] == "logit_bias"
+    assert selected_calibration["equivalent_probability_threshold"] == pytest.approx(0.35)
 
     prediction_path = (
-        tmp_path / "logs" / "tccig" / "topology_test" / "top_m_case" / "all_test_ppi_pred.txt"
+        tmp_path
+        / "logs"
+        / "tccig"
+        / "topology_test"
+        / "calibrated_case"
+        / "all_test_ppi_pred.txt"
     )
     predicted_rows = prediction_path.read_text(encoding="utf-8").strip().splitlines()
     assert predicted_rows == ["T1\tT2\t1", "T1\tT3\t0"]
 
     metrics_payload = json.loads(
         (
-            tmp_path / "logs" / "tccig" / "topology_test" / "top_m_case" / "topology_metrics.json"
+            tmp_path
+            / "logs"
+            / "tccig"
+            / "topology_test"
+            / "calibrated_case"
+            / "topology_metrics.json"
         ).read_text(encoding="utf-8")
     )
-    assert metrics_payload["selected_rule"] == {"type": "top_m", "m": 1}
+    assert metrics_payload["selected_rule"] == {"type": "threshold", "value": 0.5}
+    assert metrics_payload["selected_calibration"]["type"] == "logit_bias"
     assert metrics_payload["pair_counts"] == {
         "candidate_pairs": 2,
         "pairwise_graph_edges": 1,
@@ -455,7 +609,6 @@ def test_tccig_orchestrator_runs_v3_1_pairwise_scorer_with_fake_refiner(
             "graph_selection": {
                 "rules": [
                     {"type": "threshold", "value": 0.5},
-                    {"type": "top_m", "m": 1},
                 ]
             },
         }
@@ -464,7 +617,7 @@ def test_tccig_orchestrator_runs_v3_1_pairwise_scorer_with_fake_refiner(
     assert ("train_refiner", 2) in HOOK_EVENTS
     assert ("predict_refined", "topology_test") in HOOK_EVENTS
     assert result.manifest["pair_counts"]["topology_test"] == 2
-    assert result.selected_rule["type"] in {"threshold", "top_m"}
+    assert result.selected_rule == {"type": "threshold", "value": 0.5}
 
     scoring_manifest = tmp_path / "logs" / "tccig" / "score" / "v3_1_pairwise" / "train.json"
     assert scoring_manifest.exists()
@@ -699,7 +852,6 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
             "graph_selection": {
                 "rules": [
                     {"type": "threshold", "value": 0.5},
-                    {"type": "top_m", "m": 1},
                 ]
             },
         },
@@ -709,7 +861,8 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
     assert ("prepare", 2) in accelerator_events
     assert ("forward", 1) in accelerator_events
     assert ("backward", 1) in accelerator_events
-    assert result.selected_rule["type"] in {"threshold", "top_m"}
+    assert result.selected_rule == {"type": "threshold", "value": 0.5}
+    assert result.selected_calibration["type"] == "logit_bias"
     assert result.manifest["pair_counts"]["topology_test"] == 2
     assert (tmp_path / "models" / "s2gae" / "best_model.pt").exists()
     training_summary_path = (
@@ -719,8 +872,10 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
     assert training_summary["monitor_metric"] == "val_topology_loss"
     assert training_summary["epochs_trained"] == 2
     assert "best_monitor_value" in training_summary
-    assert training_summary["selected_rule"]["validation_metrics"]["epoch"] in {1, 2}
-    assert "val_topology_loss" in training_summary["selected_rule"]["validation_metrics"]
+    assert training_summary["selected_rule"] == {"type": "threshold", "value": 0.5}
+    assert training_summary["selected_calibration"]["type"] == "logit_bias"
+    assert training_summary["selected_calibration"]["validation_metrics"]["epoch"] in {1, 2}
+    assert "val_topology_loss" in training_summary["selected_calibration"]["validation_metrics"]
     first_epoch = training_summary["history"][0]
     assert "train_loss" in first_epoch
     assert "train_bce_loss" in first_epoch
@@ -768,5 +923,7 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
     assert checkpoint["config"]["scheduler"] == {"type": "none"}
     assert checkpoint["config"]["optimization"] == {"gradient_clip_norm": 1.0}
     assert checkpoint["monitor_metric"] == "val_topology_loss"
-    assert checkpoint["selected_rule"]["validation_metrics"]["epoch"] in {1, 2}
+    assert checkpoint["selected_rule"] == {"type": "threshold", "value": 0.5}
+    assert checkpoint["selected_calibration"]["type"] == "logit_bias"
+    assert checkpoint["selected_calibration"]["validation_metrics"]["epoch"] in {1, 2}
     assert "learning_rate" not in checkpoint["config"]

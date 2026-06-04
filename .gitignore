@@ -3,6 +3,7 @@ models/
 cache/
 _agent/
 *.json
+logs/**/all_test_ppi_pred.txt
 
 # Binary & Large File Formats
 *.pkl

@@ -20,15 +20,15 @@ data_config:
     root_dir: "data/PRING"
     species: "human"
     split_strategy: "BFS"
-    processed_dir: "data/PRING/species_processed_data/human/BFS"
+    processed_dir: "data/PRING/human/BFS"
   embeddings:
     source: "esm3"
     cache_dir: "data/embeddings/esm3_1024"
   max_sequence_length: 1024
   dataloader:
-    train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi.txt"
-    valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi.txt"
-    test_dataset: "data/PRING/species_processed_data/human/BFS/human_test_ppi.txt"
+    train_dataset: "data/PRING/human/BFS/human_train_ppi.txt"
+    valid_dataset: "data/PRING/human/BFS/human_val_ppi.txt"
+    test_dataset: "data/PRING/human/BFS/human_test_ppi.txt"
     num_workers: 4
     pin_memory: true
     drop_last: true
@@ -91,8 +91,8 @@ training_config:
 topology_finetune:
   init_mode: "warm_start"
   epochs: 30
-  supervision_train_dataset: "data/PRING/species_processed_data/human/BFS/human_train_ppi_ratio5_exclusive.txt"
-  supervision_valid_dataset: "data/PRING/species_processed_data/human/BFS/human_val_ppi_ratio5_exclusive.txt"
+  supervision_train_dataset: "data/PRING/human/BFS/human_train_ppi_ratio5_exclusive.txt"
+  supervision_valid_dataset: "data/PRING/human/BFS/human_val_ppi_ratio5_exclusive.txt"
   bce_negative_ratio: 5
   subgraph_node_range: [30, 60]
   gradient_accumulation_steps: 8

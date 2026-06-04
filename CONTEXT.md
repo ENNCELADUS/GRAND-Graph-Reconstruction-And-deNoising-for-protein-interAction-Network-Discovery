@@ -40,9 +40,11 @@ not model input graphs.
 ### Refined graph decision rule
 
 The validation-selected rule that converts refined pair scores into a hard
-predicted graph. Supported rule families are probability threshold, per-node
-top-k, and global top-M. Test evaluation must reuse the validation-selected
-rule without reselecting on test data.
+predicted graph. TCCIG uses a validation-calibrated 0.5 threshold: validation
+selects one global logit bias, and test evaluation applies
+`sigmoid(raw_logit + bias) >= 0.5` without reselecting on test data. Per-node
+top-k and global top-M rules are forbidden because they impose non-biological
+degree or edge-count budgets.
 
 ### Validation topology candidate universe
 

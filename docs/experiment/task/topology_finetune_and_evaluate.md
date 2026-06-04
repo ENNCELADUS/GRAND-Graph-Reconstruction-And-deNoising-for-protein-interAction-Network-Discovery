@@ -5,8 +5,9 @@ This note explains the `topology_finetune`, `evaluate`, and
 `data/PRING/human/BFS` as the concrete PRING Human BFS example. The code reads
 the same file names from
 `data_config.benchmark.processed_dir`; older YAMLs may point to
-`data/PRING/species_processed_data/human/BFS`, but the stage contract is path
-relative and does not depend on that parent directory name.
+the archived `data/PRING/archive/species_processed_data_*` snapshot, but the
+stage contract is path relative and does not depend on that parent directory
+name.
 
 ## File Inputs
 

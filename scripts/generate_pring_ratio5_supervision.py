@@ -14,13 +14,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--root",
         type=Path,
-        default=Path("data/PRING/species_processed_data/human"),
+        default=Path("data/PRING/human"),
         help="Human PRING processed-data root containing BFS/DFS/RANDOM_WALK subdirectories.",
     )
     parser.add_argument(
         "--global-positive-path",
         type=Path,
-        default=Path("data/PRING/species_processed_data/human/human_ppi.txt"),
+        default=Path("data/PRING/human/human_ppi.txt"),
         help="Path to the global positive PPI list used to reject known positives.",
     )
     parser.add_argument(

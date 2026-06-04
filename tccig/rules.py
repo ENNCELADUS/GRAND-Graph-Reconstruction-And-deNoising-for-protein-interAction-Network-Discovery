@@ -1,14 +1,17 @@
-"""Graph decision rules for TCCIG pairwise and refined scores."""
+"""Graph decision rules and calibration helpers for TCCIG scores."""
 
 from __future__ import annotations
 
-from collections import defaultdict
+import math
 from dataclasses import dataclass
 from typing import Any
 
 from sklearn.metrics import f1_score, matthews_corrcoef
 
 from tccig.io import CandidatePair, canonical_edge
+
+DEFAULT_GRAPH_THRESHOLD = 0.5
+PROBABILITY_EPSILON = 1.0e-6
 
 
 @dataclass(frozen=True)
@@ -20,14 +23,11 @@ class GraphRule:
 
     def to_dict(self) -> dict[str, float | int | str]:
         """Return a serializable rule payload."""
-        if self.type == "threshold":
-            return {"type": self.type, "value": float(self.value)}
-        key = "k" if self.type == "top_k" else "m"
-        return {"type": self.type, key: int(self.value)}
+        return {"type": self.type, "value": float(self.value)}
 
 
 def parse_rules(raw_rules: object) -> list[GraphRule]:
-    """Parse configured threshold, top-k, and top-M rules."""
+    """Parse configured threshold-only graph rules."""
     if not isinstance(raw_rules, list) or not raw_rules:
         raise ValueError("graph_selection.rules must be a non-empty list")
     rules: list[GraphRule] = []
@@ -37,12 +37,11 @@ def parse_rules(raw_rules: object) -> list[GraphRule]:
         rule_type = str(raw_rule.get("type", "")).lower()
         if rule_type == "threshold":
             rules.append(GraphRule(type=rule_type, value=float(raw_rule.get("value", 0.5))))
-        elif rule_type == "top_k":
-            rules.append(GraphRule(type=rule_type, value=int(raw_rule["k"])))
-        elif rule_type == "top_m":
-            rules.append(GraphRule(type=rule_type, value=int(raw_rule["m"])))
         else:
-            raise ValueError(f"Unsupported graph rule type: {rule_type}")
+            raise ValueError(
+                f"Unsupported graph rule type: {rule_type}; "
+                "TCCIG graph rules only support threshold"
+            )
     return rules
 
 
@@ -62,14 +61,6 @@ def edges_from_rule(
             for pair, probability in zip(pairs, probabilities, strict=True)
             if float(probability) >= threshold
         ]
-    if rule.type == "top_m":
-        selected_indices = _top_indices(probabilities=probabilities, limit=int(rule.value))
-        return [
-            canonical_edge(pairs[index].protein_a, pairs[index].protein_b)
-            for index in selected_indices
-        ]
-    if rule.type == "top_k":
-        return _top_k_edges(pairs=pairs, probabilities=probabilities, k=int(rule.value))
     raise ValueError(f"Unsupported graph rule type: {rule.type}")
 
 
@@ -104,39 +95,50 @@ def select_rule(
     return best_rule, best_metrics
 
 
-def _top_indices(*, probabilities: list[float], limit: int) -> list[int]:
-    """Return stable top-probability indices."""
-    if limit <= 0:
-        return []
-    ranked = sorted(
-        range(len(probabilities)),
-        key=lambda index: (-float(probabilities[index]), index),
-    )
-    return ranked[:limit]
+def apply_logit_bias(probabilities: list[float], bias: float) -> list[float]:
+    """Apply one global logit bias and return calibrated probabilities."""
+    return [_apply_logit_bias_value(probability, bias) for probability in probabilities]
 
 
-def _top_k_edges(
+def equivalent_threshold_from_bias(bias: float) -> float:
+    """Return the raw probability threshold equivalent to calibrated 0.5."""
+    return 1.0 / (1.0 + math.exp(float(bias)))
+
+
+def calibration_payload(
     *,
-    pairs: list[CandidatePair],
-    probabilities: list[float],
-    k: int,
-) -> list[tuple[str, str]]:
-    """Return the union of per-node top-k incident edges."""
-    if k <= 0:
-        return []
-    incident: dict[str, list[tuple[float, int]]] = defaultdict(list)
-    for index, pair in enumerate(pairs):
-        probability = float(probabilities[index])
-        incident[pair.protein_a].append((probability, index))
-        incident[pair.protein_b].append((probability, index))
-    selected_indices: set[int] = set()
-    for entries in incident.values():
-        ranked = sorted(entries, key=lambda item: (-item[0], item[1]))
-        selected_indices.update(index for _, index in ranked[:k])
-    return [
-        canonical_edge(pairs[index].protein_a, pairs[index].protein_b)
-        for index in sorted(selected_indices)
-    ]
+    bias: float,
+    objective: str,
+    validation_metrics: dict[str, float | int] | None = None,
+    monitor_metric: str | None = None,
+    monitor_value: float | None = None,
+) -> dict[str, object]:
+    """Return the serializable selected-calibration payload."""
+    payload: dict[str, object] = {
+        "type": "logit_bias",
+        "bias": float(bias),
+        "threshold_after_calibration": DEFAULT_GRAPH_THRESHOLD,
+        "equivalent_probability_threshold": equivalent_threshold_from_bias(float(bias)),
+        "objective": objective,
+    }
+    if monitor_metric is not None:
+        payload["monitor_metric"] = monitor_metric
+    if monitor_value is not None:
+        payload["monitor_value"] = float(monitor_value)
+    if validation_metrics is not None:
+        payload["validation_metrics"] = validation_metrics
+    return payload
+
+
+def identity_calibration_payload() -> dict[str, object]:
+    """Return the no-op calibration payload used by non-S2GAE test hooks."""
+    return calibration_payload(bias=0.0, objective="identity")
+
+
+def _apply_logit_bias_value(probability: float, bias: float) -> float:
+    clamped = min(max(float(probability), PROBABILITY_EPSILON), 1.0 - PROBABILITY_EPSILON)
+    logit = math.log(clamped / (1.0 - clamped))
+    return 1.0 / (1.0 + math.exp(-(logit + float(bias))))
 
 
 def _is_better(metrics: dict[str, Any], best_metrics: dict[str, Any]) -> bool:

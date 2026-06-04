@@ -25,7 +25,13 @@ from torch import nn
 from torch.optim import Optimizer
 
 from tccig.io import CandidatePair, canonical_edge, write_json
-from tccig.rules import GraphRule, edges_from_rule
+from tccig.rules import (
+    DEFAULT_GRAPH_THRESHOLD,
+    GraphRule,
+    apply_logit_bias,
+    calibration_payload,
+    edges_from_rule,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -68,6 +74,7 @@ TCCIG_TRAIN_CSV_COLUMNS = [
     "Peak GPU Mem MB",
     "Learning Rate",
 ]
+LOGIT_BIAS_GRID = tuple(round(-4.0 + 0.25 * index, 2) for index in range(33))
 
 
 @dataclass(frozen=True)
@@ -107,6 +114,7 @@ class S2GAERefinerState:
     best_monitor_value: float
     selected_rule: GraphRule | None
     selected_rule_payload: dict[str, object] | None
+    selected_calibration_payload: dict[str, object] | None
     epochs_trained: int
 
 
@@ -184,7 +192,8 @@ class ValidationTopologyRuleEvaluation:
 
     rule: GraphRule
     validation_metrics: dict[str, float | int]
-    payload: dict[str, object]
+    rule_payload: dict[str, object]
+    calibration_payload: dict[str, object]
 
 
 class S2GAERefiner(nn.Module):
@@ -576,6 +585,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
     best_state_dict: dict[str, torch.Tensor] | None = None
     best_selected_rule: GraphRule | None = None
     best_selected_rule_payload: dict[str, object] | None = None
+    best_selected_calibration_payload: dict[str, object] | None = None
     best_validation_auprc = -math.inf
     best_monitor_value = _initial_monitor_value(cfg.monitor_metric)
     history: list[dict[str, float | int]] = []
@@ -642,6 +652,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         best_validation_auprc = max(best_validation_auprc, validation_auprc)
         selected_epoch_rule: GraphRule | None = None
         selected_epoch_rule_payload: dict[str, object] | None = None
+        selected_epoch_calibration_payload: dict[str, object] | None = None
         if cfg.topology_validation.enabled:
             if (
                 validation_topology_graph is None
@@ -660,8 +671,9 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 runtime=request.runtime,
             )
             selected_epoch_rule = topology_evaluation.rule
-            selected_epoch_rule_payload = _with_validation_epoch(
-                payload=topology_evaluation.payload,
+            selected_epoch_rule_payload = topology_evaluation.rule_payload
+            selected_epoch_calibration_payload = _with_validation_epoch(
+                payload=topology_evaluation.calibration_payload,
                 epoch=epoch,
             )
             monitor_value = _resolve_monitor_value(
@@ -693,10 +705,10 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             "global_validation_pairs": len(request.validation.pairs),
             "peak_gpu_mem_mb": _peak_gpu_memory_mb(device),
         }
-        if selected_epoch_rule_payload is not None:
+        if selected_epoch_calibration_payload is not None:
             metrics = cast(
                 Mapping[str, float],
-                selected_epoch_rule_payload["validation_metrics"],
+                selected_epoch_calibration_payload["validation_metrics"],
             )
             epoch_history.update(
                 {
@@ -724,6 +736,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                     "epoch": epoch,
                     "history": epoch_history,
                     "selected_rule": selected_epoch_rule_payload,
+                    "selected_calibration": selected_epoch_calibration_payload,
                     "checkpoint_path": str(cfg.checkpoint_path),
                 },
             )
@@ -742,6 +755,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             best_monitor_value = monitor_value
             best_selected_rule = selected_epoch_rule
             best_selected_rule_payload = selected_epoch_rule_payload
+            best_selected_calibration_payload = selected_epoch_calibration_payload
             checkpoint_model = _unwrap_refiner(train_step_model, request.runtime.accelerator)
             best_state_dict = {
                 name: tensor.detach().cpu().clone()
@@ -753,6 +767,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 best_monitor_value=best_monitor_value,
                 best_validation_auprc=best_validation_auprc,
                 best_selected_rule_payload=best_selected_rule_payload,
+                best_selected_calibration_payload=best_selected_calibration_payload,
                 optimizer=optimizer,
                 history=history,
             )
@@ -774,6 +789,11 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 "selected_rule": (
                     None if best_selected_rule_payload is None else best_selected_rule_payload
                 ),
+                "selected_calibration": (
+                    None
+                    if best_selected_calibration_payload is None
+                    else best_selected_calibration_payload
+                ),
             },
             cfg.checkpoint_path,
         )
@@ -782,6 +802,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             best_monitor_value=best_monitor_value,
             best_validation_auprc=best_validation_auprc,
             best_selected_rule_payload=best_selected_rule_payload,
+            best_selected_calibration_payload=best_selected_calibration_payload,
             optimizer=optimizer,
             history=history,
         )
@@ -793,6 +814,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         best_monitor_value=best_monitor_value,
         selected_rule=best_selected_rule,
         selected_rule_payload=best_selected_rule_payload,
+        selected_calibration_payload=best_selected_calibration_payload,
         epochs_trained=cfg.epochs,
     )
 
@@ -1061,35 +1083,40 @@ def _evaluate_validation_topology_rules(
     if len(refined_probabilities) != len(pairs):
         raise ValueError("validation topology probabilities must match candidate pairs")
 
+    fixed_rule = _fixed_threshold_rule(rules)
     best_evaluation: ValidationTopologyRuleEvaluation | None = None
-    for rule in rules:
+    for bias in LOGIT_BIAS_GRID:
+        calibrated_probabilities = apply_logit_bias(refined_probabilities, bias)
         metrics = _validation_topology_metrics(
             validation_plan=validation_plan,
             pairs=pairs,
-            probabilities=refined_probabilities,
-            rule=rule,
+            probabilities=calibrated_probabilities,
+            rule=fixed_rule,
             validation_auprc=validation_auprc,
             cfg=cfg,
         )
-        payload: dict[str, object] = {
-            **rule.to_dict(),
-            "monitor_metric": cfg.monitor_metric,
-            "monitor_value": _resolve_monitor_value(
-                monitor_metric=cfg.monitor_metric,
-                validation_auprc=validation_auprc,
-                topology_metrics=metrics,
-            ),
-            "validation_metrics": metrics,
-        }
-        evaluation = ValidationTopologyRuleEvaluation(
-            rule=rule,
-            validation_metrics=metrics,
-            payload=payload,
+        monitor_value = _resolve_monitor_value(
+            monitor_metric=cfg.monitor_metric,
+            validation_auprc=validation_auprc,
+            topology_metrics=metrics,
         )
-        if best_evaluation is None or _is_better_rule_evaluation(
+        rule_payload: dict[str, object] = fixed_rule.to_dict()
+        selected_calibration_payload = calibration_payload(
+            bias=bias,
+            objective="val_topology_loss",
+            validation_metrics=metrics,
+            monitor_metric=cfg.monitor_metric,
+            monitor_value=monitor_value,
+        )
+        evaluation = ValidationTopologyRuleEvaluation(
+            rule=fixed_rule,
+            validation_metrics=metrics,
+            rule_payload=rule_payload,
+            calibration_payload=selected_calibration_payload,
+        )
+        if best_evaluation is None or _is_better_calibration_evaluation(
             candidate=evaluation,
             incumbent=best_evaluation,
-            monitor_metric=cfg.monitor_metric,
         ):
             best_evaluation = evaluation
 
@@ -1207,27 +1234,35 @@ def _is_better_monitor(
     return value > best_value
 
 
-def _is_better_rule_evaluation(
+def _is_better_calibration_evaluation(
     *,
     candidate: ValidationTopologyRuleEvaluation,
     incumbent: ValidationTopologyRuleEvaluation,
-    monitor_metric: str,
 ) -> bool:
-    candidate_value = float(candidate.payload["monitor_value"])
-    incumbent_value = float(incumbent.payload["monitor_value"])
-    if candidate_value != incumbent_value:
-        return _is_better_monitor(
-            value=candidate_value,
-            best_value=incumbent_value,
-            monitor_metric=monitor_metric,
-        )
     return (
         -float(candidate.validation_metrics["val_topology_loss"]),
+        float(candidate.validation_metrics["graph_sim"]),
         -int(candidate.validation_metrics["positive_edges"]),
     ) > (
         -float(incumbent.validation_metrics["val_topology_loss"]),
+        float(incumbent.validation_metrics["graph_sim"]),
         -int(incumbent.validation_metrics["positive_edges"]),
     )
+
+
+def _fixed_threshold_rule(rules: Sequence[GraphRule]) -> GraphRule:
+    if not rules:
+        raise ValueError("refiner topology validation requires graph_selection.rules")
+    for rule in rules:
+        if rule.type != "threshold" or not math.isclose(
+            float(rule.value),
+            DEFAULT_GRAPH_THRESHOLD,
+        ):
+            raise ValueError(
+                "TCCIG refined graph rules must be exactly threshold=0.5; "
+                "top_m/top_k artifacts are invalid and must be rerun"
+            )
+    return GraphRule(type="threshold", value=DEFAULT_GRAPH_THRESHOLD)
 
 
 def _batch_indices(total: int, batch_size: int, device: torch.device) -> Iterator[torch.Tensor]:
@@ -1469,6 +1504,7 @@ def _write_training_summary(
     best_monitor_value: float,
     best_validation_auprc: float,
     best_selected_rule_payload: dict[str, object] | None,
+    best_selected_calibration_payload: dict[str, object] | None,
     optimizer: Optimizer,
     history: Sequence[Mapping[str, float | int]],
 ) -> None:
@@ -1479,6 +1515,7 @@ def _write_training_summary(
             "best_monitor_value": best_monitor_value,
             "best_validation_auprc": best_validation_auprc,
             "selected_rule": best_selected_rule_payload,
+            "selected_calibration": best_selected_calibration_payload,
             "epochs_trained": len(history),
             "checkpoint_path": str(cfg.checkpoint_path),
             "optimizer": _optimizer_config_to_json(cfg.optimizer),
