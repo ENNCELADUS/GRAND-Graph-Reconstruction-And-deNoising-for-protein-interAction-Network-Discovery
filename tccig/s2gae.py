@@ -452,6 +452,55 @@ def _zero_model_loss(model: nn.Module) -> torch.Tensor:
     return loss
 
 
+class _S2GAETrainStepModule(nn.Module):
+    """DDP-safe full-graph encode plus rank-local chunked decode step."""
+
+    def __init__(self, *, refiner: S2GAERefiner, cfg: S2GAEConfig) -> None:
+        super().__init__()
+        self.refiner = refiner
+        self.cfg = cfg
+
+    def forward(
+        self,
+        *,
+        graph: _SplitGraph,
+        labels: torch.Tensor,
+        pair_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return local mean loss and detached metric sums for one rank."""
+        hidden_states = self.refiner.encode(
+            node_features=graph.node_features,
+            edge_index=graph.edge_index,
+            edge_weight=graph.edge_weight,
+        )
+        local_loss = _local_full_batch_loss(
+            model=self.refiner,
+            hidden_states=hidden_states,
+            graph=graph,
+            labels=labels,
+            pair_indices=pair_indices,
+            cfg=self.cfg,
+        )
+        if local_loss is None:
+            return (
+                _zero_model_loss(self.refiner),
+                torch.zeros(4, dtype=torch.float64, device=labels.device),
+            )
+        return (
+            local_loss.total,
+            torch.tensor(
+                [
+                    local_loss.total_sum,
+                    local_loss.bce_sum,
+                    local_loss.residual_anchor_sum,
+                    local_loss.weighted_residual_anchor_sum,
+                ],
+                dtype=torch.float64,
+                device=labels.device,
+            ),
+        )
+
+
 def load_mean_pooled_node_features(
     *,
     protein_ids: Sequence[str],
@@ -490,8 +539,9 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         dropout=cfg.dropout,
     ).to(device)
     optimizer = build_s2gae_optimizer(model=model, config=cfg.optimizer)
-    prepared = request.runtime.accelerator.prepare(model, optimizer)
-    model, optimizer = _prepared_model_and_optimizer(prepared)
+    train_step = _S2GAETrainStepModule(refiner=model, cfg=cfg).to(device)
+    prepared = request.runtime.accelerator.prepare(train_step, optimizer)
+    train_step_model, optimizer = _prepared_model_and_optimizer(prepared)
 
     train_graph = _build_split_graph(request.train, cfg=cfg, device=device)
     validation_graph = _build_split_graph(request.validation, cfg=cfg, device=device)
@@ -532,54 +582,42 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
     _prepare_tccig_train_csv(csv_path=cfg.log_dir / "tccig_train_step.csv", request=request)
     for epoch in range(1, cfg.epochs + 1):
         epoch_start = time.perf_counter()
-        model.train()
+        train_step_model.train()
         optimizer.zero_grad(set_to_none=True)
         local_train_indices = _rank_local_pair_indices(
             total=len(request.train.pairs),
             runtime=request.runtime,
             device=device,
         )
-        train_hidden_states = model.encode(
-            node_features=train_graph.node_features,
-            edge_index=train_graph.edge_index,
-            edge_weight=train_graph.edge_weight,
-        )
-        local_loss = _local_full_batch_loss(
-            model=model,
-            hidden_states=train_hidden_states,
-            graph=train_graph,
-            labels=train_labels,
-            pair_indices=local_train_indices,
-            cfg=cfg,
-        )
         local_train_count = int(local_train_indices.numel())
-        if local_loss is None:
-            scaled_loss = _zero_model_loss(model)
-            local_loss_values = {
-                "total": 0.0,
-                "bce": 0.0,
-                "residual_anchor": 0.0,
-                "weighted_residual_anchor": 0.0,
-            }
-        else:
-            scale = _distributed_loss_scale(
-                local_count=local_train_count,
-                global_count=len(request.train.pairs),
-                runtime=request.runtime,
-            )
-            scaled_loss = local_loss.total * scale
-            local_loss_values = {
-                "total": local_loss.total_sum,
-                "bce": local_loss.bce_sum,
-                "residual_anchor": local_loss.residual_anchor_sum,
-                "weighted_residual_anchor": local_loss.weighted_residual_anchor_sum,
-            }
+        local_mean_loss, local_loss_sums = cast(
+            tuple[torch.Tensor, torch.Tensor],
+            train_step_model(
+                graph=train_graph,
+                labels=train_labels,
+                pair_indices=local_train_indices,
+            ),
+        )
+        scale = _distributed_loss_scale(
+            local_count=local_train_count,
+            global_count=len(request.train.pairs),
+            runtime=request.runtime,
+        )
+        scaled_loss = local_mean_loss * scale
+        local_loss_sums_cpu = local_loss_sums.detach().cpu()
+        local_loss_values = {
+            "total": float(local_loss_sums_cpu[0].item()),
+            "bce": float(local_loss_sums_cpu[1].item()),
+            "residual_anchor": float(local_loss_sums_cpu[2].item()),
+            "weighted_residual_anchor": float(local_loss_sums_cpu[3].item()),
+        }
         request.runtime.accelerator.backward(scaled_loss)
         gradient_norm = apply_gradient_clipping(
-            model=model,
+            model=train_step_model,
             gradient_clip_norm=cfg.optimization.gradient_clip_norm,
         )
         optimizer.step()
+        validation_model = _unwrap_refiner(train_step_model, request.runtime.accelerator)
         global_train_count = _distributed_sum_int(local_train_count, request.runtime, device)
         total_loss = _distributed_sum_float(local_loss_values["total"], request.runtime, device)
         total_bce_loss = _distributed_sum_float(local_loss_values["bce"], request.runtime, device)
@@ -595,7 +633,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         )
 
         validation_auprc = _validation_auprc(
-            model=model,
+            model=validation_model,
             graph=validation_graph,
             labels=validation_labels,
             batch_size=cfg.batch_size,
@@ -612,7 +650,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             ):
                 raise RuntimeError("Validation topology graph was not initialized")
             topology_evaluation = _evaluate_validation_topology_rules(
-                model=model,
+                model=validation_model,
                 graph=validation_topology_graph,
                 pairs=request.validation_topology.pairs,
                 validation_plan=request.validation_topology_plan,
@@ -704,7 +742,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             best_monitor_value = monitor_value
             best_selected_rule = selected_epoch_rule
             best_selected_rule_payload = selected_epoch_rule_payload
-            checkpoint_model = _unwrap_model(model, request.runtime.accelerator)
+            checkpoint_model = _unwrap_refiner(train_step_model, request.runtime.accelerator)
             best_state_dict = {
                 name: tensor.detach().cpu().clone()
                 for name, tensor in checkpoint_model.state_dict().items()
@@ -722,7 +760,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
 
     if best_state_dict is None:
         raise RuntimeError("S2GAE training did not produce a checkpoint")
-    checkpoint_model = _unwrap_model(model, request.runtime.accelerator)
+    checkpoint_model = _unwrap_refiner(train_step_model, request.runtime.accelerator)
     checkpoint_model.load_state_dict(best_state_dict)
     if request.runtime.is_main_process:
         cfg.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -749,7 +787,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         )
     _runtime_barrier(request.runtime)
     return S2GAERefinerState(
-        model=cast(S2GAERefiner, checkpoint_model),
+        model=checkpoint_model,
         config=cfg,
         best_validation_auprc=best_validation_auprc,
         best_monitor_value=best_monitor_value,
@@ -767,10 +805,11 @@ def predict_refined(request: RefineRequest) -> list[float]:
     state = request.refiner_state
     device = torch.device(request.runtime.device)
     state.model.to(device)
-    state.model.eval()
+    prediction_model = _unwrap_refiner(state.model, request.runtime.accelerator)
+    prediction_model.eval()
     graph = _build_prediction_graph(request, cfg=state.config, device=device)
     return _prediction_probabilities(
-        model=state.model,
+        model=prediction_model,
         graph=graph,
         batch_size=state.config.batch_size,
         runtime=request.runtime,
@@ -1479,7 +1518,20 @@ def _unwrap_model(model: nn.Module, accelerator: object) -> nn.Module:
         unwrapped = unwrap_model(model)
         if isinstance(unwrapped, nn.Module):
             return unwrapped
+    module = getattr(model, "module", None)
+    if isinstance(module, nn.Module):
+        return module
     return model
+
+
+def _unwrap_refiner(model: nn.Module, accelerator: object) -> S2GAERefiner:
+    unwrapped = _unwrap_model(model, accelerator)
+    if isinstance(unwrapped, S2GAERefiner):
+        return unwrapped
+    refiner = getattr(unwrapped, "refiner", None)
+    if isinstance(refiner, S2GAERefiner):
+        return refiner
+    raise TypeError("Prepared S2GAE model does not contain an S2GAERefiner")
 
 
 def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:

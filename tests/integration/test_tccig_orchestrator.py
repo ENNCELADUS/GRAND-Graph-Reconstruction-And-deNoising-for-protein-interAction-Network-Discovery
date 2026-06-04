@@ -611,7 +611,9 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
 
         def prepare(self, *args: object) -> tuple[object, ...]:
             accelerator_events.append(("prepare", len(args)))
-            return args
+            module, *rest = args
+            assert isinstance(module, torch.nn.Module)
+            return (_ForwardOnlyDDP(module, accelerator_events), *rest)
 
         def backward(self, loss: torch.Tensor) -> None:
             accelerator_events.append(("backward", 1))
@@ -619,7 +621,23 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
 
         def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
             accelerator_events.append(("unwrap_model", 1))
+            if isinstance(model, _ForwardOnlyDDP):
+                return model.module
             return model
+
+    class _ForwardOnlyDDP(torch.nn.Module):
+        def __init__(
+            self,
+            module: torch.nn.Module,
+            events: list[tuple[str, int]],
+        ) -> None:
+            super().__init__()
+            self.module = module
+            self._events = events
+
+        def forward(self, **kwargs: object) -> object:
+            self._events.append(("forward", 1))
+            return self.module(**kwargs)
 
     def fake_build_accelerator(**kwargs: object) -> FakeAccelerator:
         del kwargs
@@ -691,6 +709,7 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
     )
 
     assert ("prepare", 2) in accelerator_events
+    assert ("forward", 1) in accelerator_events
     assert ("backward", 1) in accelerator_events
     assert result.selected_rule["type"] in {"threshold", "top_m"}
     assert result.manifest["pair_counts"]["topology_test"] == 2
