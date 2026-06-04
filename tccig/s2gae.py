@@ -1513,18 +1513,27 @@ def _prepared_model_and_optimizer(prepared: object) -> tuple[nn.Module, Optimize
 
 
 def _unwrap_model(model: nn.Module, accelerator: object) -> nn.Module:
+    module = getattr(model, "module", None)
+    if isinstance(module, nn.Module):
+        return module
     unwrap_model = getattr(accelerator, "unwrap_model", None)
     if callable(unwrap_model):
         unwrapped = unwrap_model(model)
         if isinstance(unwrapped, nn.Module):
             return unwrapped
-    module = getattr(model, "module", None)
-    if isinstance(module, nn.Module):
-        return module
     return model
 
 
 def _unwrap_refiner(model: nn.Module, accelerator: object) -> S2GAERefiner:
+    if isinstance(model, S2GAERefiner):
+        return model
+    if isinstance(model, _S2GAETrainStepModule):
+        return model.refiner
+    module = getattr(model, "module", None)
+    if isinstance(module, S2GAERefiner):
+        return module
+    if isinstance(module, _S2GAETrainStepModule):
+        return module.refiner
     unwrapped = _unwrap_model(model, accelerator)
     if isinstance(unwrapped, S2GAERefiner):
         return unwrapped

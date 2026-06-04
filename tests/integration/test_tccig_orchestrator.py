@@ -620,10 +620,8 @@ def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -
             loss.backward()
 
         def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
-            accelerator_events.append(("unwrap_model", 1))
-            if isinstance(model, _ForwardOnlyDDP):
-                return model.module
-            return model
+            del model
+            raise AssertionError("S2GAE refiner should unwrap DDP without accelerator.unwrap_model")
 
     class _ForwardOnlyDDP(torch.nn.Module):
         def __init__(
