@@ -8,6 +8,7 @@ import pickle
 from pathlib import Path
 
 import networkx as nx
+import pytest
 import torch
 import yaml
 from src.pipeline.stages.train import build_model
@@ -120,6 +121,11 @@ def fake_score_pairs(request: PairwiseScoreRequest) -> list[float]:
     return [0.9 if pair.protein_b in {"B", "T2"} else 0.1 for pair in request.pairs]
 
 
+def fake_score_pairs_alias(request: PairwiseScoreRequest) -> list[float]:
+    """Alternate fake scorer target with the same scores but a different fingerprint."""
+    return fake_score_pairs(request)
+
+
 def fake_train_refiner(request: TrainRefinerRequest) -> dict[str, str]:
     """Fake trainer that sees train targets but no test graph artifacts."""
     assert request.train.loss_targets == [1, 0]
@@ -174,6 +180,8 @@ def test_tccig_orchestrator_keeps_pring_truth_out_of_model_inputs(tmp_path: Path
     assert ("score", "train") in HOOK_EVENTS
     assert ("score", "topology_test") in HOOK_EVENTS
     assert ("predict_refined", "topology_test") in HOOK_EVENTS
+    assert HOOK_EVENTS.index(("train_refiner", 2)) < HOOK_EVENTS.index(("score", "pairwise_test"))
+    assert HOOK_EVENTS.index(("train_refiner", 2)) < HOOK_EVENTS.index(("score", "topology_test"))
     assert result.manifest["self_pair_rows_dropped"] == {
         "train": 1,
         "validation": 1,
@@ -217,24 +225,111 @@ def test_tccig_orchestrator_keeps_pring_truth_out_of_model_inputs(tmp_path: Path
     assert '"pair_count": 2' in scoring_manifest.read_text(encoding="utf-8")
     score_dir = tmp_path / "logs" / "tccig" / "score" / "tiny"
     assert (score_dir / "validation.json").exists()
-    shard_manifest = score_dir / "shards" / "train" / "rank_0.json"
-    assert shard_manifest.exists()
-    shard_payload = json.loads(shard_manifest.read_text(encoding="utf-8"))
-    assert shard_payload["status"] == "completed"
-    assert shard_payload["local_pair_count"] == 2
-    progress_path = score_dir / "progress.csv"
-    assert progress_path.exists()
-    with progress_path.open("r", encoding="utf-8", newline="") as handle:
-        assert csv.DictReader(handle).fieldnames == [
-            "split",
-            "rank",
-            "world_size",
-            "batch_index",
-            "processed_pairs",
-            "local_pair_count",
-            "global_pair_count",
-            "elapsed_s",
-        ]
+    assert not (score_dir / "shards").exists()
+    assert not (score_dir / "progress.csv").exists()
+
+
+def test_tccig_pairwise_score_cache_reuses_strict_split_scores(tmp_path: Path) -> None:
+    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
+    _write_tiny_pring_fixture(processed_dir)
+    config = {
+        "run": {"run_id": "score_cache", "log_root": str(tmp_path / "logs")},
+        "data": {"processed_dir": str(processed_dir)},
+        "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
+        "pairwise_scorer": {
+            "target": f"{__name__}:fake_score_pairs",
+            "score_cache": {"enabled": True},
+        },
+        "refiner": {
+            "train_target": f"{__name__}:fake_train_refiner",
+            "predict_target": f"{__name__}:fake_predict_refined",
+        },
+        "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
+    }
+
+    HOOK_EVENTS.clear()
+    run_tccig_pipeline(config)
+    assert ("score", "topology_test") in HOOK_EVENTS
+    score_cache_path = tmp_path / "logs" / "tccig" / "score" / "score_cache" / "cache" / "train.pt"
+    assert score_cache_path.exists()
+
+    HOOK_EVENTS.clear()
+    result = run_tccig_pipeline(config)
+
+    assert not any(event[0] == "score" for event in HOOK_EVENTS)
+    assert ("train_refiner", 2) in HOOK_EVENTS
+    assert ("predict_refined", "topology_test") in HOOK_EVENTS
+    assert result.pairwise_metrics["f1"] == 1.0
+
+
+def test_tccig_score_cache_rescores_when_pair_order_changes(tmp_path: Path) -> None:
+    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
+    _write_tiny_pring_fixture(processed_dir)
+    config = {
+        "run": {"run_id": "pair_order_cache", "log_root": str(tmp_path / "logs")},
+        "data": {"processed_dir": str(processed_dir)},
+        "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
+        "pairwise_scorer": {
+            "target": f"{__name__}:fake_score_pairs",
+            "score_cache": {"enabled": True},
+        },
+        "refiner": {
+            "train_target": f"{__name__}:fake_train_refiner",
+            "predict_target": f"{__name__}:fake_predict_refined",
+        },
+        "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
+    }
+
+    HOOK_EVENTS.clear()
+    run_tccig_pipeline(config)
+    _write_pairs(
+        processed_dir / "human_test_ppi.txt",
+        [("T2", "T3", 0), ("T1", "T1", 1), ("T1", "T2", 1)],
+    )
+
+    HOOK_EVENTS.clear()
+    run_tccig_pipeline(config)
+
+    assert [event for event in HOOK_EVENTS if event[0] == "score"] == [("score", "pairwise_test")]
+
+
+def test_tccig_score_cache_rescores_when_scorer_fingerprint_changes(tmp_path: Path) -> None:
+    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
+    _write_tiny_pring_fixture(processed_dir)
+    base_config = {
+        "run": {"run_id": "fingerprint_cache", "log_root": str(tmp_path / "logs")},
+        "data": {"processed_dir": str(processed_dir)},
+        "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
+        "pairwise_scorer": {
+            "target": f"{__name__}:fake_score_pairs",
+            "score_cache": {"enabled": True},
+        },
+        "refiner": {
+            "train_target": f"{__name__}:fake_train_refiner",
+            "predict_target": f"{__name__}:fake_predict_refined",
+        },
+        "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
+    }
+    changed_config = {
+        **base_config,
+        "pairwise_scorer": {
+            "target": f"{__name__}:fake_score_pairs_alias",
+            "score_cache": {"enabled": True},
+        },
+    }
+
+    HOOK_EVENTS.clear()
+    run_tccig_pipeline(base_config)
+
+    HOOK_EVENTS.clear()
+    run_tccig_pipeline(changed_config)
+
+    assert [event for event in HOOK_EVENTS if event[0] == "score"] == [
+        ("score", "train"),
+        ("score", "validation"),
+        ("score", "pairwise_test"),
+        ("score", "topology_test"),
+    ]
 
 
 def test_validation_selected_rule_is_reused_for_topology_test(tmp_path: Path) -> None:
@@ -375,10 +470,90 @@ def test_tccig_orchestrator_runs_v3_1_pairwise_scorer_with_fake_refiner(
     assert scoring_manifest.exists()
     manifest = json.loads(scoring_manifest.read_text(encoding="utf-8"))
     assert manifest["pair_count"] == 2
-    progress_path = tmp_path / "logs" / "tccig" / "score" / "v3_1_pairwise" / "progress.csv"
-    with progress_path.open("r", encoding="utf-8", newline="") as handle:
-        progress_rows = list(csv.DictReader(handle))
-    assert any(row["split"] == "train" and row["processed_pairs"] == "2" for row in progress_rows)
+    score_dir = tmp_path / "logs" / "tccig" / "score" / "v3_1_pairwise"
+    assert not (score_dir / "shards").exists()
+    assert not (score_dir / "progress.csv").exists()
+
+
+def test_tccig_preflight_rejects_refiner_input_dim_mismatch(tmp_path: Path) -> None:
+    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
+    _write_tiny_pring_fixture(processed_dir)
+    model_config_path, checkpoint_path, cache_dir = _write_tiny_v3_1_pairwise_assets(tmp_path)
+    HOOK_EVENTS.clear()
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"TCCIG preflight dimension mismatch: "
+            r"pairwise_scorer.model_config.input_dim=8, "
+            r"refiner.input_dim=7, embedding_cache_dim=8"
+        ),
+    ):
+        run_tccig_pipeline(
+            {
+                "run": {"run_id": "dim_mismatch", "log_root": str(tmp_path / "logs")},
+                "data": {"processed_dir": str(processed_dir)},
+                "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
+                "pairwise_scorer": {
+                    "target": "tccig.train:score_pairs_with_v3_1",
+                    "model_config_path": str(model_config_path),
+                    "checkpoint_path": str(checkpoint_path),
+                    "embedding_cache_dir": str(cache_dir),
+                    "batch_size": 2,
+                    "max_sequence_length": 8,
+                },
+                "refiner": {
+                    "train_target": f"{__name__}:fake_train_refiner",
+                    "predict_target": f"{__name__}:fake_predict_refined",
+                    "input_dim": 7,
+                },
+                "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
+            }
+        )
+
+    assert HOOK_EVENTS == []
+    assert not (tmp_path / "logs" / "tccig" / "score" / "dim_mismatch").exists()
+
+
+def test_tccig_preflight_rejects_embedding_cache_dim_mismatch(tmp_path: Path) -> None:
+    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
+    _write_tiny_pring_fixture(processed_dir)
+    model_config_path, checkpoint_path, cache_dir = _write_tiny_v3_1_pairwise_assets(tmp_path)
+    torch.save(torch.ones((3, 6), dtype=torch.float32), cache_dir / "embeddings" / "A.pt")
+    HOOK_EVENTS.clear()
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"TCCIG preflight dimension mismatch: "
+            r"pairwise_scorer.model_config.input_dim=8, "
+            r"refiner.input_dim=8, embedding_cache_dim=6"
+        ),
+    ):
+        run_tccig_pipeline(
+            {
+                "run": {"run_id": "cache_dim_mismatch", "log_root": str(tmp_path / "logs")},
+                "data": {"processed_dir": str(processed_dir)},
+                "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
+                "pairwise_scorer": {
+                    "target": "tccig.train:score_pairs_with_v3_1",
+                    "model_config_path": str(model_config_path),
+                    "checkpoint_path": str(checkpoint_path),
+                    "embedding_cache_dir": str(cache_dir),
+                    "batch_size": 2,
+                    "max_sequence_length": 8,
+                },
+                "refiner": {
+                    "train_target": f"{__name__}:fake_train_refiner",
+                    "predict_target": f"{__name__}:fake_predict_refined",
+                    "input_dim": 8,
+                },
+                "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
+            }
+        )
+
+    assert HOOK_EVENTS == []
+    assert not (tmp_path / "logs" / "tccig" / "score" / "cache_dim_mismatch").exists()
 
 
 def test_tccig_runtime_wires_deepspeed_backend_without_launching_it(tmp_path: Path) -> None:

@@ -1,5 +1,5 @@
 run:
-  run_id: start
+  run_id: "01"
   log_root: logs
 
 data:
@@ -16,14 +16,16 @@ pairwise_scorer:
   model_config_path: configs/v3-1/0517/pair_context_gated_abba_no_cross_s47.yaml
   checkpoint_path: models/v3.1/train/pair_context_gated_abba_no_cross_s47/best_model.pth
   embedding_cache_dir: data/embeddings/esm3_1024
-  batch_size: 256
+  batch_size: 512
   max_sequence_length: 1024
+  score_cache:
+    enabled: true
 
 refiner:
   train_target: tccig.s2gae:train_refiner
   predict_target: tccig.s2gae:predict_refined
   encoder: graphconv
-  input_dim: 1024
+  input_dim: 1536
   hidden_dim: 128
   num_layers: 2
   decoder_hidden_dim: 256

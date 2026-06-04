@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib
 import json
 import logging
 import math
 import pickle
-import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,17 +58,6 @@ TOPOLOGY_CSV_COLUMNS = [
     "graph_count",
     *TOPOLOGY_METRIC_NAMES,
 ]
-SCORE_PROGRESS_COLUMNS = [
-    "split",
-    "rank",
-    "world_size",
-    "batch_index",
-    "processed_pairs",
-    "local_pair_count",
-    "global_pair_count",
-    "elapsed_s",
-]
-SPLIT_ORDER = ("train", "validation", "pairwise_test", "topology_test")
 ProgressCallback = Callable[[Mapping[str, object]], None]
 
 
@@ -410,6 +399,7 @@ def run_tccig_pipeline(
     _configure_tccig_logging(runtime)
     run_id = _run_id(config)
     log_root = _log_root(config)
+    _preflight_tccig_dimensions(config)
     tables = _load_tables(config)
     self_pair_rows = {split: table.self_pair_rows for split, table in tables.items()}
 
@@ -418,27 +408,28 @@ def run_tccig_pipeline(
     scorer_cfg = _mapping_section(config, "pairwise_scorer")
     rules = tuple(parse_rules(_mapping_section(config, "graph_selection").get("rules")))
     score_dir = log_root / "tccig" / "score" / run_id
-    _prepare_score_progress_log(output_dir=score_dir, runtime=runtime)
-    bundles: dict[str, SplitBundle] = {}
-    for split in SPLIT_ORDER:
-        table = tables[split]
-        bundle = _score_table(
-            table=table,
-            split=split,
-            scorer=pairwise_scorer,
-            runtime=runtime,
-            scorer_cfg=scorer_cfg,
-            pairwise_graph_rule=pairwise_graph_rule,
-            output_dir=score_dir,
-        )
-        bundles[split] = bundle
-        if runtime.is_main_process:
-            _write_scoring_manifest(output_dir=score_dir, table=table, bundle=bundle)
-        _runtime_barrier(runtime)
+    train_scored = _score_table_stage(
+        table=tables["train"],
+        split="train",
+        scorer=pairwise_scorer,
+        runtime=runtime,
+        scorer_cfg=scorer_cfg,
+        pairwise_graph_rule=pairwise_graph_rule,
+        output_dir=score_dir,
+    )
+    validation_scored = _score_table_stage(
+        table=tables["validation"],
+        split="validation",
+        scorer=pairwise_scorer,
+        runtime=runtime,
+        scorer_cfg=scorer_cfg,
+        pairwise_graph_rule=pairwise_graph_rule,
+        output_dir=score_dir,
+    )
 
-    train_bundle = _with_targets(bundles["train"], tables["train"], include_loss=True)
+    train_bundle = _with_targets(train_scored, tables["train"], include_loss=True)
     validation_bundle = _with_targets(
-        bundles["validation"],
+        validation_scored,
         tables["validation"],
         include_loss=False,
     )
@@ -513,14 +504,32 @@ def run_tccig_pipeline(
     selected_rule_path = log_root / "tccig" / "validation" / run_id / "selected_rule.json"
     write_json(selected_rule_path, selected_rule_payload)
 
+    pairwise_test_bundle = _score_table_stage(
+        table=tables["pairwise_test"],
+        split="pairwise_test",
+        scorer=pairwise_scorer,
+        runtime=runtime,
+        scorer_cfg=scorer_cfg,
+        pairwise_graph_rule=pairwise_graph_rule,
+        output_dir=score_dir,
+    )
     pairwise_metrics = _run_pairwise_test(
-        bundle=bundles["pairwise_test"],
+        bundle=pairwise_test_bundle,
         labels=tables["pairwise_test"].labels,
         output_dir=log_root / "tccig" / "pairwise_test" / run_id,
     )
+    topology_test_bundle = _score_table_stage(
+        table=tables["topology_test"],
+        split="topology_test",
+        scorer=pairwise_scorer,
+        runtime=runtime,
+        scorer_cfg=scorer_cfg,
+        pairwise_graph_rule=pairwise_graph_rule,
+        output_dir=score_dir,
+    )
     topology_metrics = _run_topology_test(
         config=config,
-        bundle=bundles["topology_test"],
+        bundle=topology_test_bundle,
         predict_refined=cast(PredictRefined, predict_refined),
         refiner_state=refiner_state,
         selected_rule=selected_rule,
@@ -593,6 +602,31 @@ def _score_table(
     )
 
 
+def _score_table_stage(
+    *,
+    table: PairTable,
+    split: str,
+    scorer: PairwiseScorer,
+    runtime: TCCIGRuntime,
+    scorer_cfg: Mapping[str, object],
+    pairwise_graph_rule: GraphRule,
+    output_dir: Path,
+) -> SplitBundle:
+    bundle = _score_table(
+        table=table,
+        split=split,
+        scorer=scorer,
+        runtime=runtime,
+        scorer_cfg=scorer_cfg,
+        pairwise_graph_rule=pairwise_graph_rule,
+        output_dir=output_dir,
+    )
+    if runtime.is_main_process:
+        _write_scoring_manifest(output_dir=output_dir, table=table, bundle=bundle)
+    _runtime_barrier(runtime)
+    return bundle
+
+
 def _score_pairs(
     *,
     pairs: Sequence[CandidatePair],
@@ -604,48 +638,39 @@ def _score_pairs(
     output_dir: Path,
 ) -> SplitBundle:
     candidate_pairs = list(pairs)
-    start_time = time.perf_counter()
     local_indexed_pairs = _rank_local_indexed_pairs(
         pairs=candidate_pairs,
         runtime=runtime,
     )
     local_pairs = [pair for _, pair in local_indexed_pairs]
-    _write_score_shard_manifest(
+    cache_metadata = _score_cache_metadata(
+        split=split,
+        pairs=candidate_pairs,
+        scorer_cfg=scorer_cfg,
+    )
+    cached_probabilities = _load_cached_pairwise_probabilities(
         output_dir=output_dir,
         split=split,
-        runtime=runtime,
-        global_pair_count=len(candidate_pairs),
-        local_pair_count=len(local_pairs),
-        processed_pair_count=0,
-        status="running",
-        elapsed_s=0.0,
+        expected_metadata=cache_metadata,
     )
-
-    def progress_callback(progress: Mapping[str, object]) -> None:
-        _append_score_progress_row(
-            output_dir=output_dir,
-            split=split,
-            runtime=runtime,
-            batch_index=_non_negative_int(
-                progress.get("batch_index", 0),
-                "pairwise_scorer.progress.batch_index",
-            ),
-            processed_pairs=_non_negative_int(
-                progress.get("processed_pairs", 0),
-                "pairwise_scorer.progress.processed_pairs",
-            ),
-            local_pair_count=len(local_pairs),
-            global_pair_count=len(candidate_pairs),
-            elapsed_s=time.perf_counter() - start_time,
+    if cached_probabilities is not None:
+        graph_edges = edges_from_rule(
+            pairs=candidate_pairs,
+            probabilities=cached_probabilities,
+            rule=pairwise_graph_rule,
         )
-
+        return SplitBundle(
+            split=split,
+            pairs=candidate_pairs,
+            pairwise_probabilities=cached_probabilities,
+            pairwise_graph_edges=graph_edges,
+        )
     raw_scores = scorer(
         PairwiseScoreRequest(
             split=split,
             pairs=local_pairs,
             runtime=runtime,
             config=scorer_cfg,
-            progress_callback=progress_callback,
         )
     )
     local_probabilities = _normalize_probabilities(raw_scores)
@@ -672,15 +697,12 @@ def _score_pairs(
         probabilities=probabilities,
         rule=pairwise_graph_rule,
     )
-    _write_score_shard_manifest(
+    _write_pairwise_score_cache(
         output_dir=output_dir,
         split=split,
+        metadata=cache_metadata,
+        probabilities=probabilities,
         runtime=runtime,
-        global_pair_count=len(candidate_pairs),
-        local_pair_count=len(local_pairs),
-        processed_pair_count=len(local_pairs),
-        status="completed",
-        elapsed_s=time.perf_counter() - start_time,
     )
     return SplitBundle(
         split=split,
@@ -688,6 +710,130 @@ def _score_pairs(
         pairwise_probabilities=probabilities,
         pairwise_graph_edges=graph_edges,
     )
+
+
+def _score_cache_metadata(
+    *,
+    split: str,
+    pairs: Sequence[CandidatePair],
+    scorer_cfg: Mapping[str, object],
+) -> dict[str, object] | None:
+    if not _score_cache_enabled(scorer_cfg):
+        return None
+    return {
+        "version": 1,
+        "split": split,
+        "pair_count": len(pairs),
+        "pair_hash": _ordered_pair_hash(pairs),
+        "scorer": _score_cache_scorer_fingerprint(scorer_cfg),
+    }
+
+
+def _score_cache_enabled(scorer_cfg: Mapping[str, object]) -> bool:
+    cache_cfg = scorer_cfg.get("score_cache")
+    return isinstance(cache_cfg, Mapping) and bool(cache_cfg.get("enabled", False))
+
+
+def _score_cache_scorer_fingerprint(scorer_cfg: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "target": str(scorer_cfg.get("target", "")),
+        "model_config_sha256": _optional_config_file_sha256(
+            scorer_cfg.get("model_config_path"),
+        ),
+        "checkpoint_sha256": _optional_config_file_sha256(
+            scorer_cfg.get("checkpoint_path"),
+        ),
+        "embedding_index_sha256": _optional_embedding_index_sha256(scorer_cfg),
+        "max_sequence_length": scorer_cfg.get("max_sequence_length"),
+    }
+
+
+def _optional_embedding_index_sha256(scorer_cfg: Mapping[str, object]) -> str | None:
+    raw_cache_dir = scorer_cfg.get("embedding_cache_dir")
+    if raw_cache_dir is None:
+        return None
+    return _file_sha256(Path(str(raw_cache_dir)) / "index.json")
+
+
+def _optional_config_file_sha256(raw_path: object) -> str | None:
+    if raw_path is None:
+        return None
+    return _file_sha256(Path(str(raw_path)))
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _ordered_pair_hash(pairs: Sequence[CandidatePair]) -> str:
+    digest = hashlib.sha256()
+    for pair in pairs:
+        digest.update(pair.protein_a.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(pair.protein_b.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _load_cached_pairwise_probabilities(
+    *,
+    output_dir: Path,
+    split: str,
+    expected_metadata: Mapping[str, object] | None,
+) -> list[float] | None:
+    if expected_metadata is None:
+        return None
+    cache_path = _score_cache_path(output_dir=output_dir, split=split)
+    if not cache_path.exists():
+        return None
+    try:
+        payload = torch.load(cache_path, map_location="cpu")
+    except (EOFError, OSError, RuntimeError, ValueError, pickle.UnpicklingError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    if payload.get("metadata") != dict(expected_metadata):
+        return None
+    probabilities = payload.get("probabilities")
+    if not isinstance(probabilities, torch.Tensor):
+        return None
+    if probabilities.dim() != 1 or int(probabilities.numel()) != int(
+        expected_metadata["pair_count"]
+    ):
+        return None
+    return [float(value) for value in probabilities.to(dtype=torch.float32).tolist()]
+
+
+def _write_pairwise_score_cache(
+    *,
+    output_dir: Path,
+    split: str,
+    metadata: Mapping[str, object] | None,
+    probabilities: Sequence[float],
+    runtime: TCCIGRuntime,
+) -> None:
+    if metadata is None or not runtime.is_main_process:
+        return
+    cache_path = _score_cache_path(output_dir=output_dir, split=split)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "metadata": dict(metadata),
+            "probabilities": torch.tensor(
+                [float(probability) for probability in probabilities],
+                dtype=torch.float32,
+            ),
+        },
+        cache_path,
+    )
+
+
+def _score_cache_path(*, output_dir: Path, split: str) -> Path:
+    return output_dir / "cache" / f"{split}.pt"
 
 
 def _build_validation_topology_bundle(
@@ -870,70 +1016,6 @@ def _fallback_select_validation_rule(
         **selected_rule.to_dict(),
         "validation_metrics": selected_rule_metrics,
     }
-
-
-def _prepare_score_progress_log(*, output_dir: Path, runtime: TCCIGRuntime) -> None:
-    if runtime.is_main_process:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        progress_path = output_dir / "progress.csv"
-        with progress_path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=SCORE_PROGRESS_COLUMNS)
-            writer.writeheader()
-    _runtime_barrier(runtime)
-
-
-def _append_score_progress_row(
-    *,
-    output_dir: Path,
-    split: str,
-    runtime: TCCIGRuntime,
-    batch_index: int,
-    processed_pairs: int,
-    local_pair_count: int,
-    global_pair_count: int,
-    elapsed_s: float,
-) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "progress.csv").open("a", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SCORE_PROGRESS_COLUMNS)
-        writer.writerow(
-            {
-                "split": split,
-                "rank": runtime.rank,
-                "world_size": runtime.world_size,
-                "batch_index": batch_index,
-                "processed_pairs": processed_pairs,
-                "local_pair_count": local_pair_count,
-                "global_pair_count": global_pair_count,
-                "elapsed_s": elapsed_s,
-            }
-        )
-
-
-def _write_score_shard_manifest(
-    *,
-    output_dir: Path,
-    split: str,
-    runtime: TCCIGRuntime,
-    global_pair_count: int,
-    local_pair_count: int,
-    processed_pair_count: int,
-    status: str,
-    elapsed_s: float,
-) -> None:
-    write_json(
-        output_dir / "shards" / split / f"rank_{runtime.rank}.json",
-        {
-            "split": split,
-            "rank": runtime.rank,
-            "world_size": runtime.world_size,
-            "global_pair_count": global_pair_count,
-            "local_pair_count": local_pair_count,
-            "processed_pair_count": processed_pair_count,
-            "status": status,
-            "elapsed_s": elapsed_s,
-        },
-    )
 
 
 def _write_scoring_manifest(
@@ -1269,6 +1351,65 @@ def _normalize_probabilities(raw_scores: Sequence[float]) -> list[float]:
 def _load_pairwise_scorer(config: Mapping[str, object]) -> PairwiseScorer:
     scorer_cfg = _mapping_section(config, "pairwise_scorer")
     return cast(PairwiseScorer, _load_callable(scorer_cfg["target"]))
+
+
+def _preflight_tccig_dimensions(config: Mapping[str, object]) -> None:
+    """Fail fast when scorer, refiner, and embedding cache dimensions disagree."""
+    scorer_cfg = _mapping_section(config, "pairwise_scorer")
+    if scorer_cfg.get("target") != "tccig.train:score_pairs_with_v3_1":
+        return
+
+    model_config_path = _required_path(scorer_cfg, "model_config_path", "pairwise_scorer")
+    embedding_cache_dir = _required_path(
+        scorer_cfg,
+        "embedding_cache_dir",
+        "pairwise_scorer",
+    )
+    model_config = _load_v3_1_abba_no_cross_model_config(model_config_path)
+    scorer_input_dim = _positive_int(
+        model_config.get("input_dim"),
+        "pairwise_scorer.model_config.input_dim",
+    )
+    refiner_cfg = _mapping_section(config, "refiner")
+    refiner_input_dim = _preflight_refiner_input_dim(
+        refiner_cfg=refiner_cfg,
+        scorer_input_dim=scorer_input_dim,
+    )
+    embedding_cache_dim = _first_embedding_cache_dim(embedding_cache_dir)
+    if len({scorer_input_dim, refiner_input_dim, embedding_cache_dim}) == 1:
+        return
+    raise ValueError(
+        "TCCIG preflight dimension mismatch: "
+        f"pairwise_scorer.model_config.input_dim={scorer_input_dim}, "
+        f"refiner.input_dim={refiner_input_dim}, "
+        f"embedding_cache_dim={embedding_cache_dim}"
+    )
+
+
+def _first_embedding_cache_dim(cache_dir: Path) -> int:
+    embedding_index = _load_embedding_index(cache_dir / "index.json")
+    if not embedding_index:
+        raise ValueError("pairwise_scorer.embedding_cache_dir index must not be empty")
+    protein_id = sorted(embedding_index)[0]
+    embedding = load_cached_embedding(
+        cache_dir=cache_dir,
+        index=embedding_index,
+        protein_id=protein_id,
+    )
+    return int(embedding.size(1))
+
+
+def _preflight_refiner_input_dim(
+    *,
+    refiner_cfg: Mapping[str, object],
+    scorer_input_dim: int,
+) -> int:
+    raw_input_dim = refiner_cfg.get("input_dim")
+    if raw_input_dim is not None:
+        return _positive_int(raw_input_dim, "refiner.input_dim")
+    if refiner_cfg.get("train_target") == "tccig.s2gae:train_refiner":
+        return _positive_int(1024, "refiner.input_dim")
+    return scorer_input_dim
 
 
 def _load_optional_callable(value: object, default: Callable[..., object]) -> Callable[..., object]:
