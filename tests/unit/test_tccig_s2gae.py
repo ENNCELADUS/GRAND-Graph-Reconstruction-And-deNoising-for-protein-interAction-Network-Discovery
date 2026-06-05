@@ -93,8 +93,6 @@ def test_refiner_preserves_pairwise_probability_when_delta_is_zero() -> None:
         decoder_layers=1,
         dropout=0.0,
     )
-    for parameter in model.decoder.parameters():
-        torch.nn.init.zeros_(parameter)
     node_features = torch.ones((2, 4), dtype=torch.float32)
     edge_index = torch.tensor([[0, 1], [1, 0]], dtype=torch.long)
     edge_weight = torch.tensor([0.8, 0.8], dtype=torch.float32)

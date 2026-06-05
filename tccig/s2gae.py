@@ -306,6 +306,13 @@ class CrossLayerDecoder(nn.Module):
                 layers.append(nn.Linear(decoder_hidden_dim, decoder_hidden_dim))
             layers.append(nn.Linear(decoder_hidden_dim, 1))
         self.layers = nn.ModuleList(layers)
+        self.reset_output_layer()
+
+    def reset_output_layer(self) -> None:
+        """Initialize the residual decoder to preserve pairwise logits."""
+        output_layer = self.layers[-1]
+        nn.init.zeros_(output_layer.weight)
+        nn.init.zeros_(output_layer.bias)
 
     def forward(
         self,
