@@ -6,7 +6,7 @@
 #SBATCH -t 4-00:00:00
 #SBATCH --mem=300G
 #SBATCH --cpus-per-task=32
-#SBATCH --gres=gpu:NVIDIAA40:8
+#SBATCH --gres=gpu:NVIDIAA40:4
 #SBATCH --output=logs/tccig/slurm_%j.out
 #SBATCH --error=logs/tccig/slurm_%j.err
 #SBATCH --mail-type=ALL
@@ -22,7 +22,7 @@ if [ -f "$HOME/.bashrc" ]; then
   source "$HOME/.bashrc"
 fi
 
-CONFIG_PATH="${1:-configs/tccig/start.yaml}"
+CONFIG_PATH="${1:-configs/tccig/02.yaml}"
 
 if [ ! -d ".venv" ]; then
   echo "Missing .venv. Run 'uv sync --group dev --locked' before running TCCIG."
