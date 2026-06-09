@@ -125,7 +125,7 @@ graph_selection:
   scorer baseline is a pinned historical artifact under
   `logs/tccig/pairwise_baseline`; the pipeline does not regenerate it. The
   full v3.1-plus-refiner pairwise metrics are written to
-  `logs/tccig/pairwise_test/{run_id}`.
+  `logs/tccig/{run_id}/pairwise_test`.
 - `all_test_ppi.txt` is the topology candidate universe; its labels are ignored.
 - `human_test_graph.pkl` and `test_sampled_nodes.pkl` are loaded only after
   topology predictions exist, for metrics only.

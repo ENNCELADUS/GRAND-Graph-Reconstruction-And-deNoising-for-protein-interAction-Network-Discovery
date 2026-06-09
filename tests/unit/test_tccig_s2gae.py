@@ -14,9 +14,11 @@ from tccig.s2gae import (
     CrossLayerDecoder,
     S2GAERefiner,
     _build_graph,
+    _local_topology_loss,
     _parse_config,
     _prediction_probabilities,
     _SplitGraph,
+    _TopologyLossTask,
     apply_gradient_clipping,
     load_mean_pooled_node_features,
     residual_refined_logits,
@@ -256,6 +258,24 @@ def test_parse_config_reads_nested_loss_config(tmp_path: Path) -> None:
     assert cfg.residual_weight == pytest.approx(0.25)
 
 
+def test_parse_config_reads_train_topology_loss_config(tmp_path: Path) -> None:
+    config = _base_refiner_config(tmp_path)
+    config["topology_loss"] = {
+        "enabled": True,
+        "weight": 0.2,
+        "losses": {"alpha": 0.7, "beta": 1.5, "gamma": 0.0, "delta": 0.0},
+    }
+
+    cfg = _parse_config(config)
+
+    assert cfg.topology_loss.enabled
+    assert cfg.topology_loss.weight == pytest.approx(0.2)
+    assert cfg.topology_loss.losses.alpha == pytest.approx(0.7)
+    assert cfg.topology_loss.losses.beta == pytest.approx(1.5)
+    assert cfg.topology_loss.losses.gamma == 0.0
+    assert cfg.topology_loss.losses.delta == 0.0
+
+
 def test_parse_config_rejects_unsupported_encoder(tmp_path: Path) -> None:
     config = _base_refiner_config(tmp_path)
     config["encoder"] = "sage"
@@ -363,6 +383,68 @@ def test_s2gae_loss_terms_use_weighted_bce_and_all_pair_residual_anchor() -> Non
     assert terms.residual_anchor.item() == pytest.approx(5.0)
     assert terms.weighted_residual_anchor.item() == pytest.approx(1.25)
     assert terms.total.item() == pytest.approx(expected_bce.item() + 1.25)
+
+
+def test_train_topology_loss_uses_only_graph_similarity_and_relative_density(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cfg = _parse_config(
+        {
+            **_base_refiner_config(tmp_path),
+            "topology_loss": {
+                "enabled": True,
+                "weight": 2.0,
+                "losses": {"alpha": 0.5, "beta": 3.0, "gamma": 9.0, "delta": 9.0},
+            },
+        }
+    )
+    observed_weights: list[tuple[float, float, float, float]] = []
+
+    def fake_compute_topology_losses(**kwargs: object) -> dict[str, torch.Tensor]:
+        weights = kwargs["weights"]
+        observed_weights.append((weights.alpha, weights.beta, weights.gamma, weights.delta))
+        return {
+            "total_topology": torch.tensor(4.0, dtype=torch.float32),
+            "graph_similarity": torch.tensor(1.25, dtype=torch.float32),
+            "relative_density": torch.tensor(2.75, dtype=torch.float32),
+        }
+
+    class FakeModel:
+        def decode(self, **kwargs: object) -> tuple[torch.Tensor, torch.Tensor]:
+            pair_index = kwargs["pair_index"]
+            assert isinstance(pair_index, torch.Tensor)
+            logits = torch.zeros(pair_index.size(1), dtype=torch.float32)
+            return logits, logits
+
+    monkeypatch.setattr("tccig.s2gae.compute_topology_losses", fake_compute_topology_losses)
+    graph = _SplitGraph(
+        node_features=torch.ones((2, 4), dtype=torch.float32),
+        edge_index=torch.empty((2, 0), dtype=torch.long),
+        edge_weight=torch.empty((0,), dtype=torch.float32),
+        pair_index=torch.tensor([[0], [1]], dtype=torch.long),
+        pairwise_probabilities=torch.tensor([0.8], dtype=torch.float32),
+    )
+    task = _TopologyLossTask(
+        pair_indices=torch.tensor([0], dtype=torch.long),
+        pair_index_a=torch.tensor([0], dtype=torch.long),
+        pair_index_b=torch.tensor([1], dtype=torch.long),
+        targets=torch.tensor([1.0], dtype=torch.float32),
+        num_nodes=2,
+    )
+
+    loss, sums = _local_topology_loss(
+        model=FakeModel(),
+        hidden_states=[torch.ones((2, 4), dtype=torch.float32)],
+        graph=graph,
+        tasks=(task,),
+        task_indices=torch.tensor([0], dtype=torch.long),
+        cfg=cfg,
+    )
+
+    assert observed_weights == [(0.5, 3.0, 0.0, 0.0)]
+    assert loss.item() == pytest.approx(8.0)
+    assert sums.tolist() == pytest.approx([8.0, 1.25, 2.75, 1.0])
 
 
 def test_mean_pooled_features_require_embedding_index(tmp_path: Path) -> None:

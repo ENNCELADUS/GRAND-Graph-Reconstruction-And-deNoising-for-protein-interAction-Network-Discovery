@@ -58,21 +58,20 @@ G_pairwise = (V, E_pairwise, edge_weight=s_ij)
 ```
 
 `G_pairwise` 是 refiner 的 noisy input graph；它可以用 pairwise scorer
-概率阈值构造，但不能使用真实 topology。refined hard graph 的最终决策不再使用
-per-node top-k 或 global top-M，因为这些规则分别强制非生物的固定出边数和
-固定全图边数。TCCIG v1 使用 **validation-calibrated 0.5 threshold**：
+概率阈值构造，但不能使用真实 topology。当前实现把这个阈值定义为
+**pairwise input graph threshold**：epoch 0 在 scorer-only validation scores
+上选择达到 `precision >= 0.8` 的最低 threshold，然后冻结并用于所有 split 的
+`G_pairwise` 构造。
 
 ```text
-b* = argmin_b topology_val_loss(sigmoid(l_refined + b) >= 0.5)
+τ_pair = min τ such that precision(s_ij >= τ on validation) >= 0.8
+build E_pairwise = { (i, j): s_ij >= τ_pair }
 ```
 
-这等价于在 raw refined probability 上选择一个 validation threshold
-`τ* = sigmoid(-b*)`，但 artifact 仍保存为 logit bias，并让 evaluator 统一使用
-`0.5`：
-
-```text
-l'_ij = l_ij + b*
-```
+refined hard graph 的最终决策不复用 `τ_pair`。Stage 6 使用独立的
+**refined output threshold**，当前固定为 `p_refined >= 0.5`。per-node top-k
+和 global top-M 仍然禁用，因为这些规则分别强制非生物的固定出边数和固定全图
+边数。
 
 ---
 
@@ -126,7 +125,7 @@ z_ij = concat(z_ij, |h_i^K - h_j^K|, h_i^K * h_j^K)
 p_refined_ij = sigmoid(l_pairwise_ij + Δ_ij)
 ```
 
-`p_refined_ij = sigmoid(l_pairwise_ij + Δ_ij)` 是硬性设计：denoiser 学的是 residual refinement，而不是从零替代 pairwise classifier。训练时可以在 edge-score level 上计算 BCE；validation/test 再用 validation-selected logit bias 把 refined scores 校准到固定 `0.5` hard threshold。
+`p_refined_ij = sigmoid(l_pairwise_ij + Δ_ij)` 是硬性设计：denoiser 学的是 residual refinement，而不是从零替代 pairwise classifier。训练时可以在 edge-score level 上计算 BCE；validation/test 使用独立配置的 refined output threshold，当前固定为 `0.5`。
 
 S2GAE 适合作为主模板，因为它不是只重建 node feature，而是用 perturbed graph input、multi-layer GNN hidden states、cross-correlation decoder 来预测 missing edges。TCCIG 的改动是把 “masked edges from true graph” 换成 “missing / false edges relative to true topology under a classifier-generated noisy graph”。
 
@@ -144,12 +143,14 @@ A_true   = adjacency(train positive PPI graph)
 p_refine = Dθ(X_train, G_input, Ω_train)
 ```
 
-v1 总 loss 已接入 `tccig.s2gae:train_refiner`。当前实现只做 supervised
-link denoising，不把 topology metric loss 放进 backward：
+v1 总 loss 已接入 `tccig.s2gae:train_refiner`。当前实现包含 supervised link
+denoising、residual anchor，以及只来自 train topology buckets 的可微 topology
+surrogate：
 
 ```text
 L = L_bce
   + λ_resid * L_residual_anchor
+  + λ_topo * (α * L_graph_similarity + β * L_relative_density)
 ```
 
 #### 1. BCE denoise loss
@@ -180,21 +181,23 @@ L_residual_anchor = mean_{(i,j) in Ω_batch}(Δ_ij^2)
 
 权重要小，只是约束 refined score 不要脱离 pairwise evidence。
 
-#### Future: Topology loss
+#### 3. Train soft topology loss
 
-当前 v1 不训练这个 loss；topology metrics 只用于 validation/test 侧的 graph
-decision rule 和结果解释。后续如果要加入训练目标，可以再用 soft adjacency
-`P_refined` 对齐 `A_true`：
+训练侧 topology loss 只从 train true topology target 采样 PRING-style
+bucket all-pairs；validation/test truth 不进入 backward。loss 使用已有可微
+surrogate，在第一版只启用 graph similarity 和 relative density：
 
 ```text
 L_topology =
     α * graph_similarity_loss
   + β * relative_density_loss
-  + γ * degree_mmd
-  + δ * clustering_mmd
+
+γ = 0, δ = 0
 ```
 
-或后续加入 soft distillation：
+hard NetworkX topology metrics 仍然只用于 validation/test reporting 和 checkpoint
+monitor，不作为 test-time threshold search。后续如需更强正则，可以再评估
+degree/clustering MMD 或 soft distillation：
 
 ```text
 L_distill = BCE(p_ij_refined, stopgrad(s_ij_pairwise))
@@ -235,14 +238,16 @@ epoch 内对同一个 `G_pairwise` 重复运行 GraphConv encoder。每个 epoch
 
 Validation and test refined prediction follow the same operational rule: encode the
 split graph once per eval pass, decode only rank-local candidate pairs, gather
-scores back into original candidate-file order, then apply the validation-selected
-hard graph rule globally. Initial pairwise scoring is also rank-sharded by original
+scores back into original candidate-file order, then apply the fixed refined output
+threshold globally. Initial pairwise scoring is also rank-sharded by original
 candidate row index, with progress evidence under
-`logs/tccig/score/<run_id>/`.
+`data/tccig/score_cache/<run_id>/`.
 
 Training progress is written after every completed epoch to
-`logs/tccig/refiner/<run_id>/tccig_train_step.csv`, alongside
-`training_summary.json` and per-epoch manifests.
+`logs/tccig/<run_id>/tccig_train_step.csv`, alongside
+`training_summary.json`. Per-epoch details are retained inside
+`training_summary.json.history`; standalone per-epoch manifest files are not
+written.
 
 当前 config 明确使用 fixed-LR AdamW，不启用 scheduler：
 
@@ -279,7 +284,7 @@ Validation 必须模拟 test：
 5. 构造 G_pairwise_val_topology
 6. 输入 G_pairwise_val_topology + X_val_topology 到 denoiser
 7. 输出 refined scores
-8. 对每个 configured graph rule 重建 hard refined bucket graphs
+8. 用 fixed refined output threshold 重建 hard refined bucket graphs
 9. 和 validation true topology bucket subgraphs 比较，计算 graph_sim / relative_density / MMD metrics
 ```
 
@@ -300,10 +305,10 @@ refiner.monitor_metric =
   | val_auprc
 ```
 
-当 monitor 是 topology 指标时，同一次 validation epoch 同时决定 best checkpoint
-和 selected refined graph calibration。selected rule 固定为 `threshold=0.5`，
-selected calibration 会在 test time 原样复用；test 不能重新根据
-`human_test_graph.pkl` 选 threshold、edge budget、或 degree budget。
+当 monitor 是 topology 指标时，validation 只决定 best checkpoint。refined
+output rule 由 config 固定为 `threshold=0.5`，validation/test 都不再 sweep
+logit bias 或重新选择 threshold；test 也不能根据 `human_test_graph.pkl` 选
+threshold、edge budget、或 degree budget。
 
 `val_topology_loss` 使用和 topology fine-tune validation 一致的 hard-metric
 penalty：
@@ -333,13 +338,13 @@ candidate pairs Ω_test = all_test_ppi.txt
 2. build G_pairwise_test from pairwise scores only
 3. H_test = Encθ(X_test, G_pairwise_test)
 4. p_ij_refined = sigmoid(l_ij_pairwise + Decθ(H_i, H_j))
-5. apply validation-selected logit bias, then threshold calibrated probability at 0.5
+5. apply fixed refined output threshold: p_ij_refined >= 0.5
 6. write refined positive pairs as predicted graph
 7. evaluate against human_test_graph.pkl
 ```
 
 For the standalone `tccig/` pipeline, binary pairwise test metrics follow the
-same full-model scoring boundary: `logs/tccig/pairwise_test/{run_id}` uses
+same full-model scoring boundary: `logs/tccig/{run_id}/pairwise_test` uses
 refined probabilities from v3.1 + refiner on `human_test_ppi.txt`. The frozen
 v3.1-only result is retained as the pinned
 `logs/tccig/pairwise_baseline` artifact and is not regenerated by the
@@ -350,7 +355,7 @@ pipeline.
 ```text
 G_pairwise_test must not use human_test_graph.pkl
 G_pairwise_test must not use true labels from all_test_ppi.txt
-calibration bias must be selected on validation, not test
+refined output threshold must not be selected on test
 global top-M and per-node top-k are forbidden graph decision rules
 ```
 
@@ -372,11 +377,11 @@ Bandana 适合处理你的 `G_pairwise`，因为 pairwise graph 天然有 soft c
 最终推荐的 paper claim 是：
 
 ```text
-We convert a mature pairwise PPI classifier into an inductive graph reconstruction system by using its predictions to construct an input graph, then training an S2GAE-style residual topology denoiser to refine that noisy graph under validation-calibrated graph-level objectives.
+We convert a mature pairwise PPI classifier into an inductive graph reconstruction system by using its predictions to construct an input graph, then training an S2GAE-style residual topology denoiser to refine that noisy graph under train soft-topology objectives and validation-monitored checkpointing.
 ```
 
 v1 的实现性 claim 应收窄为：
 
 ```text
-We convert a mature pairwise PPI classifier into an inductive graph reconstruction system by using its predictions to construct an input graph, then training an S2GAE-style residual denoiser with supervised link reconstruction and validation-calibrated graph decision rules.
+We convert a mature pairwise PPI classifier into an inductive graph reconstruction system by using its predictions to construct an input graph, then training an S2GAE-style residual denoiser with supervised link reconstruction, train GS/RD topology loss, and fixed refined-output thresholding.
 ```

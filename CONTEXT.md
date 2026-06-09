@@ -37,14 +37,22 @@ may define loss targets, validation truth may select checkpoints and graph
 decision rules, and test truth may compute metrics. True topology targets are
 not model input graphs.
 
-### Refined graph decision rule
+### Pairwise input graph threshold
 
-The validation-selected rule that converts refined pair scores into a hard
-predicted graph. TCCIG uses a validation-calibrated 0.5 threshold: validation
-selects one global logit bias, and test evaluation applies
-`sigmoid(raw_logit + bias) >= 0.5` without reselecting on test data. Per-node
-top-k and global top-M rules are forbidden because they impose non-biological
-degree or edge-count budgets.
+The scorer-only threshold used to construct the noisy `G_pairwise` input graph
+for S2GAE. It is frozen at epoch 0 from validation scorer outputs, currently by
+selecting the lowest threshold that reaches `precision >= 0.8`, and then reused
+for train, validation, pairwise test, and topology test input-graph assembly.
+It is not a decision rule for refined S2GAE outputs.
+
+### Refined output threshold
+
+The output-side hard decision rule that converts S2GAE refined probabilities
+into a final predicted graph. It is independent from the pairwise input graph
+threshold; the current TCCIG pipeline uses fixed `p_refined >= 0.5` for
+validation, pairwise test, and topology test. Per-node top-k and global top-M
+rules are forbidden because they impose non-biological degree or edge-count
+budgets.
 
 ### Validation topology candidate universe
 

@@ -18,6 +18,12 @@ import torch.distributed as dist
 import torch.nn.functional as functional
 from sklearn.metrics import average_precision_score
 from src.embed import load_cached_embedding
+from src.topology.finetune_losses import (
+    TopologyLossWeights as SoftTopologyLossWeights,
+)
+from src.topology.finetune_losses import (
+    compute_topology_losses,
+)
 from src.topology.metrics import evaluate_graph_samples
 from src.train.config import LossConfig
 from src.utils.losses import binary_classification_loss
@@ -26,10 +32,7 @@ from torch.optim import Optimizer
 
 from tccig.io import CandidatePair, canonical_edge, write_json
 from tccig.rules import (
-    DEFAULT_GRAPH_THRESHOLD,
     GraphRule,
-    apply_logit_bias,
-    calibration_payload,
     edges_from_rule,
 )
 
@@ -56,6 +59,9 @@ TCCIG_TRAIN_CSV_COLUMNS = [
     "Train BCE Loss",
     "Train Residual Anchor Loss",
     "Train Weighted Residual Anchor Loss",
+    "Train Topology Loss",
+    "Train GS Loss",
+    "Train RD Loss",
     "Train Gradient Norm",
     "Val auprc",
     "Val Topology Loss",
@@ -74,9 +80,6 @@ TCCIG_TRAIN_CSV_COLUMNS = [
     "Peak GPU Mem MB",
     "Learning Rate",
 ]
-LOGIT_BIAS_GRID = tuple(round(-4.0 + 0.25 * index, 2) for index in range(33))
-
-
 @dataclass(frozen=True)
 class S2GAEConfig:
     """Parsed S2GAE refiner configuration."""
@@ -92,6 +95,7 @@ class S2GAEConfig:
     batch_size: int
     loss_config: LossConfig
     residual_weight: float
+    topology_loss: S2GAETopologyLossConfig
     monitor_metric: str
     topology_validation: S2GAETopologyValidationConfig
     optimizer: S2GAEOptimizerConfig
@@ -114,7 +118,6 @@ class S2GAERefinerState:
     best_monitor_value: float
     selected_rule: GraphRule | None
     selected_rule_payload: dict[str, object] | None
-    selected_calibration_payload: dict[str, object] | None
     epochs_trained: int
 
 
@@ -142,6 +145,15 @@ class S2GAEOptimizationConfig:
     """Backward and optimization-loop controls."""
 
     gradient_clip_norm: float | None
+
+
+@dataclass(frozen=True)
+class S2GAETopologyLossConfig:
+    """Differentiable topology-loss controls for S2GAE training."""
+
+    enabled: bool
+    weight: float
+    losses: S2GAETopologyLossWeights
 
 
 @dataclass(frozen=True)
@@ -183,6 +195,10 @@ class _LocalFullBatchLoss:
     bce_sum: float
     residual_anchor_sum: float
     weighted_residual_anchor_sum: float
+    topology_loss_sum: float
+    graph_similarity_sum: float
+    relative_density_sum: float
+    topology_count: int
     count: int
 
 
@@ -193,7 +209,6 @@ class ValidationTopologyRuleEvaluation:
     rule: GraphRule
     validation_metrics: dict[str, float | int]
     rule_payload: dict[str, object]
-    calibration_payload: dict[str, object]
 
 
 class S2GAERefiner(nn.Module):
@@ -453,7 +468,75 @@ def _local_full_batch_loss(
         bce_sum=bce_sum,
         residual_anchor_sum=residual_anchor_sum,
         weighted_residual_anchor_sum=weighted_residual_anchor_sum,
+        topology_loss_sum=0.0,
+        graph_similarity_sum=0.0,
+        relative_density_sum=0.0,
+        topology_count=0,
         count=total_count,
+    )
+
+
+def _local_topology_loss(
+    *,
+    model: S2GAERefiner,
+    hidden_states: Sequence[torch.Tensor],
+    graph: _SplitGraph,
+    tasks: Sequence[_TopologyLossTask],
+    task_indices: torch.Tensor,
+    cfg: S2GAEConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute rank-local differentiable GS/RD loss over train topology buckets."""
+    if task_indices.numel() == 0 or not cfg.topology_loss.enabled:
+        zero = graph.pairwise_probabilities.sum() * 0.0
+        return zero, torch.zeros(4, dtype=torch.float64, device=graph.pairwise_probabilities.device)
+    topology_total: torch.Tensor | None = None
+    topology_sum = 0.0
+    graph_similarity_sum = 0.0
+    relative_density_sum = 0.0
+    task_count = 0
+    weights = SoftTopologyLossWeights(
+        alpha=cfg.topology_loss.losses.alpha,
+        beta=cfg.topology_loss.losses.beta,
+        gamma=0.0,
+        delta=0.0,
+    )
+    for task_position in task_indices.detach().cpu().tolist():
+        task = tasks[int(task_position)]
+        refined_logits, _ = model.decode(
+            hidden_states=hidden_states,
+            pair_index=graph.pair_index[:, task.pair_indices],
+            pairwise_probabilities=graph.pairwise_probabilities[task.pair_indices],
+        )
+        losses = compute_topology_losses(
+            weights=weights,
+            num_nodes=task.num_nodes,
+            pair_index_a=task.pair_index_a,
+            pair_index_b=task.pair_index_b,
+            pred_pair_probabilities=torch.sigmoid(refined_logits),
+            target_pair_probabilities=task.targets,
+            include_clustering_mmd=False,
+        )
+        weighted_loss = cfg.topology_loss.weight * losses["total_topology"]
+        topology_total = weighted_loss if topology_total is None else topology_total + weighted_loss
+        topology_sum += float(weighted_loss.detach().item())
+        graph_similarity_sum += float(losses["graph_similarity"].detach().item())
+        relative_density_sum += float(losses["relative_density"].detach().item())
+        task_count += 1
+    if topology_total is None or task_count == 0:
+        zero = graph.pairwise_probabilities.sum() * 0.0
+        return zero, torch.zeros(4, dtype=torch.float64, device=graph.pairwise_probabilities.device)
+    return (
+        topology_total / task_count,
+        torch.tensor(
+            [
+                topology_sum,
+                graph_similarity_sum,
+                relative_density_sum,
+                float(task_count),
+            ],
+            dtype=torch.float64,
+            device=graph.pairwise_probabilities.device,
+        ),
     )
 
 
@@ -482,6 +565,9 @@ class _S2GAETrainStepModule(nn.Module):
         graph: _SplitGraph,
         labels: torch.Tensor,
         pair_indices: torch.Tensor,
+        topology_graph: _SplitGraph | None = None,
+        topology_tasks: Sequence[_TopologyLossTask] = (),
+        topology_task_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return local mean loss and detached metric sums for one rank."""
         hidden_states = self.refiner.encode(
@@ -500,16 +586,42 @@ class _S2GAETrainStepModule(nn.Module):
         if local_loss is None:
             return (
                 _zero_model_loss(self.refiner),
-                torch.zeros(4, dtype=torch.float64, device=labels.device),
+                torch.zeros(8, dtype=torch.float64, device=labels.device),
             )
+        topology_loss = labels.sum() * 0.0
+        topology_sums = torch.zeros(4, dtype=torch.float64, device=labels.device)
+        if (
+            self.cfg.topology_loss.enabled
+            and topology_graph is not None
+            and topology_task_indices is not None
+            and topology_tasks
+        ):
+            topology_hidden_states = self.refiner.encode(
+                node_features=topology_graph.node_features,
+                edge_index=topology_graph.edge_index,
+                edge_weight=topology_graph.edge_weight,
+            )
+            topology_loss, topology_sums = _local_topology_loss(
+                model=self.refiner,
+                hidden_states=topology_hidden_states,
+                graph=topology_graph,
+                tasks=topology_tasks,
+                task_indices=topology_task_indices,
+                cfg=self.cfg,
+            )
+        total = local_loss.total + topology_loss
         return (
-            local_loss.total,
+            total,
             torch.tensor(
                 [
-                    local_loss.total_sum,
+                    local_loss.total_sum + float(topology_sums[0].detach().cpu().item()),
                     local_loss.bce_sum,
                     local_loss.residual_anchor_sum,
                     local_loss.weighted_residual_anchor_sum,
+                    float(topology_sums[0].detach().cpu().item()),
+                    float(topology_sums[1].detach().cpu().item()),
+                    float(topology_sums[2].detach().cpu().item()),
+                    float(topology_sums[3].detach().cpu().item()),
                 ],
                 dtype=torch.float64,
                 device=labels.device,
@@ -561,6 +673,17 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
 
     train_graph = _build_split_graph(request.train, cfg=cfg, device=device)
     validation_graph = _build_split_graph(request.validation, cfg=cfg, device=device)
+    train_topology_graph: _SplitGraph | None = None
+    train_topology_tasks: tuple[_TopologyLossTask, ...] = ()
+    if cfg.topology_loss.enabled:
+        if request.train_topology is None or request.train_topology_plan is None:
+            raise ValueError("refiner.topology_loss.enabled requires train_topology inputs")
+        train_topology_graph = _build_split_graph(request.train_topology, cfg=cfg, device=device)
+        train_topology_tasks = _build_topology_loss_tasks(
+            pairs=request.train_topology.pairs,
+            validation_plan=request.train_topology_plan,
+            device=device,
+        )
     validation_topology_graph: _SplitGraph | None = None
     if cfg.topology_validation.enabled:
         if request.validation_topology is None or request.validation_topology_plan is None:
@@ -592,7 +715,6 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
     best_state_dict: dict[str, torch.Tensor] | None = None
     best_selected_rule: GraphRule | None = None
     best_selected_rule_payload: dict[str, object] | None = None
-    best_selected_calibration_payload: dict[str, object] | None = None
     best_validation_auprc = -math.inf
     best_monitor_value = _initial_monitor_value(cfg.monitor_metric)
     history: list[dict[str, float | int]] = []
@@ -606,6 +728,11 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             runtime=request.runtime,
             device=device,
         )
+        local_topology_task_indices = _rank_local_pair_indices(
+            total=len(train_topology_tasks),
+            runtime=request.runtime,
+            device=device,
+        )
         local_train_count = int(local_train_indices.numel())
         local_mean_loss, local_loss_sums = cast(
             tuple[torch.Tensor, torch.Tensor],
@@ -613,6 +740,9 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 graph=train_graph,
                 labels=train_labels,
                 pair_indices=local_train_indices,
+                topology_graph=train_topology_graph,
+                topology_tasks=train_topology_tasks,
+                topology_task_indices=local_topology_task_indices,
             ),
         )
         scale = _distributed_loss_scale(
@@ -627,6 +757,10 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             "bce": float(local_loss_sums_cpu[1].item()),
             "residual_anchor": float(local_loss_sums_cpu[2].item()),
             "weighted_residual_anchor": float(local_loss_sums_cpu[3].item()),
+            "topology": float(local_loss_sums_cpu[4].item()),
+            "graph_similarity": float(local_loss_sums_cpu[5].item()),
+            "relative_density": float(local_loss_sums_cpu[6].item()),
+            "topology_count": float(local_loss_sums_cpu[7].item()),
         }
         request.runtime.accelerator.backward(scaled_loss)
         gradient_norm = apply_gradient_clipping(
@@ -648,6 +782,26 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             request.runtime,
             device,
         )
+        total_topology_loss = _distributed_sum_float(
+            local_loss_values["topology"],
+            request.runtime,
+            device,
+        )
+        total_graph_similarity_loss = _distributed_sum_float(
+            local_loss_values["graph_similarity"],
+            request.runtime,
+            device,
+        )
+        total_relative_density_loss = _distributed_sum_float(
+            local_loss_values["relative_density"],
+            request.runtime,
+            device,
+        )
+        total_topology_count = _distributed_sum_float(
+            local_loss_values["topology_count"],
+            request.runtime,
+            device,
+        )
 
         validation_auprc = _validation_auprc(
             model=validation_model,
@@ -659,7 +813,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         best_validation_auprc = max(best_validation_auprc, validation_auprc)
         selected_epoch_rule: GraphRule | None = None
         selected_epoch_rule_payload: dict[str, object] | None = None
-        selected_epoch_calibration_payload: dict[str, object] | None = None
+        selected_epoch_topology_metrics: dict[str, float | int] | None = None
         if cfg.topology_validation.enabled:
             if (
                 validation_topology_graph is None
@@ -679,10 +833,8 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             )
             selected_epoch_rule = topology_evaluation.rule
             selected_epoch_rule_payload = topology_evaluation.rule_payload
-            selected_epoch_calibration_payload = _with_validation_epoch(
-                payload=topology_evaluation.calibration_payload,
-                epoch=epoch,
-            )
+            selected_epoch_topology_metrics = dict(topology_evaluation.validation_metrics)
+            selected_epoch_topology_metrics["epoch"] = epoch
             monitor_value = _resolve_monitor_value(
                 monitor_metric=cfg.monitor_metric,
                 validation_auprc=validation_auprc,
@@ -699,6 +851,13 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             "train_weighted_residual_anchor_loss": (
                 total_weighted_residual_anchor_loss / epoch_denominator
             ),
+            "train_topology_loss": total_topology_loss / max(1.0, total_topology_count),
+            "train_graph_similarity_loss": (
+                total_graph_similarity_loss / max(1.0, total_topology_count)
+            ),
+            "train_relative_density_loss": (
+                total_relative_density_loss / max(1.0, total_topology_count)
+            ),
             "train_gradient_norm": gradient_norm,
             "learning_rate": _current_learning_rate(optimizer),
             "val_auprc": validation_auprc,
@@ -712,11 +871,8 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             "global_validation_pairs": len(request.validation.pairs),
             "peak_gpu_mem_mb": _peak_gpu_memory_mb(device),
         }
-        if selected_epoch_calibration_payload is not None:
-            metrics = cast(
-                Mapping[str, float],
-                selected_epoch_calibration_payload["validation_metrics"],
-            )
+        if selected_epoch_topology_metrics is not None:
+            metrics = selected_epoch_topology_metrics
             epoch_history.update(
                 {
                     "val_topology_loss": float(metrics["val_topology_loss"]),
@@ -737,16 +893,6 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 monitor_metric=cfg.monitor_metric,
                 epoch_time_s=epoch_time_s,
             )
-            write_json(
-                cfg.log_dir / "epoch_manifests" / f"epoch_{epoch:04d}.json",
-                {
-                    "epoch": epoch,
-                    "history": epoch_history,
-                    "selected_rule": selected_epoch_rule_payload,
-                    "selected_calibration": selected_epoch_calibration_payload,
-                    "checkpoint_path": str(cfg.checkpoint_path),
-                },
-            )
             _log_epoch_summary(
                 epoch_history=epoch_history,
                 selected_rule=selected_epoch_rule,
@@ -762,7 +908,6 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             best_monitor_value = monitor_value
             best_selected_rule = selected_epoch_rule
             best_selected_rule_payload = selected_epoch_rule_payload
-            best_selected_calibration_payload = selected_epoch_calibration_payload
             checkpoint_model = _unwrap_refiner(train_step_model, request.runtime.accelerator)
             best_state_dict = {
                 name: tensor.detach().cpu().clone()
@@ -774,7 +919,6 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 best_monitor_value=best_monitor_value,
                 best_validation_auprc=best_validation_auprc,
                 best_selected_rule_payload=best_selected_rule_payload,
-                best_selected_calibration_payload=best_selected_calibration_payload,
                 optimizer=optimizer,
                 history=history,
             )
@@ -796,11 +940,6 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 "selected_rule": (
                     None if best_selected_rule_payload is None else best_selected_rule_payload
                 ),
-                "selected_calibration": (
-                    None
-                    if best_selected_calibration_payload is None
-                    else best_selected_calibration_payload
-                ),
             },
             cfg.checkpoint_path,
         )
@@ -809,7 +948,6 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             best_monitor_value=best_monitor_value,
             best_validation_auprc=best_validation_auprc,
             best_selected_rule_payload=best_selected_rule_payload,
-            best_selected_calibration_payload=best_selected_calibration_payload,
             optimizer=optimizer,
             history=history,
         )
@@ -821,7 +959,6 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         best_monitor_value=best_monitor_value,
         selected_rule=best_selected_rule,
         selected_rule_payload=best_selected_rule_payload,
-        selected_calibration_payload=best_selected_calibration_payload,
         epochs_trained=cfg.epochs,
     )
 
@@ -854,6 +991,15 @@ class _SplitGraph:
     pairwise_probabilities: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _TopologyLossTask:
+    num_nodes: int
+    pair_indices: torch.Tensor
+    pair_index_a: torch.Tensor
+    pair_index_b: torch.Tensor
+    targets: torch.Tensor
+
+
 def _build_split_graph(
     bundle: SplitBundle,
     *,
@@ -882,6 +1028,50 @@ def _build_prediction_graph(
         cfg=cfg,
         device=device,
     )
+
+
+def _build_topology_loss_tasks(
+    *,
+    pairs: Sequence[CandidatePair],
+    validation_plan: InternalValidationPlan,
+    device: torch.device,
+) -> tuple[_TopologyLossTask, ...]:
+    pair_indices_by_edge = {
+        canonical_edge(pair.protein_a, pair.protein_b): index
+        for index, pair in enumerate(pairs)
+    }
+    tasks: list[_TopologyLossTask] = []
+    for bucket in validation_plan.buckets:
+        records_by_subgraph: dict[int, list[object]] = {}
+        for record in bucket.pair_records:
+            records_by_subgraph.setdefault(record.subgraph_index, []).append(record)
+        for subgraph_index, records in sorted(records_by_subgraph.items()):
+            target_graph = bucket.target_subgraphs[subgraph_index]
+            pair_indices = []
+            pair_index_a = []
+            pair_index_b = []
+            targets = []
+            for record in records:
+                edge = canonical_edge(record.protein_a, record.protein_b)
+                if edge not in pair_indices_by_edge:
+                    raise ValueError(
+                        "topology loss pair is missing from scored train topology pairs"
+                    )
+                pair_indices.append(pair_indices_by_edge[edge])
+                pair_index_a.append(record.pair_index_a)
+                pair_index_b.append(record.pair_index_b)
+                targets.append(float(target_graph.has_edge(record.protein_a, record.protein_b)))
+            if pair_indices:
+                tasks.append(
+                    _TopologyLossTask(
+                        num_nodes=bucket.node_size,
+                        pair_indices=torch.tensor(pair_indices, dtype=torch.long, device=device),
+                        pair_index_a=torch.tensor(pair_index_a, dtype=torch.long, device=device),
+                        pair_index_b=torch.tensor(pair_index_b, dtype=torch.long, device=device),
+                        targets=torch.tensor(targets, dtype=torch.float32, device=device),
+                    )
+                )
+    return tuple(tasks)
 
 
 def _build_graph(
@@ -1091,45 +1281,19 @@ def _evaluate_validation_topology_rules(
         raise ValueError("validation topology probabilities must match candidate pairs")
 
     fixed_rule = _fixed_threshold_rule(rules)
-    best_evaluation: ValidationTopologyRuleEvaluation | None = None
-    for bias in LOGIT_BIAS_GRID:
-        calibrated_probabilities = apply_logit_bias(refined_probabilities, bias)
-        metrics = _validation_topology_metrics(
-            validation_plan=validation_plan,
-            pairs=pairs,
-            probabilities=calibrated_probabilities,
-            rule=fixed_rule,
-            validation_auprc=validation_auprc,
-            cfg=cfg,
-        )
-        monitor_value = _resolve_monitor_value(
-            monitor_metric=cfg.monitor_metric,
-            validation_auprc=validation_auprc,
-            topology_metrics=metrics,
-        )
-        rule_payload: dict[str, object] = fixed_rule.to_dict()
-        selected_calibration_payload = calibration_payload(
-            bias=bias,
-            objective="val_topology_loss",
-            validation_metrics=metrics,
-            monitor_metric=cfg.monitor_metric,
-            monitor_value=monitor_value,
-        )
-        evaluation = ValidationTopologyRuleEvaluation(
-            rule=fixed_rule,
-            validation_metrics=metrics,
-            rule_payload=rule_payload,
-            calibration_payload=selected_calibration_payload,
-        )
-        if best_evaluation is None or _is_better_calibration_evaluation(
-            candidate=evaluation,
-            incumbent=best_evaluation,
-        ):
-            best_evaluation = evaluation
-
-    if best_evaluation is None:
-        raise ValueError("No validation topology graph rules were evaluated")
-    return best_evaluation
+    metrics = _validation_topology_metrics(
+        validation_plan=validation_plan,
+        pairs=pairs,
+        probabilities=refined_probabilities,
+        rule=fixed_rule,
+        validation_auprc=validation_auprc,
+        cfg=cfg,
+    )
+    return ValidationTopologyRuleEvaluation(
+        rule=fixed_rule,
+        validation_metrics=metrics,
+        rule_payload=fixed_rule.to_dict(),
+    )
 
 
 def _validation_topology_metrics(
@@ -1179,12 +1343,6 @@ def _validation_topology_metrics(
     metrics["val_auprc"] = float(validation_auprc)
     metrics["positive_edges"] = int(len(selected_edges))
     return metrics
-
-
-def _with_validation_epoch(*, payload: dict[str, object], epoch: int) -> dict[str, object]:
-    metrics = dict(cast(Mapping[str, object], payload["validation_metrics"]))
-    metrics["epoch"] = int(epoch)
-    return {**payload, "validation_metrics": metrics}
 
 
 def _validation_topology_loss(
@@ -1241,35 +1399,16 @@ def _is_better_monitor(
     return value > best_value
 
 
-def _is_better_calibration_evaluation(
-    *,
-    candidate: ValidationTopologyRuleEvaluation,
-    incumbent: ValidationTopologyRuleEvaluation,
-) -> bool:
-    return (
-        -float(candidate.validation_metrics["val_topology_loss"]),
-        float(candidate.validation_metrics["graph_sim"]),
-        -int(candidate.validation_metrics["positive_edges"]),
-    ) > (
-        -float(incumbent.validation_metrics["val_topology_loss"]),
-        float(incumbent.validation_metrics["graph_sim"]),
-        -int(incumbent.validation_metrics["positive_edges"]),
-    )
-
-
 def _fixed_threshold_rule(rules: Sequence[GraphRule]) -> GraphRule:
     if not rules:
         raise ValueError("refiner topology validation requires graph_selection.rules")
     for rule in rules:
-        if rule.type != "threshold" or not math.isclose(
-            float(rule.value),
-            DEFAULT_GRAPH_THRESHOLD,
-        ):
+        if rule.type != "threshold":
             raise ValueError(
-                "TCCIG refined graph rules must be exactly threshold=0.5; "
+                "TCCIG refined graph rules must be fixed threshold rules; "
                 "top_m/top_k artifacts are invalid and must be rerun"
             )
-    return GraphRule(type="threshold", value=DEFAULT_GRAPH_THRESHOLD)
+    return rules[0]
 
 
 def _batch_indices(total: int, batch_size: int, device: torch.device) -> Iterator[torch.Tensor]:
@@ -1438,6 +1577,9 @@ def _append_tccig_train_csv_row(
                 "Train Weighted Residual Anchor Loss": float(
                     epoch_history["train_weighted_residual_anchor_loss"]
                 ),
+                "Train Topology Loss": float(epoch_history["train_topology_loss"]),
+                "Train GS Loss": float(epoch_history["train_graph_similarity_loss"]),
+                "Train RD Loss": float(epoch_history["train_relative_density_loss"]),
                 "Train Gradient Norm": float(epoch_history["train_gradient_norm"]),
                 "Val auprc": float(epoch_history["val_auprc"]),
                 "Val Topology Loss": epoch_history.get("val_topology_loss", ""),
@@ -1479,7 +1621,7 @@ def _log_epoch_summary(
     LOGGER.info(
         (
             "TCCIG epoch %s complete: time_s=%.2f train_loss=%.6f "
-            "train_bce=%.6f val_auprc=%.6f monitor[%s]=%.6f "
+            "train_bce=%.6f train_topology=%.6f val_auprc=%.6f monitor[%s]=%.6f "
             "val_topology_loss=%s rule=%s local_train_pairs=%s "
             "global_train_pairs=%s lr=%.6g peak_gpu_mem_mb=%.1f"
         ),
@@ -1487,6 +1629,7 @@ def _log_epoch_summary(
         epoch_time_s,
         float(epoch_history["train_loss"]),
         float(epoch_history["train_bce_loss"]),
+        float(epoch_history["train_topology_loss"]),
         float(epoch_history["val_auprc"]),
         monitor_metric,
         float(epoch_history["monitor_value"]),
@@ -1511,18 +1654,17 @@ def _write_training_summary(
     best_monitor_value: float,
     best_validation_auprc: float,
     best_selected_rule_payload: dict[str, object] | None,
-    best_selected_calibration_payload: dict[str, object] | None,
     optimizer: Optimizer,
     history: Sequence[Mapping[str, float | int]],
 ) -> None:
     write_json(
         cfg.log_dir / "training_summary.json",
         {
+            "config": _config_to_json(cfg),
             "monitor_metric": cfg.monitor_metric,
             "best_monitor_value": best_monitor_value,
             "best_validation_auprc": best_validation_auprc,
             "selected_rule": best_selected_rule_payload,
-            "selected_calibration": best_selected_calibration_payload,
             "epochs_trained": len(history),
             "checkpoint_path": str(cfg.checkpoint_path),
             "optimizer": _optimizer_config_to_json(cfg.optimizer),
@@ -1592,7 +1734,7 @@ def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
         raise ValueError("refiner.learning_rate is no longer supported; use refiner.optimizer.lr")
     run_id = str(config.get("_run_id", "tccig_run"))
     log_root = Path(str(config.get("_log_root", "logs")))
-    log_dir = _path(config.get("log_dir"), log_root / "tccig" / "refiner" / run_id)
+    log_dir = _path(config.get("log_dir"), log_root / "tccig" / run_id)
     checkpoint_path = _path(
         config.get("checkpoint_path"),
         Path("models") / "tccig" / "s2gae" / run_id / "best_model.pt",
@@ -1637,6 +1779,7 @@ def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
             config.get("residual_weight", 0.001),
             "refiner.residual_weight",
         ),
+        topology_loss=_parse_topology_loss_config(config.get("topology_loss", {})),
         monitor_metric=monitor_metric,
         topology_validation=_parse_topology_validation_config(
             raw_topology_validation=config.get("topology_validation", {}),
@@ -1671,6 +1814,16 @@ def _config_to_json(cfg: S2GAEConfig) -> dict[str, object]:
             "label_smoothing": cfg.loss_config.label_smoothing,
         },
         "residual_weight": cfg.residual_weight,
+        "topology_loss": {
+            "enabled": cfg.topology_loss.enabled,
+            "weight": cfg.topology_loss.weight,
+            "losses": {
+                "alpha": cfg.topology_loss.losses.alpha,
+                "beta": cfg.topology_loss.losses.beta,
+                "gamma": cfg.topology_loss.losses.gamma,
+                "delta": cfg.topology_loss.losses.delta,
+            },
+        },
         "monitor_metric": cfg.monitor_metric,
         "topology_validation": {
             "enabled": cfg.topology_validation.enabled,
@@ -1791,6 +1944,44 @@ def _parse_topology_validation_config(
             delta=_non_negative_float(
                 raw_losses.get("delta", 0.3),
                 "refiner.topology_validation.losses.delta",
+            ),
+        ),
+    )
+
+
+def _parse_topology_loss_config(raw_topology_loss: object) -> S2GAETopologyLossConfig:
+    if not isinstance(raw_topology_loss, Mapping):
+        raise ValueError("refiner.topology_loss must be a mapping")
+    raw_losses = raw_topology_loss.get("losses", {})
+    if not isinstance(raw_losses, Mapping):
+        raise ValueError("refiner.topology_loss.losses must be a mapping")
+    enabled = (
+        _bool(raw_topology_loss.get("enabled"), "refiner.topology_loss.enabled")
+        if "enabled" in raw_topology_loss
+        else False
+    )
+    return S2GAETopologyLossConfig(
+        enabled=enabled,
+        weight=_non_negative_float(
+            raw_topology_loss.get("weight", 1.0),
+            "refiner.topology_loss.weight",
+        ),
+        losses=S2GAETopologyLossWeights(
+            alpha=_non_negative_float(
+                raw_losses.get("alpha", 1.0),
+                "refiner.topology_loss.losses.alpha",
+            ),
+            beta=_non_negative_float(
+                raw_losses.get("beta", 1.0),
+                "refiner.topology_loss.losses.beta",
+            ),
+            gamma=_non_negative_float(
+                raw_losses.get("gamma", 0.0),
+                "refiner.topology_loss.losses.gamma",
+            ),
+            delta=_non_negative_float(
+                raw_losses.get("delta", 0.0),
+                "refiner.topology_loss.losses.delta",
             ),
         ),
     )

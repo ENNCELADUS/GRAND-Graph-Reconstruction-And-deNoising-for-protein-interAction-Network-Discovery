@@ -22,7 +22,7 @@ if [ -f "$HOME/.bashrc" ]; then
   source "$HOME/.bashrc"
 fi
 
-CONFIG_PATH="${1:-configs/tccig/02.yaml}"
+CONFIG_PATH="${1:-configs/tccig/03_fixed_threshold_topology_loss.yaml}"
 
 if [ ! -d ".venv" ]; then
   echo "Missing .venv. Run 'uv sync --group dev --locked' before running TCCIG."

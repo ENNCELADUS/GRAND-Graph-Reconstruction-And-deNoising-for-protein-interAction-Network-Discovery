@@ -1,10 +1,8 @@
-"""Graph decision rules and calibration helpers for TCCIG scores."""
+"""Graph decision rules for TCCIG scores."""
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Any
 
 from sklearn.metrics import f1_score, matthews_corrcoef
 
@@ -64,93 +62,60 @@ def edges_from_rule(
     raise ValueError(f"Unsupported graph rule type: {rule.type}")
 
 
-def select_rule(
+def threshold_for_target_precision(
     *,
-    pairs: list[CandidatePair],
     probabilities: list[float],
     labels: list[int],
-    rules: list[GraphRule],
-) -> tuple[GraphRule, dict[str, Any]]:
-    """Select the validation rule with the best binary F1 and MCC tie-breaker."""
-    if len(pairs) != len(probabilities) or len(pairs) != len(labels):
-        raise ValueError("pairs, probabilities, and labels must have matching lengths")
-    best_rule: GraphRule | None = None
-    best_metrics: dict[str, Any] = {}
-    for rule in rules:
-        selected_edges = set(edges_from_rule(pairs=pairs, probabilities=probabilities, rule=rule))
-        predictions = [
-            int(canonical_edge(pair.protein_a, pair.protein_b) in selected_edges) for pair in pairs
-        ]
-        metrics = {
-            "f1": float(f1_score(labels, predictions, zero_division=0)),
-            "mcc": float(matthews_corrcoef(labels, predictions)),
-            "positive_edges": int(sum(predictions)),
-            "rule": rule.to_dict(),
-        }
-        if _is_better(metrics, best_metrics):
-            best_rule = rule
+    target_precision: float,
+) -> tuple[float, dict[str, float | int]]:
+    """Return the lowest probability threshold that reaches target precision."""
+    if len(probabilities) != len(labels):
+        raise ValueError("probabilities and labels must have matching lengths")
+    if not 0.0 <= target_precision <= 1.0:
+        raise ValueError("target_precision must be in [0, 1]")
+    if not probabilities:
+        raise ValueError("target_precision threshold requires at least one probability")
+
+    best_threshold: float | None = None
+    best_metrics: dict[str, float | int] = {}
+    for threshold in sorted({float(probability) for probability in probabilities}):
+        metrics = binary_metrics_at_threshold(
+            labels=labels,
+            probabilities=probabilities,
+            threshold=threshold,
+        )
+        if int(metrics["positive_edges"]) <= 0:
+            continue
+        if float(metrics["precision"]) >= target_precision:
+            best_threshold = threshold
             best_metrics = metrics
-    if best_rule is None:
-        raise ValueError("No validation graph rules were evaluated")
-    return best_rule, best_metrics
+            break
+    if best_threshold is None:
+        raise ValueError(
+            f"No scorer threshold reaches target_precision={target_precision}"
+        )
+    return best_threshold, best_metrics
 
 
-def apply_logit_bias(probabilities: list[float], bias: float) -> list[float]:
-    """Apply one global logit bias and return calibrated probabilities."""
-    return [_apply_logit_bias_value(probability, bias) for probability in probabilities]
-
-
-def equivalent_threshold_from_bias(bias: float) -> float:
-    """Return the raw probability threshold equivalent to calibrated 0.5."""
-    return 1.0 / (1.0 + math.exp(float(bias)))
-
-
-def calibration_payload(
+def binary_metrics_at_threshold(
     *,
-    bias: float,
-    objective: str,
-    validation_metrics: dict[str, float | int] | None = None,
-    monitor_metric: str | None = None,
-    monitor_value: float | None = None,
-) -> dict[str, object]:
-    """Return the serializable selected-calibration payload."""
-    payload: dict[str, object] = {
-        "type": "logit_bias",
-        "bias": float(bias),
-        "threshold_after_calibration": DEFAULT_GRAPH_THRESHOLD,
-        "equivalent_probability_threshold": equivalent_threshold_from_bias(float(bias)),
-        "objective": objective,
-    }
-    if monitor_metric is not None:
-        payload["monitor_metric"] = monitor_metric
-    if monitor_value is not None:
-        payload["monitor_value"] = float(monitor_value)
-    if validation_metrics is not None:
-        payload["validation_metrics"] = validation_metrics
-    return payload
-
-
-def identity_calibration_payload() -> dict[str, object]:
-    """Return the no-op calibration payload used by non-S2GAE test hooks."""
-    return calibration_payload(bias=0.0, objective="identity")
-
-
-def _apply_logit_bias_value(probability: float, bias: float) -> float:
-    clamped = min(max(float(probability), PROBABILITY_EPSILON), 1.0 - PROBABILITY_EPSILON)
-    logit = math.log(clamped / (1.0 - clamped))
-    return 1.0 / (1.0 + math.exp(-(logit + float(bias))))
-
-
-def _is_better(metrics: dict[str, Any], best_metrics: dict[str, Any]) -> bool:
-    """Return whether metrics beat the incumbent validation rule."""
-    if not best_metrics:
-        return True
-    return (
-        float(metrics["f1"]),
-        float(metrics["mcc"]),
-        -int(metrics["positive_edges"]),
-    ) > (
-        float(best_metrics["f1"]),
-        float(best_metrics["mcc"]),
-        -int(best_metrics["positive_edges"]),
+    labels: list[int],
+    probabilities: list[float],
+    threshold: float,
+) -> dict[str, float | int]:
+    """Return binary metrics under a fixed probability threshold."""
+    if len(labels) != len(probabilities):
+        raise ValueError("labels and probabilities must have matching lengths")
+    predictions = [int(float(probability) >= float(threshold)) for probability in probabilities]
+    positive_edges = sum(predictions)
+    true_positive_edges = sum(
+        1 for label, pred in zip(labels, predictions, strict=True) if label == 1 and pred
     )
+    actual_positive_edges = sum(1 for label in labels if label == 1)
+    return {
+        "precision": 0.0 if positive_edges == 0 else float(true_positive_edges / positive_edges),
+        "recall": float(true_positive_edges / max(1, actual_positive_edges)),
+        "f1": float(f1_score(labels, predictions, zero_division=0)),
+        "mcc": float(matthews_corrcoef(labels, predictions)),
+        "positive_edges": int(positive_edges),
+    }
