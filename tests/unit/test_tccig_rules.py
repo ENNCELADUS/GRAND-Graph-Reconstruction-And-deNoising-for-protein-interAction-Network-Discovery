@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import pytest
-from tccig.io import CandidatePair
-from tccig.rules import (
+from tccig.prepare import (
+    CandidatePair,
     GraphRule,
-    binary_metrics_at_threshold,
     edges_from_rule,
+)
+from tccig.train import (
+    binary_metrics_at_threshold,
     parse_rules,
     threshold_for_target_precision,
 )

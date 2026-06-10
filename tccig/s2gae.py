@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -18,30 +18,34 @@ import torch.distributed as dist
 import torch.nn.functional as functional
 from sklearn.metrics import average_precision_score
 from src.embed import load_cached_embedding
-from src.topology.finetune_losses import (
-    TopologyLossWeights as SoftTopologyLossWeights,
-)
-from src.topology.finetune_losses import (
-    compute_topology_losses,
-)
 from src.topology.metrics import evaluate_graph_samples
 from src.train.config import LossConfig
 from src.utils.losses import binary_classification_loss
 from torch import nn
 from torch.optim import Optimizer
+from torch.utils.data import DataLoader
 
-from tccig.io import CandidatePair, canonical_edge, write_json
-from tccig.rules import (
+from tccig.prepare import (
+    CandidatePair,
+    EdgeSamplingConfig,
+    EdgeTargetDataset,
     GraphRule,
+    RefineRequest,
+    SplitBundle,
+    TrainRefinerRequest,
+    canonical_edge,
+    classify_scorer_error_targets,
+    collate_edge_targets,
     edges_from_rule,
+    parse_edge_sampling_config,
+    sample_epoch_edge_targets,
+    write_json,
 )
 
 LOGGER = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from src.topology.finetune_data import InternalValidationPlan
-
-    from tccig.train import RefineRequest, SplitBundle, TrainRefinerRequest
 
 SUPPORTED_MONITOR_METRICS = {
     "val_topology_loss",
@@ -80,6 +84,8 @@ TCCIG_TRAIN_CSV_COLUMNS = [
     "Peak GPU Mem MB",
     "Learning Rate",
 ]
+
+
 @dataclass(frozen=True)
 class S2GAEConfig:
     """Parsed S2GAE refiner configuration."""
@@ -93,6 +99,7 @@ class S2GAEConfig:
     dropout: float
     epochs: int
     batch_size: int
+    edge_sampling: EdgeSamplingConfig
     loss_config: LossConfig
     residual_weight: float
     topology_loss: S2GAETopologyLossConfig
@@ -184,22 +191,6 @@ class S2GAELossTerms:
     residual_anchor: torch.Tensor
     weighted_residual_anchor: torch.Tensor
     total: torch.Tensor
-
-
-@dataclass(frozen=True)
-class _LocalFullBatchLoss:
-    """Rank-local full-batch loss with tensor and numeric sums."""
-
-    total: torch.Tensor
-    total_sum: float
-    bce_sum: float
-    residual_anchor_sum: float
-    weighted_residual_anchor_sum: float
-    topology_loss_sum: float
-    graph_similarity_sum: float
-    relative_density_sum: float
-    topology_count: int
-    count: int
 
 
 @dataclass(frozen=True)
@@ -419,125 +410,24 @@ def apply_gradient_clipping(
     return float(total_norm.detach().cpu().item())
 
 
-def _local_full_batch_loss(
+def _clip_grad_norm_with_accelerator(
     *,
-    model: S2GAERefiner,
-    hidden_states: Sequence[torch.Tensor],
-    graph: _SplitGraph,
-    labels: torch.Tensor,
-    pair_indices: torch.Tensor,
-    cfg: S2GAEConfig,
-) -> _LocalFullBatchLoss | None:
-    """Compute rank-local chunked decoder loss from one cached full-graph encoding."""
-    if pair_indices.numel() == 0:
-        return None
-    total_loss_sum: torch.Tensor | None = None
-    total_sum = 0.0
-    bce_sum = 0.0
-    residual_anchor_sum = 0.0
-    weighted_residual_anchor_sum = 0.0
-    total_count = int(pair_indices.numel())
-    for chunk_positions in _batch_indices(total_count, cfg.batch_size, pair_indices.device):
-        chunk_indices = pair_indices[chunk_positions]
-        refined_logits, delta = model.decode(
-            hidden_states=hidden_states,
-            pair_index=graph.pair_index[:, chunk_indices],
-            pairwise_probabilities=graph.pairwise_probabilities[chunk_indices],
-        )
-        loss_terms = s2gae_loss_terms(
-            refined_logits=refined_logits,
-            labels=labels[chunk_indices],
-            delta_logits=delta,
-            loss_config=cfg.loss_config,
-            residual_weight=cfg.residual_weight,
-        )
-        chunk_count = int(chunk_indices.numel())
-        chunk_total = loss_terms.total * chunk_count
-        total_loss_sum = chunk_total if total_loss_sum is None else total_loss_sum + chunk_total
-        total_sum += float(loss_terms.total.detach().item()) * chunk_count
-        bce_sum += float(loss_terms.bce.detach().item()) * chunk_count
-        residual_anchor_sum += float(loss_terms.residual_anchor.detach().item()) * chunk_count
-        weighted_residual_anchor_sum += (
-            float(loss_terms.weighted_residual_anchor.detach().item()) * chunk_count
-        )
-    if total_loss_sum is None:
-        return None
-    return _LocalFullBatchLoss(
-        total=total_loss_sum / total_count,
-        total_sum=total_sum,
-        bce_sum=bce_sum,
-        residual_anchor_sum=residual_anchor_sum,
-        weighted_residual_anchor_sum=weighted_residual_anchor_sum,
-        topology_loss_sum=0.0,
-        graph_similarity_sum=0.0,
-        relative_density_sum=0.0,
-        topology_count=0,
-        count=total_count,
-    )
-
-
-def _local_topology_loss(
-    *,
-    model: S2GAERefiner,
-    hidden_states: Sequence[torch.Tensor],
-    graph: _SplitGraph,
-    tasks: Sequence[_TopologyLossTask],
-    task_indices: torch.Tensor,
-    cfg: S2GAEConfig,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute rank-local differentiable GS/RD loss over train topology buckets."""
-    if task_indices.numel() == 0 or not cfg.topology_loss.enabled:
-        zero = graph.pairwise_probabilities.sum() * 0.0
-        return zero, torch.zeros(4, dtype=torch.float64, device=graph.pairwise_probabilities.device)
-    topology_total: torch.Tensor | None = None
-    topology_sum = 0.0
-    graph_similarity_sum = 0.0
-    relative_density_sum = 0.0
-    task_count = 0
-    weights = SoftTopologyLossWeights(
-        alpha=cfg.topology_loss.losses.alpha,
-        beta=cfg.topology_loss.losses.beta,
-        gamma=0.0,
-        delta=0.0,
-    )
-    for task_position in task_indices.detach().cpu().tolist():
-        task = tasks[int(task_position)]
-        refined_logits, _ = model.decode(
-            hidden_states=hidden_states,
-            pair_index=graph.pair_index[:, task.pair_indices],
-            pairwise_probabilities=graph.pairwise_probabilities[task.pair_indices],
-        )
-        losses = compute_topology_losses(
-            weights=weights,
-            num_nodes=task.num_nodes,
-            pair_index_a=task.pair_index_a,
-            pair_index_b=task.pair_index_b,
-            pred_pair_probabilities=torch.sigmoid(refined_logits),
-            target_pair_probabilities=task.targets,
-            include_clustering_mmd=False,
-        )
-        weighted_loss = cfg.topology_loss.weight * losses["total_topology"]
-        topology_total = weighted_loss if topology_total is None else topology_total + weighted_loss
-        topology_sum += float(weighted_loss.detach().item())
-        graph_similarity_sum += float(losses["graph_similarity"].detach().item())
-        relative_density_sum += float(losses["relative_density"].detach().item())
-        task_count += 1
-    if topology_total is None or task_count == 0:
-        zero = graph.pairwise_probabilities.sum() * 0.0
-        return zero, torch.zeros(4, dtype=torch.float64, device=graph.pairwise_probabilities.device)
-    return (
-        topology_total / task_count,
-        torch.tensor(
-            [
-                topology_sum,
-                graph_similarity_sum,
-                relative_density_sum,
-                float(task_count),
-            ],
-            dtype=torch.float64,
-            device=graph.pairwise_probabilities.device,
-        ),
-    )
+    model: nn.Module,
+    runtime: object,
+    gradient_clip_norm: float | None,
+) -> float:
+    if gradient_clip_norm is None:
+        return apply_gradient_clipping(model=model, gradient_clip_norm=None)
+    clip_fn = getattr(getattr(runtime, "accelerator", None), "clip_grad_norm_", None)
+    if callable(clip_fn):
+        parameters = [parameter for parameter in model.parameters() if parameter.grad is not None]
+        if not parameters:
+            return 0.0
+        norm = clip_fn(parameters, gradient_clip_norm)
+        if isinstance(norm, torch.Tensor):
+            return float(norm.detach().cpu().item())
+        return float(norm)
+    return apply_gradient_clipping(model=model, gradient_clip_norm=gradient_clip_norm)
 
 
 def _zero_model_loss(model: nn.Module) -> torch.Tensor:
@@ -551,8 +441,8 @@ def _zero_model_loss(model: nn.Module) -> torch.Tensor:
     return loss
 
 
-class _S2GAETrainStepModule(nn.Module):
-    """DDP-safe full-graph encode plus rank-local chunked decode step."""
+class _S2GAESampledTrainStepModule(nn.Module):
+    """DDP-safe sampled-edge train step with per-batch input-edge masking."""
 
     def __init__(self, *, refiner: S2GAERefiner, cfg: S2GAEConfig) -> None:
         super().__init__()
@@ -563,65 +453,47 @@ class _S2GAETrainStepModule(nn.Module):
         self,
         *,
         graph: _SplitGraph,
-        labels: torch.Tensor,
         pair_indices: torch.Tensor,
-        topology_graph: _SplitGraph | None = None,
-        topology_tasks: Sequence[_TopologyLossTask] = (),
-        topology_task_indices: torch.Tensor | None = None,
+        labels: torch.Tensor,
+        mask_input_edges: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return local mean loss and detached metric sums for one rank."""
-        hidden_states = self.refiner.encode(
-            node_features=graph.node_features,
-            edge_index=graph.edge_index,
-            edge_weight=graph.edge_weight,
-        )
-        local_loss = _local_full_batch_loss(
-            model=self.refiner,
-            hidden_states=hidden_states,
-            graph=graph,
-            labels=labels,
-            pair_indices=pair_indices,
-            cfg=self.cfg,
-        )
-        if local_loss is None:
+        """Return batch mean loss and detached metric sums for sampled edge targets."""
+        if pair_indices.numel() == 0:
             return (
                 _zero_model_loss(self.refiner),
-                torch.zeros(8, dtype=torch.float64, device=labels.device),
+                torch.zeros(5, dtype=torch.float64, device=labels.device),
             )
-        topology_loss = labels.sum() * 0.0
-        topology_sums = torch.zeros(4, dtype=torch.float64, device=labels.device)
-        if (
-            self.cfg.topology_loss.enabled
-            and topology_graph is not None
-            and topology_task_indices is not None
-            and topology_tasks
-        ):
-            topology_hidden_states = self.refiner.encode(
-                node_features=topology_graph.node_features,
-                edge_index=topology_graph.edge_index,
-                edge_weight=topology_graph.edge_weight,
-            )
-            topology_loss, topology_sums = _local_topology_loss(
-                model=self.refiner,
-                hidden_states=topology_hidden_states,
-                graph=topology_graph,
-                tasks=topology_tasks,
-                task_indices=topology_task_indices,
-                cfg=self.cfg,
-            )
-        total = local_loss.total + topology_loss
+        masked_graph = _masked_split_graph(
+            graph=graph,
+            masked_pair_indices=pair_indices[mask_input_edges],
+        )
+        hidden_states = self.refiner.encode(
+            node_features=masked_graph.node_features,
+            edge_index=masked_graph.edge_index,
+            edge_weight=masked_graph.edge_weight,
+        )
+        refined_logits, delta = self.refiner.decode(
+            hidden_states=hidden_states,
+            pair_index=masked_graph.pair_index[:, pair_indices],
+            pairwise_probabilities=masked_graph.pairwise_probabilities[pair_indices],
+        )
+        loss_terms = s2gae_loss_terms(
+            refined_logits=refined_logits,
+            labels=labels,
+            delta_logits=delta,
+            loss_config=self.cfg.loss_config,
+            residual_weight=self.cfg.residual_weight,
+        )
+        count = int(pair_indices.numel())
         return (
-            total,
+            loss_terms.total,
             torch.tensor(
                 [
-                    local_loss.total_sum + float(topology_sums[0].detach().cpu().item()),
-                    local_loss.bce_sum,
-                    local_loss.residual_anchor_sum,
-                    local_loss.weighted_residual_anchor_sum,
-                    float(topology_sums[0].detach().cpu().item()),
-                    float(topology_sums[1].detach().cpu().item()),
-                    float(topology_sums[2].detach().cpu().item()),
-                    float(topology_sums[3].detach().cpu().item()),
+                    float(loss_terms.total.detach().item()) * count,
+                    float(loss_terms.bce.detach().item()) * count,
+                    float(loss_terms.residual_anchor.detach().item()) * count,
+                    float(loss_terms.weighted_residual_anchor.detach().item()) * count,
+                    float(count),
                 ],
                 dtype=torch.float64,
                 device=labels.device,
@@ -667,23 +539,12 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         dropout=cfg.dropout,
     ).to(device)
     optimizer = build_s2gae_optimizer(model=model, config=cfg.optimizer)
-    train_step = _S2GAETrainStepModule(refiner=model, cfg=cfg).to(device)
+    train_step = _S2GAESampledTrainStepModule(refiner=model, cfg=cfg).to(device)
     prepared = request.runtime.accelerator.prepare(train_step, optimizer)
     train_step_model, optimizer = _prepared_model_and_optimizer(prepared)
 
     train_graph = _build_split_graph(request.train, cfg=cfg, device=device)
     validation_graph = _build_split_graph(request.validation, cfg=cfg, device=device)
-    train_topology_graph: _SplitGraph | None = None
-    train_topology_tasks: tuple[_TopologyLossTask, ...] = ()
-    if cfg.topology_loss.enabled:
-        if request.train_topology is None or request.train_topology_plan is None:
-            raise ValueError("refiner.topology_loss.enabled requires train_topology inputs")
-        train_topology_graph = _build_split_graph(request.train_topology, cfg=cfg, device=device)
-        train_topology_tasks = _build_topology_loss_tasks(
-            pairs=request.train_topology.pairs,
-            validation_plan=request.train_topology_plan,
-            device=device,
-        )
     validation_topology_graph: _SplitGraph | None = None
     if cfg.topology_validation.enabled:
         if request.validation_topology is None or request.validation_topology_plan is None:
@@ -701,16 +562,19 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         raise ValueError(
             f"refiner.monitor_metric={cfg.monitor_metric!r} requires topology_validation.enabled"
         )
-    train_labels = _required_float_tensor(
-        request.train.loss_targets,
-        "request.train.loss_targets",
-        device=device,
-    )
+    if request.train.loss_targets is None:
+        raise ValueError("request.train.loss_targets is required for S2GAE training")
     validation_labels = _required_float_tensor(
         request.validation.candidate_labels,
         "request.validation.candidate_labels",
         device=device,
     )
+    quadrants = classify_scorer_error_targets(
+        pairs=request.train.pairs,
+        labels=request.train.loss_targets,
+        pairwise_graph_edges=request.train.pairwise_graph_edges,
+    )
+    quadrant_counts = {name: len(targets) for name, targets in quadrants.items()}
 
     best_state_dict: dict[str, torch.Tensor] | None = None
     best_selected_rule: GraphRule | None = None
@@ -722,86 +586,46 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
     for epoch in range(1, cfg.epochs + 1):
         epoch_start = time.perf_counter()
         train_step_model.train()
-        optimizer.zero_grad(set_to_none=True)
-        local_train_indices = _rank_local_pair_indices(
-            total=len(request.train.pairs),
-            runtime=request.runtime,
-            device=device,
+        epoch_targets = sample_epoch_edge_targets(
+            quadrants=quadrants,
+            sampling=cfg.edge_sampling,
+            epoch=epoch,
         )
-        local_topology_task_indices = _rank_local_pair_indices(
-            total=len(train_topology_tasks),
-            runtime=request.runtime,
-            device=device,
+        loader = DataLoader(
+            EdgeTargetDataset(epoch_targets),
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            collate_fn=collate_edge_targets,
         )
-        local_train_count = int(local_train_indices.numel())
-        local_mean_loss, local_loss_sums = cast(
-            tuple[torch.Tensor, torch.Tensor],
-            train_step_model(
-                graph=train_graph,
-                labels=train_labels,
-                pair_indices=local_train_indices,
-                topology_graph=train_topology_graph,
-                topology_tasks=train_topology_tasks,
-                topology_task_indices=local_topology_task_indices,
-            ),
-        )
-        scale = _distributed_loss_scale(
-            local_count=local_train_count,
-            global_count=len(request.train.pairs),
-            runtime=request.runtime,
-        )
-        scaled_loss = local_mean_loss * scale
-        local_loss_sums_cpu = local_loss_sums.detach().cpu()
-        local_loss_values = {
-            "total": float(local_loss_sums_cpu[0].item()),
-            "bce": float(local_loss_sums_cpu[1].item()),
-            "residual_anchor": float(local_loss_sums_cpu[2].item()),
-            "weighted_residual_anchor": float(local_loss_sums_cpu[3].item()),
-            "topology": float(local_loss_sums_cpu[4].item()),
-            "graph_similarity": float(local_loss_sums_cpu[5].item()),
-            "relative_density": float(local_loss_sums_cpu[6].item()),
-            "topology_count": float(local_loss_sums_cpu[7].item()),
-        }
-        request.runtime.accelerator.backward(scaled_loss)
-        gradient_norm = apply_gradient_clipping(
-            model=train_step_model,
-            gradient_clip_norm=cfg.optimization.gradient_clip_norm,
-        )
-        optimizer.step()
+        prepared_loader = request.runtime.accelerator.prepare(loader)
+        local_loss_sums = torch.zeros(5, dtype=torch.float64, device=device)
+        gradient_norm = 0.0
+        for batch in cast(Iterable[Mapping[str, torch.Tensor]], prepared_loader):
+            optimizer.zero_grad(set_to_none=True)
+            batch_loss, batch_sums = cast(
+                tuple[torch.Tensor, torch.Tensor],
+                train_step_model(
+                    graph=train_graph,
+                    pair_indices=batch["pair_index"].to(device),
+                    labels=batch["label"].to(device),
+                    mask_input_edges=batch["mask_input_edge"].to(device),
+                ),
+            )
+            request.runtime.accelerator.backward(batch_loss)
+            gradient_norm = _clip_grad_norm_with_accelerator(
+                model=train_step_model,
+                runtime=request.runtime,
+                gradient_clip_norm=cfg.optimization.gradient_clip_norm,
+            )
+            optimizer.step()
+            local_loss_sums += batch_sums.detach()
         validation_model = _unwrap_refiner(train_step_model, request.runtime.accelerator)
-        global_train_count = _distributed_sum_int(local_train_count, request.runtime, device)
-        total_loss = _distributed_sum_float(local_loss_values["total"], request.runtime, device)
-        total_bce_loss = _distributed_sum_float(local_loss_values["bce"], request.runtime, device)
-        total_residual_anchor_loss = _distributed_sum_float(
-            local_loss_values["residual_anchor"],
-            request.runtime,
-            device,
-        )
-        total_weighted_residual_anchor_loss = _distributed_sum_float(
-            local_loss_values["weighted_residual_anchor"],
-            request.runtime,
-            device,
-        )
-        total_topology_loss = _distributed_sum_float(
-            local_loss_values["topology"],
-            request.runtime,
-            device,
-        )
-        total_graph_similarity_loss = _distributed_sum_float(
-            local_loss_values["graph_similarity"],
-            request.runtime,
-            device,
-        )
-        total_relative_density_loss = _distributed_sum_float(
-            local_loss_values["relative_density"],
-            request.runtime,
-            device,
-        )
-        total_topology_count = _distributed_sum_float(
-            local_loss_values["topology_count"],
-            request.runtime,
-            device,
-        )
+        global_loss_sums = _accelerator_reduce_sum(local_loss_sums, request.runtime)
+        total_loss = float(global_loss_sums[0].detach().cpu().item())
+        total_bce_loss = float(global_loss_sums[1].detach().cpu().item())
+        total_residual_anchor_loss = float(global_loss_sums[2].detach().cpu().item())
+        total_weighted_residual_anchor_loss = float(global_loss_sums[3].detach().cpu().item())
+        global_train_count = int(round(float(global_loss_sums[4].detach().cpu().item())))
 
         validation_auprc = _validation_auprc(
             model=validation_model,
@@ -851,18 +675,14 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             "train_weighted_residual_anchor_loss": (
                 total_weighted_residual_anchor_loss / epoch_denominator
             ),
-            "train_topology_loss": total_topology_loss / max(1.0, total_topology_count),
-            "train_graph_similarity_loss": (
-                total_graph_similarity_loss / max(1.0, total_topology_count)
-            ),
-            "train_relative_density_loss": (
-                total_relative_density_loss / max(1.0, total_topology_count)
-            ),
+            "train_topology_loss": 0.0,
+            "train_graph_similarity_loss": 0.0,
+            "train_relative_density_loss": 0.0,
             "train_gradient_norm": gradient_norm,
             "learning_rate": _current_learning_rate(optimizer),
             "val_auprc": validation_auprc,
             "monitor_value": monitor_value,
-            "local_train_pairs": local_train_count,
+            "local_train_pairs": int(local_loss_sums[4].detach().cpu().item()),
             "global_train_pairs": global_train_count,
             "local_validation_pairs": _rank_local_pair_count(
                 total=len(request.validation.pairs),
@@ -870,6 +690,11 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             ),
             "global_validation_pairs": len(request.validation.pairs),
             "peak_gpu_mem_mb": _peak_gpu_memory_mb(device),
+            "sampled_edge_targets": len(epoch_targets),
+            "train_fp_targets": quadrant_counts["fp"],
+            "train_fn_targets": quadrant_counts["fn"],
+            "train_tp_targets": quadrant_counts["tp"],
+            "train_tn_targets": quadrant_counts["tn"],
         }
         if selected_epoch_topology_metrics is not None:
             metrics = selected_epoch_topology_metrics
@@ -930,19 +755,21 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
     checkpoint_model.load_state_dict(best_state_dict)
     if request.runtime.is_main_process:
         cfg.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "model_state_dict": best_state_dict,
-                "config": _config_to_json(cfg),
-                "best_validation_auprc": best_validation_auprc,
-                "monitor_metric": cfg.monitor_metric,
-                "best_monitor_value": best_monitor_value,
-                "selected_rule": (
-                    None if best_selected_rule_payload is None else best_selected_rule_payload
-                ),
-            },
-            cfg.checkpoint_path,
-        )
+        payload = {
+            "model_state_dict": best_state_dict,
+            "config": _config_to_json(cfg),
+            "best_validation_auprc": best_validation_auprc,
+            "monitor_metric": cfg.monitor_metric,
+            "best_monitor_value": best_monitor_value,
+            "selected_rule": (
+                None if best_selected_rule_payload is None else best_selected_rule_payload
+            ),
+        }
+        save_fn = getattr(request.runtime.accelerator, "save", None)
+        if callable(save_fn):
+            save_fn(payload, cfg.checkpoint_path, safe_serialization=False)
+        else:
+            torch.save(payload, cfg.checkpoint_path)
         _write_training_summary(
             cfg=cfg,
             best_monitor_value=best_monitor_value,
@@ -991,15 +818,6 @@ class _SplitGraph:
     pairwise_probabilities: torch.Tensor
 
 
-@dataclass(frozen=True)
-class _TopologyLossTask:
-    num_nodes: int
-    pair_indices: torch.Tensor
-    pair_index_a: torch.Tensor
-    pair_index_b: torch.Tensor
-    targets: torch.Tensor
-
-
 def _build_split_graph(
     bundle: SplitBundle,
     *,
@@ -1028,50 +846,6 @@ def _build_prediction_graph(
         cfg=cfg,
         device=device,
     )
-
-
-def _build_topology_loss_tasks(
-    *,
-    pairs: Sequence[CandidatePair],
-    validation_plan: InternalValidationPlan,
-    device: torch.device,
-) -> tuple[_TopologyLossTask, ...]:
-    pair_indices_by_edge = {
-        canonical_edge(pair.protein_a, pair.protein_b): index
-        for index, pair in enumerate(pairs)
-    }
-    tasks: list[_TopologyLossTask] = []
-    for bucket in validation_plan.buckets:
-        records_by_subgraph: dict[int, list[object]] = {}
-        for record in bucket.pair_records:
-            records_by_subgraph.setdefault(record.subgraph_index, []).append(record)
-        for subgraph_index, records in sorted(records_by_subgraph.items()):
-            target_graph = bucket.target_subgraphs[subgraph_index]
-            pair_indices = []
-            pair_index_a = []
-            pair_index_b = []
-            targets = []
-            for record in records:
-                edge = canonical_edge(record.protein_a, record.protein_b)
-                if edge not in pair_indices_by_edge:
-                    raise ValueError(
-                        "topology loss pair is missing from scored train topology pairs"
-                    )
-                pair_indices.append(pair_indices_by_edge[edge])
-                pair_index_a.append(record.pair_index_a)
-                pair_index_b.append(record.pair_index_b)
-                targets.append(float(target_graph.has_edge(record.protein_a, record.protein_b)))
-            if pair_indices:
-                tasks.append(
-                    _TopologyLossTask(
-                        num_nodes=bucket.node_size,
-                        pair_indices=torch.tensor(pair_indices, dtype=torch.long, device=device),
-                        pair_index_a=torch.tensor(pair_index_a, dtype=torch.long, device=device),
-                        pair_index_b=torch.tensor(pair_index_b, dtype=torch.long, device=device),
-                        targets=torch.tensor(targets, dtype=torch.float32, device=device),
-                    )
-                )
-    return tuple(tasks)
 
 
 def _build_graph(
@@ -1111,6 +885,28 @@ def _build_graph(
             dtype=torch.float32,
             device=device,
         ),
+    )
+
+
+def _masked_split_graph(*, graph: _SplitGraph, masked_pair_indices: torch.Tensor) -> _SplitGraph:
+    """Return a graph with selected undirected pair edges removed from encoder input."""
+    if masked_pair_indices.numel() == 0 or graph.edge_index.numel() == 0:
+        return graph
+    node_count = int(graph.node_features.size(0))
+    edge_min = torch.minimum(graph.edge_index[0], graph.edge_index[1])
+    edge_max = torch.maximum(graph.edge_index[0], graph.edge_index[1])
+    edge_codes = edge_min * node_count + edge_max
+    target_pairs = graph.pair_index[:, masked_pair_indices]
+    target_min = torch.minimum(target_pairs[0], target_pairs[1])
+    target_max = torch.maximum(target_pairs[0], target_pairs[1])
+    target_codes = target_min * node_count + target_max
+    keep_mask = ~torch.isin(edge_codes, target_codes)
+    return _SplitGraph(
+        node_features=graph.node_features,
+        edge_index=graph.edge_index[:, keep_mask],
+        edge_weight=graph.edge_weight[keep_mask],
+        pair_index=graph.pair_index,
+        pairwise_probabilities=graph.pairwise_probabilities,
     )
 
 
@@ -1230,7 +1026,7 @@ def _prediction_probabilities(
         runtime=runtime,
         device=device,
     )
-    indexed_probabilities: list[tuple[int, float]] = []
+    indexed_rows: list[torch.Tensor] = []
     with torch.inference_mode():
         hidden_states = model.encode(
             node_features=graph.node_features,
@@ -1244,18 +1040,23 @@ def _prediction_probabilities(
                 pair_index=graph.pair_index[:, global_indices],
                 pairwise_probabilities=graph.pairwise_probabilities[global_indices],
             )
-            batch_probabilities = torch.sigmoid(refined_logits).detach().cpu().tolist()
-            indexed_probabilities.extend(
-                (int(pair_index), float(probability))
-                for pair_index, probability in zip(
-                    global_indices.detach().cpu().tolist(),
-                    batch_probabilities,
-                    strict=True,
+            indexed_rows.append(
+                torch.stack(
+                    (
+                        global_indices.to(dtype=torch.float64),
+                        torch.sigmoid(refined_logits).to(dtype=torch.float64),
+                    ),
+                    dim=1,
                 )
             )
-    return _ordered_values_from_rank_shards(
+    local_rows = (
+        torch.cat(indexed_rows, dim=0)
+        if indexed_rows
+        else torch.empty((0, 2), dtype=torch.float64, device=device)
+    )
+    return _ordered_values_from_accelerate_rows(
         total=int(graph.pairwise_probabilities.numel()),
-        local_indexed_values=indexed_probabilities,
+        local_rows=local_rows,
         runtime=runtime,
     )
 
@@ -1442,65 +1243,46 @@ def _rank_local_pair_count(*, total: int, runtime: object) -> int:
     return ((total - 1 - rank) // world_size) + 1
 
 
-def _distributed_loss_scale(
-    *,
-    local_count: int,
-    global_count: int,
-    runtime: object,
-) -> float:
-    if local_count <= 0:
-        return 0.0
-    if global_count <= 0:
-        raise ValueError("global_count must be positive")
-    if not _runtime_is_distributed(runtime):
-        return 1.0
-    return float(local_count * _runtime_world_size(runtime)) / float(global_count)
-
-
-def _distributed_sum_float(value: float, runtime: object, device: torch.device) -> float:
-    if not _runtime_is_distributed(runtime):
-        return float(value)
-    tensor = torch.tensor(float(value), dtype=torch.float64, device=device)
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        return float(tensor.detach().cpu().item())
+def _accelerator_reduce_sum(value: torch.Tensor, runtime: object) -> torch.Tensor:
     reduce_fn = getattr(getattr(runtime, "accelerator", None), "reduce", None)
     if callable(reduce_fn):
-        reduced = reduce_fn(tensor, reduction="sum")
+        reduced = reduce_fn(value, reduction="sum")
         if isinstance(reduced, torch.Tensor):
-            return float(reduced.detach().cpu().item())
-    return float(value)
+            return reduced
+    if _runtime_is_distributed(runtime) and dist.is_available() and dist.is_initialized():
+        reduced = value.clone()
+        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+        return reduced
+    return value
 
 
-def _distributed_sum_int(value: int, runtime: object, device: torch.device) -> int:
-    return int(round(_distributed_sum_float(float(value), runtime, device)))
-
-
-def _ordered_values_from_rank_shards(
+def _ordered_values_from_accelerate_rows(
     *,
     total: int,
-    local_indexed_values: Sequence[tuple[int, float]],
+    local_rows: torch.Tensor,
     runtime: object,
-    gather_fn: Callable[
-        [Sequence[tuple[int, float]]],
-        Sequence[Sequence[tuple[int, float]]],
-    ]
-    | None = None,
 ) -> list[float]:
-    if not _runtime_is_distributed(runtime):
-        return _ordered_values_from_shards(
-            total=total,
-            shard_payloads=[local_indexed_values],
-        )
-    if gather_fn is not None:
-        gathered_payloads = list(gather_fn(local_indexed_values))
-    elif dist.is_available() and dist.is_initialized():
-        gathered: list[list[tuple[int, float]] | None] = [None] * _runtime_world_size(runtime)
-        dist.all_gather_object(gathered, list(local_indexed_values))
-        gathered_payloads = [payload for payload in gathered if payload is not None]
-    else:
-        gathered_payloads = [local_indexed_values]
-    return _ordered_values_from_shards(total=total, shard_payloads=gathered_payloads)
+    accelerator = getattr(runtime, "accelerator", None)
+    if _runtime_is_distributed(runtime):
+        pad_fn = getattr(accelerator, "pad_across_processes", None)
+        gather_fn = getattr(accelerator, "gather_for_metrics", None)
+        if callable(pad_fn) and callable(gather_fn):
+            local_rows = pad_fn(local_rows, dim=0, pad_index=-1)
+            gathered = gather_fn(local_rows)
+            if isinstance(gathered, torch.Tensor):
+                valid = gathered[:, 0] >= 0
+                return _ordered_values_from_row_tensor(total=total, rows=gathered[valid])
+    return _ordered_values_from_row_tensor(total=total, rows=local_rows)
+
+
+def _ordered_values_from_row_tensor(*, total: int, rows: torch.Tensor) -> list[float]:
+    local_indexed_values = [
+        (int(row[0].detach().cpu().item()), float(row[1].detach().cpu().item())) for row in rows
+    ]
+    return _ordered_values_from_shards(
+        total=total,
+        shard_payloads=[local_indexed_values],
+    )
 
 
 def _ordered_values_from_shards(
@@ -1573,9 +1355,7 @@ def _append_tccig_train_csv_row(
                 "Epoch Time": epoch_time_s,
                 "Train Loss": float(epoch_history["train_loss"]),
                 "Train BCE Loss": float(epoch_history["train_bce_loss"]),
-                "Train Residual Anchor Loss": float(
-                    epoch_history["train_residual_anchor_loss"]
-                ),
+                "Train Residual Anchor Loss": float(epoch_history["train_residual_anchor_loss"]),
                 "Train Weighted Residual Anchor Loss": float(
                     epoch_history["train_weighted_residual_anchor_loss"]
                 ),
@@ -1715,12 +1495,12 @@ def _unwrap_model(model: nn.Module, accelerator: object) -> nn.Module:
 def _unwrap_refiner(model: nn.Module, accelerator: object) -> S2GAERefiner:
     if isinstance(model, S2GAERefiner):
         return model
-    if isinstance(model, _S2GAETrainStepModule):
+    if isinstance(model, _S2GAESampledTrainStepModule):
         return model.refiner
     module = getattr(model, "module", None)
     if isinstance(module, S2GAERefiner):
         return module
-    if isinstance(module, _S2GAETrainStepModule):
+    if isinstance(module, _S2GAESampledTrainStepModule):
         return module.refiner
     unwrapped = _unwrap_model(model, accelerator)
     if isinstance(unwrapped, S2GAERefiner):
@@ -1776,6 +1556,7 @@ def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
         dropout=_probability(config.get("dropout", 0.5), "refiner.dropout"),
         epochs=_positive_int(config.get("epochs", 20), "refiner.epochs"),
         batch_size=_positive_int(config.get("batch_size", 4096), "refiner.batch_size"),
+        edge_sampling=parse_edge_sampling_config(config.get("edge_sampling", {})),
         loss_config=_parse_loss_config(config.get("loss", {})),
         residual_weight=_non_negative_float(
             config.get("residual_weight", 0.001),
@@ -1810,6 +1591,12 @@ def _config_to_json(cfg: S2GAEConfig) -> dict[str, object]:
         "dropout": cfg.dropout,
         "epochs": cfg.epochs,
         "batch_size": cfg.batch_size,
+        "edge_sampling": {
+            "hard_fraction": cfg.edge_sampling.hard_fraction,
+            "easy_anchor_fraction": cfg.edge_sampling.easy_anchor_fraction,
+            "seed": cfg.edge_sampling.seed,
+            "reshuffle_easy_each_epoch": cfg.edge_sampling.reshuffle_easy_each_epoch,
+        },
         "loss": {
             "type": cfg.loss_config.loss_type,
             "pos_weight": cfg.loss_config.pos_weight,
@@ -1962,6 +1749,8 @@ def _parse_topology_loss_config(raw_topology_loss: object) -> S2GAETopologyLossC
         if "enabled" in raw_topology_loss
         else False
     )
+    if enabled:
+        raise ValueError("refiner.topology_loss.enabled is not supported in the Accelerate rewrite")
     return S2GAETopologyLossConfig(
         enabled=enabled,
         weight=_non_negative_float(

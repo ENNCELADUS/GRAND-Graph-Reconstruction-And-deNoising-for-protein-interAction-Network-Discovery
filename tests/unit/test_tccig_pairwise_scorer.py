@@ -9,20 +9,63 @@ import pytest
 import torch
 import yaml
 from src.pipeline.stages.train import build_model
-from tccig.io import CandidatePair
-from tccig.train import PairwiseScoreRequest, TCCIGRuntime, score_pairs_with_v3_1
+from tccig.prepare import CandidatePair, TCCIGRuntime
+from tccig.train import score_pairs_with_v3_1
 
 
 class _FakeAccelerator:
-    device = "cpu"
+    device = torch.device("cpu")
+    is_main_process = True
+    use_distributed = False
+    process_index = 0
+    local_process_index = 0
+    num_processes = 1
+
+    def prepare(self, *components: object) -> object:
+        return components
+
+    def gather(self, value: torch.Tensor) -> torch.Tensor:
+        return value
+
+    def gather_for_metrics(self, value: torch.Tensor) -> torch.Tensor:
+        return value
+
+    def pad_across_processes(
+        self,
+        value: torch.Tensor,
+        dim: int = 0,
+        pad_index: int = 0,
+        pad_first: bool = False,
+    ) -> torch.Tensor:
+        del dim, pad_index, pad_first
+        return value
+
+    def reduce(self, value: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+        del reduction
+        return value
+
+    def wait_for_everyone(self) -> None:
+        return None
+
+    def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
+        return model
+
+    def save(self, obj: object, f: str | Path, safe_serialization: bool = False) -> None:
+        del safe_serialization
+        torch.save(obj, f)
 
 
 def _runtime() -> TCCIGRuntime:
     return TCCIGRuntime(
+        accelerator=_FakeAccelerator(),
         device="cpu",
         backend="ddp",
-        mixed_precision=False,
-        accelerator=_FakeAccelerator(),
+        mixed_precision="no",
+        is_distributed=False,
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        is_main_process=True,
     )
 
 
@@ -103,14 +146,12 @@ def _request_config(tmp_path: Path, checkpoint_path: Path | None = None) -> dict
 def test_score_pairs_with_v3_1_returns_one_probability_per_candidate(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "best_model.pth"
     _write_checkpoint(checkpoint_path)
-    request = PairwiseScoreRequest(
-        split="validation",
+
+    probabilities = score_pairs_with_v3_1(
         pairs=[CandidatePair("P1", "P2"), CandidatePair("P2", "P3")],
         runtime=_runtime(),
         config=_request_config(tmp_path, checkpoint_path),
     )
-
-    probabilities = score_pairs_with_v3_1(request)
 
     assert len(probabilities) == 2
     assert all(0.0 <= probability <= 1.0 for probability in probabilities)
@@ -122,8 +163,8 @@ def test_score_pairs_with_v3_1_reports_batch_progress(tmp_path: Path) -> None:
     progress_events: list[dict[str, object]] = []
     config = _request_config(tmp_path, checkpoint_path)
     config["batch_size"] = 2
-    request = PairwiseScoreRequest(
-        split="validation",
+
+    probabilities = score_pairs_with_v3_1(
         pairs=[
             CandidatePair("P1", "P2"),
             CandidatePair("P2", "P3"),
@@ -133,8 +174,6 @@ def test_score_pairs_with_v3_1_reports_batch_progress(tmp_path: Path) -> None:
         config=config,
         progress_callback=lambda event: progress_events.append(dict(event)),
     )
-
-    probabilities = score_pairs_with_v3_1(request)
 
     assert len(probabilities) == 3
     assert progress_events == [
@@ -146,28 +185,23 @@ def test_score_pairs_with_v3_1_reports_batch_progress(tmp_path: Path) -> None:
 def test_score_pairs_with_v3_1_does_not_filter_self_pairs(tmp_path: Path) -> None:
     checkpoint_path = tmp_path / "best_model.pth"
     _write_checkpoint(checkpoint_path)
-    request = PairwiseScoreRequest(
-        split="train",
+
+    probabilities = score_pairs_with_v3_1(
         pairs=[CandidatePair("P1", "P1"), CandidatePair("P1", "P2")],
         runtime=_runtime(),
         config=_request_config(tmp_path, checkpoint_path),
     )
 
-    probabilities = score_pairs_with_v3_1(request)
-
     assert len(probabilities) == 2
 
 
 def test_score_pairs_with_v3_1_requires_existing_checkpoint(tmp_path: Path) -> None:
-    request = PairwiseScoreRequest(
-        split="validation",
-        pairs=[CandidatePair("P1", "P2")],
-        runtime=_runtime(),
-        config=_request_config(tmp_path),
-    )
-
     with pytest.raises(FileNotFoundError, match="checkpoint_path does not exist"):
-        score_pairs_with_v3_1(request)
+        score_pairs_with_v3_1(
+            pairs=[CandidatePair("P1", "P2")],
+            runtime=_runtime(),
+            config=_request_config(tmp_path),
+        )
 
 
 def test_score_pairs_with_v3_1_rejects_non_abba_no_cross_config(tmp_path: Path) -> None:
@@ -175,12 +209,10 @@ def test_score_pairs_with_v3_1_rejects_non_abba_no_cross_config(tmp_path: Path) 
     _write_checkpoint(checkpoint_path)
     config = _request_config(tmp_path, checkpoint_path)
     _write_model_config(Path(str(config["model_config_path"])), interaction_mode="block_self")
-    request = PairwiseScoreRequest(
-        split="validation",
-        pairs=[CandidatePair("P1", "P2")],
-        runtime=_runtime(),
-        config=config,
-    )
 
     with pytest.raises(ValueError, match="model_config.interaction.mode"):
-        score_pairs_with_v3_1(request)
+        score_pairs_with_v3_1(
+            pairs=[CandidatePair("P1", "P2")],
+            runtime=_runtime(),
+            config=config,
+        )

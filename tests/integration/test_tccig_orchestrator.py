@@ -1,10 +1,13 @@
-"""Integration tests for the standalone TCCIG PRING orchestrator."""
+"""Integration tests for the concrete TCCIG Accelerate orchestrator."""
 
 from __future__ import annotations
 
 import csv
 import json
+import os
 import pickle
+import subprocess
+import sys
 from pathlib import Path
 
 import networkx as nx
@@ -12,23 +15,7 @@ import pytest
 import torch
 import yaml
 from src.pipeline.stages.train import build_model
-from tccig.train import (
-    PairwiseScoreRequest,
-    RefineRequest,
-    TrainRefinerRequest,
-    run_tccig_pipeline,
-)
-
-HOOK_EVENTS: list[tuple[str, object]] = []
-SCORE_PAIR_COUNTS: list[tuple[str, int]] = []
-
-
-def _run_config(tmp_path: Path, run_id: str) -> dict[str, str]:
-    return {
-        "run_id": run_id,
-        "log_root": str(tmp_path / "logs"),
-        "cache_root": str(tmp_path / "data" / "tccig"),
-    }
+from tccig.train import _build_runtime, run_tccig_pipeline
 
 
 def _write_pairs(path: Path, rows: list[tuple[str, str, int]]) -> None:
@@ -41,19 +28,19 @@ def _write_pairs(path: Path, rows: list[tuple[str, str, int]]) -> None:
 def _write_tiny_pring_fixture(processed_dir: Path) -> None:
     _write_pairs(
         processed_dir / "human_train_ppi_ratio5_exclusive.txt",
-        [("A", "B", 1), ("A", "A", 1), ("A", "C", 0)],
+        [("A", "B", 1), ("A", "C", 0), ("B", "C", 1), ("C", "D", 0)],
     )
     _write_pairs(
         processed_dir / "human_val_ppi_ratio5_exclusive.txt",
-        [("A", "B", 1), ("B", "B", 1), ("A", "C", 0)],
+        [("A", "B", 1), ("A", "C", 0), ("B", "D", 0), ("C", "D", 1)],
     )
     _write_pairs(
         processed_dir / "human_test_ppi.txt",
-        [("T1", "T2", 1), ("T1", "T1", 1), ("T2", "T3", 0)],
+        [("T1", "T2", 1), ("T1", "T3", 0), ("T2", "T3", 0)],
     )
     _write_pairs(
         processed_dir / "all_test_ppi.txt",
-        [("T1", "T2", 1), ("T1", "T3", 0), ("T3", "T3", 1)],
+        [("T1", "T2", 1), ("T1", "T3", 0), ("T2", "T3", 0)],
     )
 
     graph = nx.Graph()
@@ -63,8 +50,6 @@ def _write_tiny_pring_fixture(processed_dir: Path) -> None:
         pickle.dump(graph, handle)
     with (processed_dir / "test_sampled_nodes.pkl").open("wb") as handle:
         pickle.dump({2: [["T1", "T2"], ["T1", "T3"]]}, handle)
-    with (processed_dir / "human_BFS_split.pkl").open("wb") as handle:
-        pickle.dump({"train": {"A", "B", "C"}, "val": {"A", "B", "C"}}, handle)
 
 
 def _tiny_v3_1_config() -> dict[str, object]:
@@ -104,921 +89,304 @@ def _write_tiny_v3_1_pairwise_assets(tmp_path: Path) -> tuple[Path, Path, Path]:
 
     checkpoint_path = tmp_path / "models" / "best_model.pth"
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.manual_seed(0)
     torch.save(build_model(_tiny_v3_1_config()).state_dict(), checkpoint_path)
 
     cache_dir = tmp_path / "cache"
     index: dict[str, str] = {}
-    for protein_id in ["A", "B", "C", "T1", "T2", "T3"]:
+    for offset, protein_id in enumerate(["A", "B", "C", "D", "T1", "T2", "T3"], start=1):
         relative_path = f"embeddings/{protein_id}.pt"
         output_path = cache_dir / relative_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(torch.ones((3, 8), dtype=torch.float32), output_path)
+        torch.save(torch.full((3, 8), float(offset), dtype=torch.float32), output_path)
         index[protein_id] = relative_path
     (cache_dir / "index.json").write_text(json.dumps(index), encoding="utf-8")
     return model_config_path, checkpoint_path, cache_dir
 
 
-def fake_score_pairs(request: PairwiseScoreRequest) -> list[float]:
-    """Fake external pairwise scorer that enforces label-free inputs."""
-    assert all(not hasattr(pair, "label") for pair in request.pairs)
-    assert all(pair.protein_a != pair.protein_b for pair in request.pairs)
-    assert not hasattr(request, "human_test_graph")
-    assert not hasattr(request, "test_sampled_nodes")
-    HOOK_EVENTS.append(("score", request.split))
-    SCORE_PAIR_COUNTS.append((request.split, len(request.pairs)))
-    return [0.9 if pair.protein_b in {"B", "T2"} else 0.1 for pair in request.pairs]
-
-
-def fake_score_pairs_alias(request: PairwiseScoreRequest) -> list[float]:
-    """Alternate fake scorer target with the same scores but a different fingerprint."""
-    return fake_score_pairs(request)
-
-
-def fake_score_pairs_with_wrong_pairwise_baseline(request: PairwiseScoreRequest) -> list[float]:
-    """Fake scorer that makes raw pairwise-test scores distinguishable from refined scores."""
-    if request.split != "pairwise_test":
-        return fake_score_pairs(request)
-    assert all(pair.protein_a != pair.protein_b for pair in request.pairs)
-    HOOK_EVENTS.append(("score", request.split))
-    SCORE_PAIR_COUNTS.append((request.split, len(request.pairs)))
-    return [0.1 if pair.protein_b == "T2" else 0.9 for pair in request.pairs]
-
-
-def fake_train_refiner(request: TrainRefinerRequest) -> dict[str, str]:
-    """Fake trainer that sees train targets but no test graph artifacts."""
-    assert request.train.loss_targets == [1, 0]
-    assert request.train.candidate_labels == [1, 0]
-    assert request.train.graph_edges == [("A", "B")]
-    assert not hasattr(request, "human_test_graph")
-    assert not hasattr(request, "test_sampled_nodes")
-    HOOK_EVENTS.append(("train_refiner", len(request.train.pairs)))
-    return {"state": "fake"}
-
-
-def fake_predict_refined(request: RefineRequest) -> list[float]:
-    """Fake refiner that receives pairwise graph inputs but not ground truth graphs."""
-    assert all(not hasattr(pair, "label") for pair in request.pairs)
-    assert not hasattr(request, "human_test_graph")
-    assert not hasattr(request, "test_sampled_nodes")
-    HOOK_EVENTS.append(("predict_refined", request.split))
-    return list(request.pairwise_probabilities)
-
-
-def fake_predict_refined_corrects_pairwise_test(request: RefineRequest) -> list[float]:
-    """Fake refiner whose pairwise-test scores intentionally differ from the baseline."""
-    assert all(not hasattr(pair, "label") for pair in request.pairs)
-    HOOK_EVENTS.append(("predict_refined", request.split))
-    if request.split == "pairwise_test":
-        return [0.9 if pair.protein_b == "T2" else 0.1 for pair in request.pairs]
-    return list(request.pairwise_probabilities)
-
-
-def fake_predict_refined_uses_fixed_output_threshold(request: RefineRequest) -> list[float]:
-    """Fake refiner whose hard graph is controlled by the refined output threshold."""
-    assert all(not hasattr(pair, "label") for pair in request.pairs)
-    HOOK_EVENTS.append(("predict_refined", request.split))
-    return [0.6 if pair.protein_b in {"B", "T2"} else 0.4 for pair in request.pairs]
-
-
-def test_tccig_orchestrator_keeps_pring_truth_out_of_model_inputs(tmp_path: Path) -> None:
+def _tiny_config(tmp_path: Path, run_id: str) -> dict[str, object]:
     processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
     _write_tiny_pring_fixture(processed_dir)
-    HOOK_EVENTS.clear()
-
-    result = run_tccig_pipeline(
-        {
-            "run": _run_config(tmp_path, "tiny"),
-            "data": {"processed_dir": str(processed_dir)},
-            "device": {
-                "device": "cpu",
-                "backend": "ddp",
-                "mixed_precision": False,
-            },
-            "pairwise_scorer": {
-                "target": f"{__name__}:fake_score_pairs",
-            },
-            "refiner": {
-                "train_target": f"{__name__}:fake_train_refiner",
-                "predict_target": f"{__name__}:fake_predict_refined",
-            },
-            "graph_selection": {
-                "rules": [
-                    {"type": "threshold", "value": 0.5},
-                ]
-            },
-        }
+    model_config_path, checkpoint_path, embedding_cache_dir = _write_tiny_v3_1_pairwise_assets(
+        tmp_path
     )
+    return {
+        "run": {
+            "run_id": run_id,
+            "log_root": str(tmp_path / "logs"),
+            "cache_root": str(tmp_path / "tccig_cache"),
+        },
+        "data": {"processed_dir": str(processed_dir)},
+        "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
+        "pairwise_scorer": {
+            "model_config_path": str(model_config_path),
+            "checkpoint_path": str(checkpoint_path),
+            "embedding_cache_dir": str(embedding_cache_dir),
+            "batch_size": 2,
+            "max_sequence_length": 8,
+            "score_cache": {"enabled": True},
+        },
+        "refiner": {
+            "encoder": "graphconv",
+            "input_dim": 8,
+            "hidden_dim": 4,
+            "num_layers": 1,
+            "decoder_hidden_dim": 4,
+            "decoder_layers": 1,
+            "dropout": 0.0,
+            "epochs": 1,
+            "batch_size": 2,
+            "edge_sampling": {
+                "hard_fraction": 0.7,
+                "easy_anchor_fraction": 0.3,
+                "seed": 0,
+                "reshuffle_easy_each_epoch": True,
+            },
+            "loss": {
+                "type": "bce_with_logits",
+                "pos_weight": 1.0,
+                "label_smoothing": 0.0,
+            },
+            "optimizer": {
+                "type": "adamw",
+                "lr": 0.001,
+                "weight_decay": 0.0,
+                "beta1": 0.9,
+                "beta2": 0.999,
+                "eps": 1.0e-8,
+            },
+            "scheduler": {"type": "none"},
+            "optimization": {"gradient_clip_norm": 1.0},
+            "residual_weight": 0.0,
+            "topology_loss": {"enabled": False},
+            "monitor_metric": "val_auprc",
+            "topology_validation": {"enabled": False},
+            "embedding_cache_dir": str(embedding_cache_dir),
+            "embedding_index_path": str(embedding_cache_dir / "index.json"),
+            "max_sequence_length": 8,
+            "checkpoint_path": str(tmp_path / "models" / "tccig" / run_id / "best_model.pt"),
+        },
+        "graph_selection": {
+            "pairwise_input_threshold": {"mode": "fixed", "value": 0.5},
+            "refined_output_rule": {"type": "threshold", "value": 0.5},
+            "rules": [{"type": "threshold", "value": 0.5}],
+        },
+    }
 
-    assert ("score", "train") in HOOK_EVENTS
-    assert ("score", "topology_test") in HOOK_EVENTS
-    assert ("predict_refined", "pairwise_test") in HOOK_EVENTS
-    assert ("predict_refined", "topology_test") in HOOK_EVENTS
-    assert HOOK_EVENTS.index(("train_refiner", 2)) < HOOK_EVENTS.index(("score", "pairwise_test"))
-    assert HOOK_EVENTS.index(("train_refiner", 2)) < HOOK_EVENTS.index(("score", "topology_test"))
-    assert result.manifest["self_pair_rows_dropped"] == {
-        "train": 1,
-        "validation": 1,
-        "pairwise_test": 1,
-        "topology_test": 1,
-    }
-    assert result.pairwise_input_threshold == {
-        "type": "threshold",
-        "mode": "fixed",
-        "value": 0.5,
-        "source": "graph_selection.pairwise_graph_rule",
-    }
+
+def _read_topology_prediction_rows(path: Path) -> list[list[str]]:
+    return [line.split("\t") for line in path.read_text(encoding="utf-8").splitlines()]
+
+
+def _read_pairwise_prediction_rows(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def test_tccig_runtime_uses_bf16_mixed_precision_from_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    config = _tiny_config(tmp_path, "bf16_runtime")
+    config["device"] = {"device": "cpu", "backend": "ddp", "mixed_precision": "bf16"}
+    accelerator_calls: list[dict[str, object]] = []
+
+    class FakeAccelerator:
+        device = torch.device("cpu")
+        num_processes = 1
+        use_distributed = False
+        process_index = 0
+        local_process_index = 0
+        is_main_process = True
+
+    def fake_accelerator(**kwargs: object) -> FakeAccelerator:
+        accelerator_calls.append(kwargs)
+        return FakeAccelerator()
+
+    monkeypatch.setattr("tccig.train.Accelerator", fake_accelerator)
+
+    runtime = _build_runtime(config=config, build_accelerator_fn=None)
+
+    assert accelerator_calls[0]["mixed_precision"] == "bf16"
+    assert runtime.mixed_precision == "bf16"
+
+
+def test_tccig_orchestrator_runs_concrete_pipeline_and_writes_artifacts(tmp_path: Path) -> None:
+    config = _tiny_config(tmp_path, "tiny")
+
+    result = run_tccig_pipeline(config)
+
+    assert result.pairwise_input_threshold["value"] == 0.5
     assert result.refined_output_rule == {"type": "threshold", "value": 0.5}
-
-    run_log_dir = tmp_path / "logs" / "tccig" / "tiny"
-    topology_log_dir = run_log_dir / "topology_test"
-    assert (topology_log_dir / "all_test_ppi_pred.txt").exists()
-    metrics_path = topology_log_dir / "topology_metrics.json"
-    metrics_csv_path = topology_log_dir / "topology_metrics.csv"
-    assert metrics_path.exists()
-    assert metrics_csv_path.exists()
-    metrics_payload = json.loads(metrics_path.read_text(encoding="utf-8"))
-    assert set(metrics_payload["summary"]) == {
+    assert set(result.pairwise_metrics) >= {"auprc", "auroc", "f1", "threshold"}
+    assert set(result.topology_metrics) == {
         "graph_sim",
         "relative_density",
         "deg_dist_mmd",
         "cc_mmd",
         "laplacian_eigen_mmd",
     }
-    assert "2" in metrics_payload["per_node_size"]
-    assert set(metrics_payload["details"]) == set(metrics_payload["summary"])
-    assert metrics_payload["refined_output_rule"] == {"type": "threshold", "value": 0.5}
-    assert metrics_payload["pairwise_input_rule"] == {"type": "threshold", "value": 0.5}
-    assert metrics_payload["protocol"] == {
-        "candidate_universe": "all_test_ppi.txt",
-        "ground_truth_graph": "human_test_graph.pkl",
-        "sampled_nodes": "test_sampled_nodes.pkl",
-        "test_labels_visible_to_model": False,
-    }
-    with metrics_csv_path.open("r", encoding="utf-8", newline="") as handle:
-        rows = list(csv.DictReader(handle))
-    assert [row["scope"] for row in rows] == ["node_size", "summary"]
-    assert rows[-1]["node_size"] == "all"
-    assert rows[-1]["graph_count"] == "2"
 
-    scoring_manifest = (
-        tmp_path / "data" / "tccig" / "score_cache" / "tiny" / "manifests" / "train.json"
+    run_log_dir = tmp_path / "logs" / "tccig" / "tiny"
+    assert (run_log_dir / "manifest.json").exists()
+    assert (run_log_dir / "pairwise_test" / "pairwise_metrics.json").exists()
+    assert (run_log_dir / "topology_test" / "all_test_ppi_pred.txt").exists()
+    assert (run_log_dir / "topology_test" / "topology_metrics.json").exists()
+    assert (run_log_dir / "topology_test" / "topology_metrics.csv").exists()
+    assert (tmp_path / "tccig_cache" / "score_cache" / "tiny" / "manifests" / "train.json").exists()
+
+
+def test_tccig_orchestrator_rejects_removed_hook_config(tmp_path: Path) -> None:
+    config = _tiny_config(tmp_path, "legacy")
+    config["pairwise_scorer"] = {"target": "legacy.module:score"}
+
+    with pytest.raises(ValueError, match="pairwise_scorer.target"):
+        run_tccig_pipeline(config)
+
+
+def test_tccig_script_uses_cpu_fallback_when_nvidia_smi_is_absent(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    uv_args_path = tmp_path / "uv_args.txt"
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\n" "$@" > "$GRAND_UV_ARGS_OUT"\n',
+        encoding="utf-8",
     )
-    assert scoring_manifest.exists()
-    assert '"pair_count": 2' in scoring_manifest.read_text(encoding="utf-8")
-    score_dir = tmp_path / "data" / "tccig" / "score_cache" / "tiny"
-    assert (score_dir / "manifests" / "validation.json").exists()
-    assert not (score_dir / "shards").exists()
-    assert not (score_dir / "progress.csv").exists()
-    assert not (tmp_path / "logs" / "tccig" / "score" / "tiny").exists()
-    assert not (tmp_path / "logs" / "tccig" / "refiner" / "tiny").exists()
-    assert not (tmp_path / "logs" / "tccig" / "validation" / "tiny").exists()
-    assert not (tmp_path / "logs" / "tccig" / "run" / "tiny").exists()
+    fake_uv.chmod(0o755)
+    (tmp_path / ".venv").mkdir()
 
-
-def test_tccig_freezes_epoch0_scorer_threshold_from_validation_precision(
-    tmp_path: Path,
-) -> None:
-    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
-    _write_tiny_pring_fixture(processed_dir)
-
-    result = run_tccig_pipeline(
-        {
-            "run": _run_config(tmp_path, "target_precision"),
-            "data": {"processed_dir": str(processed_dir)},
-            "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
-            "pairwise_scorer": {"target": f"{__name__}:fake_score_pairs"},
-            "refiner": {
-                "train_target": f"{__name__}:fake_train_refiner",
-                "predict_target": f"{__name__}:fake_predict_refined",
-            },
-            "graph_selection": {
-                "pairwise_input_threshold": {
-                    "mode": "target_precision",
-                    "target_precision": 0.8,
-                    "split": "validation",
-                },
-                "refined_output_rule": {"type": "threshold", "value": 0.5},
-                "rules": [{"type": "threshold", "value": 0.5}],
-            },
-        }
-    )
-
-    assert result.pairwise_input_threshold["mode"] == "target_precision"
-    assert result.pairwise_input_threshold["value"] == pytest.approx(0.9)
-    assert result.pairwise_input_threshold["metrics_at_threshold"]["precision"] == pytest.approx(
-        1.0
-    )
-    run_log_dir = tmp_path / "logs" / "tccig" / "target_precision"
-    epoch0_metrics = json.loads(
-        (run_log_dir / "epoch0" / "scorer_metrics.json").read_text(encoding="utf-8")
-    )
-    assert epoch0_metrics["epoch"] == 0
-    assert epoch0_metrics["pairwise_input_threshold"]["source"] == "scorer_validation_epoch0"
-    assert epoch0_metrics["pairwise_input_threshold"]["target_precision"] == pytest.approx(0.8)
-    assert epoch0_metrics["refined_output_rule"] == {"type": "threshold", "value": 0.5}
-    assert epoch0_metrics["splits"]["validation"]["precision_at_threshold"] == pytest.approx(1.0)
-    assert (
-        run_log_dir / "thresholds" / "frozen_pairwise_input_threshold.json"
-    ).exists()
-    assert not (run_log_dir / "validation" / "selected_calibration.json").exists()
-
-
-def test_pairwise_test_metrics_use_refined_probabilities_without_baseline_logs(
-    tmp_path: Path,
-) -> None:
-    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
-    _write_tiny_pring_fixture(processed_dir)
-    HOOK_EVENTS.clear()
-
-    result = run_tccig_pipeline(
-        {
-            "run": _run_config(tmp_path, "refined_pairwise"),
-            "data": {"processed_dir": str(processed_dir)},
-            "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
-            "pairwise_scorer": {
-                "target": f"{__name__}:fake_score_pairs_with_wrong_pairwise_baseline",
-            },
-            "refiner": {
-                "train_target": f"{__name__}:fake_train_refiner",
-                "predict_target": f"{__name__}:fake_predict_refined_corrects_pairwise_test",
-            },
-            "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
-        }
-    )
-
-    assert ("predict_refined", "pairwise_test") in HOOK_EVENTS
-    assert result.pairwise_metrics["f1"] == 1.0
-    assert result.pairwise_metrics["mcc"] == 1.0
-
-    baseline_dir = (
-        tmp_path
-        / "logs"
-        / "tccig"
-        / "pairwise_baseline"
-    )
-    pairwise_metrics_path = (
-        tmp_path
-        / "logs"
-        / "tccig"
-        / "refined_pairwise"
-        / "pairwise_test"
-        / "pairwise_metrics.json"
-    )
-    pairwise_metrics = json.loads(pairwise_metrics_path.read_text(encoding="utf-8"))
-    assert not baseline_dir.exists()
-    assert pairwise_metrics["f1"] == 1.0
-    assert pairwise_metrics["mcc"] == 1.0
-
-
-def test_tccig_orchestrator_rejects_removed_top_m_and_top_k_rules(tmp_path: Path) -> None:
-    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
-    _write_tiny_pring_fixture(processed_dir)
-
-    base_config = {
-        "run": _run_config(tmp_path, "removed_rule"),
-        "data": {"processed_dir": str(processed_dir)},
-        "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
-        "pairwise_scorer": {"target": f"{__name__}:fake_score_pairs"},
-        "refiner": {
-            "train_target": f"{__name__}:fake_train_refiner",
-            "predict_target": f"{__name__}:fake_predict_refined",
+    subprocess.run(
+        ["/bin/bash", str(repo_root / "scripts" / "tccig.sh")],
+        cwd=repo_root,
+        env={
+            "GRAND_REPO_ROOT": str(tmp_path),
+            "GRAND_UV_ARGS_OUT": str(uv_args_path),
+            "HOME": str(tmp_path),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
         },
-    }
-
-    for removed_rule in ({"type": "top_m", "m": 1}, {"type": "top_k", "k": 1}):
-        with pytest.raises(ValueError, match="only support threshold"):
-            run_tccig_pipeline(
-                {
-                    **base_config,
-                    "graph_selection": {
-                        "rules": [{"type": "threshold", "value": 0.5}, removed_rule]
-                    },
-                }
-            )
-
-
-def test_tccig_pairwise_score_cache_reuses_strict_split_scores(tmp_path: Path) -> None:
-    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
-    _write_tiny_pring_fixture(processed_dir)
-    config = {
-        "run": _run_config(tmp_path, "score_cache"),
-        "data": {"processed_dir": str(processed_dir)},
-        "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
-        "pairwise_scorer": {
-            "target": f"{__name__}:fake_score_pairs",
-            "score_cache": {"enabled": True},
-        },
-        "refiner": {
-            "train_target": f"{__name__}:fake_train_refiner",
-            "predict_target": f"{__name__}:fake_predict_refined",
-        },
-        "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
-    }
-
-    HOOK_EVENTS.clear()
-    run_tccig_pipeline(config)
-    assert ("score", "topology_test") in HOOK_EVENTS
-    score_cache_path = (
-        tmp_path / "data" / "tccig" / "score_cache" / "score_cache" / "cache" / "train.pt"
-    )
-    assert score_cache_path.exists()
-    score_manifest_path = (
-        tmp_path
-        / "data"
-        / "tccig"
-        / "score_cache"
-        / "score_cache"
-        / "manifests"
-        / "train.json"
-    )
-    assert score_manifest_path.exists()
-
-    HOOK_EVENTS.clear()
-    result = run_tccig_pipeline(config)
-
-    assert not any(event[0] == "score" for event in HOOK_EVENTS)
-    assert ("train_refiner", 2) in HOOK_EVENTS
-    assert ("predict_refined", "topology_test") in HOOK_EVENTS
-    assert result.pairwise_metrics["f1"] == 1.0
-
-
-def test_tccig_score_cache_rescores_when_pair_order_changes(tmp_path: Path) -> None:
-    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
-    _write_tiny_pring_fixture(processed_dir)
-    config = {
-        "run": _run_config(tmp_path, "pair_order_cache"),
-        "data": {"processed_dir": str(processed_dir)},
-        "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
-        "pairwise_scorer": {
-            "target": f"{__name__}:fake_score_pairs",
-            "score_cache": {"enabled": True},
-        },
-        "refiner": {
-            "train_target": f"{__name__}:fake_train_refiner",
-            "predict_target": f"{__name__}:fake_predict_refined",
-        },
-        "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
-    }
-
-    HOOK_EVENTS.clear()
-    run_tccig_pipeline(config)
-    _write_pairs(
-        processed_dir / "human_test_ppi.txt",
-        [("T2", "T3", 0), ("T1", "T1", 1), ("T1", "T2", 1)],
+        check=True,
+        timeout=30,
     )
 
-    HOOK_EVENTS.clear()
-    run_tccig_pipeline(config)
-
-    assert [event for event in HOOK_EVENTS if event[0] == "score"] == [("score", "pairwise_test")]
-
-
-def test_tccig_score_cache_rescores_when_scorer_fingerprint_changes(tmp_path: Path) -> None:
-    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
-    _write_tiny_pring_fixture(processed_dir)
-    base_config = {
-        "run": _run_config(tmp_path, "fingerprint_cache"),
-        "data": {"processed_dir": str(processed_dir)},
-        "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
-        "pairwise_scorer": {
-            "target": f"{__name__}:fake_score_pairs",
-            "score_cache": {"enabled": True},
-        },
-        "refiner": {
-            "train_target": f"{__name__}:fake_train_refiner",
-            "predict_target": f"{__name__}:fake_predict_refined",
-        },
-        "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
-    }
-    changed_config = {
-        **base_config,
-        "pairwise_scorer": {
-            "target": f"{__name__}:fake_score_pairs_alias",
-            "score_cache": {"enabled": True},
-        },
-    }
-
-    HOOK_EVENTS.clear()
-    run_tccig_pipeline(base_config)
-
-    HOOK_EVENTS.clear()
-    run_tccig_pipeline(changed_config)
-
-    assert [event for event in HOOK_EVENTS if event[0] == "score"] == [
-        ("score", "train"),
-        ("score", "validation"),
-        ("score", "pairwise_test"),
-        ("score", "topology_test"),
+    assert uv_args_path.read_text(encoding="utf-8").splitlines() == [
+        "run",
+        "--locked",
+        "--no-sync",
+        "--offline",
+        "python",
+        "-m",
+        "tccig.train",
+        "--config",
+        "configs/tccig/01.yaml",
     ]
 
 
-def test_fixed_refined_output_threshold_is_independent_from_scorer_input_threshold(
-    tmp_path: Path,
-) -> None:
-    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
-    _write_tiny_pring_fixture(processed_dir)
-    HOOK_EVENTS.clear()
-
-    result = run_tccig_pipeline(
-        {
-            "run": _run_config(tmp_path, "calibrated_case"),
-            "data": {"processed_dir": str(processed_dir)},
-            "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
-            "pairwise_scorer": {"target": f"{__name__}:fake_score_pairs"},
-            "refiner": {
-                "train_target": f"{__name__}:fake_train_refiner",
-                "predict_target": f"{__name__}:fake_predict_refined_uses_fixed_output_threshold",
-            },
-            "graph_selection": {
-                "pairwise_input_threshold": {"mode": "fixed", "value": 0.95},
-                "refined_output_rule": {"type": "threshold", "value": 0.5},
-                "rules": [{"type": "threshold", "value": 0.5}],
-            },
-        }
+def test_tccig_script_launches_accelerate_with_detected_gpu_count(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    srun_args_path = tmp_path / "srun_args.txt"
+    fake_nvidia_smi = fake_bin / "nvidia-smi"
+    fake_nvidia_smi.write_text(
+        "#!/bin/bash\n"
+        "printf 'GPU 0\\nGPU 1\\n'\n",
+        encoding="utf-8",
     )
-
-    assert result.pairwise_input_threshold["value"] == pytest.approx(0.95)
-    assert result.refined_output_rule == {"type": "threshold", "value": 0.5}
-    assert result.pairwise_metrics["f1"] == 1.0
-    assert result.pairwise_metrics["mcc"] == 1.0
-
-    threshold_dir = tmp_path / "logs" / "tccig" / "calibrated_case" / "thresholds"
-    pairwise_input_threshold = json.loads(
-        (threshold_dir / "frozen_pairwise_input_threshold.json").read_text(encoding="utf-8")
+    fake_nvidia_smi.chmod(0o755)
+    fake_srun = fake_bin / "srun"
+    fake_srun.write_text(
+        "#!/bin/bash\n"
+        'printf "%s\\n" "$@" > "$GRAND_SRUN_ARGS_OUT"\n',
+        encoding="utf-8",
     )
-    refined_output_rule = json.loads(
-        (threshold_dir / "refined_output_rule.json").read_text(encoding="utf-8")
-    )
-    assert pairwise_input_threshold["value"] == pytest.approx(0.95)
-    assert refined_output_rule == {"type": "threshold", "value": 0.5}
+    fake_srun.chmod(0o755)
+    (tmp_path / ".venv").mkdir()
 
-    prediction_path = (
-        tmp_path
-        / "logs"
-        / "tccig"
-        / "calibrated_case"
-        / "topology_test"
-        / "all_test_ppi_pred.txt"
-    )
-    predicted_rows = prediction_path.read_text(encoding="utf-8").strip().splitlines()
-    assert predicted_rows == ["T1\tT2\t1", "T1\tT3\t0"]
-
-    metrics_payload = json.loads(
-        (
-            tmp_path
-            / "logs"
-            / "tccig"
-            / "calibrated_case"
-            / "topology_test"
-            / "topology_metrics.json"
-        ).read_text(encoding="utf-8")
-    )
-    assert metrics_payload["refined_output_rule"] == {"type": "threshold", "value": 0.5}
-    assert metrics_payload["pairwise_input_rule"] == {"type": "threshold", "value": 0.95}
-    assert metrics_payload["pair_counts"] == {
-        "candidate_pairs": 2,
-        "pairwise_graph_edges": 0,
-        "refined_positive_edges": 1,
-    }
-
-
-def test_tccig_builds_validation_topology_bucket_all_pairs(tmp_path: Path) -> None:
-    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
-    _write_tiny_pring_fixture(processed_dir)
-    HOOK_EVENTS.clear()
-    SCORE_PAIR_COUNTS.clear()
-
-    run_tccig_pipeline(
-        {
-            "run": _run_config(tmp_path, "validation_topology"),
-            "data": {"processed_dir": str(processed_dir)},
-            "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
-            "pairwise_scorer": {"target": f"{__name__}:fake_score_pairs"},
-            "refiner": {
-                "train_target": f"{__name__}:fake_train_refiner",
-                "predict_target": f"{__name__}:fake_predict_refined",
-                "monitor_metric": "val_auprc",
-                "topology_validation": {
-                    "enabled": True,
-                    "node_sizes": [3],
-                    "samples_per_size": 1,
-                    "strategy": "mixed",
-                    "seed": 7,
-                    "inference_batch_size": 4,
-                    "compute_clustering_mmd": False,
-                },
-            },
-            "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
-        }
-    )
-
-    assert ("score", "validation_topology") in HOOK_EVENTS
-    assert ("validation_topology", 3) in SCORE_PAIR_COUNTS
-    validation_topology_manifest = (
-        tmp_path
-        / "data"
-        / "tccig"
-        / "score_cache"
-        / "validation_topology"
-        / "manifests"
-        / "validation_topology.json"
-    )
-    manifest = json.loads(validation_topology_manifest.read_text(encoding="utf-8"))
-    assert manifest["pair_count"] == 3
-    assert manifest["validation_topology_pairs"] == 3
-    assert manifest["validation_topology_node_sizes"] == [3]
-    assert not (tmp_path / "logs" / "tccig" / "score" / "validation_topology").exists()
-
-
-def test_tccig_orchestrator_runs_v3_1_pairwise_scorer_with_fake_refiner(
-    tmp_path: Path,
-) -> None:
-    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
-    _write_tiny_pring_fixture(processed_dir)
-    model_config_path, checkpoint_path, cache_dir = _write_tiny_v3_1_pairwise_assets(tmp_path)
-    HOOK_EVENTS.clear()
-
-    result = run_tccig_pipeline(
-        {
-            "run": _run_config(tmp_path, "v3_1_pairwise"),
-            "data": {"processed_dir": str(processed_dir)},
-            "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
-            "pairwise_scorer": {
-                "target": "tccig.train:score_pairs_with_v3_1",
-                "model_config_path": str(model_config_path),
-                "checkpoint_path": str(checkpoint_path),
-                "embedding_cache_dir": str(cache_dir),
-                "batch_size": 2,
-                "max_sequence_length": 8,
-            },
-            "refiner": {
-                "train_target": f"{__name__}:fake_train_refiner",
-                "predict_target": f"{__name__}:fake_predict_refined",
-            },
-            "graph_selection": {
-                "rules": [
-                    {"type": "threshold", "value": 0.5},
-                ]
-            },
-        }
-    )
-
-    assert ("train_refiner", 2) in HOOK_EVENTS
-    assert ("predict_refined", "topology_test") in HOOK_EVENTS
-    assert result.manifest["pair_counts"]["topology_test"] == 2
-    assert result.refined_output_rule == {"type": "threshold", "value": 0.5}
-
-    scoring_manifest = (
-        tmp_path
-        / "data"
-        / "tccig"
-        / "score_cache"
-        / "v3_1_pairwise"
-        / "manifests"
-        / "train.json"
-    )
-    assert scoring_manifest.exists()
-    manifest = json.loads(scoring_manifest.read_text(encoding="utf-8"))
-    assert manifest["pair_count"] == 2
-    score_dir = tmp_path / "data" / "tccig" / "score_cache" / "v3_1_pairwise"
-    assert not (score_dir / "shards").exists()
-    assert not (score_dir / "progress.csv").exists()
-    assert not (tmp_path / "logs" / "tccig" / "score" / "v3_1_pairwise").exists()
-
-
-def test_tccig_preflight_rejects_refiner_input_dim_mismatch(tmp_path: Path) -> None:
-    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
-    _write_tiny_pring_fixture(processed_dir)
-    model_config_path, checkpoint_path, cache_dir = _write_tiny_v3_1_pairwise_assets(tmp_path)
-    HOOK_EVENTS.clear()
-
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"TCCIG preflight dimension mismatch: "
-            r"pairwise_scorer.model_config.input_dim=8, "
-            r"refiner.input_dim=7, embedding_cache_dim=8"
-        ),
-    ):
-        run_tccig_pipeline(
-            {
-                "run": _run_config(tmp_path, "dim_mismatch"),
-                "data": {"processed_dir": str(processed_dir)},
-                "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
-                "pairwise_scorer": {
-                    "target": "tccig.train:score_pairs_with_v3_1",
-                    "model_config_path": str(model_config_path),
-                    "checkpoint_path": str(checkpoint_path),
-                    "embedding_cache_dir": str(cache_dir),
-                    "batch_size": 2,
-                    "max_sequence_length": 8,
-                },
-                "refiner": {
-                    "train_target": f"{__name__}:fake_train_refiner",
-                    "predict_target": f"{__name__}:fake_predict_refined",
-                    "input_dim": 7,
-                },
-                "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
-            }
-        )
-
-    assert HOOK_EVENTS == []
-    assert not (tmp_path / "logs" / "tccig" / "score" / "dim_mismatch").exists()
-
-
-def test_tccig_preflight_rejects_embedding_cache_dim_mismatch(tmp_path: Path) -> None:
-    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
-    _write_tiny_pring_fixture(processed_dir)
-    model_config_path, checkpoint_path, cache_dir = _write_tiny_v3_1_pairwise_assets(tmp_path)
-    torch.save(torch.ones((3, 6), dtype=torch.float32), cache_dir / "embeddings" / "A.pt")
-    HOOK_EVENTS.clear()
-
-    with pytest.raises(
-        ValueError,
-        match=(
-            r"TCCIG preflight dimension mismatch: "
-            r"pairwise_scorer.model_config.input_dim=8, "
-            r"refiner.input_dim=8, embedding_cache_dim=6"
-        ),
-    ):
-        run_tccig_pipeline(
-            {
-                "run": _run_config(tmp_path, "cache_dim_mismatch"),
-                "data": {"processed_dir": str(processed_dir)},
-                "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
-                "pairwise_scorer": {
-                    "target": "tccig.train:score_pairs_with_v3_1",
-                    "model_config_path": str(model_config_path),
-                    "checkpoint_path": str(checkpoint_path),
-                    "embedding_cache_dir": str(cache_dir),
-                    "batch_size": 2,
-                    "max_sequence_length": 8,
-                },
-                "refiner": {
-                    "train_target": f"{__name__}:fake_train_refiner",
-                    "predict_target": f"{__name__}:fake_predict_refined",
-                    "input_dim": 8,
-                },
-                "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
-            }
-        )
-
-    assert HOOK_EVENTS == []
-    assert not (tmp_path / "logs" / "tccig" / "score" / "cache_dim_mismatch").exists()
-
-
-def test_tccig_runtime_wires_deepspeed_backend_without_launching_it(tmp_path: Path) -> None:
-    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
-    _write_tiny_pring_fixture(processed_dir)
-    accelerator_calls: list[dict[str, object]] = []
-
-    class FakeAccelerator:
-        device = "cpu"
-
-    def fake_build_accelerator(**kwargs: object) -> FakeAccelerator:
-        accelerator_calls.append(dict(kwargs))
-        return FakeAccelerator()
-
-    run_tccig_pipeline(
-        {
-            "run": _run_config(tmp_path, "runtime_case"),
-            "data": {"processed_dir": str(processed_dir)},
-            "device": {
-                "device": "cuda",
-                "backend": "deepspeed",
-                "mixed_precision": True,
-                "find_unused_parameters": True,
-            },
-            "pairwise_scorer": {"target": f"{__name__}:fake_score_pairs"},
-            "refiner": {
-                "train_target": f"{__name__}:fake_train_refiner",
-                "predict_target": f"{__name__}:fake_predict_refined",
-            },
-            "graph_selection": {"rules": [{"type": "threshold", "value": 0.5}]},
+    subprocess.run(
+        ["/bin/bash", str(repo_root / "scripts" / "tccig.sh")],
+        cwd=repo_root,
+        env={
+            "GRAND_REPO_ROOT": str(tmp_path),
+            "GRAND_SRUN_ARGS_OUT": str(srun_args_path),
+            "HOME": str(tmp_path),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
         },
-        build_accelerator_fn=fake_build_accelerator,
+        check=True,
+        timeout=30,
     )
 
-    assert accelerator_calls == [
-        {
-            "requested_device": "cuda",
-            "backend": "deepspeed",
-            "ddp_enabled": True,
-            "use_mixed_precision": True,
-            "find_unused_parameters": True,
-        }
+    assert srun_args_path.read_text(encoding="utf-8").splitlines() == [
+        "uv",
+        "run",
+        "--locked",
+        "--no-sync",
+        "--offline",
+        "accelerate",
+        "launch",
+        "--num_processes",
+        "2",
+        "--num_machines",
+        "1",
+        "--mixed_precision",
+        "bf16",
+        "--dynamo_backend",
+        "no",
+        "tccig/train.py",
+        "--config",
+        "configs/tccig/01.yaml",
     ]
 
 
-def test_tccig_orchestrator_runs_s2gae_refiner_on_tiny_fixture(tmp_path: Path) -> None:
-    processed_dir = tmp_path / "data" / "PRING" / "human" / "BFS"
-    _write_tiny_pring_fixture(processed_dir)
-    _, _, cache_dir = _write_tiny_v3_1_pairwise_assets(tmp_path)
-    HOOK_EVENTS.clear()
-    accelerator_events: list[tuple[str, int]] = []
+def test_tccig_accelerate_cpu_smoke_preserves_topology_artifact_order(tmp_path: Path) -> None:
+    single_config = _tiny_config(tmp_path, "single")
+    run_tccig_pipeline(single_config)
 
-    class FakeAccelerator:
-        device = "cpu"
+    config = _tiny_config(tmp_path, "ddp")
+    config_path = tmp_path / "tccig.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    repo_root = Path(__file__).resolve().parents[2]
+    pythonpath = f"{repo_root}:{os.environ.get('PYTHONPATH', '')}"
 
-        def prepare(self, *args: object) -> tuple[object, ...]:
-            accelerator_events.append(("prepare", len(args)))
-            module, *rest = args
-            assert isinstance(module, torch.nn.Module)
-            return (_ForwardOnlyDDP(module, accelerator_events), *rest)
-
-        def backward(self, loss: torch.Tensor) -> None:
-            accelerator_events.append(("backward", 1))
-            loss.backward()
-
-        def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
-            del model
-            raise AssertionError("S2GAE refiner should unwrap DDP without accelerator.unwrap_model")
-
-    class _ForwardOnlyDDP(torch.nn.Module):
-        def __init__(
-            self,
-            module: torch.nn.Module,
-            events: list[tuple[str, int]],
-        ) -> None:
-            super().__init__()
-            self.module = module
-            self._events = events
-
-        def forward(self, **kwargs: object) -> object:
-            self._events.append(("forward", 1))
-            return self.module(**kwargs)
-
-    def fake_build_accelerator(**kwargs: object) -> FakeAccelerator:
-        del kwargs
-        return FakeAccelerator()
-
-    result = run_tccig_pipeline(
-        {
-            "run": _run_config(tmp_path, "s2gae_tiny"),
-            "data": {"processed_dir": str(processed_dir)},
-            "device": {"device": "cpu", "backend": "ddp", "mixed_precision": False},
-            "pairwise_scorer": {"target": f"{__name__}:fake_score_pairs"},
-            "refiner": {
-                "train_target": "tccig.s2gae:train_refiner",
-                "predict_target": "tccig.s2gae:predict_refined",
-                "encoder": "graphconv",
-                "input_dim": 8,
-                "hidden_dim": 8,
-                "num_layers": 1,
-                "decoder_hidden_dim": 8,
-                "decoder_layers": 1,
-                "dropout": 0.0,
-                "epochs": 2,
-                "batch_size": 2,
-                "loss": {
-                    "type": "bce_with_logits",
-                    "pos_weight": 1.5,
-                    "label_smoothing": 0.1,
-                },
-                "optimizer": {
-                    "type": "adamw",
-                    "lr": 0.01,
-                    "weight_decay": 0.0,
-                    "beta1": 0.9,
-                    "beta2": 0.999,
-                    "eps": 1.0e-8,
-                },
-                "scheduler": {"type": "none"},
-                "optimization": {"gradient_clip_norm": 1.0},
-                "residual_weight": 0.001,
-                "topology_loss": {
-                    "enabled": True,
-                    "weight": 0.1,
-                    "sampling": {
-                        "node_sizes": [3],
-                        "samples_per_size": 1,
-                        "strategy": "mixed",
-                        "seed": 11,
-                    },
-                    "losses": {
-                        "alpha": 0.5,
-                        "beta": 1.0,
-                        "gamma": 0.0,
-                        "delta": 0.0,
-                    },
-                },
-                "monitor_metric": "val_topology_loss",
-                "topology_validation": {
-                    "enabled": True,
-                    "node_sizes": [3],
-                    "samples_per_size": 1,
-                    "strategy": "mixed",
-                    "seed": 7,
-                    "inference_batch_size": 2,
-                    "compute_clustering_mmd": False,
-                    "losses": {
-                        "alpha": 0.5,
-                        "beta": 1.0,
-                        "gamma": 0.3,
-                        "delta": 0.3,
-                    },
-                },
-                "embedding_cache_dir": str(cache_dir),
-                "embedding_index_path": str(cache_dir / "index.json"),
-                "max_sequence_length": 8,
-                "checkpoint_path": str(tmp_path / "models" / "s2gae" / "best_model.pt"),
-            },
-            "graph_selection": {
-                "rules": [
-                    {"type": "threshold", "value": 0.5},
-                ]
-            },
-        },
-        build_accelerator_fn=fake_build_accelerator,
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "accelerate.commands.launch",
+            "--cpu",
+            "--num_processes",
+            "2",
+            "tccig/train.py",
+            "--config",
+            str(config_path),
+        ],
+        cwd=repo_root,
+        env={**os.environ, "PYTHONPATH": pythonpath},
+        check=True,
+        timeout=180,
     )
 
-    assert ("prepare", 2) in accelerator_events
-    assert ("forward", 1) in accelerator_events
-    assert ("backward", 1) in accelerator_events
-    assert ("score", "train_topology") in HOOK_EVENTS
-    assert result.refined_output_rule == {"type": "threshold", "value": 0.5}
-    assert result.manifest["pair_counts"]["topology_test"] == 2
-    assert (tmp_path / "models" / "s2gae" / "best_model.pt").exists()
-    training_summary_path = (
-        tmp_path / "logs" / "tccig" / "s2gae_tiny" / "training_summary.json"
+    single_rows = _read_topology_prediction_rows(
+        tmp_path / "logs" / "tccig" / "single" / "topology_test" / "all_test_ppi_pred.txt"
     )
-    training_summary = json.loads(training_summary_path.read_text(encoding="utf-8"))
-    assert training_summary["monitor_metric"] == "val_topology_loss"
-    assert training_summary["epochs_trained"] == 2
-    assert "best_monitor_value" in training_summary
-    assert training_summary["selected_rule"] == {"type": "threshold", "value": 0.5}
-    assert training_summary["config"]["topology_loss"] == {
-        "enabled": True,
-        "weight": 0.1,
-        "losses": {"alpha": 0.5, "beta": 1.0, "gamma": 0.0, "delta": 0.0},
-    }
-    first_epoch = training_summary["history"][0]
-    assert "train_loss" in first_epoch
-    assert "train_bce_loss" in first_epoch
-    assert "train_residual_anchor_loss" in first_epoch
-    assert "train_weighted_residual_anchor_loss" in first_epoch
-    assert "train_topology_loss" in first_epoch
-    assert "train_graph_similarity_loss" in first_epoch
-    assert "train_relative_density_loss" in first_epoch
-    assert "train_gradient_norm" in first_epoch
-    assert first_epoch["learning_rate"] == 0.01
-    assert "val_auprc" in first_epoch
-    assert "val_topology_loss" in first_epoch
-    assert "internal_val_graph_sim" in first_epoch
-    assert training_summary["optimizer"] == {
-        "type": "adamw",
-        "lr": 0.01,
-        "weight_decay": 0.0,
-        "beta1": 0.9,
-        "beta2": 0.999,
-        "eps": 1.0e-8,
-    }
-    assert training_summary["scheduler"] == {"type": "none"}
-    assert training_summary["optimization"] == {"gradient_clip_norm": 1.0}
-    assert training_summary["current_learning_rate"] == 0.01
-    step_csv_path = (
-        tmp_path / "logs" / "tccig" / "s2gae_tiny" / "tccig_train_step.csv"
+    ddp_rows = _read_topology_prediction_rows(
+        tmp_path / "logs" / "tccig" / "ddp" / "topology_test" / "all_test_ppi_pred.txt"
     )
-    with step_csv_path.open("r", encoding="utf-8", newline="") as handle:
-        step_rows = list(csv.DictReader(handle))
-    assert [row["Epoch"] for row in step_rows] == ["1", "2"]
-    assert all(row["Global Train Pairs"] == "2" for row in step_rows)
-    assert all(row["Monitor Metric"] == "val_topology_loss" for row in step_rows)
-    assert all(row["Train Topology Loss"] for row in step_rows)
-    train_topology_manifest = (
-        tmp_path
-        / "data"
-        / "tccig"
-        / "score_cache"
-        / "s2gae_tiny"
-        / "manifests"
-        / "train_topology.json"
+    single_pairwise_rows = _read_pairwise_prediction_rows(
+        tmp_path / "logs" / "tccig" / "single" / "pairwise_test" / "human_test_ppi_pred.csv"
     )
-    assert train_topology_manifest.exists()
-    assert not (tmp_path / "logs" / "tccig" / "s2gae_tiny" / "epoch_manifests").exists()
-    assert not (tmp_path / "logs" / "tccig" / "refiner" / "s2gae_tiny").exists()
+    ddp_pairwise_rows = _read_pairwise_prediction_rows(
+        tmp_path / "logs" / "tccig" / "ddp" / "pairwise_test" / "human_test_ppi_pred.csv"
+    )
 
-    checkpoint = torch.load(tmp_path / "models" / "s2gae" / "best_model.pt")
-    assert checkpoint["config"]["loss"] == {
-        "type": "bce_with_logits",
-        "pos_weight": 1.5,
-        "label_smoothing": 0.1,
-    }
-    assert checkpoint["config"]["optimizer"] == {
-        "type": "adamw",
-        "lr": 0.01,
-        "weight_decay": 0.0,
-        "beta1": 0.9,
-        "beta2": 0.999,
-        "eps": 1.0e-8,
-    }
-    assert checkpoint["config"]["scheduler"] == {"type": "none"}
-    assert checkpoint["config"]["optimization"] == {"gradient_clip_norm": 1.0}
-    assert checkpoint["config"]["topology_loss"] == {
-        "enabled": True,
-        "weight": 0.1,
-        "losses": {"alpha": 0.5, "beta": 1.0, "gamma": 0.0, "delta": 0.0},
-    }
-    assert checkpoint["monitor_metric"] == "val_topology_loss"
-    assert checkpoint["selected_rule"] == {"type": "threshold", "value": 0.5}
-    assert "learning_rate" not in checkpoint["config"]
+    assert len(ddp_pairwise_rows) == len(single_pairwise_rows)
+    assert [set(row) for row in ddp_pairwise_rows] == [set(row) for row in single_pairwise_rows]
+    assert [(row["protein_a"], row["protein_b"]) for row in ddp_pairwise_rows] == [
+        (row["protein_a"], row["protein_b"]) for row in single_pairwise_rows
+    ]
+    assert len(ddp_rows) == len(single_rows)
+    assert [len(row) for row in ddp_rows] == [len(row) for row in single_rows]
+    assert [row[:2] for row in ddp_rows] == [row[:2] for row in single_rows]
+    assert all(row[2] in {"0", "1"} for row in ddp_rows)

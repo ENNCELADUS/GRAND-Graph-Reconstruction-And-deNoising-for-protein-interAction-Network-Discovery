@@ -26,11 +26,14 @@ def test_topology_monitor_values_match_checkpoint_direction() -> None:
         "relative_density": 1.2,
     }
 
-    assert _resolve_monitor_value(
-        monitor_metric="internal_val_graph_sim",
-        validation_auprc=0.1,
-        topology_metrics=metrics,
-    ) == 0.8
+    assert (
+        _resolve_monitor_value(
+            monitor_metric="internal_val_graph_sim",
+            validation_auprc=0.1,
+            topology_metrics=metrics,
+        )
+        == 0.8
+    )
     assert _resolve_monitor_value(
         monitor_metric="internal_val_relative_density",
         validation_auprc=0.1,

@@ -292,7 +292,7 @@ def _tccig_runtime(*, rank: int, world_size: int) -> tccig_train.TCCIGRuntime:
     return tccig_train.TCCIGRuntime(
         device="cpu",
         backend="ddp",
-        mixed_precision=False,
+        mixed_precision="no",
         accelerator=_TCCIGFakeAccelerator(),
         is_distributed=True,
         rank=rank,

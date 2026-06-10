@@ -7,10 +7,10 @@
 ### Stage 0 — Pairwise classifier 准备
 
 第一版具体 pairwise 模块是 checkpoint-backed v3.1
-`pair_context_gated_abba_no_cross` scorer。它通过
-`pairwise_scorer.target: tccig.train:score_pairs_with_v3_1` 接入
-`tccig/train.py`，从配置加载 v3.1 architecture config、single checkpoint 和
-ESM3 embedding cache，对 TCCIG scaffold 传入的 label-free candidate pairs 输出：
+`pair_context_gated_abba_no_cross` scorer。它是 `tccig/train.py` 中的 concrete
+`score_pairs_with_v3_1(...)` path，从配置加载 v3.1 architecture config、single
+checkpoint 和 ESM3 embedding cache，对 TCCIG scaffold 传入的 label-free
+candidate pairs 输出：
 
 ```text
 s_ij = sigmoid(Cφ(x_i, x_j))
@@ -29,12 +29,11 @@ model_config:
     mode: none
 ```
 
-当前实现保留 frozen pairwise scorer，并通过 `refiner.train_target:
-tccig.s2gae:train_refiner` / `refiner.predict_target:
-tccig.s2gae:predict_refined` 接入 S2GAE residual denoiser。TCCIG run 内不训练
-pairwise model；pairwise scorer 只负责生成 `G_pairwise` 和 residual baseline。
+当前实现保留 frozen pairwise scorer，并直接调用 concrete S2GAE residual
+denoiser。TCCIG run 内不训练 pairwise model；pairwise scorer 只负责生成
+`G_pairwise` 和 residual baseline。动态 scorer/refiner hook config 已移除。
 
-当前 `03_fixed_threshold` pipeline 使用一个 frozen v3.1 checkpoint 对 train、validation、pairwise-test、topology-test candidate pairs 打分，并把 scorer outputs 缓存在 `data/tccig/score_cache/<run_id>/cache/*.pt`。如果后续重新训练 pairwise model，不要直接用“在同一批 train labels 上训练过的 pairwise model”给 train graph 打分，否则 noisy graph 会过于干净；那时应改成 **K-fold out-of-fold pairwise predictions**：
+当前 `01` pipeline 使用一个 frozen v3.1 checkpoint 对 train、validation、pairwise-test、topology-test candidate pairs 打分，并把 scorer outputs 缓存在 `data/tccig/score_cache/<run_id>/scores/*.pt`。如果后续重新训练 pairwise model，不要直接用“在同一批 train labels 上训练过的 pairwise model”给 train graph 打分，否则 noisy graph 会过于干净；那时应改成 **K-fold out-of-fold pairwise predictions**：
 
 ```text
 for fold k:
@@ -88,7 +87,7 @@ h_e(v,u) = concat_{k,j=1..K}(h_v^k * h_u^j)
 g(v,u) = MLP(h_e(v,u))
 ```
 
-这里不直接照搬 vanilla S2GAE 的 `true graph -> mask -> reconstruct masked true edges`。对 TCCIG，`G_pairwise` 已经是 classifier 生成的 noisy / perturbed graph，因此 first implementation 可以把它视作 S2GAE 的 `G_perb`，再训练 decoder 去恢复真实 train topology。可选地，在训练时对 `G_pairwise` 做轻量 edge dropout 作为额外 perturbation，但目标仍然是 `A_true`，不是重建 `G_pairwise` 本身。
+这里不直接照搬 vanilla S2GAE 的 `true graph -> mask -> reconstruct masked true edges`。对 TCCIG，`G_pairwise` 已经是 classifier 生成的 noisy graph；训练时用 frozen scorer 和 frozen `tau_pair` 把 train candidate pairs 分成 `TP` / `FP` / `FN` / `TN` 四类，再采样 edge targets。每个 step 只把本 step 需要预测且已经存在于 `G_pairwise` 的 target edges 从 encoder 输入里临时 mask 掉，让 encoder 在 masked full `G_pairwise` 上生成 node representations，decoder/loss 只作用于 sampled edge targets。目标仍然是真实 train topology，不是重建 `G_pairwise` 本身。
 
 #### Forward
 
@@ -103,9 +102,7 @@ G_pairwise = predicted graph from pairwise classifier
 Encoder 采用 S2GAE-style GNN backbone。它必须是 **feature-based inductive encoder**，不能是 transductive node embedding table。v1 实现使用 PyG `GraphConv`，并把 `G_pairwise` 中的 pairwise score confidence 作为 `edge_weight=s_ij` 输入 weighted message passing。
 
 ```text
-G_input = G_pairwise
-# optional training-only perturbation:
-# G_input = drop_edges(G_pairwise, drop_rate)
+G_input_step = G_pairwise - (FP_batch union TP_batch)
 
 h_i^0 = MLP_x(x_i)
 for k = 1..K:
@@ -114,7 +111,7 @@ for k = 1..K:
         + W_neigh AGG_k({edge_weight_ij * h_j^{k-1}: j in N_input(i)})
 ```
 
-这里的 `G_input` 对应 S2GAE 的 perturbed graph input；区别是 perturbation 主来源不是从真实图里人工 mask，而是 pairwise classifier 的 imperfect predictions。当前 `GraphConv` 路径不显式加入 self-loop；node self-information 来自 root/self transform `W_self h_i`。这样 test 时也能用同一套流程：`X_test + G_pairwise_test -> H_test`，不需要也不允许访问 `human_test_graph.pkl`。
+这里的 `G_input_step` 对应 S2GAE 的 perturbed graph input；区别是 mask 集合由 scorer error quadrant sampling 决定，而不是从真实 observed graph 随机采样。`FP_batch` 和 `TP_batch` 本来存在于 `G_pairwise`，所以作为当前 step 的 prediction targets 时必须临时移除；`FN_batch` 和 `TN_batch` 本来不在 `G_pairwise`，只作为 decoder/loss targets。当前 `GraphConv` 路径不显式加入 self-loop；node self-information 来自 root/self transform `W_self h_i`。test 时不做 training mask，流程仍是 `X_test + G_pairwise_test -> H_test`，不需要也不允许访问 `human_test_graph.pkl`。
 
 Decoder 用 S2GAE 的 cross-correlation 思路，显式利用多层 node representations 的交叉粒度信息：
 
@@ -127,39 +124,91 @@ p_refined_ij = sigmoid(l_pairwise_ij + Δ_ij)
 
 `p_refined_ij = sigmoid(l_pairwise_ij + Δ_ij)` 是硬性设计：denoiser 学的是 residual refinement，而不是从零替代 pairwise classifier。训练时可以在 edge-score level 上计算 BCE；validation/test 使用独立配置的 refined output threshold，当前固定为 `0.5`。
 
-S2GAE 适合作为主模板，因为它不是只重建 node feature，而是用 perturbed graph input、multi-layer GNN hidden states、cross-correlation decoder 来预测 missing edges。TCCIG 的改动是把 “masked edges from true graph” 换成 “missing / false edges relative to true topology under a classifier-generated noisy graph”。
+S2GAE 适合作为主模板，因为它不是只重建 node feature，而是用 perturbed graph input、multi-layer GNN hidden states、cross-correlation decoder 来预测 masked edge targets。TCCIG 的改动是把 “masked observed edges from true graph” 换成 “sampled scorer-correct and scorer-error edge targets under a classifier-generated noisy graph”。
 
 ---
 
-### Stage 3 — Training loss
+### Stage 3 — Sampled-edge training objective
 
 训练 target 是真实 train topology，不是 pairwise graph 本身。
 
 对 train proteins：
 
 ```text
-G_input  = G_pairwise_train
-A_true   = adjacency(train positive PPI graph)
-p_refine = Dθ(X_train, G_input, Ω_train)
+G_pairwise_train = {(i,j): s_ij >= tau_pair}
+y_ij             = PRING train label for candidate pair (i,j)
 ```
 
-当前 `03_fixed_threshold.yaml` 的实际 backward objective 是 supervised link
-denoising 加 residual anchor；`refiner.topology_loss.enabled: false`，所以 train
-topology loss 不进入 backward：
+用 frozen scorer probabilities 和 frozen `tau_pair` 在 epoch 0 定义四个训练象限：
 
 ```text
-L = L_bce
-  + λ_resid * L_residual_anchor
+TP = {(i,j): s_ij >= tau_pair and y_ij = 1}
+FP = {(i,j): s_ij >= tau_pair and y_ij = 0}
+FN = {(i,j): s_ij <  tau_pair and y_ij = 1}
+TN = {(i,j): s_ij <  tau_pair and y_ij = 0}
 ```
 
-#### 1. BCE denoise loss
+`FP` 和 `FN` 是 hard cases，也是 refiner 的主训练对象：`FP` 代表
+`G_pairwise` 里错加的 input edges，`FN` 代表 `G_pairwise` 漏掉的 true
+topology edges。`TP` 和 `TN` 是 easy anchors，用来保持概率校准、防止 refiner
+把 residual correction 学成激进翻转器。
+
+每个 epoch 的 edge targets 是：
 
 ```text
-L_bce = BCEWithLogits(l_ij_refined, y_ij; pos_weight, label_smoothing)
+epoch_targets =
+    all FP
+  + all FN
+  + sampled TP
+  + sampled TN
 ```
 
-其中 `y_ij` 来自 `human_train_ppi_ratio5_exclusive.txt` 的真实 PRING labels。
-权重通过 `refiner.loss` 显式配置；当前 config 为：
+默认训练分布以 hard cases 为主：
+
+```text
+hard_fraction = 0.7
+easy_anchor_fraction = 0.3
+
+hard = FP union FN
+anchor_count = ceil(|hard| * easy_anchor_fraction / hard_fraction)
+sampled_TP ~= anchor_count / 2
+sampled_TN ~= anchor_count / 2
+```
+
+如果 `TP` 或 `TN` 数量不足，由另一类 easy anchor 补齐；如果 scorer 很好导致
+`FP + FN` 太少，训练实现需要用最小 target 数或重复采样保证每个 epoch 有足够
+updates。四个象限由 frozen scorer 和 frozen `tau_pair` 定义，不随 refiner 输出动态
+变化。
+
+#### 1. S2GAE-style mask for sampled targets
+
+每个 optimizer step 从 `epoch_targets` 取一个 edge batch：
+
+```text
+target_batch = FP_batch + FN_batch + TP_batch + TN_batch
+G_input_step = G_pairwise_train - (FP_batch union TP_batch)
+H = Encoder_theta(X_train, G_input_step)
+p_refined = Decoder_theta(H, target_batch)
+```
+
+只 mask 当前 step 被采样为 target 且本来存在于 `G_pairwise_train` 的 edges。
+没有被当前 step 采到的 `TP` / `FP` 仍留在 message passing graph 中。`FN` / `TN`
+本来不在 `G_pairwise_train`，所以不会从 encoder input 中删除，只作为 decoder/loss
+targets。
+
+这个规则对应 S2GAE 的核心约束：被当前 step 预测的 observed/input edge 不能同时
+作为 encoder message-passing edge。否则 decoder 会看到 target edge 本身，容易形成
+trivial shortcut。
+
+#### 2. BCE denoise loss
+
+```text
+L_bce = BCEWithLogits(l_ij_refined, y_ij; pos_weight, label_smoothing),
+for (i,j) in target_batch
+```
+
+其中 `y_ij` 来自 `human_train_ppi_ratio5_exclusive.txt` 的真实 PRING labels。权重通过
+`refiner.loss` 显式配置：
 
 ```yaml
 refiner:
@@ -169,18 +218,26 @@ refiner:
     label_smoothing: 0.02
 ```
 
-#### 2. Residual anchor loss
+#### 3. Residual anchor loss
 
-防止 denoiser 过度 hallucinate。该项对 train batch 里的全部 candidate
-pairs 计算，不只约束 negatives：
+防止 denoiser 过度 hallucinate。该项对当前 `target_batch` 里的全部 pairs 计算，
+不只约束 negatives：
 
 ```text
-L_residual_anchor = mean_{(i,j) in Ω_batch}(Δ_ij^2)
+L_residual_anchor = mean_{(i,j) in target_batch}(Delta_ij^2)
 ```
 
-权重要小，只是约束 refined score 不要脱离 pairwise evidence。
+总训练目标为：
 
-#### 3. Optional train soft topology loss
+```text
+L = L_bce + lambda_resid * L_residual_anchor
+```
+
+权重要小，只是约束 refined score 不要脱离 pairwise evidence。hard-case
+oversampling 会放大 correction 信号，因此 residual anchor 是该 sampled objective 的
+必要稳定项。
+
+#### 4. Optional train soft topology loss
 
 代码支持可选的 train soft topology loss，但当前 config 关闭它。开启时，训练侧
 topology loss 只从 train true topology target 采样 PRING-style bucket all-pairs；
@@ -212,36 +269,38 @@ L_distill = BCE(p_ij_refined, stopgrad(s_ij_pairwise))
 
 ### Stage 4 — Backward / optimization
 
-第一版保持最稳，已经按 standalone `tccig.s2gae:train_refiner`
-实现为 refiner-only optimization：
+Standalone TCCIG 仍然是 refiner-only optimization：
 
 ```text
 freeze Cφ
 train θ only
 ```
 
-`Cφ` 是 pairwise scorer hook，只在进入 refiner 前生成 pairwise probabilities
+`Cφ` 是 frozen pairwise scorer，只在进入 refiner 前生成 pairwise probabilities
 和 `G_pairwise`。它不进入 autograd graph，也不会被 optimizer 持有。
 
-当前 standalone S2GAE 路径使用 **full-batch epoch update**，避免在同一
-epoch 内对同一个 `G_pairwise` 重复运行 GraphConv encoder。每个 epoch：
+新的训练契约使用 sampled-edge DataLoader。每个 epoch 先 materialize
+`epoch_targets = all FP + all FN + sampled TP + sampled TN`，然后 shuffle 成 edge
+batches。每个 batch：
 
 ```text
-1. construct/load G_pairwise subgraph
-2. encode full graph once: H = Encoderθ(X, G_pairwise)
-3. shard Ω by distributed rank with original pair indices
-4. decode rank-local Ω chunks from cached H
-5. reduce rank-local BCE + residual-anchor losses to the global mean objective
-6. accelerator.backward(loss) on θ
-7. optionally clip θ gradients
-8. one AdamW update on θ
+1. remove FP_batch and TP_batch from G_pairwise_train to form G_input_step
+2. encode masked full graph: H = Encoder_theta(X_train, G_input_step)
+3. decode only target_batch
+4. compute BCE + residual anchor on target_batch
+5. accelerator.backward(loss) on theta
+6. optionally clip theta gradients
+7. one AdamW update on theta
 ```
 
-Validation and test refined prediction follow the same operational rule: encode the
-split graph once per eval pass, decode only rank-local candidate pairs, gather
-scores back into original candidate-file order, then apply the fixed refined output
-threshold globally. Initial pairwise scoring is also rank-sharded by original
-candidate row index, with progress evidence under
+This changes the old full-batch one-step-per-epoch behavior. Encoder context stays
+full-graph, but the supervised objective is edge-batched and scorer-error focused.
+
+Validation and test refined prediction do not use training masks. They encode the
+split `G_pairwise` once per eval pass or per implementation-safe eval chunk, decode
+candidate pairs, gather scores back into original candidate-file order, then apply
+the fixed refined output threshold globally. Initial pairwise scoring may still be
+rank-sharded by original candidate row index, with cache evidence under
 `data/tccig/score_cache/<run_id>/`.
 
 Training progress is written after every completed epoch to
@@ -308,7 +367,7 @@ refiner.monitor_metric =
 
 当 monitor 是 topology 指标时，validation 只决定 best checkpoint。refined
 output rule 由 config 固定为 `threshold=0.5`，validation/test 都不再 sweep
-logit bias 或重新选择 threshold；test 也不能根据 `human_test_graph.pkl` 选
+或重新选择 refined threshold；test 也不能根据 `human_test_graph.pkl` 选
 threshold、edge budget、或 degree budget。
 
 `val_topology_loss` 使用和 topology fine-tune validation 一致的 hard-metric
@@ -365,16 +424,15 @@ pipeline.
 Current run artifacts are:
 
 ```text
-logs/tccig/<run_id>/epoch0/scorer_metrics.json
-logs/tccig/<run_id>/thresholds/frozen_pairwise_input_threshold.json
-logs/tccig/<run_id>/thresholds/refined_output_rule.json
+logs/tccig/<run_id>/manifest.json
 logs/tccig/<run_id>/tccig_train_step.csv
 logs/tccig/<run_id>/training_summary.json
-logs/tccig/<run_id>/pairwise_test/pairwise_metrics.{json,csv}
+logs/tccig/<run_id>/pairwise_test/human_test_ppi_pred.csv
+logs/tccig/<run_id>/pairwise_test/pairwise_metrics.json
 logs/tccig/<run_id>/topology_test/all_test_ppi_pred.txt
 logs/tccig/<run_id>/topology_test/topology_metrics.{json,csv}
 models/tccig/s2gae/<run_id>/best_model.pt
-data/tccig/score_cache/<run_id>/cache/*.pt
+data/tccig/score_cache/<run_id>/scores/*.pt
 data/tccig/score_cache/<run_id>/manifests/*.json
 ```
 
@@ -405,11 +463,11 @@ Bandana 适合处理你的 `G_pairwise`，因为 pairwise graph 天然有 soft c
 最终推荐的 paper claim 是：
 
 ```text
-We convert a mature pairwise PPI classifier into an inductive graph reconstruction system by using its predictions to construct an input graph, then training an S2GAE-style residual topology denoiser to refine that noisy graph under supervised link reconstruction, residual anchoring, topology-validation checkpointing, and fixed output thresholding.
+We convert a mature pairwise PPI classifier into an inductive graph reconstruction system by using its predictions to construct an input graph, then training an S2GAE-style residual topology denoiser to refine that noisy graph with scorer-error-focused sampled edge targets, residual anchoring, topology-validation checkpointing, and fixed output thresholding.
 ```
 
 v1 的实现性 claim 应收窄为：
 
 ```text
-We convert a mature pairwise PPI classifier into an inductive graph reconstruction system by using its predictions to construct an input graph, then training an S2GAE-style residual denoiser with supervised link reconstruction, residual anchoring, topology-validation checkpointing, and fixed refined-output thresholding.
+We convert a mature pairwise PPI classifier into an inductive graph reconstruction system by using its predictions to construct an input graph, then training an S2GAE-style residual denoiser with sampled scorer-error edge reconstruction, residual anchoring, topology-validation checkpointing, and fixed refined-output thresholding.
 ```

@@ -9,17 +9,18 @@ import pytest
 import torch
 from src.train.config import LossConfig
 from src.utils.losses import binary_classification_loss
-from tccig.io import CandidatePair
+from tccig.prepare import CandidatePair
 from tccig.s2gae import (
     CrossLayerDecoder,
     S2GAERefiner,
     _build_graph,
-    _local_topology_loss,
+    _masked_split_graph,
+    _ordered_values_from_accelerate_rows,
     _parse_config,
     _prediction_probabilities,
     _rank_local_pair_indices,
+    _S2GAESampledTrainStepModule,
     _SplitGraph,
-    _TopologyLossTask,
     apply_gradient_clipping,
     load_mean_pooled_node_features,
     residual_refined_logits,
@@ -41,6 +42,34 @@ class _FakeDistributedRuntime:
 
     def __init__(self, rank: int) -> None:
         self.rank = rank
+
+
+class _FakeGatherAccelerator:
+    def __init__(self, gathered_rows: torch.Tensor) -> None:
+        self.gathered_rows = gathered_rows
+
+    def pad_across_processes(
+        self,
+        value: torch.Tensor,
+        dim: int = 0,
+        pad_index: int = 0,
+        pad_first: bool = False,
+    ) -> torch.Tensor:
+        del dim, pad_index, pad_first
+        return value
+
+    def gather_for_metrics(self, value: torch.Tensor) -> torch.Tensor:
+        del value
+        return self.gathered_rows
+
+
+class _FakeGatherRuntime:
+    is_distributed = True
+    rank = 0
+    world_size = 2
+
+    def __init__(self, gathered_rows: torch.Tensor) -> None:
+        self.accelerator = _FakeGatherAccelerator(gathered_rows)
 
 
 @pytest.mark.parametrize("rank", [1, 2, 3])
@@ -74,6 +103,43 @@ def test_rank_local_pair_indices_preserves_distributed_stride() -> None:
     )
 
     assert indices.tolist() == [2, 6]
+
+
+def test_ordered_values_from_accelerate_rows_restores_global_order() -> None:
+    gathered_rows = torch.tensor(
+        [
+            [2.0, 0.2],
+            [-1.0, -1.0],
+            [0.0, 0.0],
+            [1.0, 0.1],
+        ],
+        dtype=torch.float64,
+    )
+
+    values = _ordered_values_from_accelerate_rows(
+        total=3,
+        local_rows=torch.empty((0, 2), dtype=torch.float64),
+        runtime=_FakeGatherRuntime(gathered_rows),
+    )
+
+    assert values == [0.0, 0.1, 0.2]
+
+
+def test_ordered_values_from_accelerate_rows_rejects_duplicate_indices() -> None:
+    gathered_rows = torch.tensor(
+        [
+            [0.0, 0.0],
+            [0.0, 0.1],
+        ],
+        dtype=torch.float64,
+    )
+
+    with pytest.raises(ValueError, match="Duplicate rank-local value"):
+        _ordered_values_from_accelerate_rows(
+            total=1,
+            local_rows=torch.empty((0, 2), dtype=torch.float64),
+            runtime=_FakeGatherRuntime(gathered_rows),
+        )
 
 
 def test_cross_layer_decoder_returns_one_finite_delta_per_pair() -> None:
@@ -301,7 +367,7 @@ def test_parse_config_reads_nested_loss_config(tmp_path: Path) -> None:
     assert cfg.residual_weight == pytest.approx(0.25)
 
 
-def test_parse_config_reads_train_topology_loss_config(tmp_path: Path) -> None:
+def test_parse_config_rejects_train_topology_loss_enabled(tmp_path: Path) -> None:
     config = _base_refiner_config(tmp_path)
     config["topology_loss"] = {
         "enabled": True,
@@ -309,14 +375,8 @@ def test_parse_config_reads_train_topology_loss_config(tmp_path: Path) -> None:
         "losses": {"alpha": 0.7, "beta": 1.5, "gamma": 0.0, "delta": 0.0},
     }
 
-    cfg = _parse_config(config)
-
-    assert cfg.topology_loss.enabled
-    assert cfg.topology_loss.weight == pytest.approx(0.2)
-    assert cfg.topology_loss.losses.alpha == pytest.approx(0.7)
-    assert cfg.topology_loss.losses.beta == pytest.approx(1.5)
-    assert cfg.topology_loss.losses.gamma == 0.0
-    assert cfg.topology_loss.losses.delta == 0.0
+    with pytest.raises(ValueError, match="topology_loss.enabled is not supported"):
+        _parse_config(config)
 
 
 def test_parse_config_rejects_unsupported_encoder(tmp_path: Path) -> None:
@@ -428,68 +488,6 @@ def test_s2gae_loss_terms_use_weighted_bce_and_all_pair_residual_anchor() -> Non
     assert terms.total.item() == pytest.approx(expected_bce.item() + 1.25)
 
 
-def test_train_topology_loss_uses_only_graph_similarity_and_relative_density(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    cfg = _parse_config(
-        {
-            **_base_refiner_config(tmp_path),
-            "topology_loss": {
-                "enabled": True,
-                "weight": 2.0,
-                "losses": {"alpha": 0.5, "beta": 3.0, "gamma": 9.0, "delta": 9.0},
-            },
-        }
-    )
-    observed_weights: list[tuple[float, float, float, float]] = []
-
-    def fake_compute_topology_losses(**kwargs: object) -> dict[str, torch.Tensor]:
-        weights = kwargs["weights"]
-        observed_weights.append((weights.alpha, weights.beta, weights.gamma, weights.delta))
-        return {
-            "total_topology": torch.tensor(4.0, dtype=torch.float32),
-            "graph_similarity": torch.tensor(1.25, dtype=torch.float32),
-            "relative_density": torch.tensor(2.75, dtype=torch.float32),
-        }
-
-    class FakeModel:
-        def decode(self, **kwargs: object) -> tuple[torch.Tensor, torch.Tensor]:
-            pair_index = kwargs["pair_index"]
-            assert isinstance(pair_index, torch.Tensor)
-            logits = torch.zeros(pair_index.size(1), dtype=torch.float32)
-            return logits, logits
-
-    monkeypatch.setattr("tccig.s2gae.compute_topology_losses", fake_compute_topology_losses)
-    graph = _SplitGraph(
-        node_features=torch.ones((2, 4), dtype=torch.float32),
-        edge_index=torch.empty((2, 0), dtype=torch.long),
-        edge_weight=torch.empty((0,), dtype=torch.float32),
-        pair_index=torch.tensor([[0], [1]], dtype=torch.long),
-        pairwise_probabilities=torch.tensor([0.8], dtype=torch.float32),
-    )
-    task = _TopologyLossTask(
-        pair_indices=torch.tensor([0], dtype=torch.long),
-        pair_index_a=torch.tensor([0], dtype=torch.long),
-        pair_index_b=torch.tensor([1], dtype=torch.long),
-        targets=torch.tensor([1.0], dtype=torch.float32),
-        num_nodes=2,
-    )
-
-    loss, sums = _local_topology_loss(
-        model=FakeModel(),
-        hidden_states=[torch.ones((2, 4), dtype=torch.float32)],
-        graph=graph,
-        tasks=(task,),
-        task_indices=torch.tensor([0], dtype=torch.long),
-        cfg=cfg,
-    )
-
-    assert observed_weights == [(0.5, 3.0, 0.0, 0.0)]
-    assert loss.item() == pytest.approx(8.0)
-    assert sums.tolist() == pytest.approx([8.0, 1.25, 2.75, 1.0])
-
-
 def test_mean_pooled_features_require_embedding_index(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError, match="embedding_index_path"):
         load_mean_pooled_node_features(
@@ -556,3 +554,83 @@ def test_build_graph_uses_weighted_bidirectional_edges_without_self_loops(
     assert graph.edge_index.t().tolist() == [[0, 1], [1, 0], [0, 2], [2, 0]]
     assert graph.edge_weight.tolist() == pytest.approx([0.8, 0.8, 0.4, 0.4])
     assert all(src != dst for src, dst in graph.edge_index.t().tolist())
+
+
+def test_masked_split_graph_removes_only_batch_input_edges() -> None:
+    graph = _SplitGraph(
+        node_features=torch.ones((3, 4), dtype=torch.float32),
+        edge_index=torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]], dtype=torch.long),
+        edge_weight=torch.ones(4, dtype=torch.float32),
+        pair_index=torch.tensor([[0, 1, 0], [1, 2, 2]], dtype=torch.long),
+        pairwise_probabilities=torch.tensor([0.8, 0.7, 0.2], dtype=torch.float32),
+    )
+
+    masked = _masked_split_graph(
+        graph=graph,
+        masked_pair_indices=torch.tensor([0], dtype=torch.long),
+    )
+
+    assert masked.edge_index.t().tolist() == [[1, 2], [2, 1]]
+    assert masked.pair_index.tolist() == graph.pair_index.tolist()
+
+
+def test_sampled_train_step_masks_fp_tp_edges_but_decodes_all_batch_targets(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    cfg = _parse_config(
+        {
+            **_base_refiner_config(tmp_path),
+            "input_dim": 4,
+            "hidden_dim": 4,
+            "num_layers": 1,
+            "decoder_hidden_dim": 4,
+            "decoder_layers": 1,
+            "dropout": 0.0,
+        }
+    )
+    model = S2GAERefiner(
+        encoder="graphconv",
+        input_dim=4,
+        hidden_dim=4,
+        num_layers=1,
+        decoder_hidden_dim=4,
+        decoder_layers=1,
+        dropout=0.0,
+    )
+    observed_edges: list[list[list[int]]] = []
+    observed_decoded_pairs: list[list[list[int]]] = []
+
+    def fake_encode(**kwargs: torch.Tensor) -> list[torch.Tensor]:
+        observed_edges.append(kwargs["edge_index"].t().tolist())
+        return [torch.ones((3, 4), dtype=torch.float32)]
+
+    def fake_decode(**kwargs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pair_index = kwargs["pair_index"]
+        assert isinstance(pair_index, torch.Tensor)
+        observed_decoded_pairs.append(pair_index.tolist())
+        logits = torch.zeros(pair_index.size(1), dtype=torch.float32)
+        return logits, logits
+
+    monkeypatch.setattr(model, "encode", fake_encode)
+    monkeypatch.setattr(model, "decode", fake_decode)
+    step = _S2GAESampledTrainStepModule(refiner=model, cfg=cfg)
+    graph = _SplitGraph(
+        node_features=torch.ones((3, 4), dtype=torch.float32),
+        edge_index=torch.tensor([[0, 1, 1, 2], [1, 0, 2, 1]], dtype=torch.long),
+        edge_weight=torch.ones(4, dtype=torch.float32),
+        pair_index=torch.tensor([[0, 1, 0], [1, 2, 2]], dtype=torch.long),
+        pairwise_probabilities=torch.tensor([0.8, 0.7, 0.2], dtype=torch.float32),
+    )
+
+    loss, sums = step(
+        graph=graph,
+        pair_indices=torch.tensor([0, 2], dtype=torch.long),
+        labels=torch.tensor([0.0, 1.0], dtype=torch.float32),
+        mask_input_edges=torch.tensor([True, False], dtype=torch.bool),
+    )
+
+    assert torch.isfinite(loss)
+    assert sums[-1].item() == 2.0
+    assert observed_edges == [[[1, 2], [2, 1]]]
+    assert observed_decoded_pairs == [[[0, 0], [1, 2]]]

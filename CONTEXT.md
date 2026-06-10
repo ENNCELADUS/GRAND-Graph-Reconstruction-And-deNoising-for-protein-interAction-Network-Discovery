@@ -37,6 +37,20 @@ may define loss targets, validation truth may select checkpoints and graph
 decision rules, and test truth may compute metrics. True topology targets are
 not model input graphs.
 
+### Scorer error quadrant
+
+The four-way partition of train candidate pairs induced by frozen pairwise
+scores, the frozen pairwise input graph threshold, and true train labels. `FP`
+and `FN` are scorer-error hard cases; `TP` and `TN` are scorer-correct easy
+cases.
+
+### Sampled edge target objective
+
+The TCCIG S2GAE training objective that prioritizes all scorer-error hard cases
+and samples scorer-correct `TP`/`TN` pairs as calibration anchors. It trains the
+refiner to correct `G_pairwise` without letting the edge currently being
+predicted serve as an encoder input edge.
+
 ### Pairwise input graph threshold
 
 The scorer-only threshold used to construct the noisy `G_pairwise` input graph
