@@ -1,4 +1,4 @@
-# ADR 001: Fixed TCCIG Thresholds and Train Topology Loss
+# ADR 001: Fixed TCCIG Thresholds and Optional Train Topology Loss
 
 ## Status
 
@@ -27,15 +27,24 @@ TCCIG now uses two independent fixed rules:
 Dynamic validation calibration, logit-bias sweeps, and validation-selected refined thresholds are
 removed from the standalone TCCIG pipeline.
 
-S2GAE training also includes train-only soft topology loss:
+S2GAE training uses supervised BCE plus a residual anchor in the current
+`03_fixed_threshold` config:
+
+```text
+BCE + residual_weight * mean(delta^2)
+```
+
+The code also supports an optional train-only soft topology loss behind
+`refiner.topology_loss.enabled`:
 
 ```text
 BCE + residual_weight * mean(delta^2)
   + topology_weight * (alpha * soft_graph_similarity + beta * soft_relative_density)
 ```
 
-The first version intentionally sets degree and clustering topology terms to zero in backward.
-Hard NetworkX metrics remain validation/test reporting metrics.
+The current config sets `refiner.topology_loss.enabled: false`. When it is enabled, degree and
+clustering topology terms are still intentionally zero in backward. Hard NetworkX metrics remain
+validation/test reporting metrics and checkpoint-monitoring signals.
 
 ## Consequences
 
@@ -43,5 +52,6 @@ Input graph density is controlled by the frozen scorer threshold and no longer s
 validation calibration. Refined output graph density is controlled by the independent fixed
 threshold, so scorer input selection and S2GAE output evaluation can be audited separately.
 
-The GS/RD-only topology loss is a limited stabilization step. Degree and clustering MMD can be
-added later after the fixed-threshold pipeline runs reliably.
+The GS/RD-only topology loss remains a supported stabilization option, not the default training
+objective for the fixed-threshold run. Degree and clustering MMD can be added later after the
+fixed-threshold pipeline runs reliably.
