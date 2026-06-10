@@ -1427,6 +1427,8 @@ def _rank_local_pair_indices(
     world_size = _runtime_world_size(runtime)
     if not _runtime_is_distributed(runtime):
         return torch.arange(0, total, dtype=torch.long, device=device)
+    if total <= 0 or rank >= total:
+        return torch.empty(0, dtype=torch.long, device=device)
     return torch.arange(rank, total, world_size, dtype=torch.long, device=device)
 
 

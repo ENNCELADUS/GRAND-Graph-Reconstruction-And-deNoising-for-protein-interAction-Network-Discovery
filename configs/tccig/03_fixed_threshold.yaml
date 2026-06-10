@@ -79,7 +79,7 @@ refiner:
   embedding_cache_dir: data/embeddings/esm3_1024
   embedding_index_path: data/embeddings/esm3_1024/index.json
   max_sequence_length: 1024
-  checkpoint_path: models/tccig/s2gae/03_fixed_threshold_topology_loss/best_model.pt
+  checkpoint_path: models/tccig/s2gae/03_fixed_threshold/best_model.pt
 
 graph_selection:
   pairwise_input_threshold:

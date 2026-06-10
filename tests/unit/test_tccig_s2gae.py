@@ -17,6 +17,7 @@ from tccig.s2gae import (
     _local_topology_loss,
     _parse_config,
     _prediction_probabilities,
+    _rank_local_pair_indices,
     _SplitGraph,
     _TopologyLossTask,
     apply_gradient_clipping,
@@ -31,6 +32,48 @@ class _FakeRuntime:
     rank = 0
     world_size = 1
     accelerator = object()
+
+
+class _FakeDistributedRuntime:
+    is_distributed = True
+    world_size = 4
+    accelerator = object()
+
+    def __init__(self, rank: int) -> None:
+        self.rank = rank
+
+
+@pytest.mark.parametrize("rank", [1, 2, 3])
+def test_rank_local_pair_indices_returns_empty_for_zero_total(rank: int) -> None:
+    indices = _rank_local_pair_indices(
+        total=0,
+        runtime=_FakeDistributedRuntime(rank),
+        device=torch.device("cpu"),
+    )
+
+    assert indices.dtype == torch.long
+    assert indices.tolist() == []
+
+
+def test_rank_local_pair_indices_returns_empty_when_rank_exceeds_total() -> None:
+    indices = _rank_local_pair_indices(
+        total=2,
+        runtime=_FakeDistributedRuntime(rank=3),
+        device=torch.device("cpu"),
+    )
+
+    assert indices.dtype == torch.long
+    assert indices.tolist() == []
+
+
+def test_rank_local_pair_indices_preserves_distributed_stride() -> None:
+    indices = _rank_local_pair_indices(
+        total=10,
+        runtime=_FakeDistributedRuntime(rank=2),
+        device=torch.device("cpu"),
+    )
+
+    assert indices.tolist() == [2, 6]
 
 
 def test_cross_layer_decoder_returns_one_finite_delta_per_pair() -> None:
