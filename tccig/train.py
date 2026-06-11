@@ -389,7 +389,7 @@ def _build_validation_topology_bundle(
     if not isinstance(topology_cfg, Mapping) or not bool(topology_cfg.get("enabled", False)):
         return None, None
     split_path = processed_dir / "human_BFS_split.pkl"
-    node_ids = load_split_node_ids(split_path=split_path, split_name="val")
+    node_ids = load_split_node_ids(split_path=split_path, split_name="train")
     validation_graph = build_pair_supervision_graph(
         pair_path=processed_dir / "human_val_ppi_ratio5_exclusive.txt",
         node_ids=node_ids,

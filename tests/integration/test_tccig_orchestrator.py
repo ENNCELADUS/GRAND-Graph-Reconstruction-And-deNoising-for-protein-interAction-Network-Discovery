@@ -26,6 +26,10 @@ def _write_pairs(path: Path, rows: list[tuple[str, str, int]]) -> None:
 
 
 def _write_tiny_pring_fixture(processed_dir: Path) -> None:
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    with (processed_dir / "human_BFS_split.pkl").open("wb") as handle:
+        pickle.dump({"train": {"A", "B", "C", "D"}, "test": {"T1", "T2", "T3"}}, handle)
+
     _write_pairs(
         processed_dir / "human_train_ppi_ratio5_exclusive.txt",
         [("A", "B", 1), ("A", "C", 0), ("B", "C", 1), ("C", "D", 0)],
@@ -234,6 +238,43 @@ def test_tccig_orchestrator_runs_concrete_pipeline_and_writes_artifacts(tmp_path
     assert (run_log_dir / "topology_test" / "topology_metrics.json").exists()
     assert (run_log_dir / "topology_test" / "topology_metrics.csv").exists()
     assert (tmp_path / "tccig_cache" / "score_cache" / "tiny" / "manifests" / "train.json").exists()
+
+
+def test_tccig_orchestrator_runs_validation_topology_with_pring_train_test_split(
+    tmp_path: Path,
+) -> None:
+    config = _tiny_config(tmp_path, "validation_topology")
+    refiner_config = config["refiner"]
+    assert isinstance(refiner_config, dict)
+    refiner_config["monitor_metric"] = "val_topology_loss"
+    refiner_config["topology_validation"] = {
+        "enabled": True,
+        "node_sizes": [2],
+        "samples_per_size": 1,
+        "strategy": "mixed",
+        "seed": 0,
+        "inference_batch_size": 4,
+        "compute_clustering_mmd": False,
+        "losses": {"alpha": 1.0, "beta": 1.0, "gamma": 0.0, "delta": 0.0},
+    }
+
+    result = run_tccig_pipeline(config)
+
+    assert set(result.topology_metrics) == {
+        "graph_sim",
+        "relative_density",
+        "deg_dist_mmd",
+        "cc_mmd",
+        "laplacian_eigen_mmd",
+    }
+    assert (
+        tmp_path
+        / "tccig_cache"
+        / "score_cache"
+        / "validation_topology"
+        / "manifests"
+        / "validation_topology.json"
+    ).exists()
 
 
 def test_tccig_orchestrator_rejects_removed_hook_config(tmp_path: Path) -> None:
