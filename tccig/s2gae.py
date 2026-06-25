@@ -1334,6 +1334,12 @@ def _unwrap_refiner(model: nn.Module, accelerator: object) -> S2GAERefiner:
 def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
     if "learning_rate" in config:
         raise ValueError("refiner.learning_rate is no longer supported; use refiner.optimizer.lr")
+    topology_loss_raw = config.get("topology_loss")
+    if isinstance(topology_loss_raw, Mapping) and bool(topology_loss_raw.get("enabled", False)):
+        raise ValueError(
+            "refiner.topology_loss is no longer supported; remove the block "
+            "(use refiner.topology_validation for checkpoint selection)"
+        )
     run_id = str(config.get("_run_id", "tccig_run"))
     log_root = Path(str(config.get("_log_root", "logs")))
     log_dir = _path(config.get("log_dir"), log_root / "tccig" / run_id)

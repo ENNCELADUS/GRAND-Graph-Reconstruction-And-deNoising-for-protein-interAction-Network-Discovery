@@ -289,10 +289,10 @@ def test_parse_config_reads_nested_loss_config(tmp_path: Path) -> None:
     assert cfg.residual_weight == pytest.approx(0.25)
 
 
-def test_parse_config_ignores_legacy_topology_loss_block(tmp_path: Path) -> None:
+def test_parse_config_ignores_disabled_legacy_topology_loss_block(tmp_path: Path) -> None:
     config = _base_refiner_config(tmp_path)
     config["topology_loss"] = {
-        "enabled": True,
+        "enabled": False,
         "weight": 0.2,
         "losses": {"alpha": 0.7, "beta": 1.5, "gamma": 0.0, "delta": 0.0},
     }
@@ -300,6 +300,18 @@ def test_parse_config_ignores_legacy_topology_loss_block(tmp_path: Path) -> None
     cfg = _parse_config(config)
 
     assert not hasattr(cfg, "topology_loss")
+
+
+def test_parse_config_rejects_enabled_legacy_topology_loss_block(tmp_path: Path) -> None:
+    config = _base_refiner_config(tmp_path)
+    config["topology_loss"] = {
+        "enabled": True,
+        "weight": 0.2,
+        "losses": {"alpha": 0.7, "beta": 1.5, "gamma": 0.0, "delta": 0.0},
+    }
+
+    with pytest.raises(ValueError, match="refiner.topology_loss is no longer supported"):
+        _parse_config(config)
 
 
 def test_parse_config_rejects_unsupported_encoder(tmp_path: Path) -> None:
