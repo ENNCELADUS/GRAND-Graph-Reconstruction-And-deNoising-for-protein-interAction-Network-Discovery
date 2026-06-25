@@ -423,13 +423,19 @@ def test_tccig_accelerate_cpu_smoke_preserves_topology_artifact_order(tmp_path: 
     )
 
     assert len(ddp_pairwise_rows) == len(single_pairwise_rows)
-    assert [set(row) for row in ddp_pairwise_rows] == [set(row) for row in single_pairwise_rows]
-    assert [(row["protein_a"], row["protein_b"]) for row in ddp_pairwise_rows] == [
-        (row["protein_a"], row["protein_b"]) for row in single_pairwise_rows
+    # Compare ordered identity, label, and the numeric refined probability so a
+    # distributed gather that shards or reorders values is caught, not just a
+    # schema/column-name match.
+    assert [(row["protein_a"], row["protein_b"], row["label"]) for row in ddp_pairwise_rows] == [
+        (row["protein_a"], row["protein_b"], row["label"]) for row in single_pairwise_rows
     ]
+    assert [float(row["refined_probability"]) for row in ddp_pairwise_rows] == pytest.approx(
+        [float(row["refined_probability"]) for row in single_pairwise_rows]
+    )
     assert len(ddp_rows) == len(single_rows)
-    assert [len(row) for row in ddp_rows] == [len(row) for row in single_rows]
-    assert [row[:2] for row in ddp_rows] == [row[:2] for row in single_rows]
+    # Topology artifact carries (protein_a, protein_b, hard-graph prediction);
+    # compare the full row including the 0/1 prediction value.
+    assert ddp_rows == single_rows
     assert all(row[2] in {"0", "1"} for row in ddp_rows)
 
 
