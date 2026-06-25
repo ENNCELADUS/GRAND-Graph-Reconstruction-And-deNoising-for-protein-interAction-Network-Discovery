@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, cast
 
 import networkx as nx
 import torch
-import torch.distributed as dist
 import torch.nn.functional as functional
 from sklearn.metrics import average_precision_score
 from src.embed import load_cached_embedding
@@ -393,26 +392,6 @@ def apply_gradient_clipping(
     return float(total_norm.detach().cpu().item())
 
 
-def _clip_grad_norm_with_accelerator(
-    *,
-    model: nn.Module,
-    runtime: object,
-    gradient_clip_norm: float | None,
-) -> float:
-    if gradient_clip_norm is None:
-        return apply_gradient_clipping(model=model, gradient_clip_norm=None)
-    clip_fn = getattr(getattr(runtime, "accelerator", None), "clip_grad_norm_", None)
-    if callable(clip_fn):
-        parameters = [parameter for parameter in model.parameters() if parameter.grad is not None]
-        if not parameters:
-            return 0.0
-        norm = clip_fn(parameters, gradient_clip_norm)
-        if isinstance(norm, torch.Tensor):
-            return float(norm.detach().cpu().item())
-        return float(norm)
-    return apply_gradient_clipping(model=model, gradient_clip_norm=gradient_clip_norm)
-
-
 def _zero_model_loss(model: nn.Module) -> torch.Tensor:
     """Return a zero loss connected to model parameters for empty DDP ranks."""
     loss: torch.Tensor | None = None
@@ -593,15 +572,20 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 ),
             )
             request.runtime.accelerator.backward(batch_loss)
-            gradient_norm = _clip_grad_norm_with_accelerator(
-                model=train_step_model,
-                runtime=request.runtime,
-                gradient_clip_norm=cfg.optimization.gradient_clip_norm,
-            )
+            if cfg.optimization.gradient_clip_norm is None:
+                gradient_norm = apply_gradient_clipping(
+                    model=train_step_model, gradient_clip_norm=None
+                )
+            else:
+                clipped = request.runtime.accelerator.clip_grad_norm_(
+                    train_step_model.parameters(),
+                    cfg.optimization.gradient_clip_norm,
+                )
+                gradient_norm = float(clipped.detach().cpu().item())
             optimizer.step()
             local_loss_sums += batch_sums.detach()
         validation_model = _unwrap_refiner(train_step_model, request.runtime.accelerator)
-        global_loss_sums = _accelerator_reduce_sum(local_loss_sums, request.runtime)
+        global_loss_sums = request.runtime.accelerator.reduce(local_loss_sums, reduction="sum")
         total_loss = float(global_loss_sums[0].detach().cpu().item())
         total_bce_loss = float(global_loss_sums[1].detach().cpu().item())
         total_residual_anchor_loss = float(global_loss_sums[2].detach().cpu().item())
@@ -736,11 +720,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 None if best_selected_rule_payload is None else best_selected_rule_payload
             ),
         }
-        save_fn = getattr(request.runtime.accelerator, "save", None)
-        if callable(save_fn):
-            save_fn(payload, cfg.checkpoint_path, safe_serialization=False)
-        else:
-            torch.save(payload, cfg.checkpoint_path)
+        request.runtime.accelerator.save(payload, cfg.checkpoint_path, safe_serialization=False)
     _runtime_barrier(request.runtime)
     return S2GAERefinerState(
         model=checkpoint_model,
@@ -1166,29 +1146,6 @@ def _is_better_monitor(
     return value > best_value
 
 
-def _rank_local_pair_count(*, total: int, runtime: object) -> int:
-    rank = _runtime_rank(runtime)
-    world_size = _runtime_world_size(runtime)
-    if not _runtime_is_distributed(runtime):
-        return total
-    if rank >= total:
-        return 0
-    return ((total - 1 - rank) // world_size) + 1
-
-
-def _accelerator_reduce_sum(value: torch.Tensor, runtime: object) -> torch.Tensor:
-    reduce_fn = getattr(getattr(runtime, "accelerator", None), "reduce", None)
-    if callable(reduce_fn):
-        reduced = reduce_fn(value, reduction="sum")
-        if isinstance(reduced, torch.Tensor):
-            return reduced
-    if _runtime_is_distributed(runtime) and dist.is_available() and dist.is_initialized():
-        reduced = value.clone()
-        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
-        return reduced
-    return value
-
-
 def _ordered_probabilities_from_indexed_rows(
     *,
     total: int,
@@ -1210,18 +1167,6 @@ def _ordered_probabilities_from_indexed_rows(
     if missing:
         raise ValueError(f"Missing refined probabilities for indices: {missing[:10]}")
     return [float(value) for value in ordered]
-
-
-def _runtime_is_distributed(runtime: object) -> bool:
-    return bool(getattr(runtime, "is_distributed", False))
-
-
-def _runtime_rank(runtime: object) -> int:
-    return int(getattr(runtime, "rank", 0))
-
-
-def _runtime_world_size(runtime: object) -> int:
-    return int(getattr(runtime, "world_size", 1))
 
 
 def _runtime_barrier(runtime: object) -> None:

@@ -111,6 +111,19 @@ class NoOpAccelerator:
         self.reduce_calls += 1
         return value
 
+    def clip_grad_norm_(
+        self,
+        parameters: object,
+        max_norm: float,
+        norm_type: float = 2.0,
+    ) -> torch.Tensor:
+        """Clip gradients like accelerate and return the observed norm."""
+        del norm_type
+        params = [p for p in parameters if p.grad is not None]  # type: ignore[attr-defined]
+        if not params:
+            return torch.tensor(0.0)
+        return torch.nn.utils.clip_grad_norm_(params, max_norm)
+
     def wait_for_everyone(self) -> None:
         """No-op synchronization."""
         return None

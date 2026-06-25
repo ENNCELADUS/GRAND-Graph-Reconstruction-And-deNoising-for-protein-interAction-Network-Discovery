@@ -48,6 +48,14 @@ class AcceleratorLike(Protocol):
     def reduce(self, value: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
         """Reduce a tensor across processes."""
 
+    def clip_grad_norm_(
+        self,
+        parameters: object,
+        max_norm: float,
+        norm_type: float = 2.0,
+    ) -> torch.Tensor:
+        """Clip the gradient norm of prepared parameters and return it."""
+
     def wait_for_everyone(self) -> None:
         """Synchronize ranks."""
 
