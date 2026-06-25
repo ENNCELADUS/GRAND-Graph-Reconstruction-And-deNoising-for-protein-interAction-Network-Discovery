@@ -182,7 +182,7 @@ class ValidationTopologyRuleEvaluation:
 
     rule: GraphRule
     validation_metrics: dict[str, float | int]
-    rule_payload: dict[str, object]
+    rule_payload: Mapping[str, object]
 
 
 class S2GAERefiner(nn.Module):
@@ -621,7 +621,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 runtime=request.runtime,
             )
             selected_epoch_rule = topology_evaluation.rule
-            selected_epoch_rule_payload = topology_evaluation.rule_payload
+            selected_epoch_rule_payload = dict(topology_evaluation.rule_payload)
             selected_epoch_topology_metrics = dict(topology_evaluation.validation_metrics)
             selected_epoch_topology_metrics["epoch"] = epoch
             monitor_value = _resolve_monitor_value(
