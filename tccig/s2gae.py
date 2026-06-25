@@ -7,7 +7,7 @@ import json
 import logging
 import math
 import time
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -23,7 +23,7 @@ from src.train.config import LossConfig
 from src.utils.losses import binary_classification_loss
 from torch import nn
 from torch.optim import Optimizer
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, TensorDataset
 
 from tccig.prepare import (
     CandidatePair,
@@ -980,11 +980,18 @@ def _prediction_probabilities(
 ) -> list[float]:
     model.eval()
     device = graph.pairwise_probabilities.device
-    local_indices = _rank_local_pair_indices(
-        total=int(graph.pairwise_probabilities.numel()),
-        runtime=runtime,
-        device=device,
+    total = int(graph.pairwise_probabilities.numel())
+    accelerator = getattr(runtime, "accelerator", None)
+
+    loader: Iterable[tuple[torch.Tensor]] = DataLoader(
+        TensorDataset(torch.arange(total, dtype=torch.long)),
+        batch_size=max(1, batch_size),
+        shuffle=False,
     )
+    prepare_fn = getattr(accelerator, "prepare", None)
+    if callable(prepare_fn):
+        loader = cast(Iterable[tuple[torch.Tensor]], prepare_fn(loader))
+
     indexed_rows: list[torch.Tensor] = []
     with torch.inference_mode():
         hidden_states = model.encode(
@@ -992,17 +999,17 @@ def _prediction_probabilities(
             edge_index=graph.edge_index,
             edge_weight=graph.edge_weight,
         )
-        for batch_indices in _batch_indices(local_indices.numel(), batch_size, device):
-            global_indices = local_indices[batch_indices]
+        for (batch_indices,) in loader:
+            batch_indices = batch_indices.to(device)
             refined_logits, _ = model.decode(
                 hidden_states=hidden_states,
-                pair_index=graph.pair_index[:, global_indices],
-                pairwise_probabilities=graph.pairwise_probabilities[global_indices],
+                pair_index=graph.pair_index[:, batch_indices],
+                pairwise_probabilities=graph.pairwise_probabilities[batch_indices],
             )
             indexed_rows.append(
                 torch.stack(
                     (
-                        global_indices.to(dtype=torch.float64),
+                        batch_indices.to(dtype=torch.float64),
                         torch.sigmoid(refined_logits).to(dtype=torch.float64),
                     ),
                     dim=1,
@@ -1013,11 +1020,12 @@ def _prediction_probabilities(
         if indexed_rows
         else torch.empty((0, 2), dtype=torch.float64, device=device)
     )
-    return _ordered_values_from_accelerate_rows(
-        total=int(graph.pairwise_probabilities.numel()),
-        local_rows=local_rows,
-        runtime=runtime,
-    )
+    gather_fn = getattr(accelerator, "gather_for_metrics", None)
+    if bool(getattr(runtime, "is_distributed", False)) and callable(gather_fn):
+        gathered = gather_fn(local_rows)
+        if isinstance(gathered, torch.Tensor):
+            local_rows = gathered
+    return _ordered_probabilities_from_indexed_rows(total=total, rows=local_rows)
 
 
 def _evaluate_validation_topology_rules(
@@ -1158,27 +1166,6 @@ def _is_better_monitor(
     return value > best_value
 
 
-def _batch_indices(total: int, batch_size: int, device: torch.device) -> Iterator[torch.Tensor]:
-    for start in range(0, total, batch_size):
-        stop = min(total, start + batch_size)
-        yield torch.arange(start, stop, dtype=torch.long, device=device)
-
-
-def _rank_local_pair_indices(
-    *,
-    total: int,
-    runtime: object,
-    device: torch.device,
-) -> torch.Tensor:
-    rank = _runtime_rank(runtime)
-    world_size = _runtime_world_size(runtime)
-    if not _runtime_is_distributed(runtime):
-        return torch.arange(0, total, dtype=torch.long, device=device)
-    if total <= 0 or rank >= total:
-        return torch.empty(0, dtype=torch.long, device=device)
-    return torch.arange(rank, total, world_size, dtype=torch.long, device=device)
-
-
 def _rank_local_pair_count(*, total: int, runtime: object) -> int:
     rank = _runtime_rank(runtime)
     world_size = _runtime_world_size(runtime)
@@ -1202,51 +1189,26 @@ def _accelerator_reduce_sum(value: torch.Tensor, runtime: object) -> torch.Tenso
     return value
 
 
-def _ordered_values_from_accelerate_rows(
+def _ordered_probabilities_from_indexed_rows(
     *,
     total: int,
-    local_rows: torch.Tensor,
-    runtime: object,
+    rows: torch.Tensor,
 ) -> list[float]:
-    accelerator = getattr(runtime, "accelerator", None)
-    if _runtime_is_distributed(runtime):
-        pad_fn = getattr(accelerator, "pad_across_processes", None)
-        gather_fn = getattr(accelerator, "gather_for_metrics", None)
-        if callable(pad_fn) and callable(gather_fn):
-            local_rows = pad_fn(local_rows, dim=0, pad_index=-1)
-            gathered = gather_fn(local_rows)
-            if isinstance(gathered, torch.Tensor):
-                valid = gathered[:, 0] >= 0
-                return _ordered_values_from_row_tensor(total=total, rows=gathered[valid])
-    return _ordered_values_from_row_tensor(total=total, rows=local_rows)
+    """Map ``(index, probability)`` rows to global pair order.
 
-
-def _ordered_values_from_row_tensor(*, total: int, rows: torch.Tensor) -> list[float]:
-    local_indexed_values = [
-        (int(row[0].detach().cpu().item()), float(row[1].detach().cpu().item())) for row in rows
-    ]
-    return _ordered_values_from_shards(
-        total=total,
-        shard_payloads=[local_indexed_values],
-    )
-
-
-def _ordered_values_from_shards(
-    *,
-    total: int,
-    shard_payloads: Sequence[Sequence[tuple[int, float]]],
-) -> list[float]:
+    Tolerates duplicate rows (Accelerate ``even_batches`` repeats tail samples)
+    by keeping the first occurrence, and asserts every index is covered once.
+    """
     ordered: list[float | None] = [None] * total
-    for shard in shard_payloads:
-        for index, value in shard:
-            if index < 0 or index >= total:
-                raise ValueError(f"Rank-local value index out of range: {index}")
-            if ordered[index] is not None:
-                raise ValueError(f"Duplicate rank-local value for index {index}")
-            ordered[index] = float(value)
+    for row in rows.detach().cpu():
+        index = int(row[0].item())
+        if index < 0 or index >= total:
+            continue
+        if ordered[index] is None:
+            ordered[index] = float(row[1].item())
     missing = [index for index, value in enumerate(ordered) if value is None]
     if missing:
-        raise ValueError(f"Missing rank-local values for indices: {missing[:10]}")
+        raise ValueError(f"Missing refined probabilities for indices: {missing[:10]}")
     return [float(value) for value in ordered]
 
 

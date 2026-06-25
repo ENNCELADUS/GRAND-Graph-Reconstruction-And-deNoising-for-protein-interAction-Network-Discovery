@@ -15,10 +15,9 @@ from tccig.s2gae import (
     S2GAERefiner,
     _build_graph,
     _masked_split_graph,
-    _ordered_values_from_accelerate_rows,
+    _ordered_probabilities_from_indexed_rows,
     _parse_config,
     _prediction_probabilities,
-    _rank_local_pair_indices,
     _S2GAESampledTrainStepModule,
     _SplitGraph,
     apply_gradient_clipping,
@@ -35,111 +34,35 @@ class _FakeRuntime:
     accelerator = object()
 
 
-class _FakeDistributedRuntime:
-    is_distributed = True
-    world_size = 4
-    accelerator = object()
-
-    def __init__(self, rank: int) -> None:
-        self.rank = rank
-
-
-class _FakeGatherAccelerator:
-    def __init__(self, gathered_rows: torch.Tensor) -> None:
-        self.gathered_rows = gathered_rows
-
-    def pad_across_processes(
-        self,
-        value: torch.Tensor,
-        dim: int = 0,
-        pad_index: int = 0,
-        pad_first: bool = False,
-    ) -> torch.Tensor:
-        del dim, pad_index, pad_first
-        return value
-
-    def gather_for_metrics(self, value: torch.Tensor) -> torch.Tensor:
-        del value
-        return self.gathered_rows
-
-
-class _FakeGatherRuntime:
-    is_distributed = True
-    rank = 0
-    world_size = 2
-
-    def __init__(self, gathered_rows: torch.Tensor) -> None:
-        self.accelerator = _FakeGatherAccelerator(gathered_rows)
-
-
-@pytest.mark.parametrize("rank", [1, 2, 3])
-def test_rank_local_pair_indices_returns_empty_for_zero_total(rank: int) -> None:
-    indices = _rank_local_pair_indices(
-        total=0,
-        runtime=_FakeDistributedRuntime(rank),
-        device=torch.device("cpu"),
-    )
-
-    assert indices.dtype == torch.long
-    assert indices.tolist() == []
-
-
-def test_rank_local_pair_indices_returns_empty_when_rank_exceeds_total() -> None:
-    indices = _rank_local_pair_indices(
-        total=2,
-        runtime=_FakeDistributedRuntime(rank=3),
-        device=torch.device("cpu"),
-    )
-
-    assert indices.dtype == torch.long
-    assert indices.tolist() == []
-
-
-def test_rank_local_pair_indices_preserves_distributed_stride() -> None:
-    indices = _rank_local_pair_indices(
-        total=10,
-        runtime=_FakeDistributedRuntime(rank=2),
-        device=torch.device("cpu"),
-    )
-
-    assert indices.tolist() == [2, 6]
-
-
-def test_ordered_values_from_accelerate_rows_restores_global_order() -> None:
-    gathered_rows = torch.tensor(
-        [
-            [2.0, 0.2],
-            [-1.0, -1.0],
-            [0.0, 0.0],
-            [1.0, 0.1],
-        ],
+def test_ordered_probabilities_from_indexed_rows_restores_global_order() -> None:
+    rows = torch.tensor(
+        [[2.0, 0.2], [0.0, 0.0], [1.0, 0.1]],
         dtype=torch.float64,
     )
 
-    values = _ordered_values_from_accelerate_rows(
-        total=3,
-        local_rows=torch.empty((0, 2), dtype=torch.float64),
-        runtime=_FakeGatherRuntime(gathered_rows),
-    )
+    values = _ordered_probabilities_from_indexed_rows(total=3, rows=rows)
 
     assert values == [0.0, 0.1, 0.2]
 
 
-def test_ordered_values_from_accelerate_rows_rejects_duplicate_indices() -> None:
-    gathered_rows = torch.tensor(
-        [
-            [0.0, 0.0],
-            [0.0, 0.1],
-        ],
+def test_ordered_probabilities_from_indexed_rows_tolerates_duplicate_tail_rows() -> None:
+    # Accelerate even_batches duplicates tail samples across ranks; the helper
+    # keeps the first occurrence and still covers every index exactly once.
+    rows = torch.tensor(
+        [[0.0, 0.5], [1.0, 0.6], [1.0, 0.6]],
         dtype=torch.float64,
     )
 
-    with pytest.raises(ValueError, match="Duplicate rank-local value"):
-        _ordered_values_from_accelerate_rows(
-            total=1,
-            local_rows=torch.empty((0, 2), dtype=torch.float64),
-            runtime=_FakeGatherRuntime(gathered_rows),
-        )
+    values = _ordered_probabilities_from_indexed_rows(total=2, rows=rows)
+
+    assert values == [0.5, 0.6]
+
+
+def test_ordered_probabilities_from_indexed_rows_raises_on_missing_index() -> None:
+    rows = torch.tensor([[0.0, 0.5]], dtype=torch.float64)
+
+    with pytest.raises(ValueError, match="Missing"):
+        _ordered_probabilities_from_indexed_rows(total=2, rows=rows)
 
 
 def test_cross_layer_decoder_returns_one_finite_delta_per_pair() -> None:
