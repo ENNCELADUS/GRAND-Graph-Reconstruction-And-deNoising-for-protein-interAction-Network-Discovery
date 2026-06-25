@@ -102,7 +102,6 @@ class S2GAEConfig:
     edge_sampling: EdgeSamplingConfig
     loss_config: LossConfig
     residual_weight: float
-    topology_loss: S2GAETopologyLossConfig
     monitor_metric: str
     topology_validation: S2GAETopologyValidationConfig
     optimizer: S2GAEOptimizerConfig
@@ -152,15 +151,6 @@ class S2GAEOptimizationConfig:
     """Backward and optimization-loop controls."""
 
     gradient_clip_norm: float | None
-
-
-@dataclass(frozen=True)
-class S2GAETopologyLossConfig:
-    """Differentiable topology-loss controls for S2GAE training."""
-
-    enabled: bool
-    weight: float
-    losses: S2GAETopologyLossWeights
 
 
 @dataclass(frozen=True)
@@ -1562,7 +1552,6 @@ def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
             config.get("residual_weight", 0.001),
             "refiner.residual_weight",
         ),
-        topology_loss=_parse_topology_loss_config(config.get("topology_loss", {})),
         monitor_metric=monitor_metric,
         topology_validation=_parse_topology_validation_config(
             raw_topology_validation=config.get("topology_validation", {}),
@@ -1603,16 +1592,6 @@ def _config_to_json(cfg: S2GAEConfig) -> dict[str, object]:
             "label_smoothing": cfg.loss_config.label_smoothing,
         },
         "residual_weight": cfg.residual_weight,
-        "topology_loss": {
-            "enabled": cfg.topology_loss.enabled,
-            "weight": cfg.topology_loss.weight,
-            "losses": {
-                "alpha": cfg.topology_loss.losses.alpha,
-                "beta": cfg.topology_loss.losses.beta,
-                "gamma": cfg.topology_loss.losses.gamma,
-                "delta": cfg.topology_loss.losses.delta,
-            },
-        },
         "monitor_metric": cfg.monitor_metric,
         "topology_validation": {
             "enabled": cfg.topology_validation.enabled,
@@ -1733,46 +1712,6 @@ def _parse_topology_validation_config(
             delta=_non_negative_float(
                 raw_losses.get("delta", 0.3),
                 "refiner.topology_validation.losses.delta",
-            ),
-        ),
-    )
-
-
-def _parse_topology_loss_config(raw_topology_loss: object) -> S2GAETopologyLossConfig:
-    if not isinstance(raw_topology_loss, Mapping):
-        raise ValueError("refiner.topology_loss must be a mapping")
-    raw_losses = raw_topology_loss.get("losses", {})
-    if not isinstance(raw_losses, Mapping):
-        raise ValueError("refiner.topology_loss.losses must be a mapping")
-    enabled = (
-        _bool(raw_topology_loss.get("enabled"), "refiner.topology_loss.enabled")
-        if "enabled" in raw_topology_loss
-        else False
-    )
-    if enabled:
-        raise ValueError("refiner.topology_loss.enabled is not supported in the Accelerate rewrite")
-    return S2GAETopologyLossConfig(
-        enabled=enabled,
-        weight=_non_negative_float(
-            raw_topology_loss.get("weight", 1.0),
-            "refiner.topology_loss.weight",
-        ),
-        losses=S2GAETopologyLossWeights(
-            alpha=_non_negative_float(
-                raw_losses.get("alpha", 1.0),
-                "refiner.topology_loss.losses.alpha",
-            ),
-            beta=_non_negative_float(
-                raw_losses.get("beta", 1.0),
-                "refiner.topology_loss.losses.beta",
-            ),
-            gamma=_non_negative_float(
-                raw_losses.get("gamma", 0.0),
-                "refiner.topology_loss.losses.gamma",
-            ),
-            delta=_non_negative_float(
-                raw_losses.get("delta", 0.0),
-                "refiner.topology_loss.losses.delta",
             ),
         ),
     )

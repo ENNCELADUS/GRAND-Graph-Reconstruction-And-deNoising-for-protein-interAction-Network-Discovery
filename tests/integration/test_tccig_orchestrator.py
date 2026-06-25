@@ -162,7 +162,6 @@ def _tiny_config(tmp_path: Path, run_id: str) -> dict[str, object]:
             "scheduler": {"type": "none"},
             "optimization": {"gradient_clip_norm": 1.0},
             "residual_weight": 0.0,
-            "topology_loss": {"enabled": False},
             "monitor_metric": "val_auprc",
             "topology_validation": {"enabled": False},
             "embedding_cache_dir": str(embedding_cache_dir),
