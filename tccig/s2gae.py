@@ -758,14 +758,6 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             save_fn(payload, cfg.checkpoint_path, safe_serialization=False)
         else:
             torch.save(payload, cfg.checkpoint_path)
-        _write_training_summary(
-            cfg=cfg,
-            best_monitor_value=best_monitor_value,
-            best_validation_auprc=best_validation_auprc,
-            best_selected_rule_payload=best_selected_rule_payload,
-            optimizer=optimizer,
-            history=history,
-        )
     _runtime_barrier(request.runtime)
     return S2GAERefinerState(
         model=checkpoint_model,
@@ -935,10 +927,6 @@ def _edge_index_and_weight_from_edges(
         if edge in seen:
             continue
         seen.add(edge)
-        if protein_a not in node_to_index or protein_b not in node_to_index:
-            raise ValueError("pairwise_graph_edges contain proteins outside candidate pairs")
-        if edge not in edge_weights_by_pair:
-            raise ValueError("pairwise_graph_edges contain edges outside candidate pairs")
         src = node_to_index[protein_a]
         dst = node_to_index[protein_b]
         if src == dst:
