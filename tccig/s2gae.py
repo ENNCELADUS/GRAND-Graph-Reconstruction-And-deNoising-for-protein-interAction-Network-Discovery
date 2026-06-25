@@ -63,9 +63,6 @@ TCCIG_TRAIN_CSV_COLUMNS = [
     "Train BCE Loss",
     "Train Residual Anchor Loss",
     "Train Weighted Residual Anchor Loss",
-    "Train Topology Loss",
-    "Train GS Loss",
-    "Train RD Loss",
     "Train Gradient Norm",
     "Val auprc",
     "Val Topology Loss",
@@ -77,10 +74,6 @@ TCCIG_TRAIN_CSV_COLUMNS = [
     "Selected Rule Positive Edges",
     "Monitor Metric",
     "Monitor Value",
-    "Local Train Pairs",
-    "Global Train Pairs",
-    "Local Validation Pairs",
-    "Global Validation Pairs",
     "Peak GPU Mem MB",
     "Learning Rate",
 ]
@@ -663,20 +656,10 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             "train_weighted_residual_anchor_loss": (
                 total_weighted_residual_anchor_loss / epoch_denominator
             ),
-            "train_topology_loss": 0.0,
-            "train_graph_similarity_loss": 0.0,
-            "train_relative_density_loss": 0.0,
             "train_gradient_norm": gradient_norm,
             "learning_rate": _current_learning_rate(optimizer),
             "val_auprc": validation_auprc,
             "monitor_value": monitor_value,
-            "local_train_pairs": int(local_loss_sums[4].detach().cpu().item()),
-            "global_train_pairs": global_train_count,
-            "local_validation_pairs": _rank_local_pair_count(
-                total=len(request.validation.pairs),
-                runtime=request.runtime,
-            ),
-            "global_validation_pairs": len(request.validation.pairs),
             "peak_gpu_mem_mb": _peak_gpu_memory_mb(device),
             "sampled_edge_targets": len(epoch_targets),
             "train_fp_targets": quadrant_counts["fp"],
@@ -1322,9 +1305,6 @@ def _append_tccig_train_csv_row(
                 "Train Weighted Residual Anchor Loss": float(
                     epoch_history["train_weighted_residual_anchor_loss"]
                 ),
-                "Train Topology Loss": float(epoch_history["train_topology_loss"]),
-                "Train GS Loss": float(epoch_history["train_graph_similarity_loss"]),
-                "Train RD Loss": float(epoch_history["train_relative_density_loss"]),
                 "Train Gradient Norm": float(epoch_history["train_gradient_norm"]),
                 "Val auprc": float(epoch_history["val_auprc"]),
                 "Val Topology Loss": epoch_history.get("val_topology_loss", ""),
@@ -1345,10 +1325,6 @@ def _append_tccig_train_csv_row(
                 ),
                 "Monitor Metric": monitor_metric,
                 "Monitor Value": float(epoch_history["monitor_value"]),
-                "Local Train Pairs": int(epoch_history["local_train_pairs"]),
-                "Global Train Pairs": int(epoch_history["global_train_pairs"]),
-                "Local Validation Pairs": int(epoch_history["local_validation_pairs"]),
-                "Global Validation Pairs": int(epoch_history["global_validation_pairs"]),
                 "Peak GPU Mem MB": float(epoch_history["peak_gpu_mem_mb"]),
                 "Learning Rate": float(epoch_history["learning_rate"]),
             }
@@ -1366,22 +1342,18 @@ def _log_epoch_summary(
     LOGGER.info(
         (
             "TCCIG epoch %s complete: time_s=%.2f train_loss=%.6f "
-            "train_bce=%.6f train_topology=%.6f val_auprc=%.6f monitor[%s]=%.6f "
-            "val_topology_loss=%s rule=%s local_train_pairs=%s "
-            "global_train_pairs=%s lr=%.6g peak_gpu_mem_mb=%.1f"
+            "train_bce=%.6f val_auprc=%.6f monitor[%s]=%.6f "
+            "val_topology_loss=%s rule=%s lr=%.6g peak_gpu_mem_mb=%.1f"
         ),
         int(epoch_history["epoch"]),
         epoch_time_s,
         float(epoch_history["train_loss"]),
         float(epoch_history["train_bce_loss"]),
-        float(epoch_history["train_topology_loss"]),
         float(epoch_history["val_auprc"]),
         monitor_metric,
         float(epoch_history["monitor_value"]),
         _format_optional_epoch_value(epoch_history.get("val_topology_loss")),
         "none" if selected_rule is None else selected_rule.type,
-        int(epoch_history["local_train_pairs"]),
-        int(epoch_history["global_train_pairs"]),
         float(epoch_history["learning_rate"]),
         float(epoch_history["peak_gpu_mem_mb"]),
     )
