@@ -174,9 +174,10 @@ def run_tccig_pipeline(
         validation_labels=tables["validation"].labels,
     )
     refined_output_rule = _resolve_refined_output_rule(config)
-    graph_rules = tuple(
-        parse_rules(_graph_selection(config).get("rules", [refined_output_rule.to_dict()]))
+    parsed_rules = parse_rules(
+        _graph_selection(config).get("rules", [refined_output_rule.to_dict()])
     )
+    graph_rule = parsed_rules[0]
 
     train_bundle = _bundle_from_table(
         table=tables["train"],
@@ -205,7 +206,7 @@ def run_tccig_pipeline(
             validation=validation_bundle,
             runtime=runtime,
             config=refiner_cfg,
-            graph_rules=graph_rules,
+            graph_rule=graph_rule,
             validation_topology=validation_topology,
             validation_topology_plan=validation_topology_plan,
         )

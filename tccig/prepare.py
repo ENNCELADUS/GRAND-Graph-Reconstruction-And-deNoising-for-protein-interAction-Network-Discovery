@@ -225,7 +225,7 @@ class TrainRefinerRequest:
     validation: SplitBundle
     runtime: TCCIGRuntime
     config: Mapping[str, object]
-    graph_rules: tuple[GraphRule, ...]
+    graph_rule: GraphRule
     validation_topology: SplitBundle | None = None
     validation_topology_plan: object | None = None
 

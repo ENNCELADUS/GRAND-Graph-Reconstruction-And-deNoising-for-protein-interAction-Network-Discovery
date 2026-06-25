@@ -541,8 +541,6 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             raise ValueError(
                 "refiner.topology_validation.enabled requires validation_topology inputs"
             )
-        if not request.graph_rules:
-            raise ValueError("refiner topology validation requires graph_selection.rules")
         validation_topology_graph = _build_split_graph(
             request.validation_topology,
             cfg=cfg,
@@ -640,7 +638,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 graph=validation_topology_graph,
                 pairs=request.validation_topology.pairs,
                 validation_plan=request.validation_topology_plan,
-                rules=request.graph_rules,
+                rule=request.graph_rule,
                 validation_auprc=validation_auprc,
                 cfg=cfg,
                 runtime=request.runtime,
@@ -1057,7 +1055,7 @@ def _evaluate_validation_topology_rules(
     graph: _SplitGraph,
     pairs: Sequence[CandidatePair],
     validation_plan: InternalValidationPlan,
-    rules: Sequence[GraphRule],
+    rule: GraphRule,
     validation_auprc: float,
     cfg: S2GAEConfig,
     runtime: object,
@@ -1071,19 +1069,18 @@ def _evaluate_validation_topology_rules(
     if len(refined_probabilities) != len(pairs):
         raise ValueError("validation topology probabilities must match candidate pairs")
 
-    fixed_rule = _fixed_threshold_rule(rules)
     metrics = _validation_topology_metrics(
         validation_plan=validation_plan,
         pairs=pairs,
         probabilities=refined_probabilities,
-        rule=fixed_rule,
+        rule=rule,
         validation_auprc=validation_auprc,
         cfg=cfg,
     )
     return ValidationTopologyRuleEvaluation(
-        rule=fixed_rule,
+        rule=rule,
         validation_metrics=metrics,
-        rule_payload=fixed_rule.to_dict(),
+        rule_payload=rule.to_dict(),
     )
 
 
@@ -1188,18 +1185,6 @@ def _is_better_monitor(
     if _resolve_monitor_mode(monitor_metric) == "min":
         return value < best_value
     return value > best_value
-
-
-def _fixed_threshold_rule(rules: Sequence[GraphRule]) -> GraphRule:
-    if not rules:
-        raise ValueError("refiner topology validation requires graph_selection.rules")
-    for rule in rules:
-        if rule.type != "threshold":
-            raise ValueError(
-                "TCCIG refined graph rules must be fixed threshold rules; "
-                "top_m/top_k artifacts are invalid and must be rerun"
-            )
-    return rules[0]
 
 
 def _batch_indices(total: int, batch_size: int, device: torch.device) -> Iterator[torch.Tensor]:
