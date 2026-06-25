@@ -1,0 +1,2 @@
+- [Experiment Plan](EXPERIMENT_PLAN.md) — TCCIG run 01: S2GAE residual denoiser vs frozen v3.1 scorer on PRING Human/BFS topology
+- [Experiment Tracker](EXPERIMENT_TRACKER.md) — run-by-run status for TCCIG 01 (M0–M4, R001–R008)
