@@ -56,6 +56,7 @@ SUPPORTED_MONITOR_METRICS = {
     "val_auprc",
 }
 INTERNAL_VALIDATION_SUMMARY_KEYS = ("graph_sim", "relative_density", "deg_dist_mmd", "cc_mmd")
+SUPPORTED_ENCODER_AGGREGATIONS = {"add", "mean", "max"}
 TCCIG_TRAIN_CSV_COLUMNS = [
     "Epoch",
     "Epoch Time",
@@ -95,6 +96,9 @@ class S2GAEConfig:
     edge_sampling: EdgeSamplingConfig
     loss_config: LossConfig
     residual_weight: float
+    residual_scale: float | None
+    encoder_aggr: str
+    layer_norm: bool
     monitor_metric: str
     topology_validation: S2GAETopologyValidationConfig
     optimizer: S2GAEOptimizerConfig
@@ -198,19 +202,29 @@ class S2GAERefiner(nn.Module):
         decoder_hidden_dim: int,
         decoder_layers: int,
         dropout: float,
+        encoder_aggr: str = "add",
+        layer_norm: bool = False,
+        residual_scale: float | None = None,
     ) -> None:
         super().__init__()
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
         self.dropout = dropout
         self.encoder_name = encoder.lower()
+        self.residual_scale = residual_scale
         self.convs = nn.ModuleList()
         graph_conv = _load_graph_conv()
         for layer_index in range(num_layers):
             in_channels = input_dim if layer_index == 0 else hidden_dim
             if self.encoder_name != "graphconv":
                 raise ValueError("refiner.encoder must be 'graphconv'")
-            self.convs.append(graph_conv(in_channels, hidden_dim))
+            self.convs.append(graph_conv(in_channels, hidden_dim, aggr=encoder_aggr))
+        self.feature_norm = nn.LayerNorm(input_dim) if layer_norm else None
+        self.hidden_norms = (
+            nn.ModuleList(nn.LayerNorm(hidden_dim) for _ in range(num_layers))
+            if layer_norm
+            else None
+        )
         self.decoder = CrossLayerDecoder(
             hidden_dim=hidden_dim,
             num_layers=num_layers,
@@ -227,9 +241,11 @@ class S2GAERefiner(nn.Module):
     ) -> list[torch.Tensor]:
         """Return one hidden representation per GNN layer."""
         hidden_states: list[torch.Tensor] = []
-        x = node_features
+        x = node_features if self.feature_norm is None else self.feature_norm(node_features)
         for layer_index, conv in enumerate(self.convs):
             x = conv(x, edge_index, edge_weight)
+            if self.hidden_norms is not None:
+                x = self.hidden_norms[layer_index](x)
             if layer_index < len(self.convs) - 1:
                 x = functional.relu(x)
                 x = functional.dropout(x, p=self.dropout, training=self.training)
@@ -264,9 +280,11 @@ class S2GAERefiner(nn.Module):
         pair_index: torch.Tensor,
         pairwise_probabilities: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return refined logits from already-computed graph hidden states."""
-        delta = self.decoder(hidden_states=hidden_states, pair_index=pair_index)
-        return residual_refined_logits(pairwise_probabilities, delta), delta
+        """Return refined logits and the applied residual for already-encoded states."""
+        raw_delta = self.decoder(hidden_states=hidden_states, pair_index=pair_index)
+        applied_delta = _bounded_residual(raw_delta, self.residual_scale)
+        refined_logits = torch.logit(_clamp_probabilities(pairwise_probabilities)) + applied_delta
+        return refined_logits, applied_delta
 
 
 class CrossLayerDecoder(nn.Module):
@@ -328,13 +346,30 @@ class CrossLayerDecoder(nn.Module):
         return self.layers[-1](x).squeeze(-1)
 
 
+def _clamp_probabilities(pairwise_probabilities: torch.Tensor) -> torch.Tensor:
+    return pairwise_probabilities.clamp(min=1.0e-6, max=1.0 - 1.0e-6)
+
+
+def _bounded_residual(delta_logits: torch.Tensor, residual_scale: float | None) -> torch.Tensor:
+    """Soft-clamp the residual to ±residual_scale, keeping unit slope near zero.
+
+    Uses ``s * tanh(x / s)`` rather than ``s * tanh(x)`` so a small raw delta passes
+    through near-unchanged (slope 1 at the origin) instead of being amplified by ``s``,
+    while still saturating at ±s. With ``residual_scale=None`` the residual is unbounded.
+    """
+    if residual_scale is None:
+        return delta_logits
+    return residual_scale * torch.tanh(delta_logits / residual_scale)
+
+
 def residual_refined_logits(
     pairwise_probabilities: torch.Tensor,
     delta_logits: torch.Tensor,
+    residual_scale: float | None = None,
 ) -> torch.Tensor:
-    """Add S2GAE residual logits to clamped pairwise logits."""
-    clamped = pairwise_probabilities.clamp(min=1.0e-6, max=1.0 - 1.0e-6)
-    return torch.logit(clamped) + delta_logits
+    """Add the (optionally bounded) S2GAE residual to clamped pairwise logits."""
+    applied_delta = _bounded_residual(delta_logits, residual_scale)
+    return torch.logit(_clamp_probabilities(pairwise_probabilities)) + applied_delta
 
 
 def s2gae_loss_terms(
@@ -500,6 +535,9 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         decoder_hidden_dim=cfg.decoder_hidden_dim,
         decoder_layers=cfg.decoder_layers,
         dropout=cfg.dropout,
+        encoder_aggr=cfg.encoder_aggr,
+        layer_norm=cfg.layer_norm,
+        residual_scale=cfg.residual_scale,
     ).to(device)
     optimizer = build_s2gae_optimizer(model=model, config=cfg.optimizer)
     train_step = _S2GAESampledTrainStepModule(refiner=model, cfg=cfg).to(device)
@@ -1367,6 +1405,11 @@ def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
     encoder = str(config.get("encoder", "graphconv")).lower()
     if encoder != "graphconv":
         raise ValueError("refiner.encoder must be 'graphconv'")
+    encoder_aggr = str(config.get("encoder_aggr", "mean")).lower()
+    if encoder_aggr not in SUPPORTED_ENCODER_AGGREGATIONS:
+        raise ValueError(
+            f"refiner.encoder_aggr must be one of {sorted(SUPPORTED_ENCODER_AGGREGATIONS)}"
+        )
     return S2GAEConfig(
         encoder=encoder,
         input_dim=_positive_int(config.get("input_dim", 1024), "refiner.input_dim"),
@@ -1389,6 +1432,12 @@ def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
             config.get("residual_weight", 0.001),
             "refiner.residual_weight",
         ),
+        residual_scale=_optional_positive_float(
+            config.get("residual_scale", 4.0),
+            "refiner.residual_scale",
+        ),
+        encoder_aggr=encoder_aggr,
+        layer_norm=_bool(config.get("layer_norm", True), "refiner.layer_norm"),
         monitor_metric=monitor_metric,
         topology_validation=_parse_topology_validation_config(
             raw_topology_validation=config.get("topology_validation", {}),
@@ -1415,6 +1464,9 @@ def _config_to_json(cfg: S2GAEConfig) -> dict[str, object]:
         "decoder_hidden_dim": cfg.decoder_hidden_dim,
         "decoder_layers": cfg.decoder_layers,
         "dropout": cfg.dropout,
+        "encoder_aggr": cfg.encoder_aggr,
+        "layer_norm": cfg.layer_norm,
+        "residual_scale": cfg.residual_scale,
         "epochs": cfg.epochs,
         "batch_size": cfg.batch_size,
         "edge_sampling": {

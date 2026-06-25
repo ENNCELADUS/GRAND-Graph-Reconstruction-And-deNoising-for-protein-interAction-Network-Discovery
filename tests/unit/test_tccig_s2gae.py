@@ -248,6 +248,122 @@ def test_refiner_rejects_non_graphconv_encoder() -> None:
         )
 
 
+def test_residual_refined_logits_bounds_delta_with_scale() -> None:
+    # A huge raw delta must not be able to swamp the pairwise logit when a
+    # residual_scale is configured: the applied residual is bounded to ±scale.
+    pairwise = torch.tensor([0.5, 0.5], dtype=torch.float32)
+    delta = torch.tensor([1.0e7, -1.0e7], dtype=torch.float32)
+
+    refined = residual_refined_logits(pairwise, delta, residual_scale=4.0)
+
+    base_logit = torch.logit(pairwise.clamp(1.0e-6, 1.0 - 1.0e-6))
+    assert refined[0].item() == pytest.approx(base_logit[0].item() + 4.0, abs=1e-3)
+    assert refined[1].item() == pytest.approx(base_logit[1].item() - 4.0, abs=1e-3)
+
+
+def test_residual_refined_logits_unbounded_when_scale_is_none() -> None:
+    pairwise = torch.tensor([0.2], dtype=torch.float32)
+    delta = torch.tensor([0.5], dtype=torch.float32)
+
+    refined = residual_refined_logits(pairwise, delta, residual_scale=None)
+
+    assert refined.item() == pytest.approx(torch.logit(pairwise).item() + 0.5)
+
+
+def test_decode_returns_bounded_applied_residual_for_anchor() -> None:
+    # The residual returned for the anchor loss must be the post-scale residual
+    # so train_residual_anchor_loss stays bounded by scale**2.
+    model = S2GAERefiner(
+        encoder="graphconv",
+        input_dim=4,
+        hidden_dim=4,
+        num_layers=1,
+        decoder_hidden_dim=4,
+        decoder_layers=1,
+        dropout=0.0,
+        residual_scale=4.0,
+    )
+    with torch.no_grad():
+        output_layer = model.decoder.layers[-1]
+        output_layer.weight.fill_(1.0e6)
+        output_layer.bias.fill_(1.0e6)
+    hidden_states = [torch.full((2, 4), 5.0, dtype=torch.float32)]
+    pair_index = torch.tensor([[0], [1]], dtype=torch.long)
+    pairwise = torch.tensor([0.5], dtype=torch.float32)
+
+    _, applied_residual = model.decode(
+        hidden_states=hidden_states,
+        pair_index=pair_index,
+        pairwise_probabilities=pairwise,
+    )
+
+    assert applied_residual.abs().max().item() <= 4.0 + 1e-4
+
+
+def test_mean_aggregation_with_layer_norm_tames_dense_hub_explosion() -> None:
+    # A hub node wired to many neighbours blows up under sum aggregation of large,
+    # *non-constant* features (LayerNorm would zero out constant features, hiding
+    # the effect). The stable path (mean aggr + LayerNorm) must keep the hub's
+    # hidden state O(1) where the unstable path (add aggr, no norm) does not.
+    node_count = 200
+    torch.manual_seed(0)
+    # Non-constant large features so LayerNorm has real variance to normalise.
+    node_features = torch.randn(node_count, 8, dtype=torch.float32) * 50.0
+    hub_edges = [(0, i) for i in range(1, node_count)] + [(i, 0) for i in range(1, node_count)]
+    edge_index = torch.tensor(hub_edges, dtype=torch.long).t().contiguous()
+    edge_weight = torch.ones(edge_index.size(1), dtype=torch.float32)
+
+    def _build(*, encoder_aggr: str, layer_norm: bool) -> S2GAERefiner:
+        model = S2GAERefiner(
+            encoder="graphconv",
+            input_dim=8,
+            hidden_dim=8,
+            num_layers=2,
+            decoder_hidden_dim=8,
+            decoder_layers=2,
+            dropout=0.0,
+            encoder_aggr=encoder_aggr,
+            layer_norm=layer_norm,
+        )
+        model.eval()
+        return model
+
+    unstable = _build(encoder_aggr="add", layer_norm=False)
+    stable = _build(encoder_aggr="mean", layer_norm=True)
+
+    with torch.no_grad():
+        unstable_hidden = unstable.encode(
+            node_features=node_features, edge_index=edge_index, edge_weight=edge_weight
+        )
+        stable_hidden = stable.encode(
+            node_features=node_features, edge_index=edge_index, edge_weight=edge_weight
+        )
+
+    # Hub node (index 0) aggregates all 199 neighbours: add-aggregation scales its
+    # magnitude with degree, mean-aggregation + LayerNorm does not.
+    unstable_hub_magnitude = unstable_hidden[0][0].abs().max().item()
+    stable_hub_magnitude = stable_hidden[0][0].abs().max().item()
+    assert stable_hub_magnitude < unstable_hub_magnitude
+    for hidden in stable_hidden:
+        assert torch.isfinite(hidden).all()
+        assert hidden.abs().max().item() < 50.0
+
+
+def test_refiner_uses_configured_aggregation() -> None:
+    model = S2GAERefiner(
+        encoder="graphconv",
+        input_dim=4,
+        hidden_dim=4,
+        num_layers=1,
+        decoder_hidden_dim=4,
+        decoder_layers=1,
+        dropout=0.0,
+        encoder_aggr="mean",
+    )
+
+    assert model.convs[0].aggr == "mean"
+
+
 def _base_refiner_config(tmp_path: Path) -> dict[str, object]:
     return {
         "embedding_cache_dir": str(tmp_path / "cache"),
@@ -293,6 +409,48 @@ def test_parse_config_reads_nested_loss_config(tmp_path: Path) -> None:
         label_smoothing=0.1,
     )
     assert cfg.residual_weight == pytest.approx(0.25)
+
+
+def test_parse_config_defaults_to_stable_encoder_settings(tmp_path: Path) -> None:
+    cfg = _parse_config(_base_refiner_config(tmp_path))
+
+    assert cfg.encoder_aggr == "mean"
+    assert cfg.layer_norm is True
+    assert cfg.residual_scale == pytest.approx(4.0)
+
+
+def test_parse_config_reads_stabilization_overrides(tmp_path: Path) -> None:
+    config = _base_refiner_config(tmp_path)
+    config.update(
+        {
+            "encoder_aggr": "add",
+            "layer_norm": False,
+            "residual_scale": 2.5,
+        }
+    )
+
+    cfg = _parse_config(config)
+
+    assert cfg.encoder_aggr == "add"
+    assert cfg.layer_norm is False
+    assert cfg.residual_scale == pytest.approx(2.5)
+
+
+def test_parse_config_allows_unbounded_residual_scale(tmp_path: Path) -> None:
+    config = _base_refiner_config(tmp_path)
+    config["residual_scale"] = 0.0
+
+    cfg = _parse_config(config)
+
+    assert cfg.residual_scale is None
+
+
+def test_parse_config_rejects_unsupported_aggregation(tmp_path: Path) -> None:
+    config = _base_refiner_config(tmp_path)
+    config["encoder_aggr"] = "median"
+
+    with pytest.raises(ValueError, match="refiner.encoder_aggr"):
+        _parse_config(config)
 
 
 def test_parse_config_ignores_disabled_legacy_topology_loss_block(tmp_path: Path) -> None:

@@ -28,6 +28,9 @@ refiner:
   decoder_hidden_dim: 256
   decoder_layers: 2
   dropout: 0.2
+  encoder_aggr: mean
+  layer_norm: true
+  residual_scale: 4.0
   epochs: 40
   batch_size: 4096
   edge_sampling:

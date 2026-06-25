@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import pickle
 import subprocess
@@ -292,8 +293,7 @@ def test_tccig_script_uses_cpu_fallback_when_nvidia_smi_is_absent(tmp_path: Path
     uv_args_path = tmp_path / "uv_args.txt"
     fake_uv = fake_bin / "uv"
     fake_uv.write_text(
-        "#!/bin/bash\n"
-        'printf "%s\\n" "$@" > "$GRAND_UV_ARGS_OUT"\n',
+        '#!/bin/bash\nprintf "%s\\n" "$@" > "$GRAND_UV_ARGS_OUT"\n',
         encoding="utf-8",
     )
     fake_uv.chmod(0o755)
@@ -332,15 +332,13 @@ def test_tccig_script_launches_accelerate_with_detected_gpu_count(tmp_path: Path
     srun_args_path = tmp_path / "srun_args.txt"
     fake_nvidia_smi = fake_bin / "nvidia-smi"
     fake_nvidia_smi.write_text(
-        "#!/bin/bash\n"
-        "printf 'GPU 0\\nGPU 1\\n'\n",
+        "#!/bin/bash\nprintf 'GPU 0\\nGPU 1\\n'\n",
         encoding="utf-8",
     )
     fake_nvidia_smi.chmod(0o755)
     fake_srun = fake_bin / "srun"
     fake_srun.write_text(
-        "#!/bin/bash\n"
-        'printf "%s\\n" "$@" > "$GRAND_SRUN_ARGS_OUT"\n',
+        '#!/bin/bash\nprintf "%s\\n" "$@" > "$GRAND_SRUN_ARGS_OUT"\n',
         encoding="utf-8",
     )
     fake_srun.chmod(0o755)
@@ -481,3 +479,25 @@ def test_best_validation_auprc_matches_selected_epoch(
     selected = min(history, key=lambda row: abs(row["monitor_value"] - best_monitor))
     assert selected["val_auprc"] == pytest.approx(0.1)
     assert payload["best_validation_auprc"] == pytest.approx(selected["val_auprc"])
+
+
+def test_bounded_residual_keeps_training_anchor_loss_finite(tmp_path: Path) -> None:
+    # With residual_scale set, the applied residual is bounded to ±scale, so the
+    # all-pair residual anchor loss can never explode the way it did in the
+    # unbounded run (anchor ~7e14). Bound is scale**2 = 16.0 for scale=4.0.
+    config = _tiny_config(tmp_path, "bounded_residual")
+    refiner_config = config["refiner"]
+    assert isinstance(refiner_config, dict)
+    refiner_config["epochs"] = 2
+    refiner_config["residual_scale"] = 4.0
+    refiner_config["encoder_aggr"] = "mean"
+    refiner_config["layer_norm"] = True
+
+    run_tccig_pipeline(config)
+
+    summary_path = tmp_path / "logs" / "tccig" / "bounded_residual" / "training_summary.json"
+    history = json.loads(summary_path.read_text(encoding="utf-8"))["history"]
+    for row in history:
+        assert math.isfinite(row["train_loss"])
+        assert math.isfinite(row["train_residual_anchor_loss"])
+        assert row["train_residual_anchor_loss"] <= 16.0 + 1e-3

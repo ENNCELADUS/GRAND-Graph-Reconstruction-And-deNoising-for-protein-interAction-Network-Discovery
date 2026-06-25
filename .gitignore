@@ -199,3 +199,6 @@ __marimo__/
 # OS Generated
 .DS_Store
 Thumbs.db
+
+# Local experiment debug artifacts
+/artifacts/

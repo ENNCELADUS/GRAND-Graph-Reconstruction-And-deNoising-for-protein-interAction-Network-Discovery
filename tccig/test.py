@@ -40,6 +40,18 @@ TOPOLOGY_METRIC_NAMES = [
     "laplacian_eigen_mmd",
 ]
 TOPOLOGY_CSV_COLUMNS = ["scope", "node_size", "graph_count", *TOPOLOGY_METRIC_NAMES]
+# raw_metrics.json reports the frozen scorer's own decision quality at its natural
+# 0.5 probability boundary, independent of the (often target-precision) input-graph
+# threshold used to build G_pairwise. Threshold-free AUROC/AUPRC are the real
+# raw-vs-refined comparison; this only sets the point-metric operating point.
+RAW_SCORER_DECISION_THRESHOLD = 0.5
+PAIRWISE_CSV_COLUMNS = [
+    "protein_a",
+    "protein_b",
+    "label",
+    "raw_probability",
+    "refined_probability",
+]
 
 
 class ScoreSplitFn(Protocol):
@@ -99,9 +111,22 @@ def run_pairwise_test(
         probabilities=refined_scores,
         threshold=float(refined_output_rule.value),
     )
+    raw_metrics = _binary_metrics(
+        labels=table.labels,
+        probabilities=pairwise_scores,
+        threshold=RAW_SCORER_DECISION_THRESHOLD,
+    )
     if runtime.is_main_process:
         pairwise_dir = log_dir / "pairwise_test"
-        _write_pairwise_predictions(pairwise_dir / "human_test_ppi_pred.csv", table, refined_scores)
+        _write_pairwise_predictions(
+            pairwise_dir / "human_test_ppi_pred.csv",
+            table,
+            raw_probabilities=pairwise_scores,
+            refined_probabilities=refined_scores,
+        )
+        write_json(pairwise_dir / "raw_metrics.json", raw_metrics)
+        write_json(pairwise_dir / "refined_metrics.json", metrics)
+        # Back-compat: pairwise_metrics.json mirrors the refined metrics.
         write_json(pairwise_dir / "pairwise_metrics.json", metrics)
     _runtime_barrier(runtime)
     return metrics
@@ -222,22 +247,31 @@ def _binary_metrics(
 def _write_pairwise_predictions(
     path: Path,
     table: PairTable,
-    probabilities: Sequence[float],
+    *,
+    raw_probabilities: Sequence[float],
+    refined_probabilities: Sequence[float],
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=["protein_a", "protein_b", "label", "refined_probability"],
+            fieldnames=PAIRWISE_CSV_COLUMNS,
         )
         writer.writeheader()
-        for pair, label, probability in zip(table.pairs, table.labels, probabilities, strict=True):
+        for pair, label, raw, refined in zip(
+            table.pairs,
+            table.labels,
+            raw_probabilities,
+            refined_probabilities,
+            strict=True,
+        ):
             writer.writerow(
                 {
                     "protein_a": pair.protein_a,
                     "protein_b": pair.protein_b,
                     "label": int(label),
-                    "refined_probability": float(probability),
+                    "raw_probability": float(raw),
+                    "refined_probability": float(refined),
                 }
             )
 
