@@ -10,6 +10,7 @@ from tccig.prepare import (
     CandidatePair,
     EdgeSamplingConfig,
     classify_scorer_error_targets,
+    ordered_probabilities_from_indexed_rows,
     read_pair_table,
     sample_epoch_edge_targets,
     strict_reject_legacy_hooks,
@@ -175,9 +176,14 @@ def test_write_json_uses_stable_json_and_tensor_scalar_values(tmp_path: Path) ->
     )
 
 
-def test_ordered_probabilities_from_indexed_rows_orders_and_dedups() -> None:
-    from tccig.prepare import ordered_probabilities_from_indexed_rows
-
-    rows = torch.tensor([[1.0, 0.6], [0.0, 0.5], [1.0, 0.6]], dtype=torch.float64)
+def test_ordered_probabilities_from_indexed_rows_orders_rows() -> None:
+    rows = torch.tensor([[1.0, 0.6], [0.0, 0.5]], dtype=torch.float64)
 
     assert ordered_probabilities_from_indexed_rows(total=2, rows=rows) == [0.5, 0.6]
+
+
+def test_ordered_probabilities_from_indexed_rows_raises_on_duplicate_index() -> None:
+    rows = torch.tensor([[1.0, 0.6], [0.0, 0.5], [1.0, 0.6]], dtype=torch.float64)
+
+    with pytest.raises(ValueError, match="Duplicate"):
+        ordered_probabilities_from_indexed_rows(total=2, rows=rows)

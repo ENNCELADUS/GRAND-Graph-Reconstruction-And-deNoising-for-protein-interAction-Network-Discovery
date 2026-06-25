@@ -44,17 +44,23 @@ def test_ordered_probabilities_from_indexed_rows_restores_global_order() -> None
     assert values == [0.0, 0.1, 0.2]
 
 
-def test_ordered_probabilities_from_indexed_rows_tolerates_duplicate_tail_rows() -> None:
-    # Accelerate even_batches duplicates tail samples across ranks; the helper
-    # keeps the first occurrence and still covers every index exactly once.
+def test_ordered_probabilities_from_indexed_rows_raises_on_duplicate_index() -> None:
+    # Per-batch gather_for_metrics strips Accelerate even_batches tail
+    # duplicates, so a duplicate index reaching the helper signals a real bug.
     rows = torch.tensor(
         [[0.0, 0.5], [1.0, 0.6], [1.0, 0.6]],
         dtype=torch.float64,
     )
 
-    values = ordered_probabilities_from_indexed_rows(total=2, rows=rows)
+    with pytest.raises(ValueError, match="Duplicate"):
+        ordered_probabilities_from_indexed_rows(total=2, rows=rows)
 
-    assert values == [0.5, 0.6]
+
+def test_ordered_probabilities_from_indexed_rows_raises_on_out_of_range_index() -> None:
+    rows = torch.tensor([[0.0, 0.5], [5.0, 0.6]], dtype=torch.float64)
+
+    with pytest.raises(ValueError, match="out of range"):
+        ordered_probabilities_from_indexed_rows(total=2, rows=rows)
 
 
 def test_ordered_probabilities_from_indexed_rows_raises_on_missing_index() -> None:

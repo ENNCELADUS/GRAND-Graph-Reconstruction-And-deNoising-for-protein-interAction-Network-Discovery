@@ -200,16 +200,18 @@ def ordered_probabilities_from_indexed_rows(
 ) -> list[float]:
     """Map ``(index, probability)`` rows to global order.
 
-    Keeps the first occurrence of duplicate indices (Accelerate ``even_batches``
-    repeats tail samples) and raises if any index is uncovered.
+    Per-batch ``gather_for_metrics`` already strips Accelerate ``even_batches``
+    tail duplicates, so this helper treats out-of-range or duplicate indices as
+    bugs and raises. It also raises if any index is uncovered.
     """
     ordered: dict[int, float] = {}
     for row in rows.detach().cpu():
         index = int(row[0].item())
         if index < 0 or index >= total:
-            continue
-        if index not in ordered:
-            ordered[index] = float(row[1].item())
+            raise ValueError(f"Index out of range: {index} (total={total})")
+        if index in ordered:
+            raise ValueError(f"Duplicate probability for index: {index}")
+        ordered[index] = float(row[1].item())
     missing = [index for index in range(total) if index not in ordered]
     if missing:
         raise ValueError(f"Missing probabilities for indices: {missing[:10]}")
