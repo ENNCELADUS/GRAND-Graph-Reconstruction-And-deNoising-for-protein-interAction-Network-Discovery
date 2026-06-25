@@ -50,7 +50,7 @@ refiner:
     type: none
   optimization:
     gradient_clip_norm: 1.0
-  residual_weight: 1.0e-8
+  residual_weight: 1.0e-3
   monitor_metric: val_topology_loss
   topology_validation:
     enabled: true

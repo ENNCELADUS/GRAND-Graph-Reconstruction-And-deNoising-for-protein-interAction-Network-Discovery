@@ -61,12 +61,18 @@ model choices, or runtime settings in `train.py`.
 - `human_val_ppi_ratio5_exclusive.txt` builds `G_pairwise_val` from scorer
   outputs, preserving scorer probabilities as graph edge weights, and provides
   validation supervision for checkpoint selection.
-- Validation topology builds a true topology graph from positive rows in
-  `human_val_ppi_ratio5_exclusive.txt`, samples PRING-style validation node
-  buckets, scores every non-self pair inside those buckets, and selects the
-  checkpoint from configured hard topology metrics when
-  `refiner.topology_validation.enabled` is true. The hard graph rule remains
-  `threshold=0.5`; per-node top-k and global top-M are not supported.
+- Validation topology builds a true topology graph seeded from the **train**
+  node universe (`load_split_node_ids(..., split_name="train")`) with edges from
+  positive rows in `human_val_ppi_ratio5_exclusive.txt`, samples PRING-style
+  validation node buckets, scores every non-self pair inside those buckets, and
+  selects the checkpoint from configured hard topology metrics when
+  `refiner.topology_validation.enabled` is true. The hard graph rule for refined
+  output remains `threshold=0.5`; per-node top-k and global top-M are not
+  supported. The pairwise *input* threshold that builds `G_pairwise` is resolved
+  from `graph_selection.pairwise_input_threshold`: the live config
+  (`configs/tccig/01.yaml`) uses `mode: target_precision` on the validation
+  split, so the threshold is data-derived. The fixed `0.5` default applies only
+  when no precision target is configured.
 - `human_test_ppi.txt` is the binary pairwise test set. The raw frozen v3.1
   scorer baseline is a pinned historical artifact under
   `logs/tccig/pairwise_baseline`; the pipeline does not regenerate it. The
