@@ -46,6 +46,7 @@ from tccig.prepare import (
     collate_pair_score_records,
     edges_from_rule,
     load_pring_tables,
+    ordered_probabilities_from_indexed_rows,
     score_cache_metadata,
     strict_reject_legacy_hooks,
     write_json,
@@ -588,23 +589,8 @@ def _ordered_probabilities_from_rows(
 ) -> list[float]:
     rows = local_rows
     if runtime.is_distributed:
-        pad_fn = getattr(runtime.accelerator, "pad_across_processes", None)
-        gather_fn = getattr(runtime.accelerator, "gather_for_metrics", None)
-        if callable(pad_fn) and callable(gather_fn):
-            rows = cast(torch.Tensor, pad_fn(rows, dim=0, pad_index=-1))
-            rows = cast(torch.Tensor, gather_fn(rows))
-            rows = rows[rows[:, 0] >= 0]
-    ordered: list[float | None] = [None] * total
-    for row in rows.detach().cpu():
-        index = int(row[0].item())
-        if index < 0 or index >= total:
-            continue
-        if ordered[index] is None:
-            ordered[index] = float(row[1].item())
-    missing = [index for index, value in enumerate(ordered) if value is None]
-    if missing:
-        raise ValueError(f"Missing pairwise scores for indices: {missing[:10]}")
-    return [float(value) for value in ordered]
+        rows = runtime.accelerator.gather_for_metrics(local_rows)
+    return ordered_probabilities_from_indexed_rows(total=total, rows=rows)
 
 
 def _build_runtime(

@@ -193,6 +193,29 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(_json_safe(payload), indent=2, sort_keys=True), encoding="utf-8")
 
 
+def ordered_probabilities_from_indexed_rows(
+    *,
+    total: int,
+    rows: torch.Tensor,
+) -> list[float]:
+    """Map ``(index, probability)`` rows to global order.
+
+    Keeps the first occurrence of duplicate indices (Accelerate ``even_batches``
+    repeats tail samples) and raises if any index is uncovered.
+    """
+    ordered: dict[int, float] = {}
+    for row in rows.detach().cpu():
+        index = int(row[0].item())
+        if index < 0 or index >= total:
+            continue
+        if index not in ordered:
+            ordered[index] = float(row[1].item())
+    missing = [index for index in range(total) if index not in ordered]
+    if missing:
+        raise ValueError(f"Missing probabilities for indices: {missing[:10]}")
+    return [ordered[index] for index in range(total)]
+
+
 def edges_from_rule(
     *,
     pairs: Sequence[CandidatePair],

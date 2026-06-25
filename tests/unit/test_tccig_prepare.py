@@ -173,3 +173,11 @@ def test_write_json_uses_stable_json_and_tensor_scalar_values(tmp_path: Path) ->
     assert output_path.read_text(encoding="utf-8") == (
         '{\n  "a": 1,\n  "tensor": 3.5,\n  "z": 2\n}'
     )
+
+
+def test_ordered_probabilities_from_indexed_rows_orders_and_dedups() -> None:
+    from tccig.prepare import ordered_probabilities_from_indexed_rows
+
+    rows = torch.tensor([[1.0, 0.6], [0.0, 0.5], [1.0, 0.6]], dtype=torch.float64)
+
+    assert ordered_probabilities_from_indexed_rows(total=2, rows=rows) == [0.5, 0.6]

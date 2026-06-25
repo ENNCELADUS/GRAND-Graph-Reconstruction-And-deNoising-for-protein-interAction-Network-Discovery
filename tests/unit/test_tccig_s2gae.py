@@ -9,13 +9,12 @@ import pytest
 import torch
 from src.train.config import LossConfig
 from src.utils.losses import binary_classification_loss
-from tccig.prepare import CandidatePair
+from tccig.prepare import CandidatePair, ordered_probabilities_from_indexed_rows
 from tccig.s2gae import (
     CrossLayerDecoder,
     S2GAERefiner,
     _build_graph,
     _masked_split_graph,
-    _ordered_probabilities_from_indexed_rows,
     _parse_config,
     _prediction_probabilities,
     _S2GAESampledTrainStepModule,
@@ -40,7 +39,7 @@ def test_ordered_probabilities_from_indexed_rows_restores_global_order() -> None
         dtype=torch.float64,
     )
 
-    values = _ordered_probabilities_from_indexed_rows(total=3, rows=rows)
+    values = ordered_probabilities_from_indexed_rows(total=3, rows=rows)
 
     assert values == [0.0, 0.1, 0.2]
 
@@ -53,7 +52,7 @@ def test_ordered_probabilities_from_indexed_rows_tolerates_duplicate_tail_rows()
         dtype=torch.float64,
     )
 
-    values = _ordered_probabilities_from_indexed_rows(total=2, rows=rows)
+    values = ordered_probabilities_from_indexed_rows(total=2, rows=rows)
 
     assert values == [0.5, 0.6]
 
@@ -62,7 +61,7 @@ def test_ordered_probabilities_from_indexed_rows_raises_on_missing_index() -> No
     rows = torch.tensor([[0.0, 0.5]], dtype=torch.float64)
 
     with pytest.raises(ValueError, match="Missing"):
-        _ordered_probabilities_from_indexed_rows(total=2, rows=rows)
+        ordered_probabilities_from_indexed_rows(total=2, rows=rows)
 
 
 def test_cross_layer_decoder_returns_one_finite_delta_per_pair() -> None:

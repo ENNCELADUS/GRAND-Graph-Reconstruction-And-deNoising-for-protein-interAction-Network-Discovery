@@ -36,6 +36,7 @@ from tccig.prepare import (
     classify_scorer_error_targets,
     collate_edge_targets,
     edges_from_rule,
+    ordered_probabilities_from_indexed_rows,
     parse_edge_sampling_config,
     sample_epoch_edge_targets,
     write_json,
@@ -1005,7 +1006,7 @@ def _prediction_probabilities(
         gathered = gather_fn(local_rows)
         if isinstance(gathered, torch.Tensor):
             local_rows = gathered
-    return _ordered_probabilities_from_indexed_rows(total=total, rows=local_rows)
+    return ordered_probabilities_from_indexed_rows(total=total, rows=local_rows)
 
 
 def _evaluate_validation_topology_rules(
@@ -1144,29 +1145,6 @@ def _is_better_monitor(
     if _resolve_monitor_mode(monitor_metric) == "min":
         return value < best_value
     return value > best_value
-
-
-def _ordered_probabilities_from_indexed_rows(
-    *,
-    total: int,
-    rows: torch.Tensor,
-) -> list[float]:
-    """Map ``(index, probability)`` rows to global pair order.
-
-    Tolerates duplicate rows (Accelerate ``even_batches`` repeats tail samples)
-    by keeping the first occurrence, and asserts every index is covered once.
-    """
-    ordered: list[float | None] = [None] * total
-    for row in rows.detach().cpu():
-        index = int(row[0].item())
-        if index < 0 or index >= total:
-            continue
-        if ordered[index] is None:
-            ordered[index] = float(row[1].item())
-    missing = [index for index, value in enumerate(ordered) if value is None]
-    if missing:
-        raise ValueError(f"Missing refined probabilities for indices: {missing[:10]}")
-    return [float(value) for value in ordered]
 
 
 def _runtime_barrier(runtime: object) -> None:
