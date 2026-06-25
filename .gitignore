@@ -28,6 +28,7 @@ legacy/
 
 # External Codebases
 PRING/
+/docs/literature/
 
 # LaTeX Cache & Auxiliary Files
 *.aux
