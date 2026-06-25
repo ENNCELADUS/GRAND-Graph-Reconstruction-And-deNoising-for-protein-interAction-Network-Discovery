@@ -600,7 +600,6 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             batch_size=cfg.batch_size,
             runtime=request.runtime,
         )
-        best_validation_auprc = max(best_validation_auprc, validation_auprc)
         selected_epoch_rule: GraphRule | None = None
         selected_epoch_rule_payload: dict[str, object] | None = None
         selected_epoch_topology_metrics: dict[str, float | int] | None = None
@@ -687,6 +686,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             monitor_metric=cfg.monitor_metric,
         ):
             best_monitor_value = monitor_value
+            best_validation_auprc = validation_auprc
             best_selected_rule = selected_epoch_rule
             best_selected_rule_payload = selected_epoch_rule_payload
             checkpoint_model = _unwrap_refiner(train_step_model, request.runtime.accelerator)

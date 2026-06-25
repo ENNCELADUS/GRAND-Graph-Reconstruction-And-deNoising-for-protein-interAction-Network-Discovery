@@ -15,6 +15,7 @@ import pytest
 import torch
 import yaml
 from src.pipeline.stages.train import build_model
+from tccig import s2gae
 from tccig.train import _build_runtime, run_tccig_pipeline
 
 
@@ -430,3 +431,47 @@ def test_tccig_accelerate_cpu_smoke_preserves_topology_artifact_order(tmp_path: 
     assert [len(row) for row in ddp_rows] == [len(row) for row in single_rows]
     assert [row[:2] for row in ddp_rows] == [row[:2] for row in single_rows]
     assert all(row[2] in {"0", "1"} for row in ddp_rows)
+
+
+def test_best_validation_auprc_matches_selected_epoch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _tiny_config(tmp_path, "auprc_couple")
+    refiner_config = config["refiner"]
+    assert isinstance(refiner_config, dict)
+    refiner_config["epochs"] = 3
+    refiner_config["monitor_metric"] = "val_topology_loss"
+    refiner_config["topology_validation"] = {
+        "enabled": True,
+        "node_sizes": [2],
+        "samples_per_size": 1,
+        "strategy": "mixed",
+        "seed": 0,
+        "inference_batch_size": 4,
+        "compute_clustering_mmd": False,
+        "losses": {"alpha": 1.0, "beta": 1.0, "gamma": 0.0, "delta": 0.0},
+    }
+
+    # The tiny fixture yields identical metrics every epoch, so the global-max
+    # bug is indistinguishable from the correct behaviour. Force the per-epoch
+    # validation AUPRC to strictly increase while the monitor (val_topology_loss)
+    # stays flat: epoch 1 is selected (first strict-min wins), yet the global
+    # max AUPRC belongs to epoch 3. A correct fix reports the epoch-1 value.
+    increasing_auprc = iter([0.1, 0.5, 0.9])
+
+    def _fake_validation_auprc(**_kwargs: object) -> float:
+        return next(increasing_auprc)
+
+    monkeypatch.setattr(s2gae, "_validation_auprc", _fake_validation_auprc)
+
+    run_tccig_pipeline(config)
+
+    checkpoint_path = tmp_path / "models" / "tccig" / "auprc_couple" / "best_model.pt"
+    payload = torch.load(checkpoint_path, weights_only=False)
+    summary_path = tmp_path / "logs" / "tccig" / "auprc_couple" / "training_summary.json"
+    history = json.loads(summary_path.read_text(encoding="utf-8"))["history"]
+
+    best_monitor = payload["best_monitor_value"]
+    selected = min(history, key=lambda row: abs(row["monitor_value"] - best_monitor))
+    assert selected["val_auprc"] == pytest.approx(0.1)
+    assert payload["best_validation_auprc"] == pytest.approx(selected["val_auprc"])
