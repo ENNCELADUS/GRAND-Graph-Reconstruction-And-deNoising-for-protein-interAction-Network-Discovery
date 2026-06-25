@@ -973,6 +973,9 @@ def _prediction_probabilities(
     if callable(prepare_fn):
         loader = cast(Iterable[tuple[torch.Tensor]], prepare_fn(loader))
 
+    gather_fn = getattr(accelerator, "gather_for_metrics", None)
+    is_distributed = bool(getattr(runtime, "is_distributed", False))
+
     indexed_rows: list[torch.Tensor] = []
     with torch.inference_mode():
         hidden_states = model.encode(
@@ -987,25 +990,23 @@ def _prediction_probabilities(
                 pair_index=graph.pair_index[:, batch_indices],
                 pairwise_probabilities=graph.pairwise_probabilities[batch_indices],
             )
-            indexed_rows.append(
-                torch.stack(
-                    (
-                        batch_indices.to(dtype=torch.float64),
-                        torch.sigmoid(refined_logits).to(dtype=torch.float64),
-                    ),
-                    dim=1,
-                )
+            batch_rows = torch.stack(
+                (
+                    batch_indices.to(dtype=torch.float64),
+                    torch.sigmoid(refined_logits).to(dtype=torch.float64),
+                ),
+                dim=1,
             )
+            if is_distributed and callable(gather_fn):
+                gathered = gather_fn(batch_rows)
+                if isinstance(gathered, torch.Tensor):
+                    batch_rows = gathered
+            indexed_rows.append(batch_rows)
     local_rows = (
         torch.cat(indexed_rows, dim=0)
         if indexed_rows
         else torch.empty((0, 2), dtype=torch.float64, device=device)
     )
-    gather_fn = getattr(accelerator, "gather_for_metrics", None)
-    if bool(getattr(runtime, "is_distributed", False)) and callable(gather_fn):
-        gathered = gather_fn(local_rows)
-        if isinstance(gathered, torch.Tensor):
-            local_rows = gathered
     return ordered_probabilities_from_indexed_rows(total=total, rows=local_rows)
 
 

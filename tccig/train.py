@@ -310,12 +310,18 @@ def score_pairs_with_v3_1(
 
     rows: list[torch.Tensor] = []
     processed = 0
+    gather_for_metrics = runtime.accelerator.gather_for_metrics if runtime.is_distributed else None
     for batch_index, batch in enumerate(loader, start=1):
         indices = batch.pop("index").to(runtime.device)
         output = model({key: value.to(runtime.device) for key, value in batch.items()})
         logits = cast(torch.Tensor, output["logits"]).squeeze(-1)
         probabilities = torch.sigmoid(logits).to(dtype=torch.float64)
-        rows.append(torch.stack((indices.to(dtype=torch.float64), probabilities), dim=1))
+        batch_rows = torch.stack((indices.to(dtype=torch.float64), probabilities), dim=1)
+        if gather_for_metrics is not None:
+            gathered = gather_for_metrics(batch_rows)
+            if isinstance(gathered, torch.Tensor):
+                batch_rows = gathered
+        rows.append(batch_rows)
         processed += int(indices.numel())
         if progress_callback is not None:
             progress_callback(
@@ -331,11 +337,7 @@ def score_pairs_with_v3_1(
         if rows
         else torch.empty((0, 2), dtype=torch.float64, device=torch.device(runtime.device))
     )
-    return _ordered_probabilities_from_rows(
-        total=len(pairs),
-        local_rows=local_rows,
-        runtime=runtime,
-    )
+    return ordered_probabilities_from_indexed_rows(total=len(pairs), rows=local_rows)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -579,18 +581,6 @@ def _collate_pair_score_batch(
         "len_a": torch.tensor([tensor.size(0) for tensor in embeddings_a], dtype=torch.long),
         "len_b": torch.tensor([tensor.size(0) for tensor in embeddings_b], dtype=torch.long),
     }
-
-
-def _ordered_probabilities_from_rows(
-    *,
-    total: int,
-    local_rows: torch.Tensor,
-    runtime: TCCIGRuntime,
-) -> list[float]:
-    rows = local_rows
-    if runtime.is_distributed:
-        rows = runtime.accelerator.gather_for_metrics(local_rows)
-    return ordered_probabilities_from_indexed_rows(total=total, rows=rows)
 
 
 def _build_runtime(
