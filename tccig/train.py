@@ -6,10 +6,12 @@ import argparse
 import json
 import logging
 import math
+import random
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import cast
 
+import networkx as nx
 import torch
 import yaml  # type: ignore[import-untyped]
 from accelerate import Accelerator
@@ -22,6 +24,7 @@ from src.embed import load_cached_embedding
 from src.pipeline.stages.train import build_model
 from src.topology.finetune_data import (
     TOPOLOGY_EVAL_NODE_SIZES,
+    _expand_chunk_nodes,
     build_internal_validation_plan,
     build_pair_supervision_graph,
     load_split_node_ids,
@@ -377,6 +380,70 @@ def _score_split(
             raise RuntimeError(f"score cache was not written for split={split}")
         return cached
     return probabilities
+
+
+def _covered_positive_edges(
+    *,
+    sampled: Mapping[int, Sequence[tuple[str, ...]]],
+    graph: nx.Graph,
+) -> set[frozenset[str]]:
+    """Return the set of GT positive edges contained in any sampled bucket."""
+    covered: set[frozenset[str]] = set()
+    for buckets in sampled.values():
+        for nodes in buckets:
+            node_set = set(nodes)
+            for node_a, node_b in graph.subgraph(node_set).edges():
+                covered.add(frozenset((node_a, node_b)))
+    return covered
+
+
+def augment_plan_for_positive_edge_coverage(
+    *,
+    graph: nx.Graph,
+    base_sampled: dict[int, list[tuple[str, ...]]],
+    node_sizes: Sequence[int],
+    strategy: str,
+    seed: int,
+) -> tuple[dict[int, list[tuple[str, ...]]], dict[str, float | int]]:
+    """Add coverage buckets until every GT positive edge appears in some bucket."""
+    augmented: dict[int, list[tuple[str, ...]]] = {
+        size: list(buckets) for size, buckets in base_sampled.items()
+    }
+    base_bucket_count = sum(len(buckets) for buckets in augmented.values())
+    all_positive = {frozenset((node_a, node_b)) for node_a, node_b in graph.edges()}
+    target_size = max(node_sizes)
+    normalized_strategy = strategy.upper()
+    if normalized_strategy not in {"BFS", "DFS", "RANDOM_WALK"}:
+        normalized_strategy = "BFS"
+    rng = random.Random(seed)
+    coverage_bucket_count = 0
+    covered = _covered_positive_edges(sampled=augmented, graph=graph)
+    for edge in sorted(tuple(sorted(e)) for e in (all_positive - covered)):
+        if frozenset(edge) in _covered_positive_edges(sampled=augmented, graph=graph):
+            continue  # already covered by a previously added coverage bucket
+        nodes = _expand_chunk_nodes(
+            graph=graph,
+            edge_chunk=[(edge[0], edge[1])],
+            target_size=target_size,
+            strategy=normalized_strategy,
+            rng=rng,
+        )
+        augmented.setdefault(target_size, []).append(tuple(sorted(nodes)))
+        coverage_bucket_count += 1
+    final_covered = _covered_positive_edges(sampled=augmented, graph=graph)
+    coverage = (
+        1.0 if not all_positive else len(final_covered & all_positive) / len(all_positive)
+    )
+    if coverage != 1.0:
+        raise ValueError(
+            f"positive-edge coverage augmentation failed: coverage={coverage:.6f} < 1.0"
+        )
+    stats: dict[str, float | int] = {
+        "base_bucket_count": base_bucket_count,
+        "coverage_bucket_count": coverage_bucket_count,
+        "positive_edge_coverage": coverage,
+    }
+    return augmented, stats
 
 
 def _build_validation_topology_bundle(

@@ -24,7 +24,10 @@ def _base_refiner_config() -> dict:
         "input_dim": 8,
         "embedding_cache_dir": "data/embeddings/esm3_1024",
         "monitor_metric": "val_topology_loss",
-        "topology_validation": {"enabled": True, "losses": {"alpha": 1.0, "beta": 8.0, "gamma": 0.5, "delta": 0.1}},
+        "topology_validation": {
+            "enabled": True,
+            "losses": {"alpha": 1.0, "beta": 8.0, "gamma": 0.5, "delta": 0.1},
+        },
         "optimizer": {"type": "adamw", "lr": 1e-4},
         "scheduler": {"type": "none"},
         "optimization": {"gradient_clip_norm": 1.0},
@@ -66,3 +69,36 @@ def test_parse_config_defaults_topology_training_disabled() -> None:
     cfg = _parse_config(config)
     assert cfg.topology_training.enabled is False
     assert cfg.residual_anchor.form == "symmetric"
+
+
+def test_coverage_augmentation_covers_isolated_positive_edge() -> None:
+    import networkx as nx
+    from tccig.train import augment_plan_for_positive_edge_coverage
+
+    # A dense core plus one far-apart positive edge unlikely to be sampled at size 4.
+    graph = nx.Graph()
+    core = [f"C{i}" for i in range(6)]
+    graph.add_edges_from((core[i], core[j]) for i in range(6) for j in range(i + 1, 6))
+    graph.add_edge("FARLEFT", "FARRIGHT")  # connected via no core node
+    # Force a base sample that misses the far edge.
+    base_sampled = {4: [tuple(sorted(core[:4]))]}
+
+    augmented, stats = augment_plan_for_positive_edge_coverage(
+        graph=graph,
+        base_sampled=base_sampled,
+        node_sizes=[4],
+        strategy="BFS",
+        seed=0,
+    )
+
+    assert stats["positive_edge_coverage"] == 1.0
+    assert stats["coverage_bucket_count"] >= 1
+    # the previously-missing edge endpoints now appear together in some bucket
+    covered = {
+        frozenset((a, b))
+        for nodes in [n for buckets in augmented.values() for n in buckets]
+        for a in nodes
+        for b in nodes
+        if graph.has_edge(a, b)
+    }
+    assert frozenset(("FARLEFT", "FARRIGHT")) in covered
