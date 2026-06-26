@@ -208,3 +208,13 @@ def test_topology_plan_loss_backprops_and_pressures_density_down(
     assert components["relative_density"] > 0.0
     grads = [p.grad for p in refiner.parameters() if p.grad is not None]
     assert grads, "topology loss did not propagate to refiner parameters"
+
+
+def test_topology_loss_scale_zero_during_warmup_then_ramps() -> None:
+    from src.topology.finetune_losses import TopologyLossWeightSchedule, topology_loss_scale
+
+    schedule = TopologyLossWeightSchedule(warmup_epochs=5, ramp_epochs=10, schedule="linear")
+    assert topology_loss_scale(epoch=0, schedule=schedule) == 0.0
+    assert topology_loss_scale(epoch=4, schedule=schedule) == 0.0
+    assert 0.0 < topology_loss_scale(epoch=9, schedule=schedule) < 1.0
+    assert topology_loss_scale(epoch=15, schedule=schedule) == 1.0

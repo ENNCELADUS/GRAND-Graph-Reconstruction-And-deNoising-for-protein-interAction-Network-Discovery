@@ -10,13 +10,23 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 import networkx as nx
 import torch
 import torch.nn.functional as functional
 from sklearn.metrics import average_precision_score
 from src.embed import load_cached_embedding
+from src.topology.finetune_data import (
+    TOPOLOGY_EVAL_NODE_SIZES,
+    InternalValidationPlan,
+)
+from src.topology.finetune_losses import (
+    TopologyLossWeights,
+    TopologyLossWeightSchedule,
+    compute_topology_losses,
+    topology_loss_scale,
+)
 from src.topology.metrics import evaluate_graph_samples
 from src.train.config import LossConfig
 from src.utils.losses import binary_classification_loss
@@ -43,13 +53,6 @@ from tccig.prepare import (
 )
 
 LOGGER = logging.getLogger(__name__)
-
-from src.topology.finetune_losses import TopologyLossWeights, compute_topology_losses
-
-if TYPE_CHECKING:
-    from src.topology.finetune_data import InternalValidationPlan
-
-from src.topology.finetune_data import TOPOLOGY_EVAL_NODE_SIZES
 
 SUPPORTED_MONITOR_METRICS = {
     "val_topology_loss",
@@ -491,11 +494,15 @@ def topology_plan_loss(
             records = [r for r in bucket.pair_records if r.subgraph_index == subgraph_index]
             if len(records) == 0 or len(nodes) < 2:
                 continue
-            global_pairs = torch.tensor(
-                [[node_index[r.protein_a], node_index[r.protein_b]] for r in records],
-                dtype=torch.long,
-                device=device,
-            ).t().contiguous()
+            global_pairs = (
+                torch.tensor(
+                    [[node_index[r.protein_a], node_index[r.protein_b]] for r in records],
+                    dtype=torch.long,
+                    device=device,
+                )
+                .t()
+                .contiguous()
+            )
             refined_logits, _ = refiner.decode(
                 hidden_states=hidden_states,
                 pair_index=global_pairs,
@@ -506,10 +513,7 @@ def topology_plan_loss(
             pred = torch.sigmoid(refined_logits)
             target_graph = bucket.target_subgraphs[subgraph_index]
             target = torch.tensor(
-                [
-                    1.0 if target_graph.has_edge(r.protein_a, r.protein_b) else 0.0
-                    for r in records
-                ],
+                [1.0 if target_graph.has_edge(r.protein_a, r.protein_b) else 0.0 for r in records],
                 dtype=torch.float32,
                 device=device,
             )
@@ -628,7 +632,8 @@ class _S2GAESampledTrainStepModule(nn.Module):
             labels=labels,
             delta_logits=delta,
             loss_config=self.cfg.loss_config,
-            residual_weight=self.cfg.residual_weight,
+            residual_weight=self.cfg.residual_anchor.weight,
+            anchor_form=self.cfg.residual_anchor.form,
         )
         count = int(pair_indices.numel())
         return (
@@ -671,6 +676,12 @@ def load_mean_pooled_node_features(
     return torch.stack(features, dim=0).to(device)
 
 
+def _node_index_from_split_bundle(bundle: SplitBundle) -> dict[str, int]:
+    """Map protein IDs to the node ordering used by ``_build_split_graph``."""
+    node_ids = _collect_node_ids(pairs=bundle.pairs, graph_edges=bundle.pairwise_graph_edges)
+    return {protein_id: index for index, protein_id in enumerate(node_ids)}
+
+
 def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
     """Train an S2GAE residual denoiser on pairwise-generated train graphs."""
     cfg = _parse_config(request.config)
@@ -709,6 +720,18 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         raise ValueError(
             f"refiner.monitor_metric={cfg.monitor_metric!r} requires topology_validation.enabled"
         )
+    train_topology_graph: _SplitGraph | None = None
+    train_topology_node_index: dict[str, int] | None = None
+    topology_schedule = TopologyLossWeightSchedule(
+        warmup_epochs=cfg.topology_training.warmup_epochs,
+        ramp_epochs=cfg.topology_training.ramp_epochs,
+        schedule=cfg.topology_training.schedule,
+    )
+    if cfg.topology_training.enabled:
+        if request.train_topology is None or request.train_topology_plan is None:
+            raise ValueError("refiner.topology_training.enabled requires train_topology inputs")
+        train_topology_graph = _build_split_graph(request.train_topology, cfg=cfg, device=device)
+        train_topology_node_index = _node_index_from_split_bundle(request.train_topology)
     if request.train.loss_targets is None:
         raise ValueError("request.train.loss_targets is required for S2GAE training")
     validation_labels = _required_float_tensor(
@@ -771,6 +794,29 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 gradient_norm = float(clipped.detach().cpu().item())
             optimizer.step()
             local_loss_sums += batch_sums.detach()
+        topology_components: dict[str, float] | None = None
+        topology_scale = 0.0
+        if cfg.topology_training.enabled and train_topology_graph is not None:
+            assert train_topology_node_index is not None
+            assert request.train_topology_plan is not None
+            topology_scale = topology_loss_scale(epoch=epoch - 1, schedule=topology_schedule)
+            if topology_scale > 0.0 and cfg.topology_training.topology_weight > 0.0:
+                optimizer.zero_grad(set_to_none=True)
+                topo_loss, topology_components = topology_plan_loss(
+                    refiner=_unwrap_refiner(train_step_model, request.runtime.accelerator),
+                    graph=train_topology_graph,
+                    plan=cast(InternalValidationPlan, request.train_topology_plan),
+                    node_index=train_topology_node_index,
+                    weights=cfg.topology_training.weights,
+                    include_clustering_mmd=cfg.topology_validation.compute_clustering_mmd,
+                )
+                scaled = topology_scale * cfg.topology_training.topology_weight * topo_loss
+                request.runtime.accelerator.backward(scaled)
+                if cfg.optimization.gradient_clip_norm is not None:
+                    request.runtime.accelerator.clip_grad_norm_(
+                        train_step_model.parameters(), cfg.optimization.gradient_clip_norm
+                    )
+                optimizer.step()
         validation_model = _unwrap_refiner(train_step_model, request.runtime.accelerator)
         global_loss_sums = request.runtime.accelerator.reduce(local_loss_sums, reduction="sum")
         total_loss = float(global_loss_sums[0].detach().cpu().item())
@@ -847,6 +893,17 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                     "internal_val_deg_dist_mmd": float(metrics["deg_dist_mmd"]),
                     "internal_val_cc_mmd": float(metrics["cc_mmd"]),
                     "selected_rule_positive_edges": float(metrics["positive_edges"]),
+                }
+            )
+        epoch_history["train_topology_scale"] = topology_scale
+        if topology_components is not None:
+            epoch_history.update(
+                {
+                    "train_topology_loss": topology_components["total"],
+                    "train_topo_graph_sim": topology_components["graph_sim"],
+                    "train_topo_relative_density": topology_components["relative_density"],
+                    "train_topo_degree_mmd": topology_components["degree_mmd"],
+                    "train_topo_clustering_mmd": topology_components["clustering_mmd"],
                 }
             )
         history.append(epoch_history)
@@ -1600,7 +1657,12 @@ def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
         max_sequence_length=max_sequence_length,
         checkpoint_path=checkpoint_path,
         log_dir=log_dir,
-        residual_anchor=_parse_residual_anchor_config(config.get("residual_anchor")),
+        residual_anchor=_parse_residual_anchor_config(
+            config.get("residual_anchor"),
+            fallback_weight=_non_negative_float(
+                config.get("residual_weight", 0.001), "refiner.residual_weight"
+            ),
+        ),
         topology_training=_parse_topology_training_config(config.get("topology_training")),
     )
 
@@ -1780,16 +1842,16 @@ def _parse_topology_validation_config(
     )
 
 
-def _parse_residual_anchor_config(raw: object) -> S2GAEResidualAnchorConfig:
+def _parse_residual_anchor_config(
+    raw: object, *, fallback_weight: float
+) -> S2GAEResidualAnchorConfig:
     if raw is None:
-        return S2GAEResidualAnchorConfig(form="symmetric", weight=0.0)
+        return S2GAEResidualAnchorConfig(form="symmetric", weight=fallback_weight)
     if not isinstance(raw, Mapping):
         raise ValueError("refiner.residual_anchor must be a mapping")
     form = str(raw.get("form", "symmetric"))
     if form not in {"symmetric", "asymmetric_relu"}:
-        raise ValueError(
-            "refiner.residual_anchor.form must be 'symmetric' or 'asymmetric_relu'"
-        )
+        raise ValueError("refiner.residual_anchor.form must be 'symmetric' or 'asymmetric_relu'")
     return S2GAEResidualAnchorConfig(
         form=form,
         weight=_non_negative_float(raw.get("weight", 0.0), "refiner.residual_anchor.weight"),
@@ -1843,9 +1905,7 @@ def _parse_topology_training_config(raw: object) -> S2GAETopologyTrainingConfig:
             gamma=_non_negative_float(raw_weights.get("gamma", 0.5), "...gamma"),
             delta=_non_negative_float(raw_weights.get("delta", 0.1), "...delta"),
         ),
-        warmup_epochs=_non_negative_int(
-            raw_schedule.get("warmup_epochs", 0), "...warmup_epochs"
-        ),
+        warmup_epochs=_non_negative_int(raw_schedule.get("warmup_epochs", 0), "...warmup_epochs"),
         ramp_epochs=_non_negative_int(raw_schedule.get("ramp_epochs", 0), "...ramp_epochs"),
         schedule=str(raw_schedule.get("schedule", "linear")),
     )
