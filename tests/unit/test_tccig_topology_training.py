@@ -102,3 +102,19 @@ def test_coverage_augmentation_covers_isolated_positive_edge() -> None:
         if graph.has_edge(a, b)
     }
     assert frozenset(("FARLEFT", "FARRIGHT")) in covered
+
+
+def test_train_refiner_request_accepts_train_topology_fields() -> None:
+    from tccig.s2gae import TrainRefinerRequest
+
+    request = TrainRefinerRequest(
+        train=None,  # type: ignore[arg-type]
+        validation=None,  # type: ignore[arg-type]
+        runtime=None,  # type: ignore[arg-type]
+        config={},
+        graph_rule=None,  # type: ignore[arg-type]
+        train_topology=None,
+        train_topology_plan=None,
+    )
+    assert request.train_topology is None
+    assert request.train_topology_plan is None

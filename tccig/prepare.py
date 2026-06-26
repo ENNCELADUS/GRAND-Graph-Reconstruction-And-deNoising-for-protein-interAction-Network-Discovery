@@ -261,6 +261,8 @@ class TrainRefinerRequest:
     graph_rule: GraphRule
     validation_topology: SplitBundle | None = None
     validation_topology_plan: object | None = None
+    train_topology: SplitBundle | None = None
+    train_topology_plan: object | None = None
 
 
 @dataclass(frozen=True)

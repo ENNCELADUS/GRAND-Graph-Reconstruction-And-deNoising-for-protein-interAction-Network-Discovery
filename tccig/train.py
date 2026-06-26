@@ -203,6 +203,14 @@ def run_tccig_pipeline(
         cache_dir=cache_dir,
         pairwise_input_rule=pairwise_input_rule,
     )
+    train_topology, train_topology_plan, _train_topo_stats = _build_train_topology_bundle(
+        config=config,
+        processed_dir=processed_dir,
+        scorer_cfg=scorer_cfg,
+        runtime=runtime,
+        cache_dir=cache_dir,
+        pairwise_input_rule=pairwise_input_rule,
+    )
 
     refiner_state = s2gae.train_refiner(
         TrainRefinerRequest(
@@ -213,6 +221,8 @@ def run_tccig_pipeline(
             graph_rule=graph_rule,
             validation_topology=validation_topology,
             validation_topology_plan=validation_topology_plan,
+            train_topology=train_topology,
+            train_topology_plan=train_topology_plan,
         )
     )
     pairwise_metrics = tccig_test.run_pairwise_test(
@@ -444,6 +454,86 @@ def augment_plan_for_positive_edge_coverage(
         "positive_edge_coverage": coverage,
     }
     return augmented, stats
+
+
+def _build_train_topology_bundle(
+    *,
+    config: Mapping[str, object],
+    processed_dir: Path,
+    scorer_cfg: Mapping[str, object],
+    runtime: TCCIGRuntime,
+    cache_dir: Path,
+    pairwise_input_rule: GraphRule,
+) -> tuple[SplitBundle | None, object | None, dict[str, float | int]]:
+    refiner_cfg = _mapping_section(config, "refiner")
+    topo_cfg = refiner_cfg.get("topology_training", {})
+    if not isinstance(topo_cfg, Mapping) or not bool(topo_cfg.get("enabled", False)):
+        return None, None, {}
+    split_path = processed_dir / "human_BFS_split.pkl"
+    node_ids = load_split_node_ids(split_path=split_path, split_name="train")
+    train_graph = build_pair_supervision_graph(
+        pair_path=processed_dir / "human_train_ppi_ratio5_exclusive.txt",
+        node_ids=node_ids,
+    )
+    node_sizes = _int_sequence(
+        topo_cfg.get("node_sizes", TOPOLOGY_EVAL_NODE_SIZES),
+        "refiner.topology_training.node_sizes",
+    )
+    seed = _non_negative_int(topo_cfg.get("seed", 0), "refiner.topology_training.seed")
+    strategy = str(topo_cfg.get("strategy", "mixed"))
+    sampled = sample_topology_evaluation_subgraphs(
+        graph=train_graph,
+        seed=seed,
+        strategy=strategy,
+        node_sizes=node_sizes,
+        samples_per_size=_positive_int(
+            topo_cfg.get("samples_per_size", 20),
+            "refiner.topology_training.samples_per_size",
+        ),
+    )
+    coverage_stats: dict[str, float | int] = {}
+    if bool(topo_cfg.get("coverage_augmentation", True)):
+        sampled, coverage_stats = augment_plan_for_positive_edge_coverage(
+            graph=train_graph,
+            base_sampled={int(k): list(v) for k, v in sampled.items()},
+            node_sizes=node_sizes,
+            strategy=strategy,
+            seed=seed,
+        )
+        LOGGER.info(
+            "tccig train topology coverage: base=%d coverage=%d positive_edge_coverage=%.4f",
+            coverage_stats["base_bucket_count"],
+            coverage_stats["coverage_bucket_count"],
+            coverage_stats["positive_edge_coverage"],
+        )
+    plan = build_internal_validation_plan(graph=train_graph, sampled_subgraphs=sampled)
+    pairs = [
+        CandidatePair(record.protein_a, record.protein_b)
+        for bucket in plan.buckets
+        for record in bucket.pair_records
+    ]
+    probabilities = _score_split(
+        split="train_topology",
+        pairs=pairs,
+        scorer_cfg=scorer_cfg,
+        runtime=runtime,
+        cache_dir=cache_dir,
+    )
+    pairwise_edges = edges_from_rule(
+        pairs=pairs,
+        probabilities=probabilities,
+        rule=pairwise_input_rule,
+    )
+    return (
+        SplitBundle(
+            split="train_topology",
+            pairs=pairs,
+            pairwise_probabilities=probabilities,
+            pairwise_graph_edges=pairwise_edges,
+        ),
+        plan,
+        coverage_stats,
+    )
 
 
 def _build_validation_topology_bundle(
