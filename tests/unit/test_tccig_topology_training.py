@@ -118,3 +118,93 @@ def test_train_refiner_request_accepts_train_topology_fields() -> None:
     )
     assert request.train_topology is None
     assert request.train_topology_plan is None
+
+
+@pytest.fixture
+def make_tiny_refiner_and_plan():
+    import networkx as nx
+    from src.topology.finetune_data import build_internal_validation_plan
+    from tccig.s2gae import S2GAERefiner, _SplitGraph
+
+    def _build(*, overdense: bool) -> tuple[object, object, object, dict[str, int]]:
+        torch.manual_seed(0)
+        node_ids = ["P0", "P1", "P2", "P3"]
+        node_index = {protein: idx for idx, protein in enumerate(node_ids)}
+        num_nodes = len(node_ids)
+
+        refiner = S2GAERefiner(
+            encoder="graphconv",
+            input_dim=8,
+            hidden_dim=4,
+            num_layers=2,
+            decoder_hidden_dim=8,
+            decoder_layers=2,
+            dropout=0.0,
+            encoder_aggr="mean",
+            layer_norm=True,
+            residual_scale=4.0,
+        )
+        # Force a non-zero residual decoder so deletion is trainable from the start.
+        with torch.no_grad():
+            output_layer = refiner.decoder.layers[-1]
+            output_layer.weight.normal_(0.0, 0.1)
+            output_layer.bias.fill_(0.5)
+
+        node_features = torch.randn(num_nodes, 8)
+        # All undirected pairs as candidate pairs.
+        pair_columns = [
+            (node_index[a], node_index[b])
+            for ia, a in enumerate(node_ids)
+            for b in node_ids[ia + 1 :]
+        ]
+        pair_index = torch.tensor(pair_columns, dtype=torch.long).t().contiguous()
+        prob_value = 0.9 if overdense else 0.5
+        pairwise_probabilities = torch.full((pair_index.size(1),), prob_value)
+        # Encoder edges mirror the over-dense candidate set.
+        edge_index = torch.cat([pair_index, pair_index.flip(0)], dim=1)
+        edge_weight = torch.ones(edge_index.size(1))
+
+        graph = _SplitGraph(
+            node_features=node_features,
+            edge_index=edge_index,
+            edge_weight=edge_weight,
+            pair_index=pair_index,
+            pairwise_probabilities=pairwise_probabilities,
+        )
+
+        # True graph for this bucket has a single edge P0-P1.
+        true_graph = nx.Graph()
+        true_graph.add_nodes_from(node_ids)
+        true_graph.add_edge("P0", "P1")
+        plan = build_internal_validation_plan(
+            graph=true_graph,
+            sampled_subgraphs={4: [tuple(node_ids)]},
+        )
+        return refiner, graph, plan, node_index
+
+    return _build
+
+
+def test_topology_plan_loss_backprops_and_pressures_density_down(
+    make_tiny_refiner_and_plan: object,
+) -> None:
+    from src.topology.finetune_losses import TopologyLossWeights
+    from tccig.s2gae import topology_plan_loss
+
+    refiner, graph, plan, node_index = make_tiny_refiner_and_plan(overdense=True)
+    weights = TopologyLossWeights(alpha=1.0, beta=8.0, gamma=0.5, delta=0.0)
+
+    loss, components = topology_plan_loss(
+        refiner=refiner,
+        graph=graph,
+        plan=plan,
+        node_index=node_index,
+        weights=weights,
+        include_clustering_mmd=False,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert components["relative_density"] > 0.0
+    grads = [p.grad for p in refiner.parameters() if p.grad is not None]
+    assert grads, "topology loss did not propagate to refiner parameters"

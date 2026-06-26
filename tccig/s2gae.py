@@ -44,7 +44,7 @@ from tccig.prepare import (
 
 LOGGER = logging.getLogger(__name__)
 
-from src.topology.finetune_losses import TopologyLossWeights
+from src.topology.finetune_losses import TopologyLossWeights, compute_topology_losses
 
 if TYPE_CHECKING:
     from src.topology.finetune_data import InternalValidationPlan
@@ -441,6 +441,107 @@ def s2gae_loss_terms(
         weighted_residual_anchor=weighted_residual_anchor,
         total=bce + weighted_residual_anchor,
     )
+
+
+def _pair_lookup(all_pairs: torch.Tensor, query: torch.Tensor) -> torch.Tensor:
+    """Map each query pair column to its index in ``all_pairs`` (undirected match)."""
+    node_count = int(all_pairs.max().item()) + 1 if all_pairs.numel() else 1
+    all_min = torch.minimum(all_pairs[0], all_pairs[1])
+    all_max = torch.maximum(all_pairs[0], all_pairs[1])
+    all_codes = all_min * node_count + all_max
+    query_min = torch.minimum(query[0], query[1])
+    query_max = torch.maximum(query[0], query[1])
+    query_codes = query_min * node_count + query_max
+    # Sort the reference codes once and binary-search each query code into it.
+    order = torch.argsort(all_codes)
+    sorted_codes = all_codes[order]
+    positions = torch.searchsorted(sorted_codes, query_codes)
+    positions = positions.clamp(max=sorted_codes.numel() - 1)
+    if not bool(torch.all(sorted_codes[positions] == query_codes)):
+        raise ValueError("topology plan pair absent from split graph pair_index")
+    return order[positions]
+
+
+def topology_plan_loss(
+    *,
+    refiner: S2GAERefiner,
+    graph: _SplitGraph,
+    plan: InternalValidationPlan,
+    node_index: Mapping[str, int],
+    weights: TopologyLossWeights,
+    include_clustering_mmd: bool,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Differentiable topology loss over all plan buckets (per-epoch full plan)."""
+    device = graph.node_features.device
+    hidden_states = refiner.encode(
+        node_features=graph.node_features,
+        edge_index=graph.edge_index,
+        edge_weight=graph.edge_weight,
+    )
+    totals = {
+        "graph_sim": 0.0,
+        "relative_density": 0.0,
+        "degree_mmd": 0.0,
+        "clustering_mmd": 0.0,
+    }
+    total_loss = graph.node_features.new_zeros(())
+    bucket_count = 0
+    for bucket in plan.buckets:
+        for subgraph_index, nodes in enumerate(bucket.sampled_subgraphs):
+            records = [r for r in bucket.pair_records if r.subgraph_index == subgraph_index]
+            if len(records) == 0 or len(nodes) < 2:
+                continue
+            global_pairs = torch.tensor(
+                [[node_index[r.protein_a], node_index[r.protein_b]] for r in records],
+                dtype=torch.long,
+                device=device,
+            ).t().contiguous()
+            refined_logits, _ = refiner.decode(
+                hidden_states=hidden_states,
+                pair_index=global_pairs,
+                pairwise_probabilities=graph.pairwise_probabilities[
+                    _pair_lookup(graph.pair_index, global_pairs)
+                ],
+            )
+            pred = torch.sigmoid(refined_logits)
+            target_graph = bucket.target_subgraphs[subgraph_index]
+            target = torch.tensor(
+                [
+                    1.0 if target_graph.has_edge(r.protein_a, r.protein_b) else 0.0
+                    for r in records
+                ],
+                dtype=torch.float32,
+                device=device,
+            )
+            pair_a = torch.tensor(
+                [r.pair_index_a for r in records], dtype=torch.long, device=device
+            )
+            pair_b = torch.tensor(
+                [r.pair_index_b for r in records], dtype=torch.long, device=device
+            )
+            terms = compute_topology_losses(
+                weights=weights,
+                num_nodes=len(nodes),
+                pair_index_a=pair_a,
+                pair_index_b=pair_b,
+                pred_pair_probabilities=pred,
+                target_pair_probabilities=target,
+                include_clustering_mmd=include_clustering_mmd,
+            )
+            total_loss = total_loss + terms["total_topology"]
+            for key, term_key in (
+                ("graph_sim", "graph_similarity"),
+                ("relative_density", "relative_density"),
+                ("degree_mmd", "degree_mmd"),
+                ("clustering_mmd", "clustering_mmd"),
+            ):
+                totals[key] += float(terms[term_key].detach().item())
+            bucket_count += 1
+    if bucket_count > 0:
+        total_loss = total_loss / bucket_count
+        totals = {key: value / bucket_count for key, value in totals.items()}
+    components = {**totals, "total": float(total_loss.detach().item())}
+    return total_loss, components
 
 
 def build_s2gae_optimizer(
