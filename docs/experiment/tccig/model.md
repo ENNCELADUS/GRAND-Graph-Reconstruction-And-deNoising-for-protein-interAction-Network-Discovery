@@ -1,3 +1,108 @@
+## 0. 模型架构图 (Complete TCCIG Model)
+
+下图对应 `tccig/s2gae.py` 的 `S2GAERefiner` + `tccig/train.py` 的
+`score_pairs_with_v3_1` 完整推理路径。三个部分：
+
+1. **ESM-3 encoder**（特征来源，冻结）
+2. **Pairwise classifier**（frozen v3.1 `pair_context_gated_abba_no_cross`）
+3. **Optional graph learner**（S2GAE-style residual refiner，可选 refinement）
+
+维度取自 `configs/tccig/01.yaml` 和
+`configs/v3-1/0517/pair_context_gated_abba_no_cross_s47.yaml`。
+
+```text
+                       candidate pairs  Ω = {(i, j)}
+                                      │
+                ┌─────────────────────┴─────────────────────┐
+                ▼                                            ▼
+        protein i sequence                          protein j sequence
+                └─────────────────────┬─────────────────────┘
+                                      ▼
+   ╔══════════════════════════════════════════════════════════════════════╗
+   ║  PART 1 — ESM-3 ENCODER  (frozen, cached)                              ║
+   ║                                                                        ║
+   ║    ESM-3  ──►  per-residue embeddings   E_i ∈ R^{L_i × 1536}           ║
+   ║               cache: data/embeddings/esm3_1024  (max_len 1024)         ║
+   ║                                                                        ║
+   ║    outputs ──┬─► full token embeddings  E_i, E_j        ─► Part 2      ║
+   ║              └─► mean-pooled node feat  x_i = mean_L(E_i) ─► Part 3    ║
+   ╚════════════════════════════════════╤═════════════════════════════════╝
+                                         │ E_i, E_j
+                                         ▼
+   ╔══════════════════════════════════════════════════════════════════════╗
+   ║  PART 2 — PAIRWISE CLASSIFIER  (frozen v3.1, score_pairs_with_v3_1)    ║
+   ║                                                                        ║
+   ║    per-protein encoder : 3× self-attention  (d_model=512, heads=8)     ║
+   ║              │                                                         ║
+   ║              ▼                                                         ║
+   ║    3× cross-attention layers  (i ↔ j context)                          ║
+   ║              │                                                         ║
+   ║              ▼                                                         ║
+   ║    rich pooling  [ mean | attn | max | gated ]                         ║
+   ║              │                                                         ║
+   ║              ▼                                                         ║
+   ║    pair readout : pair_context_gated, abba_max  (order-symmetric)      ║
+   ║              │                                                         ║
+   ║              ▼                                                         ║
+   ║    MLP head  512 → 256 → 128 → 1                                        ║
+   ║              │                                                         ║
+   ║              ▼                                                         ║
+   ║    l_ij = logit ;   s_ij = sigmoid(l_ij) ∈ (0, 1)                       ║
+   ╚════════════════════════════════════╤═════════════════════════════════╝
+                                         │  s_ij
+            ┌────────────────────────────┴────────────────────────────┐
+            ▼ no refiner                                               ▼ refiner on
+     p_ij = s_ij                                  s_ij as edge weights + x as node feats
+   (frozen v3.1 baseline)                                             │
+                                                                       ▼
+   ╔══════════════════════════════════════════════════════════════════════╗
+   ║  PART 3 — OPTIONAL GRAPH LEARNER  (S2GAERefiner, residual refine)      ║
+   ║                                                                        ║
+   ║    build noisy input graph:                                            ║
+   ║      G_pairwise = (V, E),  E = {(i,j): s_ij ≥ τ_pair},  w_ij = s_ij     ║
+   ║      (train only: temporarily mask FP/TP target edges per step)        ║
+   ║              │                                                         ║
+   ║              ▼                                                         ║
+   ║    ENCODER (encode): K=2 weighted GraphConv, hidden=128                ║
+   ║      x → [LayerNorm] →                                                 ║
+   ║      for k = 1..K:                                                     ║
+   ║        h^k = GraphConv(h^{k-1}, edge_index, edge_weight, aggr=mean)     ║
+   ║             [+ LayerNorm]  [+ ReLU + Dropout(0.2) if k < K]            ║
+   ║      hidden states  H = [h^1, h^2],  h^k ∈ R^{N × 128}                  ║
+   ║              │                                                         ║
+   ║              ▼                                                         ║
+   ║    CROSS-LAYER DECODER (CrossLayerDecoder), per (i,j) ∈ Ω:              ║
+   ║      z_ij = concat( { h_i^a ⊙ h_j^b : a,b ∈ 1..K },   (K·K = 4 terms)  ║
+   ║                     | h_i^K − h_j^K | )      →  R^{128·4 + 128 = 640}   ║
+   ║      Δ̂_ij = MLP_dec(z_ij) : 640 → 256 → 1     (output layer zero-init)  ║
+   ║      Δ_ij = residual_scale · tanh(Δ̂_ij / residual_scale)               ║
+   ║             (bounded ±4.0 ; near-unit slope at 0)                       ║
+   ║              │                                                         ║
+   ║              ▼                                                         ║
+   ║    RESIDUAL CONNECTION:                                                 ║
+   ║      refined_logit_ij = logit(clamp(s_ij)) + Δ_ij                       ║
+   ║      p_refined_ij      = sigmoid(refined_logit_ij)                      ║
+   ╚════════════════════════════════════╤═════════════════════════════════╝
+                                         ▼
+              refined hard graph:  { (i, j) : p_refined_ij ≥ 0.5 }
+```
+
+要点（与代码一致）：
+
+- Part 1 与 Part 2 在 TCCIG run 内全程冻结；refiner 只更新 Part 3 参数，
+  pairwise scorer 永不被 refiner 训练循环更新。
+- 没有 refiner 时，`p_ij = s_ij` 就是 frozen v3.1 baseline；有 refiner 时是
+  **residual refinement**：decoder 输出层 zero-init，初始 `Δ_ij ≈ 0`，所以
+  refiner 从 pairwise logits 出发逐步学习偏移，而不是从零替代 classifier。
+- decoder 拼接项是 `K·K` 个跨层 Hadamard 积加一个最终层 `|h_i^K − h_j^K|`
+  差值项（`input_dim = hidden·K·K + hidden = 640`），其中 `h_i^K ⊙ h_j^K`
+  已包含在 `a=b=K` 的跨层积里。
+- node features 是 ESM-3 per-residue embedding 的 mean-pool（inductive，
+  feature-based），不是 transductive node table；test 时不访问
+  `human_test_graph.pkl`。
+
+---
+
 ## 1. 总结
 
 这套方案应该定义为 **Pairwise-generated graph → S2GAE-style topology denoiser/refiner → refined graph**，而不是“直接拿 vanilla S2GAE 做 inductive test”。训练时必须在 train/internal-val proteins 上先用 frozen 或 out-of-fold pairwise classifier 生成 `G_pairwise`，再让一个 **S2GAE-style inductive denoiser** 学习从 noisy predicted graph 恢复真实 train topology；测试时 held-out proteins 的图输入只能来自 pairwise predictions，`human_test_graph.pkl` 只能作为 topology metric 的 ground truth，不能进入模型。你的附件里 `all_test_ppi.txt` 被定义为 topology reconstruction 的 candidate universe，`human_test_graph.pkl` 是 topology metric ground truth，这正好支持这个严格 test protocol。

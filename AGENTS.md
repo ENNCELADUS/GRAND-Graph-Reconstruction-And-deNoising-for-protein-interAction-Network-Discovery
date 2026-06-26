@@ -43,6 +43,26 @@ Standard Deep Learning project layout:
 - **Testing**: `uv run python -m pytest` (Runs all tests)
 - **Orchestration**: Use shell scripts in `scripts/` to run pipelines on hpc. Avoid running `python src/run.py` directly.
 
+## HPC Slurm Rules
+- Submit experiment scripts through Slurm on `wangar2023@10.15.89.192`.
+- For CPU-only jobs, use:
+  ```bash
+  #SBATCH -p critical
+  #SBATCH -A hexm-critical
+  ```
+- For A40 GPU jobs, use:
+  ```bash
+  #SBATCH -p hexm
+  #SBATCH -A hexm
+  #SBATCH --gres=gpu:NVIDIAA40:4
+  ```
+- If the A40 queue is long, use the L40 queue instead:
+  ```bash
+  #SBATCH -p hexm_l40
+  #SBATCH -A hexm
+  #SBATCH --gres=gpu:NVIDIAL40:4
+  ```
+
 ## Testing Guidelines
 - **Framework**: `pytest`.
 - **Coverage**: Aim for ≥80% coverage on touched modules.
