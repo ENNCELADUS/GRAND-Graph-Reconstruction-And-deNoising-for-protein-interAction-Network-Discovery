@@ -132,6 +132,44 @@ def run_pairwise_test(
     return metrics
 
 
+def compute_deletion_diagnostics(
+    *,
+    raw_edges: Sequence[tuple[str, str]],
+    refined_edges: Sequence[tuple[str, str]],
+    pairs: Sequence[CandidatePair],
+    raw_probabilities: Sequence[float],
+    labels: Sequence[int] | None,
+) -> dict[str, float]:
+    """Quantify how the refiner reshapes the raw pairwise graph (adds vs deletes)."""
+    raw_set = {canonical_edge(a, b) for a, b in raw_edges}
+    refined_set = {canonical_edge(a, b) for a, b in refined_edges}
+    deleted = raw_set - refined_set
+    added = refined_set - raw_set
+    raw_prob_by_edge: dict[tuple[str, str], float] = {}
+    label_by_edge: dict[tuple[str, str], int] = {}
+    for index, pair in enumerate(pairs):
+        edge = canonical_edge(pair.protein_a, pair.protein_b)
+        raw_prob_by_edge[edge] = float(raw_probabilities[index])
+        if labels is not None:
+            label_by_edge[edge] = int(labels[index])
+    good_deletions = 0
+    for edge in deleted:
+        is_low_conf = raw_prob_by_edge.get(edge, 1.0) < RAW_SCORER_DECISION_THRESHOLD
+        if labels is not None:
+            is_negative = label_by_edge.get(edge, 0) == 0
+            if is_negative or is_low_conf:
+                good_deletions += 1
+        elif is_low_conf:
+            good_deletions += 1
+    deletion_precision = good_deletions / len(deleted) if deleted else 0.0
+    return {
+        "edges_added": float(len(added)),
+        "edges_deleted": float(len(deleted)),
+        "net_edge_delta": float(len(refined_set) - len(raw_set)),
+        "deletion_precision": float(deletion_precision),
+    }
+
+
 def run_topology_test(
     *,
     table: PairTable,
@@ -198,10 +236,18 @@ def run_topology_test(
             pairs=table.pairs,
             predictions=predictions,
         )
+        deletion_diagnostics = compute_deletion_diagnostics(
+            raw_edges=pairwise_edges,
+            refined_edges=selected_edges,
+            pairs=table.pairs,
+            raw_probabilities=pairwise_scores,
+            labels=None,
+        )
         payload = {
             "summary": summary,
             "per_node_size": _json_safe_per_node_size(topology_result["per_node_size"]),
             "details": _json_safe_details(topology_result["details"]),
+            "deletion_diagnostics": deletion_diagnostics,
             "refined_output_rule": refined_output_rule.to_dict(),
             "pairwise_input_rule": dict(pairwise_input_payload),
             "protocol": {
