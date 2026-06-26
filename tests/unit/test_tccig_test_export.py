@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import csv
 import json
+import pickle
 from pathlib import Path
 
+import networkx as nx
 from tccig.prepare import GraphRule, LabeledPair, PairTable, TCCIGRuntime
-from tccig.test import run_pairwise_test
+from tccig.test import run_pairwise_test, run_raw_pairwise_topology_baseline
 
 
 class _SingleProcessAccelerator:
@@ -91,3 +93,50 @@ def test_run_pairwise_test_exports_raw_and_refined(tmp_path: Path, monkeypatch: 
     assert metrics == refined_metrics
     # Back-compat artifact still present and equal to refined metrics.
     assert json.loads((pairwise_dir / "pairwise_metrics.json").read_text()) == refined_metrics
+
+
+def test_run_raw_pairwise_topology_baseline_exports_artifacts(tmp_path: Path) -> None:
+    table = _pair_table()
+    processed_dir = tmp_path / "processed"
+    processed_dir.mkdir()
+    graph = nx.Graph()
+    graph.add_nodes_from(["A", "B", "C", "D"])
+    graph.add_edge("A", "B")
+    graph.add_edge("B", "C")
+    with (processed_dir / "human_test_graph.pkl").open("wb") as handle:
+        pickle.dump(graph, handle)
+    with (processed_dir / "test_sampled_nodes.pkl").open("wb") as handle:
+        pickle.dump({3: [["A", "B", "C"], ["A", "C", "D"]]}, handle)
+
+    def _fake_score_split(**_kwargs: object) -> list[float]:
+        return [0.95, 0.10, 0.80, 0.20]
+
+    log_dir = tmp_path / "logs"
+    metrics = run_raw_pairwise_topology_baseline(
+        table=table,
+        processed_dir=processed_dir,
+        scorer_cfg={},
+        runtime=_runtime(),
+        cache_dir=tmp_path / "cache",
+        log_dir=log_dir,
+        raw_output_rule=GraphRule(type="threshold", value=0.5),
+        score_split_fn=_fake_score_split,
+    )
+
+    topology_dir = log_dir / "topology_test"
+    assert set(metrics) == {
+        "graph_sim",
+        "relative_density",
+        "deg_dist_mmd",
+        "cc_mmd",
+        "laplacian_eigen_mmd",
+    }
+    assert (topology_dir / "all_test_ppi_pred.txt").read_text(encoding="utf-8").splitlines() == [
+        "A\tB\t1",
+        "A\tC\t0",
+        "B\tC\t1",
+        "C\tD\t0",
+    ]
+    payload = json.loads((topology_dir / "topology_metrics.json").read_text(encoding="utf-8"))
+    assert payload["raw_output_rule"] == {"type": "threshold", "value": 0.5}
+    assert (topology_dir / "topology_metrics.csv").exists()

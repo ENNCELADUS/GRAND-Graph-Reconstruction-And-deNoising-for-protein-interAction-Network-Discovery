@@ -221,6 +221,74 @@ def run_topology_test(
     return summary
 
 
+def run_raw_pairwise_topology_baseline(
+    *,
+    table: PairTable,
+    processed_dir: Path,
+    scorer_cfg: Mapping[str, object],
+    runtime: TCCIGRuntime,
+    cache_dir: Path,
+    log_dir: Path,
+    raw_output_rule: GraphRule,
+    score_split_fn: ScoreSplitFn,
+) -> dict[str, float]:
+    """Write topology-test artifacts for the frozen raw pairwise scorer."""
+    pairwise_scores = score_split_fn(
+        split="topology_test",
+        pairs=table.pairs,
+        scorer_cfg=scorer_cfg,
+        runtime=runtime,
+        cache_dir=cache_dir,
+    )
+    selected_edges = edges_from_rule(
+        pairs=table.pairs,
+        probabilities=pairwise_scores,
+        rule=raw_output_rule,
+    )
+    selected_edge_set = set(selected_edges)
+    predictions = [
+        int(canonical_edge(pair.protein_a, pair.protein_b) in selected_edge_set)
+        for pair in table.pairs
+    ]
+    with (processed_dir / "human_test_graph.pkl").open("rb") as handle:
+        gt_graph = cast(nx.Graph, pickle.load(handle))
+    with (processed_dir / "test_sampled_nodes.pkl").open("rb") as handle:
+        test_graph_nodes = cast(dict[int, list[list[str]]], pickle.load(handle))
+    topology_result = evaluate_predicted_graph(
+        pred_graph=reconstruct_graph(selected_edges),
+        gt_graph=gt_graph,
+        test_graph_nodes=test_graph_nodes,
+    )
+    summary = {key: float(value) for key, value in topology_result["summary"].items()}
+    if runtime.is_main_process:
+        topology_dir = log_dir / "topology_test"
+        _write_topology_predictions(
+            output_path=topology_dir / "all_test_ppi_pred.txt",
+            pairs=table.pairs,
+            predictions=predictions,
+        )
+        payload = {
+            "summary": summary,
+            "per_node_size": _json_safe_per_node_size(topology_result["per_node_size"]),
+            "details": _json_safe_details(topology_result["details"]),
+            "raw_output_rule": raw_output_rule.to_dict(),
+            "protocol": {
+                "candidate_universe": "all_test_ppi.txt",
+                "ground_truth_graph": "human_test_graph.pkl",
+                "sampled_nodes": "test_sampled_nodes.pkl",
+                "test_labels_visible_to_model": False,
+            },
+        }
+        write_json(topology_dir / "topology_metrics.json", payload)
+        _write_topology_metrics_csv(
+            csv_path=topology_dir / "topology_metrics.csv",
+            per_node_size=cast(dict[int, dict[str, float | int]], topology_result["per_node_size"]),
+            summary=summary,
+        )
+    _runtime_barrier(runtime)
+    return summary
+
+
 def _binary_metrics(
     *,
     labels: Sequence[int],
