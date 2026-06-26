@@ -441,9 +441,7 @@ def augment_plan_for_positive_edge_coverage(
         augmented.setdefault(target_size, []).append(tuple(sorted(nodes)))
         coverage_bucket_count += 1
     final_covered = _covered_positive_edges(sampled=augmented, graph=graph)
-    coverage = (
-        1.0 if not all_positive else len(final_covered & all_positive) / len(all_positive)
-    )
+    coverage = 1.0 if not all_positive else len(final_covered & all_positive) / len(all_positive)
     if coverage != 1.0:
         raise ValueError(
             f"positive-edge coverage augmentation failed: coverage={coverage:.6f} < 1.0"
