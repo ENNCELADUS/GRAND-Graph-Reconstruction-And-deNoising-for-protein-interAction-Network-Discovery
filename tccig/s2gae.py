@@ -362,6 +362,16 @@ def _bounded_residual(delta_logits: torch.Tensor, residual_scale: float | None) 
     return residual_scale * torch.tanh(delta_logits / residual_scale)
 
 
+def asymmetric_residual_anchor(delta_logits: torch.Tensor) -> torch.Tensor:
+    """Penalize only upward (edge-adding) residual pushes; deletion is free.
+
+    The symmetric ``delta.pow(2).mean()`` anchor pulls the refiner toward identity
+    and equally discourages negative (edge-deleting) deltas. This one-sided variant
+    leaves ``delta < 0`` unpenalized so the topology loss can drive pruning.
+    """
+    return delta_logits.clamp(min=0.0).pow(2).mean()
+
+
 def residual_refined_logits(
     pairwise_probabilities: torch.Tensor,
     delta_logits: torch.Tensor,
@@ -379,14 +389,20 @@ def s2gae_loss_terms(
     delta_logits: torch.Tensor,
     loss_config: LossConfig,
     residual_weight: float,
+    anchor_form: str = "symmetric",
 ) -> S2GAELossTerms:
-    """Compute supervised denoising BCE plus all-pair residual anchor."""
+    """Compute supervised denoising BCE plus the configured residual anchor."""
     bce = binary_classification_loss(
         logits=refined_logits,
         labels=labels,
         loss_config=loss_config,
     )
-    residual_anchor = delta_logits.pow(2).mean()
+    if anchor_form == "asymmetric_relu":
+        residual_anchor = asymmetric_residual_anchor(delta_logits)
+    elif anchor_form == "symmetric":
+        residual_anchor = delta_logits.pow(2).mean()
+    else:
+        raise ValueError(f"Unsupported residual anchor form: {anchor_form}")
     weighted_residual_anchor = residual_weight * residual_anchor
     return S2GAELossTerms(
         bce=bce,
