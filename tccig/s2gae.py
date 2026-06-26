@@ -44,8 +44,12 @@ from tccig.prepare import (
 
 LOGGER = logging.getLogger(__name__)
 
+from src.topology.finetune_losses import TopologyLossWeights
+
 if TYPE_CHECKING:
     from src.topology.finetune_data import InternalValidationPlan
+
+from src.topology.finetune_data import TOPOLOGY_EVAL_NODE_SIZES
 
 SUPPORTED_MONITOR_METRICS = {
     "val_topology_loss",
@@ -109,6 +113,8 @@ class S2GAEConfig:
     max_sequence_length: int | None
     checkpoint_path: Path
     log_dir: Path
+    residual_anchor: S2GAEResidualAnchorConfig
+    topology_training: S2GAETopologyTrainingConfig
 
 
 @dataclass
@@ -148,6 +154,31 @@ class S2GAEOptimizationConfig:
     """Backward and optimization-loop controls."""
 
     gradient_clip_norm: float | None
+
+
+@dataclass(frozen=True)
+class S2GAEResidualAnchorConfig:
+    """Residual anchor form and weight for the training loss."""
+
+    form: str
+    weight: float
+
+
+@dataclass(frozen=True)
+class S2GAETopologyTrainingConfig:
+    """Differentiable topology-loss controls for the training objective."""
+
+    enabled: bool
+    node_sizes: tuple[int, ...]
+    samples_per_size: int
+    strategy: str
+    seed: int
+    coverage_augmentation: bool
+    topology_weight: float
+    weights: TopologyLossWeights
+    warmup_epochs: int
+    ramp_epochs: int
+    schedule: str
 
 
 @dataclass(frozen=True)
@@ -1468,6 +1499,8 @@ def _parse_config(config: Mapping[str, object]) -> S2GAEConfig:
         max_sequence_length=max_sequence_length,
         checkpoint_path=checkpoint_path,
         log_dir=log_dir,
+        residual_anchor=_parse_residual_anchor_config(config.get("residual_anchor")),
+        topology_training=_parse_topology_training_config(config.get("topology_training")),
     )
 
 
@@ -1517,6 +1550,30 @@ def _config_to_json(cfg: S2GAEConfig) -> dict[str, object]:
         "max_sequence_length": cfg.max_sequence_length,
         "checkpoint_path": str(cfg.checkpoint_path),
         "log_dir": str(cfg.log_dir),
+        "residual_anchor": {
+            "form": cfg.residual_anchor.form,
+            "weight": cfg.residual_anchor.weight,
+        },
+        "topology_training": {
+            "enabled": cfg.topology_training.enabled,
+            "node_sizes": list(cfg.topology_training.node_sizes),
+            "samples_per_size": cfg.topology_training.samples_per_size,
+            "strategy": cfg.topology_training.strategy,
+            "seed": cfg.topology_training.seed,
+            "coverage_augmentation": cfg.topology_training.coverage_augmentation,
+            "topology_weight": cfg.topology_training.topology_weight,
+            "weights": {
+                "alpha": cfg.topology_training.weights.alpha,
+                "beta": cfg.topology_training.weights.beta,
+                "gamma": cfg.topology_training.weights.gamma,
+                "delta": cfg.topology_training.weights.delta,
+            },
+            "schedule": {
+                "warmup_epochs": cfg.topology_training.warmup_epochs,
+                "ramp_epochs": cfg.topology_training.ramp_epochs,
+                "schedule": cfg.topology_training.schedule,
+            },
+        },
     }
 
 
@@ -1622,6 +1679,77 @@ def _parse_topology_validation_config(
     )
 
 
+def _parse_residual_anchor_config(raw: object) -> S2GAEResidualAnchorConfig:
+    if raw is None:
+        return S2GAEResidualAnchorConfig(form="symmetric", weight=0.0)
+    if not isinstance(raw, Mapping):
+        raise ValueError("refiner.residual_anchor must be a mapping")
+    form = str(raw.get("form", "symmetric"))
+    if form not in {"symmetric", "asymmetric_relu"}:
+        raise ValueError(
+            "refiner.residual_anchor.form must be 'symmetric' or 'asymmetric_relu'"
+        )
+    return S2GAEResidualAnchorConfig(
+        form=form,
+        weight=_non_negative_float(raw.get("weight", 0.0), "refiner.residual_anchor.weight"),
+    )
+
+
+def _parse_topology_training_config(raw: object) -> S2GAETopologyTrainingConfig:
+    if raw is None or not isinstance(raw, Mapping):
+        return S2GAETopologyTrainingConfig(
+            enabled=False,
+            node_sizes=TOPOLOGY_EVAL_NODE_SIZES,
+            samples_per_size=20,
+            strategy="mixed",
+            seed=0,
+            coverage_augmentation=True,
+            topology_weight=0.0,
+            weights=TopologyLossWeights(),
+            warmup_epochs=0,
+            ramp_epochs=0,
+            schedule="linear",
+        )
+    raw_weights = raw.get("weights", {})
+    if not isinstance(raw_weights, Mapping):
+        raise ValueError("refiner.topology_training.weights must be a mapping")
+    raw_schedule = raw.get("schedule", {})
+    if not isinstance(raw_schedule, Mapping):
+        raise ValueError("refiner.topology_training.schedule must be a mapping")
+    return S2GAETopologyTrainingConfig(
+        enabled=_bool(raw.get("enabled", False), "refiner.topology_training.enabled"),
+        node_sizes=tuple(
+            _int_sequence(
+                raw.get("node_sizes", list(TOPOLOGY_EVAL_NODE_SIZES)),
+                "refiner.topology_training.node_sizes",
+            )
+        ),
+        samples_per_size=_positive_int(
+            raw.get("samples_per_size", 20), "refiner.topology_training.samples_per_size"
+        ),
+        strategy=str(raw.get("strategy", "mixed")),
+        seed=_non_negative_int(raw.get("seed", 0), "refiner.topology_training.seed"),
+        coverage_augmentation=_bool(
+            raw.get("coverage_augmentation", True),
+            "refiner.topology_training.coverage_augmentation",
+        ),
+        topology_weight=_non_negative_float(
+            raw.get("topology_weight", 1.0), "refiner.topology_training.topology_weight"
+        ),
+        weights=TopologyLossWeights(
+            alpha=_non_negative_float(raw_weights.get("alpha", 1.0), "...alpha"),
+            beta=_non_negative_float(raw_weights.get("beta", 8.0), "...beta"),
+            gamma=_non_negative_float(raw_weights.get("gamma", 0.5), "...gamma"),
+            delta=_non_negative_float(raw_weights.get("delta", 0.1), "...delta"),
+        ),
+        warmup_epochs=_non_negative_int(
+            raw_schedule.get("warmup_epochs", 0), "...warmup_epochs"
+        ),
+        ramp_epochs=_non_negative_int(raw_schedule.get("ramp_epochs", 0), "...ramp_epochs"),
+        schedule=str(raw_schedule.get("schedule", "linear")),
+    )
+
+
 def _parse_optimizer_config(raw_optimizer: object) -> S2GAEOptimizerConfig:
     if not isinstance(raw_optimizer, Mapping):
         raise ValueError("refiner.optimizer must be a mapping")
@@ -1719,6 +1847,27 @@ def _non_negative_float(value: object, field_name: str) -> float:
     if parsed < 0.0 or math.isnan(parsed) or math.isinf(parsed):
         raise ValueError(f"{field_name} must be a non-negative float")
     return parsed
+
+
+def _non_negative_int(value: object, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    try:
+        parsed = int(cast(int | str, value))
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field_name} must be a non-negative integer") from error
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be a non-negative integer")
+    return parsed
+
+
+def _int_sequence(value: object, field_name: str) -> list[int]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field_name} must be a sequence of integers")
+    result: list[int] = []
+    for i, item in enumerate(value):
+        result.append(_non_negative_int(item, f"{field_name}[{i}]"))
+    return result
 
 
 def _probability(value: object, field_name: str) -> float:
