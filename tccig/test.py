@@ -236,12 +236,15 @@ def run_topology_test(
             pairs=table.pairs,
             predictions=predictions,
         )
+        ground_truth_labels = [
+            int(gt_graph.has_edge(pair.protein_a, pair.protein_b)) for pair in table.pairs
+        ]
         deletion_diagnostics = compute_deletion_diagnostics(
             raw_edges=pairwise_edges,
             refined_edges=selected_edges,
             pairs=table.pairs,
             raw_probabilities=pairwise_scores,
-            labels=None,
+            labels=ground_truth_labels,
         )
         payload = {
             "summary": summary,

@@ -10,7 +10,7 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import SupportsFloat, cast
 
 import networkx as nx
 import torch
@@ -351,7 +351,7 @@ class CrossLayerDecoder(nn.Module):
 
     def reset_output_layer(self) -> None:
         """Initialize the residual decoder to preserve pairwise logits."""
-        output_layer = self.layers[-1]
+        output_layer = cast(nn.Linear, self.layers[-1])
         nn.init.zeros_(output_layer.weight)
         nn.init.zeros_(output_layer.bias)
 
@@ -377,7 +377,8 @@ class CrossLayerDecoder(nn.Module):
             x = layer(x)
             x = functional.relu(x)
             x = functional.dropout(x, p=self.dropout, training=self.training)
-        return self.layers[-1](x).squeeze(-1)
+        output_layer = cast(nn.Linear, self.layers[-1])
+        return cast(torch.Tensor, output_layer(x).squeeze(-1))
 
 
 def _clamp_probabilities(pairwise_probabilities: torch.Tensor) -> torch.Tensor:
@@ -802,14 +803,27 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             topology_scale = topology_loss_scale(epoch=epoch - 1, schedule=topology_schedule)
             if topology_scale > 0.0 and cfg.topology_training.topology_weight > 0.0:
                 optimizer.zero_grad(set_to_none=True)
-                topo_loss, topology_components = topology_plan_loss(
-                    refiner=_unwrap_refiner(train_step_model, request.runtime.accelerator),
-                    graph=train_topology_graph,
-                    plan=cast(InternalValidationPlan, request.train_topology_plan),
-                    node_index=train_topology_node_index,
-                    weights=cfg.topology_training.weights,
-                    include_clustering_mmd=cfg.topology_validation.compute_clustering_mmd,
+                topology_refiner = _unwrap_refiner(
+                    train_step_model, request.runtime.accelerator
                 )
+                # The per-epoch topology backward runs on the unwrapped refiner over the
+                # full-plan graph, which is identical on every rank. Dropout is the only
+                # source of cross-rank nondeterminism, so disable it here to keep DDP
+                # parameters in lock-step (identical inputs + no dropout -> identical
+                # gradients -> identical optimizer step; no gradient all-reduce needed).
+                topology_was_training = topology_refiner.training
+                topology_refiner.eval()
+                try:
+                    topo_loss, topology_components = topology_plan_loss(
+                        refiner=topology_refiner,
+                        graph=train_topology_graph,
+                        plan=cast(InternalValidationPlan, request.train_topology_plan),
+                        node_index=train_topology_node_index,
+                        weights=cfg.topology_training.weights,
+                        include_clustering_mmd=cfg.topology_validation.compute_clustering_mmd,
+                    )
+                finally:
+                    topology_refiner.train(topology_was_training)
                 scaled = topology_scale * cfg.topology_training.topology_weight * topo_loss
                 request.runtime.accelerator.backward(scaled)
                 if cfg.optimization.gradient_clip_norm is not None:
@@ -846,7 +860,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 model=validation_model,
                 graph=validation_topology_graph,
                 pairs=request.validation_topology.pairs,
-                validation_plan=request.validation_topology_plan,
+                validation_plan=cast(InternalValidationPlan, request.validation_topology_plan),
                 rule=request.graph_rule,
                 validation_auprc=validation_auprc,
                 cfg=cfg,
@@ -1326,7 +1340,10 @@ def _validation_topology_metrics(
         include_clustering_stats=cfg.topology_validation.compute_clustering_mmd,
     )
     summary = cast(Mapping[str, object], result["summary"])
-    metrics = {name: float(summary[name]) for name in INTERNAL_VALIDATION_SUMMARY_KEYS}
+    metrics = {
+        name: float(cast(SupportsFloat, summary[name]))
+        for name in INTERNAL_VALIDATION_SUMMARY_KEYS
+    }
     metrics["val_topology_loss"] = _validation_topology_loss(
         internal_val_topology_stats=metrics,
         weights=cfg.topology_validation.losses,
@@ -2052,8 +2069,11 @@ def _bool(value: object, field_name: str) -> bool:
 
 
 def _gradient_norm(parameters: Sequence[torch.nn.Parameter]) -> float:
-    device = parameters[0].grad.device
-    norms = [parameter.grad.detach().norm(2).to(device) for parameter in parameters]
+    grads = [parameter.grad for parameter in parameters if parameter.grad is not None]
+    if not grads:
+        return 0.0
+    device = grads[0].device
+    norms = [grad.detach().norm(2).to(device) for grad in grads]
     return float(torch.norm(torch.stack(norms), 2).detach().cpu().item())
 
 
