@@ -6,7 +6,7 @@
 #SBATCH -t 08:00:00
 #SBATCH --mem=120G
 #SBATCH --cpus-per-task=16
-#SBATCH --gres=gpu:NVIDIAA40:1
+#SBATCH --gres=gpu:NVIDIAA40:4
 #SBATCH --output=logs/tccig/slurm_pairwise_baseline_%j.out
 #SBATCH --error=logs/tccig/slurm_pairwise_baseline_%j.err
 #SBATCH --mail-type=ALL
