@@ -176,6 +176,21 @@ def _manifest_path(cache_dir: Path, split: str) -> Path:
     return cache_dir / "manifests" / f"{split}_plan.json"
 
 
+def _payload_is_rehydratable(payload: Mapping[str, object]) -> bool:
+    """Return whether ``payload`` can be rehydrated into a plan.
+
+    Guards against a payload that matches the cache key but is structurally
+    incomplete (missing buckets or bucket fields). We rebuild the plan via a
+    disposable empty graph since target subgraphs are reconstructed from cached
+    induced edges and never read the passed graph.
+    """
+    try:
+        payload_to_plan(payload, graph=nx.Graph())
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
 def load_plan_cache(
     *,
     cache_dir: Path,
@@ -198,6 +213,9 @@ def load_plan_cache(
         return None
     payload = document.get("payload")
     if not isinstance(payload, Mapping):
+        return None
+    if not _payload_is_rehydratable(payload):
+        LOGGER.warning("ignoring structurally invalid topology plan cache at %s", path)
         return None
     return dict(payload)
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import networkx as nx
@@ -134,4 +135,32 @@ def test_load_returns_none_on_corrupt_json(tmp_path: Path) -> None:
     loaded = load_plan_cache(
         cache_dir=tmp_path, split="train_topology", metadata=_meta(_toy_graph())
     )
+    assert loaded is None
+
+
+def test_load_returns_none_on_structurally_invalid_payload(tmp_path: Path) -> None:
+    graph = _toy_graph()
+    metadata = _meta(graph)
+    path = tmp_path / "plans" / "train_topology.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Metadata matches, but the payload is missing the required "buckets" list,
+    # which would crash payload_to_plan if treated as a hit.
+    path.write_text(
+        json.dumps({"metadata": dict(metadata), "payload": {"version": 1}}),
+        encoding="utf-8",
+    )
+    loaded = load_plan_cache(cache_dir=tmp_path, split="train_topology", metadata=metadata)
+    assert loaded is None
+
+
+def test_load_returns_none_on_metadata_match_but_malformed_payload(tmp_path: Path) -> None:
+    graph = _toy_graph()
+    metadata = _meta(graph)
+    path = tmp_path / "plans" / "train_topology.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # A payload that matches metadata but is missing required bucket fields.
+    document = {"metadata": dict(metadata), "payload": {"buckets": [{"node_size": 3}]}}
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    loaded = load_plan_cache(cache_dir=tmp_path, split="train_topology", metadata=metadata)
     assert loaded is None
