@@ -44,3 +44,46 @@ def test_payload_round_trip_preserves_plan() -> None:
         ):
             assert set(restored_sub.nodes()) == set(original_sub.nodes())
             assert _edge_set(restored_sub) == _edge_set(original_sub)
+
+
+from src.topology.plan_cache import plan_payload_metadata
+
+
+def _meta(graph: nx.Graph, **overrides: object) -> dict[str, object]:
+    kwargs: dict[str, object] = {
+        "split": "train_topology",
+        "graph": graph,
+        "node_sizes": [3, 4],
+        "samples_per_size": 2,
+        "seed": 0,
+        "strategy": "mixed",
+        "coverage_augmentation": True,
+    }
+    kwargs.update(overrides)
+    return plan_payload_metadata(**kwargs)  # type: ignore[arg-type]
+
+
+def test_metadata_normalizes_strategy_case() -> None:
+    graph = _toy_graph()
+    assert _meta(graph, strategy="mixed") == _meta(graph, strategy="MIXED")
+
+
+def test_metadata_stable_across_edge_insertion_order() -> None:
+    graph_a = nx.Graph()
+    graph_a.add_edges_from([("a", "b"), ("b", "c"), ("c", "d")])
+    graph_b = nx.Graph()
+    graph_b.add_edges_from([("c", "d"), ("a", "b"), ("b", "c")])
+    assert _meta(graph_a)["graph_hash"] == _meta(graph_b)["graph_hash"]
+
+
+def test_metadata_changes_on_each_input() -> None:
+    graph = _toy_graph()
+    base = _meta(graph)
+    assert _meta(graph, seed=1) != base
+    assert _meta(graph, samples_per_size=3) != base
+    assert _meta(graph, node_sizes=[3, 5]) != base
+    assert _meta(graph, strategy="bfs") != base
+    assert _meta(graph, coverage_augmentation=False) != base
+    bigger = _toy_graph()
+    bigger.add_edge("a", "z")  # new edge + new node
+    assert _meta(bigger)["graph_hash"] != base["graph_hash"]

@@ -7,6 +7,7 @@ are regenerated on load by deterministic upper-triangle enumeration.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -18,6 +19,7 @@ from src.topology.finetune_data import (
     InternalValidationPairRecord,
     InternalValidationPlan,
     _canonical_edge,
+    _normalize_sampling_strategy,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -118,3 +120,47 @@ def payload_to_plan(payload: Mapping[str, object], *, graph: nx.Graph) -> Intern
         total_subgraphs=total_subgraphs,
         total_pairs=total_pairs,
     )
+
+
+def _graph_hash(graph: nx.Graph) -> str:
+    """Return a stable digest over canonical edges and node ids."""
+    digest = hashlib.sha256()
+    for node in sorted(graph.nodes()):
+        digest.update(b"n")
+        digest.update(str(node).encode("utf-8"))
+        digest.update(b"\n")
+    edges = sorted(_canonical_edge(node_a, node_b) for node_a, node_b in graph.edges())
+    for node_a, node_b in edges:
+        digest.update(node_a.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(node_b.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def plan_payload_metadata(
+    *,
+    split: str,
+    graph: nx.Graph,
+    node_sizes: Sequence[int],
+    samples_per_size: int,
+    seed: int,
+    strategy: str,
+    coverage_augmentation: bool,
+) -> dict[str, object]:
+    """Build the strict cache key for a topology plan payload.
+
+    ``strategy`` is normalized so that, for example, ``mixed`` and ``MIXED``
+    map to the same cache entry. Any change to the graph or a sampling
+    parameter changes the returned metadata, invalidating a stale cache.
+    """
+    return {
+        "version": PAYLOAD_VERSION,
+        "split": split,
+        "graph_hash": _graph_hash(graph),
+        "node_sizes": [int(size) for size in node_sizes],
+        "samples_per_size": int(samples_per_size),
+        "seed": int(seed),
+        "strategy": _normalize_sampling_strategy(strategy),
+        "coverage_augmentation": bool(coverage_augmentation),
+    }
