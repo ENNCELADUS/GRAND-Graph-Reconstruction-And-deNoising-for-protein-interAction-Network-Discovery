@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 import networkx as nx
+import pytest
 from src.topology.finetune_data import build_internal_validation_plan
 from src.topology.plan_cache import (
     load_plan_cache,
@@ -171,3 +172,93 @@ def test_load_returns_none_on_metadata_match_but_malformed_payload(tmp_path: Pat
 
     loaded = load_plan_cache(cache_dir=tmp_path, split="train_topology", metadata=metadata)
     assert loaded is None
+
+
+def _valid_payload() -> dict[str, object]:
+    graph = _toy_graph()
+    plan = build_internal_validation_plan(graph=graph, sampled_subgraphs=_toy_sampled())
+    return plan_to_payload(plan)
+
+
+def _mutate(mutator: object) -> dict[str, object]:
+    payload = _valid_payload()
+    mutator(payload)  # type: ignore[operator]
+    return payload
+
+
+def _set_wrong_version(payload: dict[str, object]) -> None:
+    payload["version"] = 999
+
+
+def _set_buckets_not_list(payload: dict[str, object]) -> None:
+    payload["buckets"] = {"node_size": 3}
+
+
+def _set_bucket_not_mapping(payload: dict[str, object]) -> None:
+    payload["buckets"] = ["not a mapping"]
+
+
+def _set_length_mismatch(payload: dict[str, object]) -> None:
+    bucket = payload["buckets"][0]  # type: ignore[index]
+    bucket["target_edges"] = bucket["target_edges"][:-1]
+
+
+def _set_non_string_node(payload: dict[str, object]) -> None:
+    payload["buckets"][0]["sampled_subgraphs"][0][0] = 42  # type: ignore[index]
+
+
+def _set_edge_wrong_arity(payload: dict[str, object]) -> None:
+    payload["buckets"][0]["target_edges"][0] = [["a"]]  # type: ignore[index]
+
+
+def _set_edge_empty(payload: dict[str, object]) -> None:
+    payload["buckets"][0]["target_edges"][0] = [[]]  # type: ignore[index]
+
+
+def _set_edge_endpoint_outside_nodes(payload: dict[str, object]) -> None:
+    payload["buckets"][0]["target_edges"][0] = [["zzz", "yyy"]]  # type: ignore[index]
+
+
+def _set_edge_non_canonical(payload: dict[str, object]) -> None:
+    nodes = payload["buckets"][0]["sampled_subgraphs"][0]  # type: ignore[index]
+    high, low = max(nodes), min(nodes)
+    payload["buckets"][0]["target_edges"][0] = [[high, low]]  # type: ignore[index]
+
+
+def _set_total_pairs_wrong(payload: dict[str, object]) -> None:
+    payload["total_pairs"] = 99999
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        _set_wrong_version,
+        _set_buckets_not_list,
+        _set_bucket_not_mapping,
+        _set_length_mismatch,
+        _set_non_string_node,
+        _set_edge_wrong_arity,
+        _set_edge_empty,
+        _set_edge_endpoint_outside_nodes,
+        _set_edge_non_canonical,
+        _set_total_pairs_wrong,
+    ],
+)
+def test_load_rejects_malformed_payload(tmp_path: Path, mutator: object) -> None:
+    metadata = _meta(_toy_graph())
+    path = tmp_path / "plans" / "train_topology.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    document = {"metadata": dict(metadata), "payload": _mutate(mutator)}
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    loaded = load_plan_cache(cache_dir=tmp_path, split="train_topology", metadata=metadata)
+    assert loaded is None
+
+
+def test_load_accepts_valid_payload(tmp_path: Path) -> None:
+    metadata = _meta(_toy_graph())
+    write_plan_cache(
+        cache_dir=tmp_path, split="train_topology", metadata=metadata, payload=_valid_payload()
+    )
+    loaded = load_plan_cache(cache_dir=tmp_path, split="train_topology", metadata=metadata)
+    assert loaded is not None

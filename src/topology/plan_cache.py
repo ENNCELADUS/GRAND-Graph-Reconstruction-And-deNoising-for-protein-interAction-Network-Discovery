@@ -178,19 +178,71 @@ def _manifest_path(cache_dir: Path, split: str) -> Path:
     return cache_dir / "manifests" / f"{split}_plan.json"
 
 
-def _payload_is_rehydratable(payload: Mapping[str, object]) -> bool:
-    """Return whether ``payload`` can be rehydrated into a plan.
-
-    Guards against a payload that matches the cache key but is structurally
-    incomplete (missing buckets or bucket fields). We rebuild the plan via a
-    disposable empty graph since target subgraphs are reconstructed from cached
-    induced edges and never read the passed graph.
-    """
-    try:
-        payload_to_plan(payload, graph=nx.Graph())
-    except (KeyError, TypeError, ValueError):
+def _validate_target_edges(edges: object, node_set: frozenset[str]) -> bool:
+    """Return whether ``edges`` is a list of canonical edges inside ``node_set``."""
+    if not isinstance(edges, list):
         return False
+    for edge in edges:
+        if not isinstance(edge, list) or len(edge) != 2:
+            return False
+        node_a, node_b = edge
+        if not isinstance(node_a, str) or not isinstance(node_b, str):
+            return False
+        if node_a not in node_set or node_b not in node_set:
+            return False
+        if (node_a, node_b) != _canonical_edge(node_a, node_b):
+            return False
     return True
+
+
+def _validate_bucket(bucket: object) -> tuple[bool, int, int]:
+    """Validate one bucket's shape; return ``(ok, subgraph_count, pair_count)``."""
+    if not isinstance(bucket, Mapping):
+        return False, 0, 0
+    if not isinstance(bucket.get("node_size"), int):
+        return False, 0, 0
+    node_sets = bucket.get("sampled_subgraphs")
+    target_edges = bucket.get("target_edges")
+    if not isinstance(node_sets, list) or not isinstance(target_edges, list):
+        return False, 0, 0
+    if len(node_sets) != len(target_edges):
+        return False, 0, 0
+    pair_count = 0
+    for nodes, edges in zip(node_sets, target_edges, strict=True):
+        if not isinstance(nodes, list) or not all(isinstance(node, str) for node in nodes):
+            return False, 0, 0
+        if not _validate_target_edges(edges, frozenset(nodes)):
+            return False, 0, 0
+        size = len(nodes)
+        pair_count += size * (size - 1) // 2
+    return True, len(node_sets), pair_count
+
+
+def _payload_is_rehydratable(payload: Mapping[str, object]) -> bool:
+    """Return whether ``payload`` is structurally valid for rehydration.
+
+    A cheap schema check (no O(n²) pair-record materialization). Guards against a
+    payload that matches the cache key but is structurally incomplete or corrupt:
+    wrong version, malformed buckets, mismatched list lengths, non-string node
+    ids, edges that are not exactly two canonical endpoints inside the sampled
+    node set, or recomputed totals that disagree with the stored totals.
+    """
+    if payload.get("version") != PAYLOAD_VERSION:
+        return False
+    raw_buckets = payload.get("buckets")
+    if not isinstance(raw_buckets, list):
+        return False
+    total_subgraphs = 0
+    total_pairs = 0
+    for bucket in raw_buckets:
+        ok, subgraph_count, pair_count = _validate_bucket(bucket)
+        if not ok:
+            return False
+        total_subgraphs += subgraph_count
+        total_pairs += pair_count
+    if payload.get("total_subgraphs") != total_subgraphs:
+        return False
+    return payload.get("total_pairs") == total_pairs
 
 
 def load_plan_cache(
