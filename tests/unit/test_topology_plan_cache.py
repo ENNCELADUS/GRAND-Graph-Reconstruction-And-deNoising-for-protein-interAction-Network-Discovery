@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
-import networkx as nx
-import pytest
+from pathlib import Path
 
+import networkx as nx
 from src.topology.finetune_data import build_internal_validation_plan
-from src.topology.plan_cache import payload_to_plan, plan_to_payload
+from src.topology.plan_cache import (
+    load_plan_cache,
+    payload_to_plan,
+    plan_payload_metadata,
+    plan_to_payload,
+    write_plan_cache,
+)
 
 
 def _toy_graph() -> nx.Graph:
@@ -44,9 +50,6 @@ def test_payload_round_trip_preserves_plan() -> None:
         ):
             assert set(restored_sub.nodes()) == set(original_sub.nodes())
             assert _edge_set(restored_sub) == _edge_set(original_sub)
-
-
-from src.topology.plan_cache import plan_payload_metadata
 
 
 def _meta(graph: nx.Graph, **overrides: object) -> dict[str, object]:
@@ -87,3 +90,53 @@ def test_metadata_changes_on_each_input() -> None:
     bigger = _toy_graph()
     bigger.add_edge("a", "z")  # new edge + new node
     assert _meta(bigger)["graph_hash"] != base["graph_hash"]
+
+
+
+
+
+def test_write_then_load_returns_payload(tmp_path: Path) -> None:
+    graph = _toy_graph()
+    plan = build_internal_validation_plan(graph=graph, sampled_subgraphs=_toy_sampled())
+    metadata = _meta(graph)
+    payload = plan_to_payload(plan)
+
+    write_plan_cache(cache_dir=tmp_path, split="train_topology", metadata=metadata, payload=payload)
+
+    assert (tmp_path / "plans" / "train_topology.json").exists()
+    assert (tmp_path / "manifests" / "train_topology_plan.json").exists()
+    loaded = load_plan_cache(cache_dir=tmp_path, split="train_topology", metadata=metadata)
+    assert loaded is not None
+    restored = payload_to_plan(loaded, graph=graph)
+    assert restored.total_pairs == plan.total_pairs
+
+
+def test_load_returns_none_on_metadata_mismatch(tmp_path: Path) -> None:
+    graph = _toy_graph()
+    plan = build_internal_validation_plan(graph=graph, sampled_subgraphs=_toy_sampled())
+    payload = plan_to_payload(plan)
+    write_plan_cache(
+        cache_dir=tmp_path, split="train_topology", metadata=_meta(graph), payload=payload
+    )
+
+    stale = load_plan_cache(
+        cache_dir=tmp_path, split="train_topology", metadata=_meta(graph, seed=999)
+    )
+    assert stale is None
+
+
+def test_load_returns_none_when_absent(tmp_path: Path) -> None:
+    loaded = load_plan_cache(
+        cache_dir=tmp_path, split="train_topology", metadata=_meta(_toy_graph())
+    )
+    assert loaded is None
+
+
+def test_load_returns_none_on_corrupt_json(tmp_path: Path) -> None:
+    path = tmp_path / "plans" / "train_topology.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not valid json", encoding="utf-8")
+    loaded = load_plan_cache(
+        cache_dir=tmp_path, split="train_topology", metadata=_meta(_toy_graph())
+    )
+    assert loaded is None

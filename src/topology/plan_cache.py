@@ -8,11 +8,13 @@ are regenerated on load by deterministic upper-triangle enumeration.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import networkx as nx
+from tccig.prepare import write_json
 
 from src.topology.finetune_data import (
     InternalValidationNodeBucketPlan,
@@ -164,3 +166,52 @@ def plan_payload_metadata(
         "strategy": _normalize_sampling_strategy(strategy),
         "coverage_augmentation": bool(coverage_augmentation),
     }
+
+
+def _plan_path(cache_dir: Path, split: str) -> Path:
+    return cache_dir / "plans" / f"{split}.json"
+
+
+def _manifest_path(cache_dir: Path, split: str) -> Path:
+    return cache_dir / "manifests" / f"{split}_plan.json"
+
+
+def load_plan_cache(
+    *,
+    cache_dir: Path,
+    split: str,
+    metadata: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Load a cached plan payload, or ``None`` on miss/mismatch/corruption."""
+    path = _plan_path(cache_dir, split)
+    if not path.exists():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("ignoring corrupt topology plan cache at %s", path)
+        return None
+    if not isinstance(document, Mapping):
+        LOGGER.warning("ignoring malformed topology plan cache at %s", path)
+        return None
+    if document.get("metadata") != dict(metadata):
+        return None
+    payload = document.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    return dict(payload)
+
+
+def write_plan_cache(
+    *,
+    cache_dir: Path,
+    split: str,
+    metadata: Mapping[str, object],
+    payload: Mapping[str, object],
+) -> None:
+    """Persist a plan payload plus its cache-key metadata and a manifest."""
+    write_json(
+        _plan_path(cache_dir, split),
+        {"metadata": dict(metadata), "payload": dict(payload)},
+    )
+    write_json(_manifest_path(cache_dir, split), dict(metadata))
