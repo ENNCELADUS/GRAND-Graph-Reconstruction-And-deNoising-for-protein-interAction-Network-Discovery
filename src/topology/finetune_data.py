@@ -212,6 +212,8 @@ def build_pair_supervision_graph(
                 continue
             if label <= 0:
                 continue
+            if parts[0] == parts[1]:
+                continue  # drop self-pairs; supervision graph is simple and undirected
             if parts[0] not in node_ids or parts[1] not in node_ids:
                 continue
             graph.add_edge(parts[0], parts[1])

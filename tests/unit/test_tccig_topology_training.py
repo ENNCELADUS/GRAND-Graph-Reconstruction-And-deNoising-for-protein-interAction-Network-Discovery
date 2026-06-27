@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 from tccig.s2gae import asymmetric_residual_anchor
@@ -102,6 +104,37 @@ def test_coverage_augmentation_covers_isolated_positive_edge() -> None:
         if graph.has_edge(a, b)
     }
     assert frozenset(("FARLEFT", "FARRIGHT")) in covered
+
+
+def test_coverage_augmentation_handles_positive_self_pair_in_pair_file(tmp_path: Path) -> None:
+    import networkx as nx
+    from src.topology.finetune_data import build_pair_supervision_graph
+    from tccig.train import augment_plan_for_positive_edge_coverage
+
+    # A positive self-pair (HPC job 928974 root cause) must be filtered by the
+    # graph builder so coverage augmentation never sees a self-loop frozenset.
+    pair_path = tmp_path / "human_train_ppi.txt"
+    pair_path.write_text(
+        "P1\tP2\t1\nP3\tP3\t1\nP3\tP4\t1\n",
+        encoding="utf-8",
+    )
+
+    graph = build_pair_supervision_graph(
+        pair_path=pair_path,
+        node_ids={"P1", "P2", "P3", "P4"},
+    )
+    assert nx.number_of_selfloops(graph) == 0
+
+    augmented, stats = augment_plan_for_positive_edge_coverage(
+        graph=graph,
+        base_sampled={2: [("P1", "P2")]},
+        node_sizes=[2],
+        strategy="BFS",
+        seed=0,
+    )
+
+    assert stats["positive_edge_coverage"] == 1.0
+    assert isinstance(augmented, dict)
 
 
 def test_train_refiner_request_accepts_train_topology_fields() -> None:

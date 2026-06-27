@@ -437,6 +437,23 @@ def test_build_pair_supervision_graph_uses_only_positive_pairs_and_keeps_isolate
     assert {tuple(sorted(edge)) for edge in graph.edges} == {("P1", "P2"), ("P2", "P3")}
 
 
+def test_build_pair_supervision_graph_drops_positive_self_pairs(tmp_path: Path) -> None:
+    split_path = tmp_path / "human_BFS_split.pkl"
+    with split_path.open("wb") as handle:
+        pickle.dump({"train": {"P1", "P2", "P3"}, "test": {"PX"}}, handle)
+    pair_path = tmp_path / "human_train_ppi.txt"
+    pair_path.write_text(
+        "P3\tP3\t1\nP1\tP2\t1\n",
+        encoding="utf-8",
+    )
+
+    train_nodes = load_split_node_ids(split_path=split_path, split_name="train")
+    graph = build_pair_supervision_graph(pair_path=pair_path, node_ids=train_nodes)
+
+    assert not list(nx.selfloop_edges(graph))
+    assert {tuple(sorted(edge)) for edge in graph.edges} == {("P1", "P2")}
+
+
 def test_build_explicit_negative_lookup_uses_only_in_split_negative_pairs(tmp_path: Path) -> None:
     pair_path = tmp_path / "human_train_ppi.txt"
     pair_path.write_text(
