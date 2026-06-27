@@ -24,6 +24,7 @@ from src.embed import load_cached_embedding
 from src.pipeline.stages.train import build_model
 from src.topology.finetune_data import (
     TOPOLOGY_EVAL_NODE_SIZES,
+    _canonical_edge,
     _expand_chunk_nodes,
     build_internal_validation_plan,
     build_pair_supervision_graph,
@@ -420,17 +421,24 @@ def augment_plan_for_positive_edge_coverage(
         size: list(buckets) for size, buckets in base_sampled.items()
     }
     base_bucket_count = sum(len(buckets) for buckets in augmented.values())
-    all_positive = {frozenset((node_a, node_b)) for node_a, node_b in graph.edges()}
+    all_positive = {_canonical_edge(node_a, node_b) for node_a, node_b in graph.edges()}
     target_size = max(node_sizes)
     normalized_strategy = strategy.upper()
     if normalized_strategy not in {"BFS", "DFS", "RANDOM_WALK"}:
         normalized_strategy = "BFS"
     rng = random.Random(seed)
+
+    # Maintain `covered` incrementally: seed it once from the base buckets, then
+    # extend it with each newly added coverage bucket's induced edges. This avoids
+    # re-scanning every bucket per uncovered edge (the previous quadratic hotspot).
+    covered: set[tuple[str, str]] = {
+        _canonical_edge(*tuple(sorted(edge)))
+        for edge in _covered_positive_edges(sampled=augmented, graph=graph)
+    }
     coverage_bucket_count = 0
-    covered = _covered_positive_edges(sampled=augmented, graph=graph)
-    for edge in sorted(tuple(sorted(e)) for e in (all_positive - covered)):
-        if frozenset(edge) in _covered_positive_edges(sampled=augmented, graph=graph):
-            continue  # already covered by a previously added coverage bucket
+    for edge in sorted(all_positive - covered):
+        if edge in covered:
+            continue  # drained by a previously added coverage bucket
         nodes = _expand_chunk_nodes(
             graph=graph,
             edge_chunk=[(edge[0], edge[1])],
@@ -439,9 +447,12 @@ def augment_plan_for_positive_edge_coverage(
             rng=rng,
         )
         augmented.setdefault(target_size, []).append(tuple(sorted(nodes)))
+        for node_a, node_b in graph.subgraph(set(nodes)).edges():
+            covered.add(_canonical_edge(node_a, node_b))
         coverage_bucket_count += 1
-    final_covered = _covered_positive_edges(sampled=augmented, graph=graph)
-    coverage = 1.0 if not all_positive else len(final_covered & all_positive) / len(all_positive)
+
+    matched_positive = len(covered & all_positive)
+    coverage = 1.0 if not all_positive else matched_positive / len(all_positive)
     if coverage != 1.0:
         raise ValueError(
             f"positive-edge coverage augmentation failed: coverage={coverage:.6f} < 1.0"

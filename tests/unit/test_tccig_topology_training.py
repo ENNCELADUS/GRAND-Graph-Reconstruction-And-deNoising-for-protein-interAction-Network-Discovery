@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import networkx as nx
 import pytest
 import torch
 from tccig.s2gae import asymmetric_residual_anchor
+from tccig.train import augment_plan_for_positive_edge_coverage
 
 
 def test_asymmetric_anchor_leaves_deletion_free() -> None:
@@ -251,3 +253,55 @@ def test_topology_loss_scale_zero_during_warmup_then_ramps() -> None:
     assert topology_loss_scale(epoch=4, schedule=schedule) == 0.0
     assert 0.0 < topology_loss_scale(epoch=9, schedule=schedule) < 1.0
     assert topology_loss_scale(epoch=15, schedule=schedule) == 1.0
+
+
+def _coverage_graph() -> nx.Graph:
+    graph = nx.Graph()
+    # two clusters joined by a bridge so some positives need coverage buckets
+    graph.add_edges_from(
+        [("a", "b"), ("b", "c"), ("a", "c"), ("c", "d"), ("d", "e"), ("e", "f"), ("d", "f")]
+    )
+    return graph
+
+
+def test_coverage_augmentation_reaches_full_coverage() -> None:
+    graph = _coverage_graph()
+    augmented, stats = augment_plan_for_positive_edge_coverage(
+        graph=graph,
+        base_sampled={4: [("a", "b", "c", "d")]},
+        node_sizes=[4],
+        strategy="bfs",
+        seed=0,
+    )
+    assert stats["positive_edge_coverage"] == 1.0
+    # every positive edge appears in some bucket
+    covered: set[frozenset[str]] = set()
+    for buckets in augmented.values():
+        for nodes in buckets:
+            for edge in graph.subgraph(set(nodes)).edges():
+                covered.add(frozenset(edge))
+    all_positive = {frozenset(edge) for edge in graph.edges()}
+    assert covered >= all_positive
+
+
+def test_coverage_augmentation_is_deterministic() -> None:
+    graph = _coverage_graph()
+    base = {4: [("a", "b", "c", "d")]}
+    first, first_stats = augment_plan_for_positive_edge_coverage(
+        graph=graph, base_sampled=base, node_sizes=[4], strategy="bfs", seed=0
+    )
+    second, second_stats = augment_plan_for_positive_edge_coverage(
+        graph=graph, base_sampled=base, node_sizes=[4], strategy="bfs", seed=0
+    )
+    assert first == second
+    assert first_stats == second_stats
+
+
+def test_coverage_augmentation_no_extra_buckets_when_already_covered() -> None:
+    graph = nx.Graph()
+    graph.add_edges_from([("a", "b"), ("b", "c"), ("a", "c")])
+    augmented, stats = augment_plan_for_positive_edge_coverage(
+        graph=graph, base_sampled={3: [("a", "b", "c")]}, node_sizes=[3], strategy="bfs", seed=0
+    )
+    assert stats["coverage_bucket_count"] == 0
+    assert stats["positive_edge_coverage"] == 1.0
