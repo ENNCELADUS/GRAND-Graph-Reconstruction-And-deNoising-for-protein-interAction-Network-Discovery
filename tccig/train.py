@@ -474,11 +474,21 @@ def augment_plan_for_positive_edge_coverage(
 
 
 def _coverage_stats_from_payload(payload: Mapping[str, object]) -> dict[str, float | int]:
-    """Extract persisted coverage stats, defaulting to an empty contract."""
+    """Extract persisted coverage stats, defaulting to an empty contract.
+
+    Only real numeric values survive; a corrupt cache with a non-numeric value
+    (e.g. ``"positive_edge_coverage": "bad"``) is dropped so the downstream log
+    path that calls ``float(...)`` on these cannot crash.
+    """
     raw = payload.get("coverage_stats", {})
     if not isinstance(raw, Mapping):
         return {}
-    return {str(key): value for key, value in raw.items()}  # type: ignore[misc]
+    stats: dict[str, float | int] = {}
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        stats[str(key)] = value
+    return stats
 
 
 def _load_or_build_topology_plan(

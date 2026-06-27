@@ -99,6 +99,14 @@ def test_metadata_changes_on_each_input() -> None:
     assert _meta(bigger)["graph_hash"] != base["graph_hash"]
 
 
+def test_metadata_hash_changes_on_isolated_node() -> None:
+    base = _meta(_toy_graph())
+    with_isolated = _toy_graph()
+    with_isolated.add_node("z")  # new node, no new edges
+    assert _meta(with_isolated)["graph_hash"] != base["graph_hash"]
+    assert _meta(with_isolated)["node_count"] != base["node_count"]
+
+
 def test_write_then_load_returns_payload(tmp_path: Path) -> None:
     graph = _toy_graph()
     plan = build_internal_validation_plan(graph=graph, sampled_subgraphs=_toy_sampled())

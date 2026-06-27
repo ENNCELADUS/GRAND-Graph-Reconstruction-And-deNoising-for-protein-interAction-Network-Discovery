@@ -13,6 +13,7 @@ import torch
 from src.topology.finetune_data import build_internal_validation_plan
 from tccig.s2gae import asymmetric_residual_anchor
 from tccig.train import (
+    _coverage_stats_from_payload,
     _load_or_build_topology_plan,
     augment_plan_for_positive_edge_coverage,
 )
@@ -444,3 +445,39 @@ def test_build_train_topology_bundle_uses_plan_cache(
         "coverage_bucket_count",
         "positive_edge_coverage",
     }
+
+
+def test_coverage_stats_from_payload_extracts_numeric_keys() -> None:
+    payload = {
+        "coverage_stats": {
+            "base_bucket_count": 3,
+            "coverage_bucket_count": 2,
+            "positive_edge_coverage": 1.0,
+        }
+    }
+    stats = _coverage_stats_from_payload(payload)
+    assert stats == {
+        "base_bucket_count": 3,
+        "coverage_bucket_count": 2,
+        "positive_edge_coverage": 1.0,
+    }
+
+
+def test_coverage_stats_from_payload_missing_key_returns_empty() -> None:
+    assert _coverage_stats_from_payload({}) == {}
+
+
+def test_coverage_stats_from_payload_non_mapping_returns_empty() -> None:
+    assert _coverage_stats_from_payload({"coverage_stats": "bad"}) == {}
+
+
+def test_coverage_stats_from_payload_drops_non_numeric_values() -> None:
+    payload = {
+        "coverage_stats": {
+            "base_bucket_count": 3,
+            "positive_edge_coverage": "bad",
+            "coverage_bucket_count": None,
+        }
+    }
+    # Non-numeric values must not survive: the log path calls float() on them.
+    assert _coverage_stats_from_payload(payload) == {"base_bucket_count": 3}
