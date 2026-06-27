@@ -24,12 +24,20 @@ from src.embed import load_cached_embedding
 from src.pipeline.stages.train import build_model
 from src.topology.finetune_data import (
     TOPOLOGY_EVAL_NODE_SIZES,
+    InternalValidationPlan,
     _canonical_edge,
     _expand_chunk_nodes,
     build_internal_validation_plan,
     build_pair_supervision_graph,
     load_split_node_ids,
     sample_topology_evaluation_subgraphs,
+)
+from src.topology.plan_cache import (
+    load_plan_cache,
+    payload_to_plan,
+    plan_payload_metadata,
+    plan_to_payload,
+    write_plan_cache,
 )
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
@@ -463,6 +471,58 @@ def augment_plan_for_positive_edge_coverage(
         "positive_edge_coverage": coverage,
     }
     return augmented, stats
+
+
+def _coverage_stats_from_payload(payload: Mapping[str, object]) -> dict[str, float | int]:
+    """Extract persisted coverage stats, defaulting to an empty contract."""
+    raw = payload.get("coverage_stats", {})
+    if not isinstance(raw, Mapping):
+        return {}
+    return {str(key): value for key, value in raw.items()}  # type: ignore[misc]
+
+
+def _load_or_build_topology_plan(
+    *,
+    split: str,
+    graph: nx.Graph,
+    node_sizes: Sequence[int],
+    samples_per_size: int,
+    seed: int,
+    strategy: str,
+    coverage_augmentation: bool,
+    runtime: TCCIGRuntime,
+    cache_dir: Path,
+    build_fn: Callable[[], tuple[InternalValidationPlan, dict[str, float | int]]],
+) -> tuple[InternalValidationPlan, dict[str, float | int]]:
+    """Load the topology plan from cache or build it once on the main rank.
+
+    Mirrors ``_score_split``: all ranks attempt the load; on a miss only the main
+    rank builds and writes, then a barrier lets every rank read the result.
+    """
+    metadata = plan_payload_metadata(
+        split=split,
+        graph=graph,
+        node_sizes=node_sizes,
+        samples_per_size=samples_per_size,
+        seed=seed,
+        strategy=strategy,
+        coverage_augmentation=coverage_augmentation,
+    )
+    cached = load_plan_cache(cache_dir=cache_dir, split=split, metadata=metadata)
+    if cached is not None:
+        return payload_to_plan(cached, graph=graph), _coverage_stats_from_payload(cached)
+
+    if runtime.is_main_process:
+        plan, coverage_stats = build_fn()
+        payload = plan_to_payload(plan)
+        payload["coverage_stats"] = dict(coverage_stats)
+        write_plan_cache(cache_dir=cache_dir, split=split, metadata=metadata, payload=payload)
+    _runtime_barrier(runtime)
+
+    reloaded = load_plan_cache(cache_dir=cache_dir, split=split, metadata=metadata)
+    if reloaded is None:
+        raise RuntimeError(f"topology plan cache was not written for split={split}")
+    return payload_to_plan(reloaded, graph=graph), _coverage_stats_from_payload(reloaded)
 
 
 def _build_train_topology_bundle(

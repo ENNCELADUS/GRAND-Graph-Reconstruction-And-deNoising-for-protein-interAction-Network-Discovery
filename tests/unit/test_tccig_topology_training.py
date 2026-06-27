@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import networkx as nx
 import pytest
 import torch
+from src.topology.finetune_data import build_internal_validation_plan
 from tccig.s2gae import asymmetric_residual_anchor
-from tccig.train import augment_plan_for_positive_edge_coverage
+from tccig.train import (
+    _load_or_build_topology_plan,
+    augment_plan_for_positive_edge_coverage,
+)
 
 
 def test_asymmetric_anchor_leaves_deletion_free() -> None:
@@ -305,3 +310,70 @@ def test_coverage_augmentation_no_extra_buckets_when_already_covered() -> None:
     )
     assert stats["coverage_bucket_count"] == 0
     assert stats["positive_edge_coverage"] == 1.0
+
+
+def _fake_runtime(*, is_main_process: bool) -> object:
+    accelerator = SimpleNamespace(wait_for_everyone=lambda: None)
+    return SimpleNamespace(accelerator=accelerator, is_main_process=is_main_process)
+
+
+def _plan_graph() -> nx.Graph:
+    graph = nx.Graph()
+    graph.add_edges_from([("a", "b"), ("b", "c"), ("c", "d"), ("a", "c")])
+    return graph
+
+
+def test_load_or_build_writes_then_reuses_cache(tmp_path: Path) -> None:
+    graph = _plan_graph()
+    calls = {"n": 0}
+
+    def build_fn() -> tuple[object, dict[str, float | int]]:
+        calls["n"] += 1
+        plan = build_internal_validation_plan(
+            graph=graph, sampled_subgraphs={3: [("a", "b", "c")]}
+        )
+        return plan, {
+            "base_bucket_count": 1,
+            "coverage_bucket_count": 0,
+            "positive_edge_coverage": 1.0,
+        }
+
+    common = {
+        "split": "train_topology",
+        "graph": graph,
+        "node_sizes": [3],
+        "samples_per_size": 1,
+        "seed": 0,
+        "strategy": "bfs",
+        "coverage_augmentation": True,
+        "runtime": _fake_runtime(is_main_process=True),
+        "cache_dir": tmp_path,
+        "build_fn": build_fn,
+    }
+    plan_first, stats_first = _load_or_build_topology_plan(**common)
+    plan_second, stats_second = _load_or_build_topology_plan(**common)
+
+    assert calls["n"] == 1  # second call served from cache, build_fn not re-run
+    assert stats_first == stats_second
+    assert plan_second.total_pairs == plan_first.total_pairs
+
+
+def test_load_or_build_non_main_rank_raises_when_cache_missing(tmp_path: Path) -> None:
+    graph = _plan_graph()
+
+    def build_fn() -> tuple[object, dict[str, float | int]]:
+        raise AssertionError("build_fn must not run on a non-main rank")
+
+    with pytest.raises(RuntimeError, match="topology plan cache was not written"):
+        _load_or_build_topology_plan(
+            split="train_topology",
+            graph=graph,
+            node_sizes=[3],
+            samples_per_size=1,
+            seed=0,
+            strategy="bfs",
+            coverage_augmentation=True,
+            runtime=_fake_runtime(is_main_process=False),
+            cache_dir=tmp_path,
+            build_fn=build_fn,
+        )
