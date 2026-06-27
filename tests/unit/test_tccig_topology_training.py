@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
 import networkx as nx
 import pytest
+import tccig.train as tccig_train
 import torch
 from src.topology.finetune_data import build_internal_validation_plan
 from tccig.s2gae import asymmetric_residual_anchor
@@ -377,3 +379,70 @@ def test_load_or_build_non_main_rank_raises_when_cache_missing(tmp_path: Path) -
             cache_dir=tmp_path,
             build_fn=build_fn,
         )
+
+
+def test_build_train_topology_bundle_uses_plan_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph = _coverage_graph()
+
+    monkeypatch.setattr(tccig_train, "load_split_node_ids", lambda **_: set(graph.nodes()))
+    monkeypatch.setattr(tccig_train, "build_pair_supervision_graph", lambda **_: graph)
+
+    sample_calls = {"n": 0}
+    real_sample = tccig_train.sample_topology_evaluation_subgraphs
+
+    def counting_sample(**kwargs: object) -> object:
+        sample_calls["n"] += 1
+        return real_sample(**kwargs)
+
+    monkeypatch.setattr(tccig_train, "sample_topology_evaluation_subgraphs", counting_sample)
+
+    captured: dict[str, object] = {}
+
+    def fake_score_split(
+        *,
+        split: str,
+        pairs: Sequence[object],
+        scorer_cfg: object,
+        runtime: object,
+        cache_dir: object,
+    ) -> list[float]:
+        captured["pairs"] = pairs
+        return [0.5] * len(pairs)
+
+    monkeypatch.setattr(tccig_train, "_score_split", fake_score_split)
+
+    config = {
+        "refiner": {
+            "topology_training": {
+                "enabled": True,
+                "node_sizes": [4],
+                "samples_per_size": 1,
+                "strategy": "bfs",
+                "seed": 0,
+                "coverage_augmentation": True,
+            }
+        }
+    }
+    runtime = _fake_runtime(is_main_process=True)
+    common = {
+        "config": config,
+        "processed_dir": tmp_path,
+        "scorer_cfg": {},
+        "runtime": runtime,
+        "cache_dir": tmp_path,
+        "pairwise_input_rule": tccig_train._resolve_refined_output_rule({}),
+    }
+
+    bundle_first, plan_first, stats_first = tccig_train._build_train_topology_bundle(**common)
+    bundle_second, plan_second, stats_second = tccig_train._build_train_topology_bundle(**common)
+
+    assert sample_calls["n"] == 1  # second run served from cache
+    assert plan_first.total_pairs == plan_second.total_pairs
+    assert stats_first == stats_second
+    assert set(stats_first) == {
+        "base_bucket_count",
+        "coverage_bucket_count",
+        "positive_edge_coverage",
+    }

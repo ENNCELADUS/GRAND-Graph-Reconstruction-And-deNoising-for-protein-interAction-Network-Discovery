@@ -550,32 +550,53 @@ def _build_train_topology_bundle(
     )
     seed = _non_negative_int(topo_cfg.get("seed", 0), "refiner.topology_training.seed")
     strategy = str(topo_cfg.get("strategy", "mixed"))
-    sampled = sample_topology_evaluation_subgraphs(
+    samples_per_size = _positive_int(
+        topo_cfg.get("samples_per_size", 20),
+        "refiner.topology_training.samples_per_size",
+    )
+    coverage_augmentation = bool(topo_cfg.get("coverage_augmentation", True))
+
+    def _build() -> tuple[InternalValidationPlan, dict[str, float | int]]:
+        sampled = sample_topology_evaluation_subgraphs(
+            graph=train_graph,
+            seed=seed,
+            strategy=strategy,
+            node_sizes=node_sizes,
+            samples_per_size=samples_per_size,
+        )
+        stats: dict[str, float | int] = {}
+        if coverage_augmentation:
+            sampled, stats = augment_plan_for_positive_edge_coverage(
+                graph=train_graph,
+                base_sampled={int(k): list(v) for k, v in sampled.items()},
+                node_sizes=node_sizes,
+                strategy=strategy,
+                seed=seed,
+            )
+        built_plan = build_internal_validation_plan(
+            graph=train_graph, sampled_subgraphs=sampled
+        )
+        return built_plan, stats
+
+    plan, coverage_stats = _load_or_build_topology_plan(
+        split="train_topology",
         graph=train_graph,
+        node_sizes=node_sizes,
+        samples_per_size=samples_per_size,
         seed=seed,
         strategy=strategy,
-        node_sizes=node_sizes,
-        samples_per_size=_positive_int(
-            topo_cfg.get("samples_per_size", 20),
-            "refiner.topology_training.samples_per_size",
-        ),
+        coverage_augmentation=coverage_augmentation,
+        runtime=runtime,
+        cache_dir=cache_dir,
+        build_fn=_build,
     )
-    coverage_stats: dict[str, float | int] = {}
-    if bool(topo_cfg.get("coverage_augmentation", True)):
-        sampled, coverage_stats = augment_plan_for_positive_edge_coverage(
-            graph=train_graph,
-            base_sampled={int(k): list(v) for k, v in sampled.items()},
-            node_sizes=node_sizes,
-            strategy=strategy,
-            seed=seed,
-        )
+    if coverage_stats:
         LOGGER.info(
-            "tccig train topology coverage: base=%d coverage=%d positive_edge_coverage=%.4f",
-            coverage_stats["base_bucket_count"],
-            coverage_stats["coverage_bucket_count"],
-            coverage_stats["positive_edge_coverage"],
+            "tccig train topology coverage: base=%s coverage=%s positive_edge_coverage=%.4f",
+            coverage_stats.get("base_bucket_count"),
+            coverage_stats.get("coverage_bucket_count"),
+            float(coverage_stats.get("positive_edge_coverage", 0.0)),
         )
-    plan = build_internal_validation_plan(graph=train_graph, sampled_subgraphs=sampled)
     pairs = [
         CandidatePair(record.protein_a, record.protein_b)
         for bucket in plan.buckets
