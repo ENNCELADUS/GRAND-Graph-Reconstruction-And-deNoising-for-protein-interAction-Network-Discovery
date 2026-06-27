@@ -27,15 +27,16 @@ this CPU-heavy work, wasting ~4× on a 4-rank job.
 ## Goal
 
 Cache a **serializable topology plan payload** keyed by graph-edge hash +
-sampling params. On a cache hit, both topology bundle builders rehydrate an
+sampling params. On a cache hit, the train topology bundle builder rehydrates an
 `InternalValidationPlan` without sampling and without coverage augmentation. We
 do **not** pickle / `torch.save` the live `InternalValidationPlan` (it contains
 `nx.Graph` objects); we store plain JSON data and reconstruct.
 
 Three independent changes, each valuable on its own:
 
-1. **Plan cache** — new module `src/topology/plan_cache.py`, wired into the two
-   TCCIG topology bundle builders.
+1. **Plan cache** — new module `src/topology/plan_cache.py`, wired into
+   `_build_train_topology_bundle`. (Wiring the validation bundle builder is
+   optional/low-priority and is not implemented.)
 2. **Incremental coverage augmentation** — rewrite
    `augment_plan_for_positive_edge_coverage` to maintain `covered` incrementally
    instead of re-scanning all buckets per edge. Fixes the first-run hotspot even
@@ -64,8 +65,10 @@ by `_build_train_topology_bundle` (required) and optionally
 scores already cached).
 
 Storage layout parallels the existing score cache:
-- payload: `cache_dir/plans/{split}.json`
-- manifest (cache key): `cache_dir/manifests/{split}_plan.json`
+- payload + cache-key metadata: `cache_dir/plans/{split}.json` (authoritative —
+  this is the only file read on load)
+- manifest: `cache_dir/manifests/{split}_plan.json` (audit-only copy of the
+  cache-key metadata; written for inspection, never read back)
 
 ## Section 2 — Serializable payload & module API
 
@@ -158,7 +161,7 @@ if miss:
 
 This removes the 4×-redundant coverage augmentation across ranks.
 `coverage_stats` (`base_bucket_count`, `coverage_bucket_count`,
-`positive_edge_coverage`) are persisted in the payload/manifest so
+`positive_edge_coverage`) are persisted in the payload so
 `_build_train_topology_bundle` returns the same stats contract on a hit (read
 back, not recomputed).
 
@@ -170,8 +173,10 @@ reload fails loudly (`RuntimeError`) rather than diverging silently.
 
 ### Error handling
 - Cache-key mismatch → treat as miss, rebuild. Never serve a stale plan.
-- Corrupt/unparseable JSON or missing manifest → treat as miss, log warning,
-  rebuild. Don't crash a run over a bad cache file.
+- Corrupt/unparseable JSON, metadata mismatch, or a structurally invalid
+  payload in `plans/{split}.json` → treat as miss, log warning, rebuild. Don't
+  crash a run over a bad cache file. (The manifest is audit-only and never read,
+  so its absence has no effect on loading.)
 - Post-barrier reload still missing → `RuntimeError` (mirrors `_score_split`).
 - Coverage assertion (`positive_edge_coverage == 1.0`) stays a hard failure in
   the build path.
