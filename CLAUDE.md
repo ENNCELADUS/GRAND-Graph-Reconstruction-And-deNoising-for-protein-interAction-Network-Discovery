@@ -65,3 +65,23 @@ Standard Deep Learning project layout:
 - **Secrets**: Never commit API keys or `.env` files. Use environment variables.
 - **Validation**: Sanitize all user inputs.
 - **Dependencies**: Periodically review and update dependencies.
+
+## HPC Slurm Rules
+- Submit experiment scripts through Slurm on `wangar2023@10.15.89.192`.
+- For CPU-only jobs, use:
+  ```bash
+  #SBATCH -p critical
+  #SBATCH -A hexm-critical
+  ```
+- For A40 GPU jobs, use:
+  ```bash
+  #SBATCH -p hexm
+  #SBATCH -A hexm
+  #SBATCH --gres=gpu:NVIDIAA40:4
+  ```
+- If the A40 queue is long, use the L40 queue instead:
+  ```bash
+  #SBATCH -p hexm_l40
+  #SBATCH -A hexm
+  #SBATCH --gres=gpu:NVIDIAL40:4
+  ```
