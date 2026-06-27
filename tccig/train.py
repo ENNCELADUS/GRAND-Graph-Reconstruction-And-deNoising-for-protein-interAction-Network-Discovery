@@ -573,9 +573,7 @@ def _build_train_topology_bundle(
                 strategy=strategy,
                 seed=seed,
             )
-        built_plan = build_internal_validation_plan(
-            graph=train_graph, sampled_subgraphs=sampled
-        )
+        built_plan = build_internal_validation_plan(graph=train_graph, sampled_subgraphs=sampled)
         return built_plan, stats
 
     plan, coverage_stats = _load_or_build_topology_plan(

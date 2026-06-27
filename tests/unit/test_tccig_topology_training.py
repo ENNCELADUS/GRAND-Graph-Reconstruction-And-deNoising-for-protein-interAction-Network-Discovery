@@ -331,9 +331,7 @@ def test_load_or_build_writes_then_reuses_cache(tmp_path: Path) -> None:
 
     def build_fn() -> tuple[object, dict[str, float | int]]:
         calls["n"] += 1
-        plan = build_internal_validation_plan(
-            graph=graph, sampled_subgraphs={3: [("a", "b", "c")]}
-        )
+        plan = build_internal_validation_plan(graph=graph, sampled_subgraphs={3: [("a", "b", "c")]})
         return plan, {
             "base_bucket_count": 1,
             "coverage_bucket_count": 0,

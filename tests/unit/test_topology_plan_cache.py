@@ -17,9 +17,7 @@ from src.topology.plan_cache import (
 
 def _toy_graph() -> nx.Graph:
     graph = nx.Graph()
-    graph.add_edges_from(
-        [("a", "b"), ("b", "c"), ("c", "d"), ("a", "c"), ("d", "e"), ("e", "a")]
-    )
+    graph.add_edges_from([("a", "b"), ("b", "c"), ("c", "d"), ("a", "c"), ("d", "e"), ("e", "a")])
     return graph
 
 
@@ -90,9 +88,6 @@ def test_metadata_changes_on_each_input() -> None:
     bigger = _toy_graph()
     bigger.add_edge("a", "z")  # new edge + new node
     assert _meta(bigger)["graph_hash"] != base["graph_hash"]
-
-
-
 
 
 def test_write_then_load_returns_payload(tmp_path: Path) -> None:
