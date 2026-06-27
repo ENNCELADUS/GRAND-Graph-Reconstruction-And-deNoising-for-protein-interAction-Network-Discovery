@@ -159,6 +159,8 @@ def plan_payload_metadata(
     return {
         "version": PAYLOAD_VERSION,
         "split": split,
+        "node_count": graph.number_of_nodes(),
+        "edge_count": graph.number_of_edges(),
         "graph_hash": _graph_hash(graph),
         "node_sizes": [int(size) for size in node_sizes],
         "samples_per_size": int(samples_per_size),

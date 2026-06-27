@@ -65,6 +65,13 @@ def _meta(graph: nx.Graph, **overrides: object) -> dict[str, object]:
     return plan_payload_metadata(**kwargs)  # type: ignore[arg-type]
 
 
+def test_metadata_records_graph_size() -> None:
+    graph = _toy_graph()
+    metadata = _meta(graph)
+    assert metadata["node_count"] == graph.number_of_nodes()
+    assert metadata["edge_count"] == graph.number_of_edges()
+
+
 def test_metadata_normalizes_strategy_case() -> None:
     graph = _toy_graph()
     assert _meta(graph, strategy="mixed") == _meta(graph, strategy="MIXED")
