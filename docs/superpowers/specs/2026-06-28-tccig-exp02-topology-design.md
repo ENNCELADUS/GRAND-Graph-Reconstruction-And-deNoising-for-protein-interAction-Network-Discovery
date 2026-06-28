@@ -292,8 +292,10 @@ The implementation uses fork (b) unless review prefers (a).
 
 ## 7. Setup / Scoring Cost
 
-- **Score only the bounded pool** (all positives + fixed negative pool), not the
-  12.79M full candidate space.
+- **Score only the bounded candidate frame** (all positives + the uniformly
+  sampled candidate negatives of §3.3, `candidate_ratio`×positives per subgraph),
+  not the 12.79M full candidate space. The pool and per-epoch subset are drawn
+  from this already-scored frame, so no further scoring is ever needed.
 - **Batch embedding loads** to avoid per-endpoint `torch.load` thrash
   (`tccig/train.py:801`).
 - **Reuse existing `scores/train_topology.pt` only if** scorer SHA,
