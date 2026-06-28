@@ -65,41 +65,103 @@ Confirmed root causes from the artifacts:
 ## 3. Objective: Hybrid Subset Loss with Inverse-Probability Weighting
 
 Retain the existing graph-level topology losses (`graph_similarity`,
-`relative_density`, `degree_mmd`; `clustering` optional via
-`include_clustering_mmd`) but evaluate them on a per-epoch **labeled subset** of
-each subgraph rather than the full `n·(n−1)` pair space:
+`relative_density`, `degree_mmd`; `clustering` **default off** for this re-run,
+see §3.3) but evaluate them on a per-epoch **labeled subset** of each subgraph
+rather than the full `n·(n−1)` pair space:
 
 - Subset = **all positives** + **sampled negatives** at a configurable
   negatives:positives ratio (default 5:1).
 - Each candidate pair carries its **sampling stratum** (`positive` /
-  `hard_negative` / `uniform_negative`) and the **actual inclusion probability
-  `π_i`** for that stratum (the without-replacement draw rate within the
-  stratum). Positives have `π_i = 1`.
+  `hard_negative` / `uniform_negative`) and the **actual two-stage inclusion
+  probability `π_i`** (defined precisely in §3.3). Positives have `π_i = 1`.
 - Reweighting uses **per-pair `1/π_i`** (Horvitz–Thompson), never a single
   global rate. A single global `π` is only valid under uniform single-stratum
   sampling and is explicitly not used.
 
-### 3.1 Bias statement (precise)
+### 3.3 Two-stage inclusion probability (sampling is conditional on a pool)
 
-Inverse-probability weighting makes the **linear** accumulators unbiased
-estimators of their full-space values: edge count, density numerator, and the
-degree scatter-add sums. The **nonlinear** graph losses — `degree_mmd`
-(soft-histogram + Gaussian-TV kernel), `graph_similarity` (ratio of weighted
-sums), and `clustering` (the `(A@A)*A` triangle term, cubic in edge variables) —
-are computed *from* these weighted estimators and are therefore treated as
-**consistent / low-bias approximations**, not strictly unbiased. The
-approximation error is bounded empirically (see §8 validation check), not assumed
-exact.
+Negatives are drawn in two stages — a fixed cached **pool** built once per
+subgraph (§4), then a per-epoch **subset** drawn from that pool. The estimator is
+only a full-space estimator if **both** stages carry a recorded inclusion
+probability. The per-pair total is the product:
 
-### 3.2 Data contract into the loss
+```
+π_i = π_pool(i) · π_epoch|pool(i)
+```
 
-The per-epoch subset is materialized as, per subgraph:
-`(pair_index, stratum, inclusion_prob, target)`. `topology_plan_loss` consumes
-`inclusion_prob` directly and never re-derives sampling rates. The linear
-accumulators inside `src/topology/finetune_losses.py`
+To make `π_pool` and `π_epoch|pool` both well-defined and computable, **hard
+negatives use a stochastic hard-stratum** rather than a deterministic top-k:
+
+- Define a **hard stratum** per subgraph = the top fraction of negatives by
+  cached scorer score (e.g. top 20%, configurable by fraction or score
+  threshold). The uniform stratum is the remaining negatives (the full negative
+  frame minus positives).
+- **Pool stage** draws without replacement *within each stratum*, so every pooled
+  negative has a known `π_pool` = (pool draws in its stratum) / (stratum size).
+- **Epoch stage** draws without replacement from the pooled members of each
+  stratum, giving a known `π_epoch|pool` = (epoch draws in its stratum) / (pooled
+  members of its stratum).
+- Per-epoch negative mix: **50% stochastic hard-stratum + 50% uniform random**.
+
+A deterministic top-k hard set has `π_pool ∈ {0,1}` and yields an objective
+*conditional on that fixed hard set*, not a full-space estimator — so this re-run
+does **not** use deterministic top-k. If a future experiment wants deterministic
+hard mining, it must be labelled a biased hard-negative objective, not an IPW
+full-space estimator.
+
+### 3.4 Bias statement (precise)
+
+Inverse-probability weighting (with the two-stage `π_i` of §3.3) makes the
+**linear** accumulators unbiased estimators of their full-space values: edge
+count, density numerator, and the degree scatter-add sums. The **nonlinear**
+graph losses — `degree_mmd` (soft-histogram + Gaussian-TV kernel),
+`graph_similarity` (ratio of weighted sums), and `clustering` (the `(A@A)*A`
+triangle term, cubic in edge variables) — are computed *from* these weighted
+estimators and are therefore treated as **consistent / low-bias approximations**,
+not strictly unbiased. The approximation error is checked, not assumed exact (see
+§3.7 production diagnostic and §9 smoke check).
+
+### 3.5 Clustering disabled for this re-run
+
+`clustering` (`include_clustering_mmd`) is **default off** for Experiment 02. It
+is the most nonlinear (cubic) of the terms, the furthest from IPW-unbiased under
+subsetting, and the most memory/compute heavy (builds dense adjacency). Re-enable
+only after the density/degree/GS path is validated.
+
+### 3.6 Data contract into the loss
+
+The per-epoch subset is materialized per subgraph with enough metadata for
+correct resampling, `π_i` auditing, and cache validation — not just
+`(pair_index, inclusion_prob, target)`. Each pair record carries:
+
+- `pair_id` — stable global pair identifier (the canonicalized undirected
+  endpoint code), independent of subgraph membership.
+- `subgraph_id` and `node_size` — a pair may appear in multiple subgraphs; its
+  `π_i` and target are per-`(subgraph_id, pair_id)`, not global.
+- `stratum` — `positive` / `hard_negative` / `uniform_negative`.
+- `pi_pool`, `pi_epoch_given_pool`, `pi_total` — the two-stage probabilities of
+  §3.3, stored separately so each stage is auditable; `pi_total` is what the loss
+  consumes as `1/π_i`.
+- `local_index_a`, `local_index_b` — subgraph-local node indices for the degree
+  scatter-add and adjacency build.
+- `target` — 1.0 if the ground-truth subgraph has the edge, else 0.0.
+
+`topology_plan_loss` consumes `pi_total` directly and never re-derives sampling
+rates. The linear accumulators inside `src/topology/finetune_losses.py`
 (`_pairwise_relative_density_loss`, `_pairwise_soft_degrees`,
-`_pairwise_graph_similarity_loss`) are extended to accept an optional
-per-pair weight `w_i = 1/π_i`; full-space normalizers (`n·(n−1)`) are unchanged.
+`_pairwise_graph_similarity_loss`) are extended to accept an optional per-pair
+weight `w_i = 1/pi_total`; full-space normalizers (`n·(n−1)`) are unchanged.
+
+### 3.7 Production bias diagnostic
+
+The §9 smoke check catches wiring errors but does **not** bound bias for the
+production 20–200-node distribution or the hard/uniform mixture — a single tiny
+held-out subgraph is not representative. Therefore, during the real run,
+periodically (every `bias_diagnostic_every_n_epochs`, e.g. 5) pick a few **capped**
+validation subgraphs (small enough that the full `n·(n−1)` space is affordable),
+compute both the IPW-reweighted subset statistics and the exact full-space
+statistics, and log the per-metric relative error. This is a running diagnostic
+of the §3.4 approximation under the actual size mixture, not a one-off check.
 
 ## 4. Balanced / Budgeted Sampler
 
@@ -109,13 +171,19 @@ Stops the 200-node bucket from dominating memory and objective.
   Coverage augmentation may no longer dump all uncovered positives into the
   maximum-size bucket; positive-edge coverage is distributed across sizes under
   the budget.
-- **Fixed cached negative pool, per-epoch resampled subset**:
+- **Fixed cached negative pool, per-epoch resampled subset** (two-stage, §3.3):
   - `pool_ratio: 10` (negatives per positive cached once per subgraph)
   - `epoch_ratio: 5` (negatives per positive drawn from the pool each epoch)
-  - `hard_fraction: 0.5` — hard negatives ranked by cached scorer scores
-  - `uniform_fraction: 0.5` — uniform negatives for distribution coverage
+  - Per-epoch negative mix: **50% stochastic hard-stratum + 50% uniform random**.
+  - **Hard stratum** = top fraction of negatives by cached scorer score
+    (`hard_stratum_fraction`, e.g. 0.2), sampled **stochastically** (not
+    deterministic top-k) so `π_pool` and `π_epoch|pool` are computable per §3.3.
+  - **Uniform stratum** = the remaining negatives, for distribution coverage.
+  - Both pool and epoch draws are **without replacement within each stratum**, so
+    every negative's two-stage `π_i` is a known ratio.
   - Only pool pairs are ever scored → bounded, fully cacheable score set.
-- The sampler emits, per epoch and per pair, the stratum and `π_i` needed by §3.
+- The sampler emits, per epoch and per pair, the full record of §3.6
+  (stratum, `pi_pool`, `pi_epoch_given_pool`, `pi_total`, ids, local indices).
 
 ## 5. Per-Size Loss Aggregation
 
@@ -127,14 +195,42 @@ total_loss         = mean over sizes of loss_by_size[size]
 ```
 
 The 200-node bucket cannot dominate the objective regardless of subgraph count.
-`S` = number of sizes with a positive global subgraph count.
+
+**Eligible sizes.** `S` = the number of **globally active** sizes, i.e. sizes that
+survive graph-size and budget filtering with a positive global subgraph count —
+**not** every configured `node_size`. A configured size that yields zero
+subgraphs (graph too small, or zero budget) is dropped from the size set and
+logged as skipped; it does not contribute a phantom `0` summand and does not abort
+the run. `S` and the active-size set are global and identical on every rank (§6.1).
 
 ## 6. Distributed Topology Step (Approach A: shard + reduce)
 
 Shard the selected subgraphs by **global subgraph index** across ranks; each rank
-computes a **chunked** backward over only its shard (peak memory becomes
-independent of total pair count). Per-size normalization is global so the
-objective is identical regardless of how subgraphs are sharded.
+computes a **per-chunk backward** over only its shard (peak memory becomes
+independent of both total pair count *and* shard size). Per-size normalization is
+global so the objective is identical regardless of how subgraphs are sharded.
+
+### 6.0 Per-chunk backward (memory non-negotiable)
+
+Sharding alone removes the 4× replication but **not** the per-shard accumulation:
+if a rank builds `local_loss_sum` over its whole shard and backprops once, it
+still holds every subgraph's autograd graph until the end, so memory scales with
+shard size. Required pattern instead:
+
+```
+for chunk in this_rank_shard:                 # chunk = one subgraph (or a small group)
+    chunk_loss = topology_loss(chunk)          # differentiable, this chunk only
+    scaled = chunk_loss / global_count_by_size[size(chunk)] / S
+    backward(scaled)                           # immediately; grads accumulate in .grad
+    detached_loss_sum[size] += chunk_loss.detach()   # logging only
+    free chunk autograd graph
+```
+
+Because gradient contributions are **additive**, per-chunk backward of
+`chunk_loss / global_count / S` accumulates into `.grad` exactly the gradient of
+the global per-size-mean objective — identical to one backward over the summed
+loss, but with peak memory bounded by a single chunk. `global_count_by_size` and
+`S` are obtained by a detached all-reduce **before** the backward loop.
 
 ### 6.1 Gradient correctness (non-negotiables)
 
@@ -142,34 +238,44 @@ objective is identical regardless of how subgraphs are sharded.
   rank**. A rank holding no subgraph of a given size contributes a true `0` to
   that size's summand.
 - Only **detached** `loss_sum` / `count` are all-reduced — for logging and for
-  the `global_count_by_size` normalizer. The backward'd loss is the rank-local
-  **differentiable** sum scaled by the global normalizer. Never all-reduce a
-  detached loss and then call backward on it (that severs the graph).
+  the `global_count_by_size` normalizer. The backward'd loss is each chunk's
+  rank-local **differentiable** loss scaled by the global normalizer. Never
+  all-reduce a detached loss and then call backward on it (that severs the graph).
 
-Per-rank differentiable loss:
+The step is **two-pass** so the normalizer is known before any backward:
 
 ```
+# Pass 1 — counts only, no autograd graph retained
 for each size:
-  local_loss_sum[size] = sum(differentiable subgraph losses on this rank)
-  local_count[size]    = number of subgraphs of that size on this rank
+  local_count[size] = number of subgraphs of that size in this rank's shard
+all_reduce(global_count_by_size, SUM)        # detached, normalization only
+S = number of sizes with global_count_by_size[size] > 0   # identical on every rank
 
-all_reduce(global_count_by_size, SUM)   # detached, normalization only
-
-rank_loss = mean over sizes of ( local_loss_sum[size] / global_count_by_size[size] )
+# Pass 2 — per-chunk differentiable backward (see §6 pattern)
+for chunk in this_rank_shard:
+  scaled = topology_loss(chunk) / global_count_by_size[size(chunk)] / S
+  backward(scaled)                            # immediately; .grad accumulates additively
+  detached_loss_sum[size(chunk)] += scaled.detach()   # logging only; free chunk graph
 ```
+
+Summing `chunk / global_count / S` across all chunks on all ranks reconstructs
+`mean_over_sizes( mean_over_subgraphs(loss) )` exactly, so per-chunk backward is
+gradient-identical to one backward over the full global objective.
 
 ### 6.2 Reduction mechanism (default = fork b)
 
 The topology step currently runs on the **unwrapped** refiner
 (`s2gae.py:806`), so DDP averaging hooks do not fire.
 
-- **Default (fork b):** keep the unwrapped refiner, backward `rank_loss` as above,
-  then **manual `dist.all_reduce(grad, SUM)`** over refiner params before
+- **Default (fork b):** keep the unwrapped refiner, run the §6.1 per-chunk
+  backward loop (grads accumulate in `.grad`), then **once after the loop** do a
+  manual `dist.all_reduce(grad, SUM)` over refiner params before
   `optimizer.step()`. No `world_size` factor. Smaller diff; avoids a second DDP
   reducer pass in the same iteration as the BCE backward.
-- **Documented equivalent (fork a):** backward through the **DDP-wrapped** model
-  so its hooks average gradients, and multiply `rank_loss` by `world_size` to
-  cancel the averaging. Mathematically identical gradients.
+- **Documented equivalent (fork a):** run the per-chunk backward through the
+  **DDP-wrapped** model so its hooks average gradients, and multiply each chunk's
+  `scaled` loss by `world_size` to cancel the averaging. Mathematically identical
+  gradients.
 
 The implementation uses fork (b) unless review prefers (a).
 
@@ -204,28 +310,37 @@ A tiny config (1–2 node sizes, a few subgraphs, 2 epochs, topology scale force
 the sharding path in minutes on the A40/L40 queue, **before** committing to the
 full 40-epoch run. Guards against "16 h setup + 6 epochs then crash."
 
-The smoke run also performs the **bias validation check**: on a held-out
+The smoke run also performs an **implementation sanity check**: on a held-out
 subgraph, compare subset-estimated (IPW-reweighted) topology statistics against
-the exact full-space statistics, and log the relative error per metric to bound
-the §3.1 approximation empirically.
+the exact full-space statistics and log the per-metric relative error. This
+catches wiring/reweighting bugs (wrong `π_i`, missing weight, normalizer
+mismatch). It does **not** bound bias for the production 20–200-node distribution
+or the hard/uniform mixture — that is the job of the §3.7 production diagnostic,
+which runs on capped validation subgraphs across the real size mixture during
+training.
 
 ## 10. Components and Interfaces
 
 | Component | Location (current) | Change |
 |---|---|---|
-| Topology plan / sampler | plan build in `tccig/train.py` + plan dataclasses | Add per-size budget, fixed pool + per-epoch resample, emit `(stratum, π_i)` |
+| Topology plan / sampler | plan build in `tccig/train.py` + plan dataclasses | Per-size budget; fixed pool + per-epoch resample; stochastic hard-stratum (50/50); emit full §3.6 record (`stratum`, `pi_pool`, `pi_epoch_given_pool`, `pi_total`, ids, local indices) |
 | Pool scoring + cache | `tccig/train.py:283/373`, collate `:801` | Score pool only; batched embedding loads; SHA/hash/order-validated reuse; progress logging |
-| `topology_plan_loss` | `tccig/s2gae.py:469` | Consume per-epoch subset + `inclusion_prob`; per-size aggregation; subgraph sharding + chunked backward |
-| Linear accumulators | `src/topology/finetune_losses.py` | Optional per-pair weight `w_i = 1/π_i` on density/degree/GS sums |
-| Distributed step | `tccig/s2gae.py:806–833` | Shard by global index; detached-only all-reduce of loss_sum/count; manual grad all-reduce (fork b) |
+| `topology_plan_loss` | `tccig/s2gae.py:469` | Consume per-epoch subset + `pi_total`; per-size aggregation over eligible sizes; subgraph sharding + per-chunk backward; `clustering` off |
+| Linear accumulators | `src/topology/finetune_losses.py` | Optional per-pair weight `w_i = 1/pi_total` on density/degree/GS sums |
+| Distributed step | `tccig/s2gae.py:806–833` | Shard by global index; detached-only all-reduce of loss_sum/count; per-chunk backward; manual grad all-reduce (fork b) |
 | Schedule | config `topology_training.schedule` | `warmup_epochs: 1`, `ramp_epochs: 5` |
-| Smoke config | `configs/` + a small run step | New tiny config + bias validation check |
+| Smoke config + diagnostic | `configs/` + run step | Tiny smoke config (sanity check) + periodic production bias diagnostic (§3.7) |
 
 ## 11. Error Handling
 
-- Reject a config where any size's per-size budget yields zero subgraphs while
-  `enabled=true` (would make `S` inconsistent across ranks).
-- Validate `inclusion_prob ∈ (0, 1]` and that every positive has `π_i = 1`.
+- **Eligible-size filtering, not rejection.** Compute the eligible size set after
+  graph-size and budget filtering (§5). Drop and **log** any configured size with
+  zero subgraphs; abort only if **no** eligible size remains while
+  `topology_training.enabled=true`. The eligible set and `S` are derived
+  identically on every rank, so a dropped size cannot desynchronize ranks.
+- Validate `pi_total ∈ (0, 1]`, `pi_pool ∈ (0,1]`, `pi_epoch_given_pool ∈ (0,1]`,
+  `pi_total == pi_pool * pi_epoch_given_pool` (to tolerance), and that every
+  positive has `pi_total = 1`.
 - On cache validation failure, log the mismatching field (SHA / pair hash / pair
   order) and fall back to scoring rather than silently using a stale artifact.
 - Preserve the existing `_pair_lookup` "pair absent from split graph" guard.
@@ -235,19 +350,33 @@ the §3.1 approximation empirically.
 - **Unit (loss):** IPW-weighted linear accumulators recover full-space density /
   degree sums on a small graph (within sampling tolerance over repeated draws).
 - **Unit (aggregation):** per-size mean is invariant to subgraph count within a
-  size; a dominating bucket does not shift `total_loss`.
-- **Unit (distributed math):** fork (b) rank-local scaled loss + manual SUM
+  size; a dominating bucket does not shift `total_loss`; eligible-size filtering
+  excludes zero-budget sizes consistently across ranks.
+- **Unit (distributed math):** fork (b) per-chunk backward + manual SUM
   all-reduce produces gradients equal (to tolerance) to a single-process
   full-plan reference on a 2-rank gloo/CPU test.
-- **Unit (sampler):** emitted `π_i` matches realized inclusion frequencies per
-  stratum over many draws; positives always `π_i = 1`.
+- **Unit (sampler):** realized two-stage inclusion frequency per stratum matches
+  the recorded `pi_pool · pi_epoch_given_pool` over many draws; positives always
+  `pi_total = 1`; `pi_total = pi_pool · pi_epoch_given_pool` holds per record.
 - **Integration:** smoke config runs a positive-scale topology step end-to-end
-  without OOM and logs the bias validation error.
+  without OOM and logs the bias sanity check (§9).
 - Target ≥80% coverage on touched modules per repo guidelines.
 
-## 13. Open Items for Review
+## 13. Decisions and Open Items
 
-- Distributed reduction: fork (b) default vs fork (a).
-- Warmup numbers (`warmup_epochs`, `ramp_epochs`).
-- Default ratios (`pool_ratio`, `epoch_ratio`, `hard_fraction`) and per-size
-  budget values.
+**Decided in review**
+- Objective: hybrid subset + two-stage IPW reweighting (§3).
+- Negatives: fixed cached pool + per-epoch resample, **stochastic hard-stratum
+  (50%) + uniform (50%)** — no deterministic top-k (§3.3, §4).
+- `clustering` **disabled** for this re-run (§3.5).
+- Distributed reduction defaults to **fork (b)** (§6.2).
+- Per-size aggregation over **eligible** sizes only; zero-budget sizes dropped and
+  logged, not rejected (§5, §11).
+
+**Open for review (tunable, non-blocking)**
+- Warmup numbers (`warmup_epochs`, `ramp_epochs`) — proposed 1 / 5.
+- `hard_stratum_fraction` (proposed 0.2) and per-size budget caps.
+- Default ratios (`pool_ratio: 10`, `epoch_ratio: 5`, neg:pos 5:1).
+- `bias_diagnostic_every_n_epochs` (proposed 5) and the capped-subgraph size for
+  the §3.7 diagnostic.
+- Whether to confirm fork (a) instead of (b).
