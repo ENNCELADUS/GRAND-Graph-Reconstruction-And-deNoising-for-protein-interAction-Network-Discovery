@@ -72,46 +72,49 @@ rather than the full `n·(n−1)` pair space:
 - Subset = **all positives** + **sampled negatives** at a configurable
   negatives:positives ratio (default 5:1).
 - Each candidate pair carries its **sampling stratum** (`positive` /
-  `hard_negative` / `uniform_negative`) and the **actual two-stage inclusion
+  `hard_negative` / `uniform_negative`) and the **actual three-stage inclusion
   probability `π_i`** (defined precisely in §3.3). Positives have `π_i = 1`.
 - Reweighting uses **per-pair `1/π_i`** (Horvitz–Thompson), never a single
   global rate. A single global `π` is only valid under uniform single-stratum
   sampling and is explicitly not used.
 
-### 3.3 Two-stage inclusion probability (sampling is conditional on a pool)
+### 3.3 Three-stage inclusion probability (sampling is conditional on a candidate frame and a pool)
 
-Negatives are drawn in two stages — a fixed cached **pool** built once per
-subgraph (§4), then a per-epoch **subset** drawn from that pool. The estimator is
-only a full-space estimator if **both** stages carry a recorded inclusion
-probability. The per-pair total is the product:
+Score-ranking the full negative frame would reintroduce the 16 h scoring cost
+(§1.3), so the hard stratum is defined over a **bounded candidate frame** that is
+itself sampled, not over the full frame. Negatives therefore pass through three
+sampling stages, each with a recorded inclusion probability; the estimator is only
+a full-space estimator if **all three** stages carry one. The per-pair total is
+the product:
 
 ```
-π_i = π_pool(i) · π_epoch|pool(i)
+π_i = π_cand(i) · π_pool|cand(i) · π_epoch|pool(i)
 ```
 
-To make `π_pool` and `π_epoch|pool` both well-defined and computable, **hard
-negatives use a stochastic hard-stratum** rather than a deterministic top-k:
-
-- Define a **hard stratum** per subgraph = the top fraction of negatives by
-  cached scorer score (e.g. top 20%, configurable by fraction or score
-  threshold). The uniform stratum is the remaining negatives (the full negative
-  frame minus positives).
-- **Pool stage** draws without replacement *within each stratum*, so every pooled
-  negative has a known `π_pool` = (pool draws in its stratum) / (stratum size).
-- **Epoch stage** draws without replacement from the pooled members of each
+- **Candidate stage** — per subgraph, draw a bounded negative candidate frame
+  **uniformly without replacement** from the full negative frame (= all
+  non-positive pairs of the subgraph). `π_cand` = (candidates drawn) / (negative
+  frame size). Only candidate-frame pairs are ever scored, so scoring is bounded.
+- **Hard stratum** is defined **within the scored candidate frame** = its top
+  fraction by cached scorer score. The uniform stratum is the rest of the
+  candidate frame.
+- **Pool stage** — draw without replacement *within each stratum of the candidate
+  frame*, so each pooled negative has a known `π_pool|cand` = (pool draws in its
+  stratum) / (stratum size within the candidate frame).
+- **Epoch stage** — draw without replacement from the pooled members of each
   stratum, giving a known `π_epoch|pool` = (epoch draws in its stratum) / (pooled
   members of its stratum).
-- Per-epoch negative mix: **50% stochastic hard-stratum + 50% uniform random**.
+- Per-epoch negative mix: **50% hard-stratum + 50% uniform**.
 
-A deterministic top-k hard set has `π_pool ∈ {0,1}` and yields an objective
-*conditional on that fixed hard set*, not a full-space estimator — so this re-run
-does **not** use deterministic top-k. If a future experiment wants deterministic
-hard mining, it must be labelled a biased hard-negative objective, not an IPW
-full-space estimator.
+Because the candidate frame is sampled uniformly with a recorded `π_cand`, the
+score-based hard ranking is conditional on that frame but still composes into an
+honest full-space inclusion probability via the product above. A deterministic
+top-k over the full frame would instead require scoring the full frame and give
+`π ∈ {0,1}` (a biased, frame-conditional objective) — explicitly not used here.
 
 ### 3.4 Bias statement (precise)
 
-Inverse-probability weighting (with the two-stage `π_i` of §3.3) makes the
+Inverse-probability weighting (with the three-stage `π_i` of §3.3) makes the
 **linear** accumulators unbiased estimators of their full-space values: edge
 count, density numerator, and the degree scatter-add sums. The **nonlinear**
 graph losses — `degree_mmd` (soft-histogram + Gaussian-TV kernel),
@@ -139,9 +142,11 @@ correct resampling, `π_i` auditing, and cache validation — not just
 - `subgraph_id` and `node_size` — a pair may appear in multiple subgraphs; its
   `π_i` and target are per-`(subgraph_id, pair_id)`, not global.
 - `stratum` — `positive` / `hard_negative` / `uniform_negative`.
-- `pi_pool`, `pi_epoch_given_pool`, `pi_total` — the two-stage probabilities of
-  §3.3, stored separately so each stage is auditable; `pi_total` is what the loss
-  consumes as `1/π_i`.
+- `pi_cand`, `pi_pool_given_cand`, `pi_epoch_given_pool`, `pi_total` — the
+  three-stage probabilities of §3.3, stored separately so each stage is
+  auditable; `pi_total = pi_cand · pi_pool_given_cand · pi_epoch_given_pool` is
+  what the loss consumes as `1/π_i`. Positives bypass sampling: all three stage
+  probabilities and `pi_total` are 1.
 - `local_index_a`, `local_index_b` — subgraph-local node indices for the degree
   scatter-add and adjacency build.
 - `target` — 1.0 if the ground-truth subgraph has the edge, else 0.0.
@@ -171,19 +176,25 @@ Stops the 200-node bucket from dominating memory and objective.
   Coverage augmentation may no longer dump all uncovered positives into the
   maximum-size bucket; positive-edge coverage is distributed across sizes under
   the budget.
-- **Fixed cached negative pool, per-epoch resampled subset** (two-stage, §3.3):
-  - `pool_ratio: 10` (negatives per positive cached once per subgraph)
+- **Bounded candidate frame + fixed cached pool, per-epoch resampled subset**
+  (three-stage, §3.3):
+  - `candidate_ratio: 20` (negatives per positive drawn uniformly into the scored
+    candidate frame; the only pairs ever scored)
+  - `pool_ratio: 10` (negatives per positive cached once per subgraph, from the
+    candidate frame)
   - `epoch_ratio: 5` (negatives per positive drawn from the pool each epoch)
-  - Per-epoch negative mix: **50% stochastic hard-stratum + 50% uniform random**.
-  - **Hard stratum** = top fraction of negatives by cached scorer score
-    (`hard_stratum_fraction`, e.g. 0.2), sampled **stochastically** (not
-    deterministic top-k) so `π_pool` and `π_epoch|pool` are computable per §3.3.
-  - **Uniform stratum** = the remaining negatives, for distribution coverage.
-  - Both pool and epoch draws are **without replacement within each stratum**, so
-    every negative's two-stage `π_i` is a known ratio.
-  - Only pool pairs are ever scored → bounded, fully cacheable score set.
+  - Per-epoch negative mix: **50% hard-stratum + 50% uniform**.
+  - **Hard stratum** = top fraction (`hard_stratum_fraction`, e.g. 0.2) of the
+    **scored candidate frame** by cached scorer score, sampled stochastically so
+    `π_pool|cand` and `π_epoch|pool` are computable per §3.3.
+  - **Uniform stratum** = the rest of the candidate frame.
+  - Candidate, pool, and epoch draws are all **without replacement within their
+    frame/stratum**, so every negative's three-stage `π_i` is a known ratio.
+  - Only candidate-frame pairs are ever scored → bounded, fully cacheable score
+    set (for the 200-node bucket, ≈ 20× positives instead of the full ~11.66M).
 - The sampler emits, per epoch and per pair, the full record of §3.6
-  (stratum, `pi_pool`, `pi_epoch_given_pool`, `pi_total`, ids, local indices).
+  (stratum, `pi_cand`, `pi_pool_given_cand`, `pi_epoch_given_pool`, `pi_total`,
+  ids, local indices).
 
 ## 5. Per-Size Loss Aggregation
 
@@ -323,7 +334,7 @@ training.
 
 | Component | Location (current) | Change |
 |---|---|---|
-| Topology plan / sampler | plan build in `tccig/train.py` + plan dataclasses | Per-size budget; fixed pool + per-epoch resample; stochastic hard-stratum (50/50); emit full §3.6 record (`stratum`, `pi_pool`, `pi_epoch_given_pool`, `pi_total`, ids, local indices) |
+| Topology plan / sampler | plan build in `tccig/train.py` + plan dataclasses | Per-size budget; bounded candidate frame + fixed pool + per-epoch resample; stochastic hard-stratum (50/50); emit full §3.6 record (`stratum`, `pi_cand`, `pi_pool_given_cand`, `pi_epoch_given_pool`, `pi_total`, ids, local indices) |
 | Pool scoring + cache | `tccig/train.py:283/373`, collate `:801` | Score pool only; batched embedding loads; SHA/hash/order-validated reuse; progress logging |
 | `topology_plan_loss` | `tccig/s2gae.py:469` | Consume per-epoch subset + `pi_total`; per-size aggregation over eligible sizes; subgraph sharding + per-chunk backward; `clustering` off |
 | Linear accumulators | `src/topology/finetune_losses.py` | Optional per-pair weight `w_i = 1/pi_total` on density/degree/GS sums |
@@ -338,9 +349,10 @@ training.
   zero subgraphs; abort only if **no** eligible size remains while
   `topology_training.enabled=true`. The eligible set and `S` are derived
   identically on every rank, so a dropped size cannot desynchronize ranks.
-- Validate `pi_total ∈ (0, 1]`, `pi_pool ∈ (0,1]`, `pi_epoch_given_pool ∈ (0,1]`,
-  `pi_total == pi_pool * pi_epoch_given_pool` (to tolerance), and that every
-  positive has `pi_total = 1`.
+- Validate `pi_cand ∈ (0,1]`, `pi_pool_given_cand ∈ (0,1]`,
+  `pi_epoch_given_pool ∈ (0,1]`, `pi_total ∈ (0, 1]`,
+  `pi_total == pi_cand * pi_pool_given_cand * pi_epoch_given_pool` (to tolerance),
+  and that every positive has all four = 1.
 - On cache validation failure, log the mismatching field (SHA / pair hash / pair
   order) and fall back to scoring rather than silently using a stale artifact.
 - Preserve the existing `_pair_lookup` "pair absent from split graph" guard.
@@ -355,9 +367,10 @@ training.
 - **Unit (distributed math):** fork (b) per-chunk backward + manual SUM
   all-reduce produces gradients equal (to tolerance) to a single-process
   full-plan reference on a 2-rank gloo/CPU test.
-- **Unit (sampler):** realized two-stage inclusion frequency per stratum matches
-  the recorded `pi_pool · pi_epoch_given_pool` over many draws; positives always
-  `pi_total = 1`; `pi_total = pi_pool · pi_epoch_given_pool` holds per record.
+- **Unit (sampler):** realized three-stage inclusion frequency per stratum matches
+  the recorded `pi_cand · pi_pool_given_cand · pi_epoch_given_pool` over many
+  draws; positives always `pi_total = 1`;
+  `pi_total = pi_cand · pi_pool_given_cand · pi_epoch_given_pool` holds per record.
 - **Integration:** smoke config runs a positive-scale topology step end-to-end
   without OOM and logs the bias sanity check (§9).
 - Target ≥80% coverage on touched modules per repo guidelines.
@@ -365,9 +378,10 @@ training.
 ## 13. Decisions and Open Items
 
 **Decided in review**
-- Objective: hybrid subset + two-stage IPW reweighting (§3).
-- Negatives: fixed cached pool + per-epoch resample, **stochastic hard-stratum
-  (50%) + uniform (50%)** — no deterministic top-k (§3.3, §4).
+- Objective: hybrid subset + **three-stage** IPW reweighting (§3.3).
+- Negatives: bounded candidate frame → fixed cached pool → per-epoch resample,
+  **stochastic hard-stratum (50%) + uniform (50%)** — no deterministic top-k
+  (§3.3, §4). Only the candidate frame is ever scored.
 - `clustering` **disabled** for this re-run (§3.5).
 - Distributed reduction defaults to **fork (b)** (§6.2).
 - Per-size aggregation over **eligible** sizes only; zero-budget sizes dropped and
@@ -375,7 +389,8 @@ training.
 
 **Open for review (tunable, non-blocking)**
 - Warmup numbers (`warmup_epochs`, `ramp_epochs`) — proposed 1 / 5.
-- `hard_stratum_fraction` (proposed 0.2) and per-size budget caps.
+- `candidate_ratio` (negatives scored per positive, proposed 20),
+  `hard_stratum_fraction` (proposed 0.2), and per-size budget caps.
 - Default ratios (`pool_ratio: 10`, `epoch_ratio: 5`, neg:pos 5:1).
 - `bias_diagnostic_every_n_epochs` (proposed 5) and the capped-subgraph size for
   the §3.7 diagnostic.
