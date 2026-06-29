@@ -11,6 +11,7 @@ from tccig.topology_subset import (
     TopologySubsetSamplerConfig,
     active_node_sizes,
     build_topology_subset_plan,
+    canonical_pair_id,
     sample_epoch_topology_subset,
 )
 
@@ -233,3 +234,104 @@ def test_subset_plan_payload_round_trips() -> None:
     )
     restored = payload_to_subset_plan(subset_plan_to_payload(plan))
     assert restored == plan
+
+
+from tccig.topology_subset import candidate_pairs_for_scoring
+
+
+def test_candidate_pairs_for_scoring_are_unique_and_ordered() -> None:
+    graph = _toy_graph()
+    sampled = {4: [("a", "b", "c", "d"), ("a", "b", "c", "e")]}
+    cfg = TopologySubsetSamplerConfig(candidate_ratio=2, pool_ratio=1, epoch_ratio=1, seed=7)
+    plan = build_topology_subset_plan(
+        graph=graph,
+        sampled_subgraphs=sampled,
+        config=cfg,
+        scorer_probabilities={},
+    )
+    pairs = candidate_pairs_for_scoring(plan)
+    pair_ids = [pair_id for pair_id, _, _ in pairs]
+    assert pair_ids == sorted(set(pair_ids))
+
+
+from tccig.topology_subset import apply_per_size_subgraph_budget
+
+
+def test_budget_distributes_coverage_and_reports_realized_coverage() -> None:
+    # size-4 base is capped to 1, but a coverage subgraph for the uncovered edge d-e
+    # must still be placed (in an eligible size with remaining budget), and the
+    # returned stats must reflect the realized (post-cap) coverage, not the pre-cap claim.
+    graph = nx.Graph()
+    graph.add_nodes_from(["a", "b", "c", "d", "e", "f"])
+    graph.add_edges_from([("a", "b"), ("b", "c"), ("d", "e")])
+    base_sampled = {4: [("a", "b", "c", "f"), ("a", "b", "c", "d"), ("a", "c", "d", "f")]}
+    # node_sizes includes a smaller eligible size (3) so the d-e coverage subgraph has a
+    # bucket with remaining budget after size-4 is capped to 2 (review: with only size 4
+    # available the cap would exhaust the sole eligible size and coverage could not be
+    # placed at all — the helper distributes coverage into the smallest free size).
+    budgeted, stats = apply_per_size_subgraph_budget(
+        graph=graph,
+        base_sampled=base_sampled,
+        node_sizes=(3, 4),
+        strategy="BFS",
+        seed=0,
+        max_subgraphs_per_size=2,
+    )
+    # No size exceeds its cap.
+    assert all(len(rows) <= 2 for rows in budgeted.values())
+    # The d-e positive edge is covered by some retained subgraph.
+    covered_edges = {
+        frozenset((u, v))
+        for rows in budgeted.values()
+        for nodes in rows
+        for u, v in graph.subgraph(set(nodes)).edges()
+    }
+    assert frozenset(("d", "e")) in covered_edges
+    # Realized coverage is reported honestly in [0, 1].
+    assert 0.0 <= float(stats["positive_edge_coverage"]) <= 1.0
+    assert stats["positive_edge_coverage"] == 1.0
+
+
+def test_budget_unbounded_is_passthrough_with_coverage() -> None:
+    graph = nx.Graph()
+    graph.add_nodes_from(["a", "b", "c", "d"])
+    graph.add_edges_from([("a", "b"), ("c", "d")])
+    base_sampled = {4: [("a", "b", "c", "d")]}
+    budgeted, stats = apply_per_size_subgraph_budget(
+        graph=graph,
+        base_sampled=base_sampled,
+        node_sizes=(4,),
+        strategy="BFS",
+        seed=0,
+        max_subgraphs_per_size=0,  # unbounded
+    )
+    assert budgeted[4] == [("a", "b", "c", "d")]
+    assert stats["positive_edge_coverage"] == 1.0
+
+
+from tccig.topology_subset import scored_pairs_from_subset_plan
+
+
+def test_scored_pairs_from_subset_plan_track_scorer_probability() -> None:
+    graph = _toy_graph()
+    sampled = {4: [("a", "b", "c", "d")]}
+    cfg = TopologySubsetSamplerConfig(candidate_ratio=3, pool_ratio=2, epoch_ratio=1, seed=4)
+    scores = {"a||c": 0.9, "a||d": 0.2, "b||d": 0.7, "c||d": 0.1}
+    plan = build_topology_subset_plan(
+        graph=graph,
+        sampled_subgraphs=sampled,
+        config=cfg,
+        scorer_probabilities=scores,
+    )
+    endpoints, probabilities = scored_pairs_from_subset_plan(plan)
+    # id-ordered uniqueness: one entry per unique pair id, sorted by id.
+    pair_ids = [canonical_pair_id(a, b) for a, b in endpoints]
+    assert pair_ids == sorted(set(pair_ids))
+    # Probabilities track the stored scorer_probability for each pair.
+    by_id = {
+        sample.pair_id: sample.scorer_probability
+        for subgraph in plan.subgraphs
+        for sample in (*subgraph.positives, *subgraph.candidate_negatives)
+    }
+    for (a, b), prob in zip(endpoints, probabilities, strict=True):
+        assert prob == by_id[canonical_pair_id(a, b)]

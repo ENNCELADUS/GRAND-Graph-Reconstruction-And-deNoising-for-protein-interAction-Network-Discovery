@@ -540,3 +540,130 @@ def payload_to_subset_plan(payload: Mapping[str, object]) -> TopologySubsetPlan:
         total_candidate_negatives=int(payload["total_candidate_negatives"]),  # type: ignore[arg-type]
         total_pool_negatives=int(payload["total_pool_negatives"]),  # type: ignore[arg-type]
     )
+
+
+def candidate_pairs_for_scoring(plan: TopologySubsetPlan) -> tuple[tuple[str, str, str], ...]:
+    """Return unique candidate pair ids and endpoints that need frozen-scorer scores."""
+    by_id: dict[str, tuple[str, str, str]] = {}
+    for subgraph in plan.subgraphs:
+        for sample in (*subgraph.positives, *subgraph.candidate_negatives):
+            by_id.setdefault(sample.pair_id, (sample.pair_id, sample.protein_a, sample.protein_b))
+    return tuple(by_id[pair_id] for pair_id in sorted(by_id))
+
+
+def scored_pairs_from_subset_plan(
+    plan: TopologySubsetPlan,
+) -> tuple[list[tuple[str, str]], list[float]]:
+    """Return (endpoints, scorer_probability) for every unique scored pair, id-ordered."""
+    by_id: dict[str, tuple[str, str, float]] = {}
+    for subgraph in plan.subgraphs:
+        for sample in (*subgraph.positives, *subgraph.candidate_negatives):
+            by_id.setdefault(
+                sample.pair_id,
+                (sample.protein_a, sample.protein_b, sample.scorer_probability),
+            )
+    endpoints = [(by_id[pid][0], by_id[pid][1]) for pid in sorted(by_id)]
+    probabilities = [by_id[pid][2] for pid in sorted(by_id)]
+    return endpoints, probabilities
+
+
+def _induced_covered_edges(
+    sampled: Mapping[int, Sequence[tuple[str, ...]]], graph: nx.Graph
+) -> set[frozenset[str]]:
+    covered: set[frozenset[str]] = set()
+    for rows in sampled.values():
+        for nodes in rows:
+            for node_a, node_b in graph.subgraph(set(nodes)).edges():
+                covered.add(frozenset((node_a, node_b)))
+    return covered
+
+
+def apply_per_size_subgraph_budget(
+    *,
+    graph: nx.Graph,
+    base_sampled: Mapping[int, Sequence[tuple[str, ...]]],
+    node_sizes: tuple[int, ...],
+    strategy: str,
+    seed: int,
+    max_subgraphs_per_size: int,
+    coverage_augmentation: bool = True,
+) -> tuple[dict[int, list[tuple[str, ...]]], dict[str, float | int]]:
+    """Cap base subgraphs per size, then add budget-aware coverage subgraphs.
+
+    This is the SINGLE entry point for the subset path's budget + coverage logic. Do
+    NOT call ``augment_plan_for_positive_edge_coverage`` separately around it — that
+    helper appends coverage buckets to ``max(node_sizes)`` and asserts full coverage,
+    which both bypasses the per-size budget and would double-augment. This helper
+    instead interleaves capping and coverage so the cap can never silently delete a
+    coverage subgraph that augmentation just added (review: coverage-redistribution
+    finding).
+
+    Order of operations:
+      1. Cap each size's base subgraphs to ``max_subgraphs_per_size`` (0 == unbounded).
+      2. If ``coverage_augmentation``, walk the still-uncovered positive edges and place
+         a coverage subgraph for each into the smallest eligible size that still has
+         remaining budget — so the largest bucket is not the sole coverage dump.
+      3. Recompute coverage from the realized (post-budget) plan and return it, so the
+         logged number is the coverage that the built plan actually has.
+
+    Unlike ``augment_plan_for_positive_edge_coverage``, this does NOT raise when coverage
+    stays below 1.0 under a tight budget: budgeting is an explicit memory/coverage
+    tradeoff and the realized coverage is reported in ``stats`` for the operator to see.
+    """
+    from src.topology.finetune_data import _expand_chunk_nodes  # local import: heavy module
+
+    rng = random.Random(seed)
+    normalized = strategy.upper()
+    if normalized not in {"BFS", "DFS", "RANDOM_WALK"}:
+        normalized = "BFS"
+    # (1) Cap the base sampled subgraphs per size.
+    budgeted: dict[int, list[tuple[str, ...]]] = {}
+    for size in sorted(int(s) for s in base_sampled):
+        rows = [tuple(sorted(nodes)) for nodes in base_sampled[size]]
+        if max_subgraphs_per_size > 0:
+            rows = rows[:max_subgraphs_per_size]
+        budgeted[size] = rows
+    base_bucket_count = sum(len(rows) for rows in budgeted.values())
+
+    def _remaining(size: int) -> int:
+        if max_subgraphs_per_size <= 0:
+            return 2**31  # effectively unbounded
+        return max(0, max_subgraphs_per_size - len(budgeted.get(size, [])))
+
+    eligible_sizes = tuple(
+        size for size in sorted(node_sizes) if size <= graph.number_of_nodes()
+    )
+    all_positive = {frozenset((node_a, node_b)) for node_a, node_b in graph.edges()}
+    covered = _induced_covered_edges(budgeted, graph)
+    coverage_bucket_count = 0
+    # (2) Distribute coverage subgraphs across eligible sizes under remaining budget.
+    if coverage_augmentation:
+        for edge in sorted(tuple(sorted(e)) for e in (all_positive - covered)):
+            if frozenset(edge) in covered:
+                continue  # drained by a previously added coverage bucket
+            target_size = next(
+                (size for size in eligible_sizes if _remaining(size) > 0), None
+            )
+            if target_size is None:
+                break  # every eligible size is at budget; report honest partial coverage
+            nodes = _expand_chunk_nodes(
+                graph=graph,
+                edge_chunk=[(edge[0], edge[1])],
+                target_size=target_size,
+                strategy=normalized,
+                rng=rng,
+            )
+            budgeted.setdefault(target_size, []).append(tuple(sorted(nodes)))
+            for node_a, node_b in graph.subgraph(set(nodes)).edges():
+                covered.add(frozenset((node_a, node_b)))
+            coverage_bucket_count += 1
+
+    # (3) Recompute coverage from the realized plan so the logged number is honest.
+    matched = len(covered & all_positive)
+    coverage = 1.0 if not all_positive else matched / len(all_positive)
+    stats: dict[str, float | int] = {
+        "base_bucket_count": base_bucket_count,
+        "coverage_bucket_count": coverage_bucket_count,
+        "positive_edge_coverage": coverage,
+    }
+    return budgeted, stats

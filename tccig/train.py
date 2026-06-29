@@ -45,6 +45,13 @@ from torch.utils.data import DataLoader
 
 from tccig import s2gae
 from tccig import test as tccig_test
+from tccig.topology_subset import (
+    TopologySubsetPlan,
+    apply_per_size_subgraph_budget,
+    build_topology_subset_plan,
+    candidate_pairs_for_scoring,
+    scored_pairs_from_subset_plan,
+)
 from tccig.prepare import (
     CandidatePair,
     GraphRule,
@@ -565,6 +572,148 @@ def _build_train_topology_bundle(
         "refiner.topology_training.samples_per_size",
     )
     coverage_augmentation = bool(topo_cfg.get("coverage_augmentation", True))
+
+    subset_raw = topo_cfg.get("subset")
+    if isinstance(subset_raw, Mapping) and bool(subset_raw.get("enabled", False)):
+        subset_cfg = s2gae._parse_topology_subset_config(subset_raw)
+        # Build this branch's own base sampled subgraphs (the full-plan `_build()`
+        # closure's `sampled` local is NOT in scope here — review Finding 2).
+        sampled = sample_topology_evaluation_subgraphs(
+            graph=train_graph,
+            seed=seed,
+            strategy=strategy,
+            node_sizes=node_sizes,
+            samples_per_size=samples_per_size,
+        )
+        # Apply the §4 per-size subgraph budget AND coverage augmentation in ONE call.
+        # `apply_per_size_subgraph_budget` is the single owner of budget+coverage for the
+        # subset path: it caps base subgraphs per size, then (when coverage_augmentation
+        # is on) distributes coverage subgraphs into eligible sizes under the remaining
+        # budget, and recomputes coverage_stats from the realized plan. Do NOT also call
+        # `augment_plan_for_positive_edge_coverage` here — that would append coverage to
+        # `max(node_sizes)`, bypass the budget, and double-augment. The build step below
+        # also trusts pre-budgeted input (`build_topology_subset_plan` no longer truncates),
+        # so this is the only place the budget is enforced (review: coverage-redistribution).
+        sampled, coverage_stats = apply_per_size_subgraph_budget(
+            graph=train_graph,
+            base_sampled={int(k): list(v) for k, v in sampled.items()},
+            node_sizes=tuple(node_sizes),
+            strategy=strategy,
+            seed=seed,
+            max_subgraphs_per_size=subset_cfg.max_subgraphs_per_size,
+            coverage_augmentation=coverage_augmentation,
+        )
+        if coverage_stats:
+            LOGGER.info(
+                "tccig train topology coverage (post-budget): base_buckets=%s "
+                "coverage_buckets=%s positive_edge_coverage=%.4f",
+                coverage_stats.get("base_bucket_count"),
+                coverage_stats.get("coverage_bucket_count"),
+                float(coverage_stats.get("positive_edge_coverage", 0.0)),
+            )
+
+        from src.topology.plan_cache import (
+            load_subset_plan_cache,
+            subset_plan_payload_metadata,
+            write_subset_plan_cache,
+        )
+        from tccig.topology_subset import payload_to_subset_plan, subset_plan_to_payload
+
+        subset_metadata = subset_plan_payload_metadata(
+            split="train_topology",
+            graph=train_graph,
+            node_sizes=node_sizes,
+            samples_per_size=samples_per_size,
+            seed=seed,
+            strategy=strategy,
+            coverage_augmentation=coverage_augmentation,
+            candidate_ratio=subset_cfg.candidate_ratio,
+            pool_ratio=subset_cfg.pool_ratio,
+            epoch_ratio=subset_cfg.epoch_ratio,
+            hard_fraction=subset_cfg.hard_fraction,
+            uniform_fraction=subset_cfg.uniform_fraction,
+            hard_stratum_fraction=subset_cfg.hard_stratum_fraction,
+            max_subgraphs_per_size=subset_cfg.max_subgraphs_per_size,
+            max_labeled_pairs_per_size=subset_cfg.max_labeled_pairs_per_size,
+            scorer_config=scorer_cfg,
+            pair_scope="subset",
+        )
+        # Subset-specific loader: the full-plan load_plan_cache would reject this
+        # payload shape via _payload_is_rehydratable (review: cache-load finding).
+        cached_payload = load_subset_plan_cache(
+            cache_dir=cache_dir, split="train_topology_subset", metadata=subset_metadata
+        )
+        if cached_payload is not None:
+            subset_plan = payload_to_subset_plan(cached_payload)
+        else:
+            # Cache miss: EVERY rank scores (via _score_split, which barriers itself),
+            # then EVERY rank builds the identical plan deterministically.
+            empty_plan = build_topology_subset_plan(
+                graph=train_graph,
+                sampled_subgraphs=sampled,
+                config=subset_cfg,
+                scorer_probabilities={},
+            )
+            scoring_rows = candidate_pairs_for_scoring(empty_plan)
+            LOGGER.info(
+                "tccig train topology subset scoring estimate: unique_pairs=%s "
+                "positives=%s candidate_negatives=%s pool_negatives=%s skipped_sizes=%s",
+                len(scoring_rows),
+                empty_plan.total_positive_pairs,
+                empty_plan.total_candidate_negatives,
+                empty_plan.total_pool_negatives,
+                dict(empty_plan.skipped_sizes),
+            )
+            candidate_pairs = [
+                CandidatePair(protein_a, protein_b)
+                for _, protein_a, protein_b in scoring_rows
+            ]
+            candidate_scores = _score_split(
+                split="train_topology_subset_candidates",
+                pairs=candidate_pairs,
+                scorer_cfg=scorer_cfg,
+                runtime=runtime,
+                cache_dir=cache_dir,
+            )
+            score_by_pair_id = {
+                pair_id: float(score)
+                for (pair_id, _protein_a, _protein_b), score in zip(
+                    scoring_rows, candidate_scores, strict=True
+                )
+            }
+            subset_plan = build_topology_subset_plan(
+                graph=train_graph,
+                sampled_subgraphs=sampled,
+                config=subset_cfg,
+                scorer_probabilities=score_by_pair_id,
+            )
+            if runtime.is_main_process:
+                write_subset_plan_cache(
+                    cache_dir=cache_dir,
+                    split="train_topology_subset",
+                    metadata=subset_metadata,
+                    payload=subset_plan_to_payload(subset_plan),
+                )
+
+        endpoints, probabilities = scored_pairs_from_subset_plan(subset_plan)
+        pairs = [
+            CandidatePair(protein_a, protein_b) for protein_a, protein_b in endpoints
+        ]
+        pairwise_edges = edges_from_rule(
+            pairs=pairs,
+            probabilities=probabilities,
+            rule=pairwise_input_rule,
+        )
+        return (
+            SplitBundle(
+                split="train_topology",
+                pairs=pairs,
+                pairwise_probabilities=probabilities,
+                pairwise_graph_edges=pairwise_edges,
+            ),
+            subset_plan,
+            coverage_stats,
+        )
 
     def _build() -> tuple[InternalValidationPlan, dict[str, float | int]]:
         sampled = sample_topology_evaluation_subgraphs(
