@@ -51,6 +51,7 @@ from tccig.prepare import (
     sample_epoch_edge_targets,
     write_json,
 )
+from tccig.topology_subset import TopologySubsetSamplerConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -182,6 +183,7 @@ class S2GAETopologyTrainingConfig:
     warmup_epochs: int
     ramp_epochs: int
     schedule: str
+    subset: TopologySubsetSamplerConfig
 
 
 @dataclass(frozen=True)
@@ -1875,6 +1877,60 @@ def _parse_residual_anchor_config(
     )
 
 
+def _parse_topology_subset_config(raw: object) -> TopologySubsetSamplerConfig:
+    """Parse refiner.topology_training.subset."""
+    if raw is None:
+        return TopologySubsetSamplerConfig(enabled=False)
+    if not isinstance(raw, Mapping):
+        raise ValueError("refiner.topology_training.subset must be a mapping")
+    cfg = TopologySubsetSamplerConfig(
+        enabled=_bool(raw.get("enabled", True), "refiner.topology_training.subset.enabled"),
+        candidate_ratio=_positive_int(
+            raw.get("candidate_ratio", 20), "refiner.topology_training.subset.candidate_ratio"
+        ),
+        pool_ratio=_positive_int(
+            raw.get("pool_ratio", 10), "refiner.topology_training.subset.pool_ratio"
+        ),
+        epoch_ratio=_positive_int(
+            raw.get("epoch_ratio", 5), "refiner.topology_training.subset.epoch_ratio"
+        ),
+        hard_fraction=_non_negative_float(
+            raw.get("hard_fraction", 0.5), "refiner.topology_training.subset.hard_fraction"
+        ),
+        uniform_fraction=_non_negative_float(
+            raw.get("uniform_fraction", 0.5),
+            "refiner.topology_training.subset.uniform_fraction",
+        ),
+        hard_stratum_fraction=_non_negative_float(
+            raw.get("hard_stratum_fraction", 0.2),
+            "refiner.topology_training.subset.hard_stratum_fraction",
+        ),
+        seed=_non_negative_int(raw.get("seed", 0), "refiner.topology_training.subset.seed"),
+        max_subgraphs_per_size=_non_negative_int(
+            raw.get("max_subgraphs_per_size", 0),
+            "refiner.topology_training.subset.max_subgraphs_per_size",
+        ),
+        max_labeled_pairs_per_size=_non_negative_int(
+            raw.get("max_labeled_pairs_per_size", 0),
+            "refiner.topology_training.subset.max_labeled_pairs_per_size",
+        ),
+        bias_diagnostic_every_n_epochs=_non_negative_int(
+            raw.get("bias_diagnostic_every_n_epochs", 0),
+            "refiner.topology_training.subset.bias_diagnostic_every_n_epochs",
+        ),
+        bias_diagnostic_max_node_size=_non_negative_int(
+            raw.get("bias_diagnostic_max_node_size", 40),
+            "refiner.topology_training.subset.bias_diagnostic_max_node_size",
+        ),
+        bias_diagnostic_max_subgraphs=_non_negative_int(
+            raw.get("bias_diagnostic_max_subgraphs", 4),
+            "refiner.topology_training.subset.bias_diagnostic_max_subgraphs",
+        ),
+    )
+    cfg.validate()
+    return cfg
+
+
 def _parse_topology_training_config(raw: object) -> S2GAETopologyTrainingConfig:
     if raw is None or not isinstance(raw, Mapping):
         return S2GAETopologyTrainingConfig(
@@ -1889,6 +1945,7 @@ def _parse_topology_training_config(raw: object) -> S2GAETopologyTrainingConfig:
             warmup_epochs=0,
             ramp_epochs=0,
             schedule="linear",
+            subset=TopologySubsetSamplerConfig(enabled=False),
         )
     raw_weights = raw.get("weights", {})
     if not isinstance(raw_weights, Mapping):
@@ -1925,6 +1982,7 @@ def _parse_topology_training_config(raw: object) -> S2GAETopologyTrainingConfig:
         warmup_epochs=_non_negative_int(raw_schedule.get("warmup_epochs", 0), "...warmup_epochs"),
         ramp_epochs=_non_negative_int(raw_schedule.get("ramp_epochs", 0), "...ramp_epochs"),
         schedule=str(raw_schedule.get("schedule", "linear")),
+        subset=_parse_topology_subset_config(raw.get("subset")),
     )
 
 

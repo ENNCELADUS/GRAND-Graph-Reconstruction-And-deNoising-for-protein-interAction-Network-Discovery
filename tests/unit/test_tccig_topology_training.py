@@ -83,6 +83,27 @@ def test_parse_config_defaults_topology_training_disabled() -> None:
     assert cfg.residual_anchor.form == "symmetric"
 
 
+def test_parse_config_reads_topology_subset_sampler() -> None:
+    from tccig.s2gae import _parse_config
+
+    config = _base_refiner_config()
+    config["topology_training"]["subset"] = {
+        "enabled": True,
+        "candidate_ratio": 20,
+        "pool_ratio": 10,
+        "epoch_ratio": 5,
+        "hard_fraction": 0.5,
+        "uniform_fraction": 0.5,
+        "hard_stratum_fraction": 0.2,
+        "seed": 11,
+    }
+    cfg = _parse_config(config)
+    assert cfg.topology_training.subset.enabled is True
+    assert cfg.topology_training.subset.candidate_ratio == 20
+    assert cfg.topology_training.subset.seed == 11
+    assert cfg.topology_validation.compute_clustering_mmd is True
+
+
 def test_coverage_augmentation_covers_isolated_positive_edge() -> None:
     import networkx as nx
     from tccig.train import augment_plan_for_positive_edge_coverage
