@@ -8,7 +8,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from math import isclose
-from typing import TypeVar
+from typing import TypeVar, cast
 
 import networkx as nx
 
@@ -429,3 +429,114 @@ def sample_epoch_topology_subset(
     for sample in selected:
         sample.validate()
     return tuple(selected)
+
+
+def _sample_to_dict(sample: TopologyPairSample) -> dict[str, object]:
+    return {
+        "pair_id": sample.pair_id,
+        "subgraph_id": sample.subgraph_id,
+        "node_size": sample.node_size,
+        "protein_a": sample.protein_a,
+        "protein_b": sample.protein_b,
+        "local_index_a": sample.local_index_a,
+        "local_index_b": sample.local_index_b,
+        "stratum": sample.stratum.value,
+        "pi_cand": sample.pi_cand,
+        "pi_pool_given_cand": sample.pi_pool_given_cand,
+        "pi_epoch_given_pool": sample.pi_epoch_given_pool,
+        "pi_total": sample.pi_total,
+        "target": sample.target,
+        "scorer_probability": sample.scorer_probability,
+    }
+
+
+def _sample_from_dict(raw: Mapping[str, object]) -> TopologyPairSample:
+    return TopologyPairSample(
+        pair_id=str(raw["pair_id"]),
+        subgraph_id=str(raw["subgraph_id"]),
+        node_size=int(raw["node_size"]),  # type: ignore[arg-type]
+        protein_a=str(raw["protein_a"]),
+        protein_b=str(raw["protein_b"]),
+        local_index_a=int(raw["local_index_a"]),  # type: ignore[arg-type]
+        local_index_b=int(raw["local_index_b"]),  # type: ignore[arg-type]
+        stratum=SamplingStratum(str(raw["stratum"])),
+        pi_cand=float(raw["pi_cand"]),  # type: ignore[arg-type]
+        pi_pool_given_cand=float(raw["pi_pool_given_cand"]),  # type: ignore[arg-type]
+        pi_epoch_given_pool=float(raw["pi_epoch_given_pool"]),  # type: ignore[arg-type]
+        pi_total=float(raw["pi_total"]),  # type: ignore[arg-type]
+        target=float(raw["target"]),  # type: ignore[arg-type]
+        scorer_probability=float(raw["scorer_probability"]),  # type: ignore[arg-type]
+    )
+
+
+SUBSET_PAYLOAD_VERSION = 1
+
+
+def subset_plan_to_payload(plan: TopologySubsetPlan) -> dict[str, object]:
+    """Serialize a TopologySubsetPlan to a JSON-friendly payload.
+
+    The ``payload_kind``/``subset_payload_version`` stamp lets the subset cache loader
+    reject a full-plan payload (different shape) or a stale subset schema instead of
+    crashing in ``payload_to_subset_plan`` on a missing key.
+    """
+    return {
+        "payload_kind": "topology_subset",
+        "subset_payload_version": SUBSET_PAYLOAD_VERSION,
+        "active_sizes": list(plan.active_sizes),
+        "skipped_sizes": {str(size): reason for size, reason in plan.skipped_sizes.items()},
+        "total_positive_pairs": plan.total_positive_pairs,
+        "total_candidate_negatives": plan.total_candidate_negatives,
+        "total_pool_negatives": plan.total_pool_negatives,
+        "subgraphs": [
+            {
+                "subgraph_id": subgraph.subgraph_id,
+                "node_size": subgraph.node_size,
+                "nodes": list(subgraph.nodes),
+                "positives": [_sample_to_dict(sample) for sample in subgraph.positives],
+                "candidate_negatives": [
+                    _sample_to_dict(sample) for sample in subgraph.candidate_negatives
+                ],
+                "hard_pool": [_sample_to_dict(sample) for sample in subgraph.hard_pool],
+                "uniform_pool": [_sample_to_dict(sample) for sample in subgraph.uniform_pool],
+            }
+            for subgraph in plan.subgraphs
+        ],
+    }
+
+
+def payload_to_subset_plan(payload: Mapping[str, object]) -> TopologySubsetPlan:
+    """Rebuild a TopologySubsetPlan from its serialized payload."""
+    raw_subgraphs = cast("Sequence[Mapping[str, object]]", payload["subgraphs"])
+    subgraphs = tuple(
+        TopologySubgraphPlan(
+            subgraph_id=str(raw["subgraph_id"]),
+            node_size=int(raw["node_size"]),  # type: ignore[arg-type]
+            nodes=tuple(str(node) for node in cast("Sequence[object]", raw["nodes"])),
+            positives=tuple(
+                _sample_from_dict(item)
+                for item in cast("Sequence[Mapping[str, object]]", raw["positives"])
+            ),
+            candidate_negatives=tuple(
+                _sample_from_dict(item)
+                for item in cast("Sequence[Mapping[str, object]]", raw["candidate_negatives"])
+            ),
+            hard_pool=tuple(
+                _sample_from_dict(item)
+                for item in cast("Sequence[Mapping[str, object]]", raw["hard_pool"])
+            ),
+            uniform_pool=tuple(
+                _sample_from_dict(item)
+                for item in cast("Sequence[Mapping[str, object]]", raw["uniform_pool"])
+            ),
+        )
+        for raw in raw_subgraphs
+    )
+    skipped_raw = cast("Mapping[str, object]", payload["skipped_sizes"])
+    return TopologySubsetPlan(
+        subgraphs=subgraphs,
+        active_sizes=tuple(int(size) for size in cast("Sequence[object]", payload["active_sizes"])),
+        skipped_sizes={int(size): str(reason) for size, reason in skipped_raw.items()},
+        total_positive_pairs=int(payload["total_positive_pairs"]),  # type: ignore[arg-type]
+        total_candidate_negatives=int(payload["total_candidate_negatives"]),  # type: ignore[arg-type]
+        total_pool_negatives=int(payload["total_pool_negatives"]),  # type: ignore[arg-type]
+    )

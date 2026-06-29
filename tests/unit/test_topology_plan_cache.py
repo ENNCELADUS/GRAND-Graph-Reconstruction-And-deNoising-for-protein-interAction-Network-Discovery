@@ -270,3 +270,123 @@ def test_load_accepts_valid_payload(tmp_path: Path) -> None:
     )
     loaded = load_plan_cache(cache_dir=tmp_path, split="train_topology", metadata=metadata)
     assert loaded is not None
+
+
+def test_subset_plan_metadata_changes_with_sampler_parameters() -> None:
+    import networkx as nx
+
+    from src.topology.plan_cache import subset_plan_payload_metadata
+
+    graph = nx.Graph()
+    graph.add_edges_from([("a", "b"), ("b", "c")])
+    first = subset_plan_payload_metadata(
+        split="train_topology",
+        graph=graph,
+        node_sizes=[20, 40],
+        samples_per_size=2,
+        seed=0,
+        strategy="mixed",
+        coverage_augmentation=True,
+        candidate_ratio=20,
+        pool_ratio=10,
+        epoch_ratio=5,
+        hard_fraction=0.5,
+        uniform_fraction=0.5,
+        hard_stratum_fraction=0.2,
+        max_subgraphs_per_size=0,
+        max_labeled_pairs_per_size=0,
+        pair_scope="subset",
+        scorer_config={},
+    )
+    second = subset_plan_payload_metadata(
+        split="train_topology",
+        graph=graph,
+        node_sizes=[20, 40],
+        samples_per_size=2,
+        seed=0,
+        strategy="mixed",
+        coverage_augmentation=True,
+        candidate_ratio=10,
+        pool_ratio=10,
+        epoch_ratio=5,
+        hard_fraction=0.5,
+        uniform_fraction=0.5,
+        hard_stratum_fraction=0.2,
+        max_subgraphs_per_size=0,
+        max_labeled_pairs_per_size=0,
+        pair_scope="subset",
+        scorer_config={},
+    )
+    assert first["candidate_ratio"] == 20
+    assert first != second
+
+
+def test_subset_plan_metadata_embeds_scorer_identity() -> None:
+    # Review finding: without scorer/checkpoint hashes the cached scored pairs can be
+    # silently reused after the frozen scorer changes. The cache key MUST carry the
+    # same scorer-identity block that score_cache_metadata uses.
+    import networkx as nx
+
+    from src.topology.plan_cache import subset_plan_payload_metadata
+
+    graph = nx.Graph()
+    graph.add_edges_from([("a", "b"), ("b", "c")])
+    kwargs = dict(
+        split="train_topology",
+        graph=graph,
+        node_sizes=[20],
+        samples_per_size=1,
+        seed=0,
+        strategy="mixed",
+        coverage_augmentation=False,
+        candidate_ratio=20,
+        pool_ratio=10,
+        epoch_ratio=5,
+        hard_fraction=0.5,
+        uniform_fraction=0.5,
+        hard_stratum_fraction=0.2,
+        max_subgraphs_per_size=0,
+        max_labeled_pairs_per_size=0,
+        pair_scope="subset",
+    )
+    meta = subset_plan_payload_metadata(scorer_config={"max_sequence_length": 1000}, **kwargs)
+    assert "scorer" in meta
+    assert meta["scorer"]["max_sequence_length"] == 1000
+    other = subset_plan_payload_metadata(scorer_config={"max_sequence_length": 2000}, **kwargs)
+    assert meta != other
+
+
+def test_subset_cache_round_trips_and_rejects_full_plan_payload(tmp_path) -> None:
+    import networkx as nx
+
+    from src.topology.plan_cache import (
+        load_plan_cache,
+        load_subset_plan_cache,
+        write_subset_plan_cache,
+    )
+    from tccig.topology_subset import (
+        TopologySubsetSamplerConfig,
+        build_topology_subset_plan,
+        subset_plan_to_payload,
+    )
+
+    graph = nx.Graph()
+    graph.add_nodes_from(["a", "b", "c", "d"])
+    graph.add_edges_from([("a", "b"), ("b", "c")])
+    cfg = TopologySubsetSamplerConfig(candidate_ratio=2, pool_ratio=1, epoch_ratio=1, seed=1)
+    plan = build_topology_subset_plan(
+        graph=graph, sampled_subgraphs={4: [("a", "b", "c", "d")]}, config=cfg,
+        scorer_probabilities={},
+    )
+    metadata = {"pair_scope": "subset", "candidate_ratio": 2}
+    write_subset_plan_cache(
+        cache_dir=tmp_path, split="train_topology_subset", metadata=metadata,
+        payload=subset_plan_to_payload(plan),
+    )
+    # Subset loader hits; the full-plan loader rejects the subset payload shape.
+    assert load_subset_plan_cache(
+        cache_dir=tmp_path, split="train_topology_subset", metadata=metadata
+    ) is not None
+    assert load_plan_cache(
+        cache_dir=tmp_path, split="train_topology_subset", metadata=metadata
+    ) is None

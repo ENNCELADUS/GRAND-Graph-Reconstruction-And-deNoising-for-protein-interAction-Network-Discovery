@@ -216,3 +216,20 @@ def test_max_labeled_pairs_per_size_caps_scored_candidates() -> None:
     for subgraph in capped_plan.subgraphs:
         for sample in subgraph.candidate_negatives:
             assert 0.0 < sample.pi_cand <= 1.0
+
+
+from tccig.topology_subset import subset_plan_to_payload, payload_to_subset_plan
+
+
+def test_subset_plan_payload_round_trips() -> None:
+    graph = _toy_graph()
+    sampled = {4: [("a", "b", "c", "d")]}
+    cfg = TopologySubsetSamplerConfig(candidate_ratio=3, pool_ratio=2, epoch_ratio=1, seed=4)
+    plan = build_topology_subset_plan(
+        graph=graph,
+        sampled_subgraphs=sampled,
+        config=cfg,
+        scorer_probabilities={"a||c": 0.9, "a||d": 0.2, "b||d": 0.7, "c||d": 0.1},
+    )
+    restored = payload_to_subset_plan(subset_plan_to_payload(plan))
+    assert restored == plan

@@ -14,7 +14,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import networkx as nx
-from tccig.prepare import write_json
+from tccig.prepare import (
+    embedding_index_sha256,
+    optional_file_sha256,
+    write_json,
+)
 
 from src.topology.finetune_data import (
     InternalValidationNodeBucketPlan,
@@ -170,6 +174,79 @@ def plan_payload_metadata(
     }
 
 
+SUBSET_METADATA_VERSION = 1
+
+
+def _scorer_identity(scorer_config: Mapping[str, object]) -> dict[str, object]:
+    """Return the same scorer-identity block score_cache_metadata uses.
+
+    Embedding this in the subset-plan cache key means a changed checkpoint, model
+    config, embedding index, or max_sequence_length invalidates the persisted plan —
+    so stale scored pairs are never silently reused.
+    """
+    return {
+        "model_config_sha256": optional_file_sha256(scorer_config.get("model_config_path")),
+        "checkpoint_sha256": optional_file_sha256(scorer_config.get("checkpoint_path")),
+        "embedding_index_sha256": embedding_index_sha256(scorer_config),
+        "max_sequence_length": scorer_config.get("max_sequence_length"),
+    }
+
+
+def subset_plan_payload_metadata(
+    *,
+    split: str,
+    graph: nx.Graph,
+    node_sizes: Sequence[int],
+    samples_per_size: int,
+    seed: int,
+    strategy: str,
+    coverage_augmentation: bool,
+    candidate_ratio: int,
+    pool_ratio: int,
+    epoch_ratio: int,
+    hard_fraction: float,
+    uniform_fraction: float,
+    hard_stratum_fraction: float,
+    max_subgraphs_per_size: int,
+    max_labeled_pairs_per_size: int,
+    pair_scope: str,
+    scorer_config: Mapping[str, object],
+) -> dict[str, object]:
+    """Build the strict cache key for a subset topology plan payload.
+
+    The key covers the sampling parameters (so a sampler change invalidates the plan)
+    AND the frozen scorer identity (so a checkpoint/config/embedding change invalidates
+    the *scored* pairs baked into the plan). `pair_scope` distinguishes this from the
+    full-plan key. `kind="subset"` lets the loader route to the subset validator.
+    """
+    metadata = plan_payload_metadata(
+        split=split,
+        graph=graph,
+        node_sizes=node_sizes,
+        samples_per_size=samples_per_size,
+        seed=seed,
+        strategy=strategy,
+        coverage_augmentation=coverage_augmentation,
+    )
+    metadata.update(
+        {
+            "kind": "subset",
+            "subset_version": SUBSET_METADATA_VERSION,
+            "pair_scope": pair_scope,
+            "candidate_ratio": int(candidate_ratio),
+            "pool_ratio": int(pool_ratio),
+            "epoch_ratio": int(epoch_ratio),
+            "hard_fraction": float(hard_fraction),
+            "uniform_fraction": float(uniform_fraction),
+            "hard_stratum_fraction": float(hard_stratum_fraction),
+            "max_subgraphs_per_size": int(max_subgraphs_per_size),
+            "max_labeled_pairs_per_size": int(max_labeled_pairs_per_size),
+            "scorer": _scorer_identity(scorer_config),
+        }
+    )
+    return metadata
+
+
 def _plan_path(cache_dir: Path, split: str) -> Path:
     return cache_dir / "plans" / f"{split}.json"
 
@@ -282,6 +359,101 @@ def write_plan_cache(
     payload: Mapping[str, object],
 ) -> None:
     """Persist a plan payload plus its cache-key metadata and a manifest."""
+    write_json(
+        _plan_path(cache_dir, split),
+        {"metadata": dict(metadata), "payload": dict(payload)},
+    )
+    write_json(_manifest_path(cache_dir, split), dict(metadata))
+
+
+def _subset_payload_is_rehydratable(payload: Mapping[str, object]) -> bool:
+    """Cheap schema check for a serialized TopologySubsetPlan payload.
+
+    Distinct from ``_payload_is_rehydratable`` (full-plan only): validates the subset
+    payload kind/version and that every subgraph carries the four sample lists, so a
+    full-plan payload or a stale subset schema is rejected instead of KeyError-ing in
+    ``payload_to_subset_plan``. The accepted version is owned by the module that
+    *writes* the payload (``tccig.topology_subset``), imported here so there is a single
+    source of truth -- not a second constant that can drift out of sync.
+    """
+    from tccig.topology_subset import SUBSET_PAYLOAD_VERSION as _WRITER_VERSION
+
+    if payload.get("payload_kind") != "topology_subset":
+        return False
+    if payload.get("subset_payload_version") != _WRITER_VERSION:
+        return False
+    raw_subgraphs = payload.get("subgraphs")
+    if not isinstance(raw_subgraphs, list):
+        return False
+    required_lists = ("positives", "candidate_negatives", "hard_pool", "uniform_pool")
+    for subgraph in raw_subgraphs:
+        if not isinstance(subgraph, Mapping):
+            return False
+        if not isinstance(subgraph.get("node_size"), int):
+            return False
+        if not isinstance(subgraph.get("nodes"), list):
+            return False
+        for key in required_lists:
+            if not isinstance(subgraph.get(key), list):
+                return False
+    for key in (
+        "active_sizes",
+        "skipped_sizes",
+        "total_positive_pairs",
+        "total_candidate_negatives",
+        "total_pool_negatives",
+    ):
+        if key not in payload:
+            return False
+    return True
+
+
+def load_subset_plan_cache(
+    *,
+    cache_dir: Path,
+    split: str,
+    metadata: Mapping[str, object],
+) -> dict[str, object] | None:
+    """Load a cached subset-plan payload, or ``None`` on miss/mismatch/corruption.
+
+    Mirrors ``load_plan_cache`` but validates the subset payload shape via
+    ``_subset_payload_is_rehydratable`` instead of the full-plan
+    ``_payload_is_rehydratable``.
+    """
+    path = _plan_path(cache_dir, split)
+    if not path.exists():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("ignoring corrupt topology subset plan cache at %s", path)
+        return None
+    if not isinstance(document, Mapping):
+        LOGGER.warning("ignoring malformed topology subset plan cache at %s", path)
+        return None
+    if document.get("metadata") != dict(metadata):
+        return None
+    payload = document.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    if not _subset_payload_is_rehydratable(payload):
+        LOGGER.warning("ignoring structurally invalid topology subset plan cache at %s", path)
+        return None
+    return dict(payload)
+
+
+def write_subset_plan_cache(
+    *,
+    cache_dir: Path,
+    split: str,
+    metadata: Mapping[str, object],
+    payload: Mapping[str, object],
+) -> None:
+    """Persist a subset-plan payload plus its cache-key metadata and a manifest.
+
+    Identical on-disk layout to ``write_plan_cache``; kept separate so the subset path
+    never silently writes under a full-plan validator's assumptions.
+    """
     write_json(
         _plan_path(cache_dir, split),
         {"metadata": dict(metadata), "payload": dict(payload)},
