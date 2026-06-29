@@ -94,15 +94,42 @@ def soft_graph_similarity_loss(
     )
 
 
+def _apply_pair_weights(
+    values: torch.Tensor,
+    pair_weights: torch.Tensor | None,
+) -> torch.Tensor:
+    """Apply optional inverse-probability pair weights.
+
+    Args:
+        values: Per-pair tensor (e.g. predicted/target pair probabilities).
+        pair_weights: Optional per-pair multipliers matching ``values`` in shape.
+
+    Returns:
+        ``values`` unchanged when ``pair_weights`` is ``None``, otherwise the
+        element-wise product cast to the device/dtype of ``values``.
+
+    Raises:
+        ValueError: If ``pair_weights`` does not match ``values`` in shape.
+    """
+    if pair_weights is None:
+        return values
+    if pair_weights.shape != values.shape:
+        raise ValueError("pair_weights must match pair probability shape")
+    return values * pair_weights.to(device=values.device, dtype=values.dtype)
+
+
 def _pairwise_graph_similarity_loss(
     *,
     pred_pair_probabilities: torch.Tensor,
     target_pair_probabilities: torch.Tensor,
+    pair_weights: torch.Tensor | None = None,
     eps: float = EPSILON,
 ) -> torch.Tensor:
     """Differentiable graph similarity loss over upper-triangle pair vectors."""
-    difference = torch.abs(pred_pair_probabilities - target_pair_probabilities).sum()
-    denominator = pred_pair_probabilities.sum() + target_pair_probabilities.sum()
+    weighted_pred = _apply_pair_weights(pred_pair_probabilities, pair_weights)
+    weighted_target = _apply_pair_weights(target_pair_probabilities, pair_weights)
+    difference = torch.abs(weighted_pred - weighted_target).sum()
+    denominator = weighted_pred.sum() + weighted_target.sum()
     return torch.where(
         denominator > eps,
         difference / (denominator + eps),
@@ -139,15 +166,18 @@ def _pairwise_relative_density_loss(
     num_nodes: int,
     pred_pair_probabilities: torch.Tensor,
     target_pair_probabilities: torch.Tensor,
+    pair_weights: torch.Tensor | None = None,
     loss_form: str = "log_ratio_huber",
     eps: float = EPSILON,
 ) -> torch.Tensor:
     """Squared deviation of relative density computed from pair vectors."""
     if num_nodes < 2:
         raise ValueError("num_nodes must be >= 2")
+    weighted_pred = _apply_pair_weights(pred_pair_probabilities, pair_weights)
+    weighted_target = _apply_pair_weights(target_pair_probabilities, pair_weights)
     normalizer = float(num_nodes * (num_nodes - 1))
-    pred_density = (2.0 * pred_pair_probabilities.sum()) / normalizer
-    target_density = (2.0 * target_pair_probabilities.sum()) / normalizer
+    pred_density = (2.0 * weighted_pred.sum()) / normalizer
+    target_density = (2.0 * weighted_target.sum()) / normalizer
     if float(target_density.detach().item()) <= eps:
         return pred_density.square()
     return _relative_density_penalty(
@@ -217,11 +247,13 @@ def _pairwise_soft_degrees(
     pair_index_a: torch.Tensor,
     pair_index_b: torch.Tensor,
     pair_probabilities: torch.Tensor,
+    pair_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return soft node degrees from upper-triangle pair probabilities."""
-    degrees = pair_probabilities.new_zeros((num_nodes,))
-    degrees.scatter_add_(0, pair_index_a, pair_probabilities)
-    degrees.scatter_add_(0, pair_index_b, pair_probabilities)
+    weighted_probabilities = _apply_pair_weights(pair_probabilities, pair_weights)
+    degrees = weighted_probabilities.new_zeros((num_nodes,))
+    degrees.scatter_add_(0, pair_index_a, weighted_probabilities)
+    degrees.scatter_add_(0, pair_index_b, weighted_probabilities)
     return degrees
 
 
@@ -282,6 +314,7 @@ def _degree_distribution_mmd_from_pairs(
     pred_pair_probabilities: torch.Tensor,
     target_pair_probabilities: torch.Tensor,
     weights: TopologyLossWeights,
+    pair_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """MMD between soft degree distributions built from pair vectors."""
     centers = torch.linspace(
@@ -297,6 +330,7 @@ def _degree_distribution_mmd_from_pairs(
             pair_index_a=pair_index_a,
             pair_index_b=pair_index_b,
             pair_probabilities=pred_pair_probabilities,
+            pair_weights=pair_weights,
         ),
         centers=centers,
         sigma=weights.histogram_sigma,
@@ -307,6 +341,7 @@ def _degree_distribution_mmd_from_pairs(
             pair_index_a=pair_index_a,
             pair_index_b=pair_index_b,
             pair_probabilities=target_pair_probabilities,
+            pair_weights=pair_weights,
         ),
         centers=centers,
         sigma=weights.histogram_sigma,
@@ -359,6 +394,7 @@ def compute_topology_losses(
     pair_index_b: torch.Tensor | None = None,
     pred_pair_probabilities: torch.Tensor | None = None,
     target_pair_probabilities: torch.Tensor | None = None,
+    pair_weights: torch.Tensor | None = None,
     include_clustering_mmd: bool = True,
 ) -> dict[str, torch.Tensor]:
     """Return weighted graph-topology loss terms and their total."""
@@ -390,6 +426,7 @@ def compute_topology_losses(
             _pairwise_graph_similarity_loss(
                 pred_pair_probabilities=pred_pair_probabilities,
                 target_pair_probabilities=target_pair_probabilities,
+                pair_weights=pair_weights,
             )
             if weights.alpha != 0.0
             else zero_loss
@@ -399,6 +436,7 @@ def compute_topology_losses(
                 num_nodes=num_nodes,
                 pred_pair_probabilities=pred_pair_probabilities,
                 target_pair_probabilities=target_pair_probabilities,
+                pair_weights=pair_weights,
                 loss_form=weights.rd_loss_form,
             )
             if weights.beta != 0.0
@@ -412,6 +450,7 @@ def compute_topology_losses(
                 pred_pair_probabilities=pred_pair_probabilities,
                 target_pair_probabilities=target_pair_probabilities,
                 weights=weights,
+                pair_weights=pair_weights,
             )
             if weights.gamma != 0.0
             else zero_loss

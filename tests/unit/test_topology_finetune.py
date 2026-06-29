@@ -1107,3 +1107,120 @@ def test_topology_loss_scale_supports_cosine_ramp() -> None:
     assert finetune_losses_module.topology_loss_scale(epoch=5, schedule=schedule) == pytest.approx(
         1.0
     )
+
+
+import random as _random
+
+
+def test_ipw_weighted_density_numerator_recovers_full_space_sum() -> None:
+    # Full-space "graph": 6 upper-triangle pairs with known predicted probabilities.
+    # Pair i is included with probability pi_i; weighted sum w_i * pred_i over the
+    # included subset is a Horvitz-Thompson estimator of the full-space sum.
+    pred_full = torch.tensor([0.9, 0.1, 0.7, 0.3, 0.5, 0.2], dtype=torch.float64)
+    inclusion = torch.tensor([1.0, 0.5, 0.5, 0.25, 0.25, 0.5], dtype=torch.float64)
+    full_space_sum = float(pred_full.sum().item())
+    rng = _random.Random(0)
+    trials = 20000
+    running = 0.0
+    for _ in range(trials):
+        included_pred: list[float] = []
+        weights_used: list[float] = []
+        for value, pi in zip(pred_full.tolist(), inclusion.tolist()):
+            if rng.random() < pi:
+                included_pred.append(value)
+                weights_used.append(1.0 / pi)
+        if not included_pred:
+            continue
+        pred_t = torch.tensor(included_pred, dtype=torch.float64)
+        weight_t = torch.tensor(weights_used, dtype=torch.float64)
+        running += float((pred_t * weight_t).sum().item())
+    estimate = running / trials
+    # Horvitz-Thompson is unbiased for the linear sum; Monte-Carlo tolerance ~1%.
+    assert estimate == pytest.approx(full_space_sum, rel=0.02)
+
+
+def test_pairwise_soft_degrees_ipw_recovers_full_space_degrees() -> None:
+    # Triangle a-b-c; the (0,2) pair carries an inverse-probability weight of 2x
+    # (pi=0.5), the others 1x. The weight multiplies into the scatter-add degree.
+    num_nodes = 3
+    pair_index_a = torch.tensor([0, 0, 1])
+    pair_index_b = torch.tensor([1, 2, 2])
+    pred = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float64)
+    pair_weights = torch.tensor([1.0, 2.0, 1.0], dtype=torch.float64)
+    weighted = finetune_losses_module._pairwise_soft_degrees(
+        num_nodes=num_nodes,
+        pair_index_a=pair_index_a,
+        pair_index_b=pair_index_b,
+        pair_probabilities=pred,
+        pair_weights=pair_weights,
+    )
+    # Weighted degrees: deg(0)=1*1+1*2=3, deg(1)=1*1+1*1=2, deg(2)=1*2+1*1=3.
+    # The 2x weight on edge (0,2) inflates the degrees of nodes 0 and 2.
+    assert weighted.tolist() == pytest.approx([3.0, 2.0, 3.0])
+
+
+def test_pairwise_relative_density_uses_pair_weights() -> None:
+    weights = finetune_losses_module.TopologyLossWeights(
+        alpha=0.0,
+        beta=1.0,
+        gamma=0.0,
+        delta=0.0,
+        rd_loss_form="squared_ratio",
+    )
+    pred = torch.tensor([0.8, 0.1], dtype=torch.float32)
+    target = torch.tensor([1.0, 0.0], dtype=torch.float32)
+    pair_weights = torch.tensor([1.0, 4.0], dtype=torch.float32)
+    weighted = finetune_losses_module.compute_topology_losses(
+        weights=weights,
+        num_nodes=3,
+        pair_index_a=torch.tensor([0, 1]),
+        pair_index_b=torch.tensor([1, 2]),
+        pred_pair_probabilities=pred,
+        target_pair_probabilities=target,
+        pair_weights=pair_weights,
+        include_clustering_mmd=False,
+    )
+    unweighted = finetune_losses_module.compute_topology_losses(
+        weights=weights,
+        num_nodes=3,
+        pair_index_a=torch.tensor([0, 1]),
+        pair_index_b=torch.tensor([1, 2]),
+        pred_pair_probabilities=pred,
+        target_pair_probabilities=target,
+        include_clustering_mmd=False,
+    )
+    assert weighted["relative_density"] != unweighted["relative_density"]
+
+
+def test_pairwise_degree_mmd_uses_pair_weights() -> None:
+    weights = finetune_losses_module.TopologyLossWeights(
+        alpha=0.0,
+        beta=0.0,
+        gamma=1.0,
+        delta=0.0,
+        histogram_sigma=1.0,
+        degree_bins=8,
+    )
+    pred = torch.tensor([0.2, 0.9, 0.1], dtype=torch.float32)
+    target = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32)
+    pair_weights = torch.tensor([1.0, 3.0, 5.0], dtype=torch.float32)
+    weighted = finetune_losses_module.compute_topology_losses(
+        weights=weights,
+        num_nodes=3,
+        pair_index_a=torch.tensor([0, 0, 1]),
+        pair_index_b=torch.tensor([1, 2, 2]),
+        pred_pair_probabilities=pred,
+        target_pair_probabilities=target,
+        pair_weights=pair_weights,
+        include_clustering_mmd=False,
+    )
+    unweighted = finetune_losses_module.compute_topology_losses(
+        weights=weights,
+        num_nodes=3,
+        pair_index_a=torch.tensor([0, 0, 1]),
+        pair_index_b=torch.tensor([1, 2, 2]),
+        pred_pair_probabilities=pred,
+        target_pair_probabilities=target,
+        include_clustering_mmd=False,
+    )
+    assert weighted["degree_mmd"] != unweighted["degree_mmd"]
