@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import time
+from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -54,8 +55,11 @@ from tccig.prepare import (
 )
 from tccig.topology_subset import (
     TopologySubgraphEpochChunk,
+    TopologySubgraphPlan,
     TopologySubsetPlan,
     TopologySubsetSamplerConfig,
+    _all_local_pairs,
+    compute_subset_bias_diagnostic,
     group_epoch_samples_by_subgraph,
     sample_epoch_topology_subset,
 )
@@ -786,6 +790,153 @@ def _topology_subset_backward_step(
     return _all_reduce_component_sums(component_sums, runtime)
 
 
+def _subgraph_bias_diagnostic(
+    *,
+    refiner: S2GAERefiner,
+    graph: _SplitGraph,
+    subgraph: TopologySubgraphPlan,
+    chunk: TopologySubgraphEpochChunk,
+    node_index: Mapping[str, int],
+) -> dict[str, float] | None:
+    """IPW-vs-full-space bias diagnostic for ONE capped subgraph. No grad."""
+    nodes = tuple(subgraph.nodes)
+    full_pairs = _all_local_pairs(nodes)  # (idx_a, idx_b, protein_a, protein_b, pair_id)
+    device = graph.node_features.device
+    with torch.no_grad():
+        hidden_states = refiner.encode(
+            node_features=graph.node_features,
+            edge_index=graph.edge_index,
+            edge_weight=graph.edge_weight,
+        )
+        global_pairs = (
+            torch.tensor(
+                [[node_index[row[2]], node_index[row[3]]] for row in full_pairs],
+                dtype=torch.long,
+                device=device,
+            )
+            .t()
+            .contiguous()
+        )
+        refined_logits, _ = refiner.decode(
+            hidden_states=hidden_states,
+            pair_index=global_pairs,
+            pairwise_probabilities=graph.pairwise_probabilities[
+                _pair_lookup(graph.pair_index, global_pairs)
+            ],
+        )
+        full_probabilities = torch.sigmoid(refined_logits).detach().cpu().tolist()
+    full_space_probabilities = {
+        row[4]: float(prob) for row, prob in zip(full_pairs, full_probabilities, strict=True)
+    }
+    # IPW subset view: this epoch's drawn pairs for the SAME subgraph. pred is read from
+    # the exact full-space decode above (the chunk pairs are a subset of the full set), so
+    # estimate and reference share one decode and differ only by sampling + reweighting.
+    subset_samples = [
+        (sample.pair_id, full_space_probabilities[sample.pair_id], 1.0 / sample.pi_total)
+        for sample in chunk.samples
+        if sample.pair_id in full_space_probabilities
+    ]
+    if not subset_samples:
+        return None
+    return compute_subset_bias_diagnostic(
+        node_size=subgraph.node_size,
+        full_space_probabilities=full_space_probabilities,
+        subset_samples=subset_samples,
+    )
+
+
+def _select_diagnostic_subgraphs(
+    *,
+    plan: TopologySubsetPlan,
+    chunk_by_id: Mapping[str, TopologySubgraphEpochChunk],
+    max_node_size: int,
+    max_subgraphs: int,
+) -> list[TopologySubgraphPlan]:
+    """Pick eligible subgraphs spread across active sizes (smallest-first within size).
+
+    Round-robins one subgraph per active size before taking a second from any size, so a
+    tight `max_subgraphs` budget still samples the size MIXTURE rather than only the
+    smallest size. `max_subgraphs == 0` means every eligible subgraph.
+    """
+    by_size: dict[int, list[TopologySubgraphPlan]] = defaultdict(list)
+    for subgraph in plan.subgraphs:
+        if subgraph.node_size <= max_node_size and subgraph.subgraph_id in chunk_by_id:
+            by_size[subgraph.node_size].append(subgraph)
+    for size in by_size:
+        by_size[size].sort(key=lambda sg: sg.subgraph_id)
+    ordered_sizes = sorted(by_size)
+    selected: list[TopologySubgraphPlan] = []
+    cap = max_subgraphs if max_subgraphs > 0 else None
+    cursor = {size: 0 for size in ordered_sizes}
+    while ordered_sizes and (cap is None or len(selected) < cap):
+        progressed = False
+        for size in ordered_sizes:
+            if cap is not None and len(selected) >= cap:
+                break
+            index = cursor[size]
+            if index < len(by_size[size]):
+                selected.append(by_size[size][index])
+                cursor[size] = index + 1
+                progressed = True
+        if not progressed:
+            break
+    return selected
+
+
+def _topology_bias_diagnostic_step(
+    *,
+    refiner: S2GAERefiner,
+    graph: _SplitGraph,
+    plan: TopologySubsetPlan,
+    chunks: Sequence[TopologySubgraphEpochChunk],
+    node_index: Mapping[str, int],
+    max_node_size: int,
+    max_subgraphs: int,
+) -> dict[str, float] | None:
+    """Aggregate IPW-vs-full-space bias across a few capped subgraphs of the size mixture.
+
+    Returns ``None`` when no eligible subgraph produced epoch samples this round (e.g.
+    every active size exceeds ``max_node_size``). Otherwise returns mean and max relative
+    error across the sampled subgraphs (so one badly-biased size cannot hide behind the
+    others), plus the subgraph count and total full/subset pair counts. No grad is taken;
+    this never touches the optimizer state.
+    """
+    if max_node_size < 2 or not chunks:
+        return None
+    chunk_by_id = {chunk.subgraph_id: chunk for chunk in chunks}
+    targets = _select_diagnostic_subgraphs(
+        plan=plan,
+        chunk_by_id=chunk_by_id,
+        max_node_size=max_node_size,
+        max_subgraphs=max_subgraphs,
+    )
+    diagnostics: list[dict[str, float]] = []
+    for subgraph in targets:
+        per_subgraph = _subgraph_bias_diagnostic(
+            refiner=refiner,
+            graph=graph,
+            subgraph=subgraph,
+            chunk=chunk_by_id[subgraph.subgraph_id],
+            node_index=node_index,
+        )
+        if per_subgraph is not None:
+            diagnostics.append(per_subgraph)
+    if not diagnostics:
+        return None
+    count = float(len(diagnostics))
+    density_errors = [diag["density_relative_error"] for diag in diagnostics]
+    degree_errors = [diag["mean_degree_relative_error"] for diag in diagnostics]
+    return {
+        "density_relative_error": sum(density_errors) / count,
+        "mean_degree_relative_error": sum(degree_errors) / count,
+        "max_density_relative_error": max(density_errors),
+        "max_mean_degree_relative_error": max(degree_errors),
+        "subgraphs": count,
+        "full_space_pairs": sum(diag["full_space_pairs"] for diag in diagnostics),
+        "subset_pairs": sum(diag["subset_pairs"] for diag in diagnostics),
+    }
+
+
 def build_s2gae_optimizer(
     *,
     model: nn.Module,
@@ -1033,6 +1184,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             optimizer.step()
             local_loss_sums += batch_sums.detach()
         topology_components: dict[str, float] | None = None
+        topology_bias_history: dict[str, float | int] = {}
         topology_scale = 0.0
         if cfg.topology_training.enabled and train_topology_graph is not None:
             assert train_topology_node_index is not None
@@ -1069,6 +1221,83 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                             topology_scale=topology_scale,
                             topology_weight=cfg.topology_training.topology_weight,
                         )
+                        diag_cfg = cfg.topology_training.subset
+                        # §9 smoke sanity check: once, on epoch 1 (the first scaled step).
+                        if (
+                            isinstance(request.train_topology_plan, TopologySubsetPlan)
+                            and epoch == 1
+                            and request.runtime.is_main_process
+                        ):
+                            smoke_diag = _topology_bias_diagnostic_step(
+                                refiner=topology_refiner,
+                                graph=train_topology_graph,
+                                plan=request.train_topology_plan,
+                                chunks=chunks,
+                                node_index=train_topology_node_index,
+                                max_node_size=diag_cfg.bias_diagnostic_max_node_size,
+                                max_subgraphs=diag_cfg.bias_diagnostic_max_subgraphs,
+                            )
+                            if smoke_diag is not None:
+                                LOGGER.info(
+                                    "tccig topology smoke sanity check (§9): "
+                                    "density_rel_err=%.4f mean_degree_rel_err=%.4f "
+                                    "subgraphs=%s full_pairs=%s subset_pairs=%s",
+                                    smoke_diag["density_relative_error"],
+                                    smoke_diag["mean_degree_relative_error"],
+                                    int(smoke_diag["subgraphs"]),
+                                    int(smoke_diag["full_space_pairs"]),
+                                    int(smoke_diag["subset_pairs"]),
+                                )
+                                topology_bias_history["topology_bias_density_rel_err"] = (
+                                    smoke_diag["density_relative_error"]
+                                )
+                                topology_bias_history["topology_bias_mean_degree_rel_err"] = (
+                                    smoke_diag["mean_degree_relative_error"]
+                                )
+
+                        # §3.7 production diagnostic: every N epochs across the size mixture.
+                        every_n = diag_cfg.bias_diagnostic_every_n_epochs
+                        if (
+                            isinstance(request.train_topology_plan, TopologySubsetPlan)
+                            and every_n > 0
+                            and epoch % every_n == 0
+                            and request.runtime.is_main_process
+                        ):
+                            prod_diag = _topology_bias_diagnostic_step(
+                                refiner=topology_refiner,
+                                graph=train_topology_graph,
+                                plan=request.train_topology_plan,
+                                chunks=chunks,
+                                node_index=train_topology_node_index,
+                                max_node_size=diag_cfg.bias_diagnostic_max_node_size,
+                                max_subgraphs=diag_cfg.bias_diagnostic_max_subgraphs,
+                            )
+                            if prod_diag is not None:
+                                LOGGER.info(
+                                    "tccig topology bias diagnostic (§3.7) epoch=%s: "
+                                    "mean_density_rel_err=%.4f mean_degree_rel_err=%.4f "
+                                    "max_density_rel_err=%.4f subgraphs=%s",
+                                    epoch,
+                                    prod_diag["density_relative_error"],
+                                    prod_diag["mean_degree_relative_error"],
+                                    prod_diag["max_density_relative_error"],
+                                    int(prod_diag["subgraphs"]),
+                                )
+                                topology_bias_history["topology_bias_density_rel_err"] = (
+                                    prod_diag["density_relative_error"]
+                                )
+                                topology_bias_history["topology_bias_mean_degree_rel_err"] = (
+                                    prod_diag["mean_degree_relative_error"]
+                                )
+                                topology_bias_history["topology_bias_max_density_rel_err"] = (
+                                    prod_diag["max_density_relative_error"]
+                                )
+
+                        if isinstance(request.train_topology_plan, TopologySubsetPlan):
+                            topology_bias_history["train_topology_subset_pairs"] = len(
+                                epoch_samples
+                            )
+                            topology_bias_history["train_topology_subset_subgraphs"] = len(chunks)
                     else:
                         topo_loss, topology_components = topology_plan_loss(
                             refiner=topology_refiner,
@@ -1176,6 +1405,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                     "train_topo_clustering_mmd": topology_components["clustering_mmd"],
                 }
             )
+        epoch_history.update(topology_bias_history)
         history.append(epoch_history)
         if request.runtime.is_main_process:
             epoch_time_s = time.perf_counter() - epoch_start

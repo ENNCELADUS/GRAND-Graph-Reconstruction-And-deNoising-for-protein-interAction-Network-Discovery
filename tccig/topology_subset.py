@@ -695,3 +695,56 @@ def group_epoch_samples_by_subgraph(
         )
         for subgraph_id, rows in sorted(grouped.items())
     }
+
+
+def relative_error(*, estimate: float, reference: float) -> float:
+    """Return bounded relative error for diagnostic logging."""
+    if reference == 0.0:
+        return 0.0 if estimate == 0.0 else 1.0
+    return abs(estimate - reference) / abs(reference)
+
+
+def compute_subset_bias_diagnostic(
+    *,
+    node_size: int,
+    full_space_probabilities: Mapping[str, float],
+    subset_samples: Sequence[tuple[str, float, float]],
+) -> dict[str, float]:
+    """Compare IPW-reweighted subset statistics against exact full-space statistics.
+
+    Shared primitive for the §9 smoke sanity check and the §3.7 production diagnostic.
+
+    - `full_space_probabilities`: every upper-triangle pair id -> predicted probability
+      over the FULL `n·(n-1)/2` pair space of one (capped) subgraph.
+    - `subset_samples`: `(pair_id, predicted_probability, weight)` for the pairs the
+      sampler actually selected, where `weight == 1 / pi_total`.
+
+    Returns per-metric relative error of the IPW subset estimate vs the exact full-space
+    value for density and mean soft-degree (both linear accumulators, so HT-unbiased).
+    """
+    if node_size < 2:
+        raise ValueError("node_size must be >= 2")
+    normalizer = float(node_size * (node_size - 1))
+    # Exact full-space statistics.
+    full_sum = sum(full_space_probabilities.values())
+    full_density = (2.0 * full_sum) / normalizer
+    # IPW subset estimates (Horvitz-Thompson) of the same linear accumulators.
+    ipw_sum = sum(prob * weight for _pair_id, prob, weight in subset_samples)
+    ipw_density = (2.0 * ipw_sum) / normalizer
+    # Mean soft degree = (2 * sum of pair probs) / num_nodes for both views.
+    full_mean_degree = (2.0 * full_sum) / float(node_size)
+    ipw_mean_degree = (2.0 * ipw_sum) / float(node_size)
+    return {
+        "density_estimate": ipw_density,
+        "density_reference": full_density,
+        "density_relative_error": relative_error(
+            estimate=ipw_density, reference=full_density
+        ),
+        "mean_degree_estimate": ipw_mean_degree,
+        "mean_degree_reference": full_mean_degree,
+        "mean_degree_relative_error": relative_error(
+            estimate=ipw_mean_degree, reference=full_mean_degree
+        ),
+        "full_space_pairs": float(len(full_space_probabilities)),
+        "subset_pairs": float(len(subset_samples)),
+    }

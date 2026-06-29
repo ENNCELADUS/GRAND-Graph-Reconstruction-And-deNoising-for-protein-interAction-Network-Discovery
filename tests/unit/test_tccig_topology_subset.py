@@ -356,3 +356,102 @@ def test_group_epoch_samples_by_subgraph_preserves_size_and_weights() -> None:
     assert chunk.node_size == 4
     assert len(chunk.samples) >= 2
     assert all(sample.pi_total > 0.0 for sample in chunk.samples)
+
+
+from tccig.topology_subset import compute_subset_bias_diagnostic, relative_error
+
+
+def test_relative_error_handles_zero_reference() -> None:
+    assert relative_error(estimate=0.0, reference=0.0) == 0.0
+    assert relative_error(estimate=1.0, reference=0.0) == 1.0
+    assert relative_error(estimate=9.0, reference=10.0) == pytest.approx(0.1)
+
+
+def test_bias_diagnostic_recovers_full_space_density_under_ipw() -> None:
+    # Full space: a 4-node subgraph, all 6 upper-triangle pairs with known probs.
+    # The IPW estimate from a pi-sampled subset must approximately recover the exact
+    # full-space density (Horvitz-Thompson unbiasedness of the linear numerator).
+    full_probs = {
+        "a||b": 0.9,
+        "a||c": 0.1,
+        "a||d": 0.7,
+        "b||c": 0.3,
+        "b||d": 0.5,
+        "c||d": 0.2,
+    }
+    # A subset that kept every pair (pi=1) must give EXACTLY the full-space stats.
+    subset = [(pair_id, prob, 1.0) for pair_id, prob in full_probs.items()]
+    diagnostic = compute_subset_bias_diagnostic(
+        node_size=4,
+        full_space_probabilities=full_probs,
+        subset_samples=subset,
+    )
+    assert diagnostic["density_relative_error"] == pytest.approx(0.0, abs=1e-9)
+    assert diagnostic["mean_degree_relative_error"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_bias_diagnostic_flags_missing_weight() -> None:
+    # If a down-sampled pair (pi=0.5) is NOT reweighted (weight forced to 1.0), the
+    # density estimate is biased low and the diagnostic must report nonzero error.
+    full_probs = {"a||b": 1.0, "a||c": 1.0, "b||c": 1.0}
+    # Keep only 2 of 3 pairs, each with pi=0.5 but WRONG weight 1.0 (bug simulation).
+    subset = [("a||b", 1.0, 1.0), ("a||c", 1.0, 1.0)]
+    diagnostic = compute_subset_bias_diagnostic(
+        node_size=3,
+        full_space_probabilities=full_probs,
+        subset_samples=subset,
+    )
+    assert diagnostic["density_relative_error"] > 0.1
+
+
+def test_select_diagnostic_subgraphs_spreads_across_size_mixture() -> None:
+    # _select_diagnostic_subgraphs lives in s2gae.py (it needs only plan/chunk metadata,
+    # no model), so a tight max_subgraphs budget must still sample the SIZE MIXTURE
+    # (round-robin one per active size first), not just the smallest size (Finding 3).
+    from tccig.s2gae import _select_diagnostic_subgraphs
+    from tccig.topology_subset import (
+        TopologySubgraphEpochChunk,
+        TopologySubgraphPlan,
+        TopologySubsetPlan,
+    )
+
+    def _plan_subgraph(size: int, index: int) -> TopologySubgraphPlan:
+        return TopologySubgraphPlan(
+            subgraph_id=f"size={size}:index={index}",
+            node_size=size,
+            nodes=tuple(f"s{size}_n{index}_{j}" for j in range(size)),
+            positives=(),
+            candidate_negatives=(),
+            hard_pool=(),
+            uniform_pool=(),
+        )
+
+    subgraphs = tuple(
+        _plan_subgraph(size, index) for size in (4, 8) for index in range(3)
+    )
+    plan = TopologySubsetPlan(
+        subgraphs=subgraphs,
+        active_sizes=(4, 8),
+        skipped_sizes={},
+        total_positive_pairs=0,
+        total_candidate_negatives=0,
+        total_pool_negatives=0,
+    )
+    # Every subgraph produced epoch samples this round.
+    chunk_by_id = {
+        sg.subgraph_id: TopologySubgraphEpochChunk(
+            subgraph_id=sg.subgraph_id, node_size=sg.node_size, samples=()
+        )
+        for sg in subgraphs
+    }
+    selected = _select_diagnostic_subgraphs(
+        plan=plan, chunk_by_id=chunk_by_id, max_node_size=40, max_subgraphs=2
+    )
+    # Budget of 2 must take one subgraph from EACH active size, not two from size 4.
+    assert {sg.node_size for sg in selected} == {4, 8}
+    # max_node_size filters out sizes above the cap.
+    capped = _select_diagnostic_subgraphs(
+        plan=plan, chunk_by_id=chunk_by_id, max_node_size=4, max_subgraphs=0
+    )
+    assert {sg.node_size for sg in capped} == {4}
+    assert len(capped) == 3  # 0 == every eligible subgraph
