@@ -588,3 +588,25 @@ def test_shard_chunks_partition_is_disjoint_and_complete() -> None:
             seen.append(global_index)
     # Disjoint and complete cover of every chunk index exactly once.
     assert sorted(seen) == list(range(len(node_sizes)))
+
+
+def test_train_refiner_accepts_subset_plan_object() -> None:
+    from tccig.s2gae import TrainRefinerRequest
+    from tccig.topology_subset import TopologySubsetPlan
+
+    request = TrainRefinerRequest(
+        train=None,  # type: ignore[arg-type]
+        validation=None,  # type: ignore[arg-type]
+        runtime=None,  # type: ignore[arg-type]
+        config={},
+        graph_rule=None,  # type: ignore[arg-type]
+        train_topology_plan=TopologySubsetPlan(
+            subgraphs=(),
+            active_sizes=(),
+            skipped_sizes={},
+            total_positive_pairs=0,
+            total_candidate_negatives=0,
+            total_pool_negatives=0,
+        ),
+    )
+    assert isinstance(request.train_topology_plan, TopologySubsetPlan)

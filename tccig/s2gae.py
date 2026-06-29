@@ -52,7 +52,13 @@ from tccig.prepare import (
     sample_epoch_edge_targets,
     write_json,
 )
-from tccig.topology_subset import TopologySubgraphEpochChunk, TopologySubsetSamplerConfig
+from tccig.topology_subset import (
+    TopologySubgraphEpochChunk,
+    TopologySubsetPlan,
+    TopologySubsetSamplerConfig,
+    group_epoch_samples_by_subgraph,
+    sample_epoch_topology_subset,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1045,18 +1051,37 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 topology_was_training = topology_refiner.training
                 topology_refiner.eval()
                 try:
-                    topo_loss, topology_components = topology_plan_loss(
-                        refiner=topology_refiner,
-                        graph=train_topology_graph,
-                        plan=cast(InternalValidationPlan, request.train_topology_plan),
-                        node_index=train_topology_node_index,
-                        weights=cfg.topology_training.weights,
-                        include_clustering_mmd=cfg.topology_validation.compute_clustering_mmd,
-                    )
+                    if isinstance(request.train_topology_plan, TopologySubsetPlan):
+                        epoch_samples = sample_epoch_topology_subset(
+                            plan=request.train_topology_plan,
+                            epoch=epoch,
+                            config=cfg.topology_training.subset,
+                        )
+                        grouped = group_epoch_samples_by_subgraph(epoch_samples)
+                        chunks = tuple(grouped[subgraph_id] for subgraph_id in sorted(grouped))
+                        topology_components = _topology_subset_backward_step(
+                            refiner=topology_refiner,
+                            graph=train_topology_graph,
+                            chunks=chunks,
+                            node_index=train_topology_node_index,
+                            weights=cfg.topology_training.weights,
+                            runtime=request.runtime,
+                            topology_scale=topology_scale,
+                            topology_weight=cfg.topology_training.topology_weight,
+                        )
+                    else:
+                        topo_loss, topology_components = topology_plan_loss(
+                            refiner=topology_refiner,
+                            graph=train_topology_graph,
+                            plan=cast(InternalValidationPlan, request.train_topology_plan),
+                            node_index=train_topology_node_index,
+                            weights=cfg.topology_training.weights,
+                            include_clustering_mmd=cfg.topology_validation.compute_clustering_mmd,
+                        )
+                        scaled = topology_scale * cfg.topology_training.topology_weight * topo_loss
+                        request.runtime.accelerator.backward(scaled)
                 finally:
                     topology_refiner.train(topology_was_training)
-                scaled = topology_scale * cfg.topology_training.topology_weight * topo_loss
-                request.runtime.accelerator.backward(scaled)
                 if cfg.optimization.gradient_clip_norm is not None:
                     request.runtime.accelerator.clip_grad_norm_(
                         train_step_model.parameters(), cfg.optimization.gradient_clip_norm
