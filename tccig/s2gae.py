@@ -2257,6 +2257,31 @@ def _config_to_json(cfg: S2GAEConfig) -> dict[str, object]:
                 "ramp_epochs": cfg.topology_training.ramp_epochs,
                 "schedule": cfg.topology_training.schedule,
             },
+            "subset": {
+                "enabled": cfg.topology_training.subset.enabled,
+                "candidate_ratio": cfg.topology_training.subset.candidate_ratio,
+                "pool_ratio": cfg.topology_training.subset.pool_ratio,
+                "epoch_ratio": cfg.topology_training.subset.epoch_ratio,
+                "hard_fraction": cfg.topology_training.subset.hard_fraction,
+                "uniform_fraction": cfg.topology_training.subset.uniform_fraction,
+                "hard_stratum_fraction": cfg.topology_training.subset.hard_stratum_fraction,
+                "seed": cfg.topology_training.subset.seed,
+                "max_subgraphs_per_size": (
+                    cfg.topology_training.subset.max_subgraphs_per_size
+                ),
+                "max_labeled_pairs_per_size": (
+                    cfg.topology_training.subset.max_labeled_pairs_per_size
+                ),
+                "bias_diagnostic_every_n_epochs": (
+                    cfg.topology_training.subset.bias_diagnostic_every_n_epochs
+                ),
+                "bias_diagnostic_max_node_size": (
+                    cfg.topology_training.subset.bias_diagnostic_max_node_size
+                ),
+                "bias_diagnostic_max_subgraphs": (
+                    cfg.topology_training.subset.bias_diagnostic_max_subgraphs
+                ),
+            },
         },
     }
 

@@ -997,3 +997,31 @@ def test_smoke_config_engages_topology_in_epoch_one() -> None:
     )
     scale_epoch_one = topology_loss_scale(epoch=0, schedule=schedule)
     assert scale_epoch_one > 0.0
+
+
+def test_config_to_json_serializes_topology_subset_fields() -> None:
+    import yaml
+    from tccig.s2gae import _config_to_json, _parse_config
+
+    raw = yaml.safe_load(
+        Path("configs/tccig/02_balanced_subset_smoke.yaml").read_text(encoding="utf-8")
+    )
+    cfg = _parse_config(raw["refiner"])
+
+    subset = _config_to_json(cfg)["topology_training"]["subset"]
+
+    assert subset == {
+        "enabled": True,
+        "candidate_ratio": 4,
+        "pool_ratio": 2,
+        "epoch_ratio": 2,
+        "hard_fraction": 0.5,
+        "uniform_fraction": 0.5,
+        "hard_stratum_fraction": 0.5,
+        "seed": 0,
+        "max_subgraphs_per_size": 0,
+        "max_labeled_pairs_per_size": 0,
+        "bias_diagnostic_every_n_epochs": 1,
+        "bias_diagnostic_max_node_size": 40,
+        "bias_diagnostic_max_subgraphs": 4,
+    }
