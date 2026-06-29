@@ -1025,3 +1025,33 @@ def test_config_to_json_serializes_topology_subset_fields() -> None:
         "bias_diagnostic_max_node_size": 40,
         "bias_diagnostic_max_subgraphs": 4,
     }
+
+
+def test_training_summary_artifact_persists_topology_subset_block(tmp_path: Path) -> None:
+    import dataclasses
+
+    import yaml
+    from tccig.s2gae import _config_to_json, _parse_config, _write_training_summary
+
+    raw = yaml.safe_load(
+        Path("configs/tccig/02_balanced_subset_smoke.yaml").read_text(encoding="utf-8")
+    )
+    cfg = _parse_config(raw["refiner"])
+    cfg = dataclasses.replace(cfg, log_dir=tmp_path)
+
+    optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.01)
+    _write_training_summary(
+        cfg=cfg,
+        best_monitor_value=0.0,
+        best_validation_auprc=0.0,
+        best_selected_rule_payload=None,
+        optimizer=optimizer,
+        history=[],
+    )
+
+    summary = json.loads((tmp_path / "training_summary.json").read_text(encoding="utf-8"))
+    # The subset block must survive into the persisted artifact, not only the in-memory
+    # _config_to_json result — _write_training_summary nests it under "config".
+    assert summary["config"]["topology_training"]["subset"] == _config_to_json(cfg)[
+        "topology_training"
+    ]["subset"]

@@ -457,6 +457,82 @@ def test_subset_cache_rejects_malformed_sample_payloads(
     ) is None
 
 
+def _mutate_local_indices_equal(payload: dict[str, object]) -> None:
+    sample = payload["subgraphs"][0]["candidate_negatives"][0]  # type: ignore[index]
+    sample.update({"local_index_b": sample["local_index_a"]})
+
+
+def _mutate_node_size_mismatch(payload: dict[str, object]) -> None:
+    payload["subgraphs"][0].update({"node_size": 3})  # type: ignore[index]
+
+
+def _mutate_endpoint_index_inconsistent(payload: dict[str, object]) -> None:
+    # Swap the endpoints without swapping the indices, breaking nodes[idx] == protein.
+    sample = payload["subgraphs"][0]["candidate_negatives"][0]  # type: ignore[index]
+    sample.update({"protein_a": sample["protein_b"], "protein_b": sample["protein_a"]})
+
+
+def _mutate_non_string_node(payload: dict[str, object]) -> None:
+    payload["subgraphs"][0]["nodes"][0] = 0  # type: ignore[index]
+
+
+def _mutate_active_sizes_shape(payload: dict[str, object]) -> None:
+    payload.update({"active_sizes": {"size": 4}})
+
+
+def _mutate_skipped_sizes_shape(payload: dict[str, object]) -> None:
+    payload.update({"skipped_sizes": []})
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        _mutate_local_indices_equal,
+        _mutate_node_size_mismatch,
+        _mutate_endpoint_index_inconsistent,
+        _mutate_non_string_node,
+        _mutate_active_sizes_shape,
+        _mutate_skipped_sizes_shape,
+    ],
+)
+def test_subset_cache_rejects_invalid_shapes_and_inconsistent_frames(
+    tmp_path: Path, mutator: object
+) -> None:
+    import networkx as nx
+    from src.topology.plan_cache import load_subset_plan_cache, write_subset_plan_cache
+    from tccig.topology_subset import (
+        TopologySubsetSamplerConfig,
+        build_topology_subset_plan,
+        subset_plan_to_payload,
+    )
+
+    graph = nx.Graph()
+    graph.add_nodes_from(["a", "b", "c", "d"])
+    graph.add_edge("a", "b")
+    cfg = TopologySubsetSamplerConfig(candidate_ratio=3, pool_ratio=2, epoch_ratio=1, seed=0)
+    plan = build_topology_subset_plan(
+        graph=graph,
+        sampled_subgraphs={4: [("a", "b", "c", "d")]},
+        config=cfg,
+        scorer_probabilities={"a||c": 0.1, "a||d": 0.2, "b||c": 0.3, "b||d": 0.4, "c||d": 0.5},
+    )
+    payload = subset_plan_to_payload(plan)
+    mutator(payload)  # type: ignore[operator]
+    metadata = {"kind": "subset", "case": "invalid_shape"}
+    write_subset_plan_cache(
+        cache_dir=tmp_path,
+        split="train_topology_subset",
+        metadata=metadata,
+        payload=payload,
+    )
+
+    assert load_subset_plan_cache(
+        cache_dir=tmp_path,
+        split="train_topology_subset",
+        metadata=metadata,
+    ) is None
+
+
 def test_subset_cache_rejects_pool_members_not_in_candidate_frame(tmp_path: Path) -> None:
     import copy  # noqa: PLC0415
 

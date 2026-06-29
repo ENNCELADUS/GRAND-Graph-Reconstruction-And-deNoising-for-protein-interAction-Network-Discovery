@@ -432,8 +432,8 @@ def _sample_identity(raw: Mapping[str, object]) -> tuple[object, ...]:
 def _validate_subset_sample_list(
     samples: list[object],
     *,
+    nodes: Sequence[str],
     node_size: int,
-    node_set: frozenset[str],
 ) -> bool:
     """Validate every sample dict in a list.
 
@@ -441,8 +441,10 @@ def _validate_subset_sample_list(
     - Each entry is a Mapping.
     - ``_sample_from_dict`` constructs without error.
     - ``TopologyPairSample.validate()`` passes (probability product, target semantics).
-    - ``local_index_a`` / ``local_index_b`` are inside ``[0, node_size)``.
-    - ``protein_a`` / ``protein_b`` appear in the subgraph node set.
+    - ``sample.node_size`` equals the owning subgraph's ``node_size``.
+    - ``local_index_a`` / ``local_index_b`` are inside ``[0, node_size)`` and distinct.
+    - ``protein_a`` / ``protein_b`` match ``nodes[local_index_a]`` / ``nodes[local_index_b]``
+      exactly (endpoint/index consistency), which also enforces node membership.
     """
     from tccig.topology_subset import _sample_from_dict
 
@@ -454,13 +456,17 @@ def _validate_subset_sample_list(
             sample.validate()
         except (KeyError, TypeError, ValueError):
             return False
+        if sample.node_size != node_size:
+            return False
         if not (0 <= sample.local_index_a < node_size):
             return False
         if not (0 <= sample.local_index_b < node_size):
             return False
-        if sample.protein_a not in node_set:
+        if sample.local_index_a == sample.local_index_b:
             return False
-        if sample.protein_b not in node_set:
+        if sample.protein_a != nodes[sample.local_index_a]:
+            return False
+        if sample.protein_b != nodes[sample.local_index_b]:
             return False
     return True
 
@@ -491,14 +497,23 @@ def _subset_payload_is_rehydratable(payload: Mapping[str, object]) -> bool:
     if not isinstance(raw_subgraphs, list):
         return False
     for key in (
-        "active_sizes",
-        "skipped_sizes",
         "total_positive_pairs",
         "total_candidate_negatives",
         "total_pool_negatives",
     ):
         if key not in payload:
             return False
+    # active_sizes / skipped_sizes must have the exact shapes payload_to_subset_plan
+    # iterates (a sequence of ints and a {size: reason} mapping); otherwise rehydration
+    # raises AttributeError/TypeError after this validator falsely approves the payload.
+    active_sizes = payload.get("active_sizes")
+    if not isinstance(active_sizes, list) or not all(
+        isinstance(size, int) for size in active_sizes
+    ):
+        return False
+    skipped_sizes = payload.get("skipped_sizes")
+    if not isinstance(skipped_sizes, Mapping):
+        return False
 
     total_positives = 0
     total_candidates = 0
@@ -515,12 +530,14 @@ def _subset_payload_is_rehydratable(payload: Mapping[str, object]) -> bool:
         nodes_raw = subgraph.get("nodes")
         if not isinstance(nodes_raw, list):
             return False
-        # nodes must be unique strings and node_size must match
-        nodes = [str(n) for n in nodes_raw]
+        # nodes must already be unique strings (no coercion) and node_size must match,
+        # so endpoint/index consistency below compares against the real stored ids.
+        if not all(isinstance(node, str) for node in nodes_raw):
+            return False
+        nodes: list[str] = list(nodes_raw)
         if len(nodes) != node_size:
             return False
-        node_set = frozenset(nodes)
-        if len(node_set) != node_size:
+        if len(set(nodes)) != node_size:
             return False
 
         for key in required_lists:
@@ -535,7 +552,7 @@ def _subset_payload_is_rehydratable(payload: Mapping[str, object]) -> bool:
         # Validate every sample in each list
         for sample_list in (positives, candidates, hard_pool, uniform_pool):
             if not _validate_subset_sample_list(
-                sample_list, node_size=node_size, node_set=node_set
+                sample_list, nodes=nodes, node_size=node_size
             ):
                 return False
 

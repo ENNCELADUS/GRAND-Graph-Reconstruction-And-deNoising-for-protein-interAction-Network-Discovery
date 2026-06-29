@@ -529,49 +529,84 @@ def test_diagnostic_full_space_scoring_pairs_are_unique_and_ordered() -> None:
 
 
 def test_three_stage_negative_inclusion_frequency_matches_pi_total() -> None:
+    # 6-node subgraph with 2 edges -> 2 positives, 13 negatives. The chosen ratios force
+    # genuine subsampling at ALL THREE stages (pi_cand=6/13, pi_pool_given_cand=2/3,
+    # pi_epoch_given_pool=1/2), so the emitted pi_total exercises the full product rather
+    # than only the candidate stage.
     graph = nx.Graph()
-    graph.add_nodes_from(["a", "b", "c", "d", "e"])
+    graph.add_nodes_from(["a", "b", "c", "d", "e", "f"])
     graph.add_edges_from([("a", "b"), ("b", "c")])
-    nodes = ("a", "b", "c", "d", "e")
+    nodes = ("a", "b", "c", "d", "e", "f")
+    scorer_probabilities = {
+        "a||c": 0.95,
+        "a||d": 0.88,
+        "a||e": 0.81,
+        "a||f": 0.74,
+        "b||d": 0.67,
+        "b||e": 0.60,
+        "b||f": 0.53,
+        "c||d": 0.46,
+        "c||e": 0.39,
+        "c||f": 0.32,
+        "d||e": 0.25,
+        "d||f": 0.18,
+        "e||f": 0.11,
+    }
+    negatives = sorted(scorer_probabilities)
     cfg_template = {
-        "candidate_ratio": 2,
-        "pool_ratio": 1,
+        "candidate_ratio": 3,
+        "pool_ratio": 2,
         "epoch_ratio": 1,
         "hard_fraction": 0.5,
         "uniform_fraction": 0.5,
         "hard_stratum_fraction": 0.5,
     }
-    exposures: dict[str, float] = defaultdict(float)
-    draws: dict[str, int] = defaultdict(int)
+    per_pair_ipw: dict[str, float] = defaultdict(float)
+    ht_total_per_trial: list[float] = []
+    stages_subsampled = {"cand": False, "pool": False, "epoch": False}
     trials = 0
-    for plan_seed in range(300):
+    # Rebuild the candidate AND pool stages across many plan seeds (not just epochs on one
+    # fixed plan), then sample a few epochs within each plan, so all three stages are random.
+    for plan_seed in range(4000):
         cfg = TopologySubsetSamplerConfig(seed=plan_seed, **cfg_template)
         plan = build_topology_subset_plan(
             graph=graph,
-            sampled_subgraphs={5: [nodes]},
+            sampled_subgraphs={6: [nodes]},
             config=cfg,
-            scorer_probabilities={
-                "a||c": 0.9,
-                "a||d": 0.2,
-                "a||e": 0.1,
-                "b||d": 0.8,
-                "b||e": 0.3,
-                "c||d": 0.7,
-                "c||e": 0.4,
-                "d||e": 0.6,
-            },
+            scorer_probabilities=scorer_probabilities,
         )
-        for epoch in range(20):
+        for epoch in range(2):
             trials += 1
             sampled = sample_epoch_topology_subset(plan=plan, epoch=epoch, config=cfg)
-            for subgraph in plan.subgraphs:
-                for candidate in subgraph.candidate_negatives:
-                    exposures[candidate.pair_id] += candidate.pi_total
+            ht = 0.0
             for sample in sampled:
-                if sample.target == 0.0:
-                    draws[sample.pair_id] += 1
-                else:
+                if sample.target == 1.0:
                     assert sample.pi_total == 1.0
-    observed_total = sum(draws.values()) / float(trials)
-    expected_total = sum(exposures.values()) / float(trials)
-    assert observed_total == pytest.approx(expected_total, rel=0.02)
+                    continue
+                # pi_total must be the exact three-stage product: dropping the pool or epoch
+                # stage would leave pi_total == pi_cand and fail this equality.
+                assert sample.pi_total == pytest.approx(
+                    sample.pi_cand * sample.pi_pool_given_cand * sample.pi_epoch_given_pool
+                )
+                if sample.pi_cand < 1.0:
+                    stages_subsampled["cand"] = True
+                if sample.pi_pool_given_cand < 1.0:
+                    stages_subsampled["pool"] = True
+                if sample.pi_epoch_given_pool < 1.0:
+                    stages_subsampled["epoch"] = True
+                weight = 1.0 / sample.pi_total
+                ht += weight
+                per_pair_ipw[sample.pair_id] += weight
+            ht_total_per_trial.append(ht)
+    # The fixture must genuinely exercise every stage, else the inclusion check is vacuous.
+    assert stages_subsampled == {"cand": True, "pool": True, "epoch": True}
+    # Aggregate Horvitz-Thompson identity: E[sum of 1/pi_total over drawn negatives] equals
+    # the number of negative pairs, since each pair p contributes 1/pi_total(p) when included.
+    mean_total = sum(ht_total_per_trial) / float(trials)
+    assert mean_total == pytest.approx(len(negatives), rel=0.02)
+    # Per-pair Horvitz-Thompson identity: each negative's inverse-probability estimator
+    # averages to one inclusion per trial. A wrong per-pair inclusion distribution (e.g. a
+    # stage applied to the wrong pairs) shifts an individual pair off 1.0 even when the
+    # aggregate total still matches, which the collapsed total-count check could not catch.
+    for pair_id in negatives:
+        assert per_pair_ipw[pair_id] / float(trials) == pytest.approx(1.0, abs=0.1)
