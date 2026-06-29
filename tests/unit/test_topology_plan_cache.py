@@ -274,7 +274,6 @@ def test_load_accepts_valid_payload(tmp_path: Path) -> None:
 
 def test_subset_plan_metadata_changes_with_sampler_parameters() -> None:
     import networkx as nx
-
     from src.topology.plan_cache import subset_plan_payload_metadata
 
     graph = nx.Graph()
@@ -326,7 +325,6 @@ def test_subset_plan_metadata_embeds_scorer_identity() -> None:
     # silently reused after the frozen scorer changes. The cache key MUST carry the
     # same scorer-identity block that score_cache_metadata uses.
     import networkx as nx
-
     from src.topology.plan_cache import subset_plan_payload_metadata
 
     graph = nx.Graph()
@@ -358,7 +356,6 @@ def test_subset_plan_metadata_embeds_scorer_identity() -> None:
 
 def test_subset_cache_round_trips_and_rejects_full_plan_payload(tmp_path) -> None:
     import networkx as nx
-
     from src.topology.plan_cache import (
         load_plan_cache,
         load_subset_plan_cache,
@@ -389,4 +386,112 @@ def test_subset_cache_round_trips_and_rejects_full_plan_payload(tmp_path) -> Non
     ) is not None
     assert load_plan_cache(
         cache_dir=tmp_path, split="train_topology_subset", metadata=metadata
+    ) is None
+
+
+def _mutate_pi_total(payload: dict[str, object]) -> None:
+    payload["subgraphs"][0]["candidate_negatives"][0].update({"pi_total": 0.99})  # type: ignore[index]
+
+
+def _mutate_target(payload: dict[str, object]) -> None:
+    payload["subgraphs"][0]["positives"][0].update({"target": 0.0})  # type: ignore[index]
+
+
+def _mutate_local_index_a(payload: dict[str, object]) -> None:
+    payload["subgraphs"][0]["candidate_negatives"][0].update({"local_index_a": 99})  # type: ignore[index]
+
+
+def _mutate_protein_a(payload: dict[str, object]) -> None:
+    payload["subgraphs"][0]["candidate_negatives"][0].update({"protein_a": "missing"})  # type: ignore[index]
+
+
+def _mutate_total_candidate_negatives(payload: dict[str, object]) -> None:
+    payload.update({"total_candidate_negatives": 999})
+
+
+@pytest.mark.parametrize(
+    "mutator",
+    [
+        _mutate_pi_total,
+        _mutate_target,
+        _mutate_local_index_a,
+        _mutate_protein_a,
+        _mutate_total_candidate_negatives,
+    ],
+)
+def test_subset_cache_rejects_malformed_sample_payloads(
+    tmp_path: Path, mutator: object
+) -> None:
+    import networkx as nx
+    from src.topology.plan_cache import load_subset_plan_cache, write_subset_plan_cache
+    from tccig.topology_subset import (
+        TopologySubsetSamplerConfig,
+        build_topology_subset_plan,
+        subset_plan_to_payload,
+    )
+
+    graph = nx.Graph()
+    graph.add_nodes_from(["a", "b", "c", "d"])
+    graph.add_edge("a", "b")
+    cfg = TopologySubsetSamplerConfig(candidate_ratio=3, pool_ratio=2, epoch_ratio=1, seed=0)
+    plan = build_topology_subset_plan(
+        graph=graph,
+        sampled_subgraphs={4: [("a", "b", "c", "d")]},
+        config=cfg,
+        scorer_probabilities={"a||c": 0.1, "a||d": 0.2, "b||c": 0.3, "b||d": 0.4, "c||d": 0.5},
+    )
+    payload = subset_plan_to_payload(plan)
+    mutator(payload)
+    metadata = {"kind": "subset", "case": "malformed"}
+    write_subset_plan_cache(
+        cache_dir=tmp_path,
+        split="train_topology_subset",
+        metadata=metadata,
+        payload=payload,
+    )
+
+    assert load_subset_plan_cache(
+        cache_dir=tmp_path,
+        split="train_topology_subset",
+        metadata=metadata,
+    ) is None
+
+
+def test_subset_cache_rejects_pool_members_not_in_candidate_frame(tmp_path: Path) -> None:
+    import copy  # noqa: PLC0415
+
+    import networkx as nx
+    from src.topology.plan_cache import load_subset_plan_cache, write_subset_plan_cache
+    from tccig.topology_subset import (
+        TopologySubsetSamplerConfig,
+        build_topology_subset_plan,
+        subset_plan_to_payload,
+    )
+
+    graph = nx.Graph()
+    graph.add_nodes_from(["a", "b", "c", "d"])
+    graph.add_edge("a", "b")
+    cfg = TopologySubsetSamplerConfig(candidate_ratio=3, pool_ratio=2, epoch_ratio=1, seed=0)
+    plan = build_topology_subset_plan(
+        graph=graph,
+        sampled_subgraphs={4: [("a", "b", "c", "d")]},
+        config=cfg,
+        scorer_probabilities={"a||c": 0.1, "a||d": 0.2, "b||c": 0.3, "b||d": 0.4, "c||d": 0.5},
+    )
+    payload = subset_plan_to_payload(plan)
+    alien = copy.deepcopy(payload["subgraphs"][0]["candidate_negatives"][0])
+    alien.update({"pair_id": "x||y", "protein_a": "x", "protein_b": "y"})
+    payload["subgraphs"][0]["uniform_pool"] = [alien]
+    metadata = {"kind": "subset", "case": "alien_pool"}
+    write_subset_plan_cache(
+        cache_dir=tmp_path,
+        split="train_topology_subset",
+        metadata=metadata,
+        payload=payload,
+    )
+
+    assert load_subset_plan_cache(
+        cache_dir=tmp_path,
+        split="train_topology_subset",
+        metadata=metadata,
     ) is None

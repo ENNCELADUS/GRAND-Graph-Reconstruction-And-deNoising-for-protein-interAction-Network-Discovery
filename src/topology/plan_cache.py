@@ -412,15 +412,74 @@ def write_plan_cache(
     write_json(_manifest_path(cache_dir, split), dict(metadata))
 
 
-def _subset_payload_is_rehydratable(payload: Mapping[str, object]) -> bool:
-    """Cheap schema check for a serialized TopologySubsetPlan payload.
+def _sample_identity(raw: Mapping[str, object]) -> tuple[object, ...]:
+    """Return the identity tuple used for pool membership checks.
 
-    Distinct from ``_payload_is_rehydratable`` (full-plan only): validates the subset
-    payload kind/version and that every subgraph carries the four sample lists, so a
-    full-plan payload or a stale subset schema is rejected instead of KeyError-ing in
-    ``payload_to_subset_plan``. The accepted version is owned by the module that
-    *writes* the payload (``tccig.topology_subset``), imported here so there is a single
-    source of truth -- not a second constant that can drift out of sync.
+    Pool membership is checked by identity tuple only — NOT full dataclass equality,
+    because ``stratum`` and the ``pi_*`` fields intentionally differ between a pool
+    entry and its candidate-frame origin.
+    """
+    return (
+        raw.get("pair_id"),
+        raw.get("subgraph_id"),
+        raw.get("local_index_a"),
+        raw.get("local_index_b"),
+        raw.get("protein_a"),
+        raw.get("protein_b"),
+    )
+
+
+def _validate_subset_sample_list(
+    samples: list[object],
+    *,
+    node_size: int,
+    node_set: frozenset[str],
+) -> bool:
+    """Validate every sample dict in a list.
+
+    Checks:
+    - Each entry is a Mapping.
+    - ``_sample_from_dict`` constructs without error.
+    - ``TopologyPairSample.validate()`` passes (probability product, target semantics).
+    - ``local_index_a`` / ``local_index_b`` are inside ``[0, node_size)``.
+    - ``protein_a`` / ``protein_b`` appear in the subgraph node set.
+    """
+    from tccig.topology_subset import _sample_from_dict
+
+    for raw in samples:
+        if not isinstance(raw, Mapping):
+            return False
+        try:
+            sample = _sample_from_dict(raw)
+            sample.validate()
+        except (KeyError, TypeError, ValueError):
+            return False
+        if not (0 <= sample.local_index_a < node_size):
+            return False
+        if not (0 <= sample.local_index_b < node_size):
+            return False
+        if sample.protein_a not in node_set:
+            return False
+        if sample.protein_b not in node_set:
+            return False
+    return True
+
+
+def _subset_payload_is_rehydratable(payload: Mapping[str, object]) -> bool:
+    """Deep validation for a serialized TopologySubsetPlan payload.
+
+    Distinct from ``_payload_is_rehydratable`` (full-plan only).  Validates:
+
+    - ``payload_kind`` / ``subset_payload_version`` match the writer's constant.
+    - Every subgraph carries the four sample lists with valid ``TopologyPairSample``
+      entries (probability products, target semantics, index bounds, node membership).
+    - ``node_size == len(nodes)`` and nodes are unique strings.
+    - ``total_positive_pairs``, ``total_candidate_negatives``, and
+      ``total_pool_negatives`` match the recomputed counts.
+    - Every hard/uniform pool identity tuple exists in ``candidate_negatives``.
+
+    On any violation returns ``False`` so the caller logs a warning and returns ``None``
+    instead of raising.
     """
     from tccig.topology_subset import SUBSET_PAYLOAD_VERSION as _WRITER_VERSION
 
@@ -431,17 +490,6 @@ def _subset_payload_is_rehydratable(payload: Mapping[str, object]) -> bool:
     raw_subgraphs = payload.get("subgraphs")
     if not isinstance(raw_subgraphs, list):
         return False
-    required_lists = ("positives", "candidate_negatives", "hard_pool", "uniform_pool")
-    for subgraph in raw_subgraphs:
-        if not isinstance(subgraph, Mapping):
-            return False
-        if not isinstance(subgraph.get("node_size"), int):
-            return False
-        if not isinstance(subgraph.get("nodes"), list):
-            return False
-        for key in required_lists:
-            if not isinstance(subgraph.get(key), list):
-                return False
     for key in (
         "active_sizes",
         "skipped_sizes",
@@ -451,7 +499,69 @@ def _subset_payload_is_rehydratable(payload: Mapping[str, object]) -> bool:
     ):
         if key not in payload:
             return False
-    return True
+
+    total_positives = 0
+    total_candidates = 0
+    total_pool = 0
+
+    required_lists = ("positives", "candidate_negatives", "hard_pool", "uniform_pool")
+    for subgraph in raw_subgraphs:
+        if not isinstance(subgraph, Mapping):
+            return False
+
+        node_size = subgraph.get("node_size")
+        if not isinstance(node_size, int):
+            return False
+        nodes_raw = subgraph.get("nodes")
+        if not isinstance(nodes_raw, list):
+            return False
+        # nodes must be unique strings and node_size must match
+        nodes = [str(n) for n in nodes_raw]
+        if len(nodes) != node_size:
+            return False
+        node_set = frozenset(nodes)
+        if len(node_set) != node_size:
+            return False
+
+        for key in required_lists:
+            if not isinstance(subgraph.get(key), list):
+                return False
+
+        positives: list[object] = subgraph["positives"]  # type: ignore[assignment]
+        candidates: list[object] = subgraph["candidate_negatives"]  # type: ignore[assignment]
+        hard_pool: list[object] = subgraph["hard_pool"]  # type: ignore[assignment]
+        uniform_pool: list[object] = subgraph["uniform_pool"]  # type: ignore[assignment]
+
+        # Validate every sample in each list
+        for sample_list in (positives, candidates, hard_pool, uniform_pool):
+            if not _validate_subset_sample_list(
+                sample_list, node_size=node_size, node_set=node_set
+            ):
+                return False
+
+        # Pool membership: every hard/uniform pool identity must exist in candidates
+        candidate_identities: set[tuple[object, ...]] = {
+            _sample_identity(raw)  # type: ignore[arg-type]
+            for raw in candidates
+            if isinstance(raw, Mapping)
+        }
+        for pool_list in (hard_pool, uniform_pool):
+            for raw in pool_list:
+                if not isinstance(raw, Mapping):
+                    return False
+                if _sample_identity(raw) not in candidate_identities:  # type: ignore[arg-type]
+                    return False
+
+        total_positives += len(positives)
+        total_candidates += len(candidates)
+        total_pool += len(hard_pool) + len(uniform_pool)
+
+    # Validate aggregate counts match
+    if payload.get("total_positive_pairs") != total_positives:
+        return False
+    if payload.get("total_candidate_negatives") != total_candidates:
+        return False
+    return payload.get("total_pool_negatives") == total_pool
 
 
 def load_subset_plan_cache(
