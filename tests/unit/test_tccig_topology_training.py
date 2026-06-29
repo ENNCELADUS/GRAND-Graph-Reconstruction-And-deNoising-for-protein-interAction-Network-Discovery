@@ -635,3 +635,49 @@ def test_score_progress_pointer_fires_when_batch_overshoots_milestone() -> None:
             pointer += 1
     # Every milestone fires once, in order, despite none equalling a `processed` value.
     assert fired == [250, 500, 750, 1000]
+
+
+def test_balanced_subset_configs_parse() -> None:
+    import yaml
+    from pathlib import Path
+    from tccig.s2gae import _parse_config
+
+    for path in (
+        Path("configs/tccig/02_balanced_subset.yaml"),
+        Path("configs/tccig/02_balanced_subset_smoke.yaml"),
+    ):
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+        cfg = _parse_config(config["refiner"])
+        assert cfg.topology_training.subset.enabled is True
+        # Review Finding 11: clustering stays ON in validation/test metrics (spec §2
+        # non-goal). The subset TRAINING path keeps clustering off independently
+        # (Task 8 hardcodes include_clustering_mmd=False in the chunk loss).
+        assert cfg.topology_validation.compute_clustering_mmd is True
+
+
+def test_smoke_config_engages_topology_in_epoch_one() -> None:
+    # Review Finding 3: the smoke config must reach a POSITIVE topology scale in
+    # epoch 1, otherwise the smoke run silently exercises none of the new path.
+    # train_refiner calls topology_loss_scale(epoch=epoch-1, ...), so epoch 1 uses
+    # index 0. With warmup_epochs=0 and ramp_epochs=0 the scale must be > 0 there.
+    import yaml
+    from pathlib import Path
+    from tccig.s2gae import _parse_config
+    from src.topology.finetune_losses import (
+        TopologyLossWeightSchedule,
+        topology_loss_scale,
+    )
+
+    config = yaml.safe_load(
+        Path("configs/tccig/02_balanced_subset_smoke.yaml").read_text(encoding="utf-8")
+    )
+    cfg = _parse_config(config["refiner"])
+    # train_refiner builds the schedule from the three flat training-config fields
+    # (see tccig/s2gae.py: TopologyLossWeightSchedule(...)). Mirror that here.
+    schedule = TopologyLossWeightSchedule(
+        warmup_epochs=cfg.topology_training.warmup_epochs,
+        ramp_epochs=cfg.topology_training.ramp_epochs,
+        schedule=cfg.topology_training.schedule,
+    )
+    scale_epoch_one = topology_loss_scale(epoch=0, schedule=schedule)
+    assert scale_epoch_one > 0.0
