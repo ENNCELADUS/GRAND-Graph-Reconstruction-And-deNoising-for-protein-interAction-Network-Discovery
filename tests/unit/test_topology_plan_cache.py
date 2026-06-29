@@ -484,6 +484,14 @@ def _mutate_skipped_sizes_shape(payload: dict[str, object]) -> None:
     payload.update({"skipped_sizes": []})
 
 
+def _mutate_overflowing_local_index(payload: dict[str, object]) -> None:
+    # JSON like ``1e9999`` parses to float('inf'); int(inf) raises OverflowError, which
+    # _sample_from_dict does not catch. Stored as Infinity, json.loads reads it back to inf.
+    payload["subgraphs"][0]["candidate_negatives"][0].update(  # type: ignore[index]
+        {"local_index_a": float("inf")}
+    )
+
+
 @pytest.mark.parametrize(
     "mutator",
     [
@@ -493,6 +501,7 @@ def _mutate_skipped_sizes_shape(payload: dict[str, object]) -> None:
         _mutate_non_string_node,
         _mutate_active_sizes_shape,
         _mutate_skipped_sizes_shape,
+        _mutate_overflowing_local_index,
     ],
 )
 def test_subset_cache_rejects_invalid_shapes_and_inconsistent_frames(

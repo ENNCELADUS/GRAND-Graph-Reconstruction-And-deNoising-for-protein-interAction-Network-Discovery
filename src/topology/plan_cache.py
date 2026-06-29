@@ -454,7 +454,9 @@ def _validate_subset_sample_list(
         try:
             sample = _sample_from_dict(raw)
             sample.validate()
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):
+            # OverflowError: JSON ``Infinity``/``1e9999`` parses to float inf, which
+            # raises when _sample_from_dict coerces an index via int(inf).
             return False
         if sample.node_size != node_size:
             return False

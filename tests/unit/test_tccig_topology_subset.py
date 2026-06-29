@@ -588,6 +588,16 @@ def test_three_stage_negative_inclusion_frequency_matches_pi_total() -> None:
                 assert sample.pi_total == pytest.approx(
                     sample.pi_cand * sample.pi_pool_given_cand * sample.pi_epoch_given_pool
                 )
+                # Pin each stage exactly. The fixture is deterministic across every seed:
+                #   pi_cand            = candidate_count / negatives = 6 / 13
+                #   pi_pool_given_cand = pool draws / stratum frame  = 2 / 3 (hard and uniform)
+                #   pi_epoch_given_pool = epoch draws / pool size    = 1 / 2 (hard and uniform)
+                # A bug that preserves the product while mis-assigning an individual stage
+                # (e.g. pi_cand and pi_epoch swapped) passes the product equality above but
+                # fails these exact checks.
+                assert sample.pi_cand == pytest.approx(6.0 / 13.0)
+                assert sample.pi_pool_given_cand == pytest.approx(2.0 / 3.0)
+                assert sample.pi_epoch_given_pool == pytest.approx(1.0 / 2.0)
                 if sample.pi_cand < 1.0:
                     stages_subsampled["cand"] = True
                 if sample.pi_pool_given_cand < 1.0:
