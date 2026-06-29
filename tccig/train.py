@@ -377,6 +377,17 @@ def main(argv: Sequence[str] | None = None) -> None:
     run_tccig_pipeline(_load_yaml_config(Path(args.config)))
 
 
+def _score_progress_events(*, total_pairs: int, interval_pairs: int) -> list[int]:
+    """Return pair-count milestones for score progress logging."""
+    if total_pairs <= 0:
+        return []
+    if interval_pairs <= 0:
+        raise ValueError("interval_pairs must be positive")
+    events = list(range(interval_pairs, total_pairs, interval_pairs))
+    events.append(total_pairs)
+    return events
+
+
 def _score_split(
     *,
     split: str,
@@ -391,7 +402,36 @@ def _score_split(
         if cached is not None:
             return cached
 
-    probabilities = score_pairs_with_v3_1(pairs=pairs, config=scorer_cfg, runtime=runtime)
+    LOGGER.info("tccig scoring split=%s pair_count=%s cache=miss", split, len(pairs))
+    milestones = _score_progress_events(total_pairs=len(pairs), interval_pairs=250_000)
+    # Mutable pointer into `milestones`; closure advances it as `processed` crosses each.
+    next_milestone_index = 0
+
+    def _progress(payload: Mapping[str, object]) -> None:
+        nonlocal next_milestone_index
+        if not runtime.is_main_process:
+            return
+        processed = int(payload["processed_pairs"])
+        # Drain every milestone this step crossed (a single batch may pass several),
+        # using >= so a milestone is never skipped when `processed` overshoots it.
+        while (
+            next_milestone_index < len(milestones)
+            and processed >= milestones[next_milestone_index]
+        ):
+            LOGGER.info(
+                "tccig scoring progress split=%s processed_local=%s total_local=%s",
+                split,
+                processed,
+                len(pairs),
+            )
+            next_milestone_index += 1
+
+    probabilities = score_pairs_with_v3_1(
+        pairs=pairs,
+        config=scorer_cfg,
+        runtime=runtime,
+        progress_callback=_progress,
+    )
     if _score_cache_enabled(scorer_cfg) and runtime.is_main_process:
         _write_score_cache(
             cache_dir=cache_dir,

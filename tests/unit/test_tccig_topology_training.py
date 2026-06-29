@@ -610,3 +610,28 @@ def test_train_refiner_accepts_subset_plan_object() -> None:
         ),
     )
     assert isinstance(request.train_topology_plan, TopologySubsetPlan)
+
+
+def test_score_progress_interval_emits_periodic_events() -> None:
+    from tccig.train import _score_progress_events
+
+    events = list(_score_progress_events(total_pairs=1000, interval_pairs=250))
+    assert events == [250, 500, 750, 1000]
+
+
+def test_score_progress_pointer_fires_when_batch_overshoots_milestone() -> None:
+    # Finding 6: `processed` advances by batch size and lands BETWEEN milestones, so an
+    # exact `processed in milestones` test would never fire. Replicate the closure's
+    # advancing-pointer logic and assert every crossed milestone is drained exactly once.
+    from tccig.train import _score_progress_events
+
+    milestones = _score_progress_events(total_pairs=1000, interval_pairs=250)
+    fired: list[int] = []
+    pointer = 0
+    # Batches overshoot 250 (->300), 500/750 in one jump (->760), then finish (->1000).
+    for processed in (300, 760, 1000):
+        while pointer < len(milestones) and processed >= milestones[pointer]:
+            fired.append(milestones[pointer])
+            pointer += 1
+    # Every milestone fires once, in order, despite none equalling a `processed` value.
+    assert fired == [250, 500, 750, 1000]
