@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import random
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from math import isclose
+from typing import TypeVar
+
+import networkx as nx
+
+T = TypeVar("T")
 
 
 class SamplingStratum(StrEnum):
@@ -148,3 +156,276 @@ def active_node_sizes(
     if not active:
         raise ValueError("topology subset sampling has no active node sizes")
     return tuple(active), skipped
+
+
+@dataclass(frozen=True)
+class TopologySubgraphPlan:
+    """Bounded candidate and pool plan for one sampled subgraph."""
+
+    subgraph_id: str
+    node_size: int
+    nodes: tuple[str, ...]
+    positives: tuple[TopologyPairSample, ...]
+    candidate_negatives: tuple[TopologyPairSample, ...]
+    hard_pool: tuple[TopologyPairSample, ...]
+    uniform_pool: tuple[TopologyPairSample, ...]
+
+
+@dataclass(frozen=True)
+class TopologySubsetPlan:
+    """All subgraph subset-sampling metadata for train topology."""
+
+    subgraphs: tuple[TopologySubgraphPlan, ...]
+    active_sizes: tuple[int, ...]
+    skipped_sizes: Mapping[int, str]
+    total_positive_pairs: int
+    total_candidate_negatives: int
+    total_pool_negatives: int
+
+
+def _all_local_pairs(nodes: tuple[str, ...]) -> list[tuple[int, int, str, str, str]]:
+    pairs: list[tuple[int, int, str, str, str]] = []
+    for index_a, protein_a in enumerate(nodes):
+        for index_b in range(index_a + 1, len(nodes)):
+            protein_b = nodes[index_b]
+            pairs.append(
+                (index_a, index_b, protein_a, protein_b, canonical_pair_id(protein_a, protein_b))
+            )
+    return pairs
+
+
+def _draw_without_replacement(items: Sequence[T], *, count: int, rng: random.Random) -> list[T]:
+    if count >= len(items):
+        return list(items)
+    return rng.sample(list(items), count)
+
+
+def _replace_sample_probability(
+    sample: TopologyPairSample,
+    *,
+    stratum: SamplingStratum,
+    pi_pool_given_cand: float,
+    pi_epoch_given_pool: float,
+) -> TopologyPairSample:
+    pi_total = sample.pi_cand * pi_pool_given_cand * pi_epoch_given_pool
+    return TopologyPairSample(
+        pair_id=sample.pair_id,
+        subgraph_id=sample.subgraph_id,
+        node_size=sample.node_size,
+        protein_a=sample.protein_a,
+        protein_b=sample.protein_b,
+        local_index_a=sample.local_index_a,
+        local_index_b=sample.local_index_b,
+        stratum=stratum,
+        pi_cand=sample.pi_cand,
+        pi_pool_given_cand=pi_pool_given_cand,
+        pi_epoch_given_pool=pi_epoch_given_pool,
+        pi_total=pi_total,
+        target=sample.target,
+        scorer_probability=sample.scorer_probability,
+    )
+
+
+def build_topology_subset_plan(
+    *,
+    graph: nx.Graph,
+    sampled_subgraphs: Mapping[int, Sequence[tuple[str, ...]]],
+    config: TopologySubsetSamplerConfig,
+    scorer_probabilities: Mapping[str, float],
+) -> TopologySubsetPlan:
+    """Build a bounded candidate/pool topology subset plan."""
+    config.validate()
+    rng = random.Random(config.seed)
+    sampled_subgraphs = {
+        int(size): [tuple(nodes) for nodes in subsets]
+        for size, subsets in sampled_subgraphs.items()
+    }
+    remaining_labeled_budget: dict[int, int] = {
+        int(size): config.max_labeled_pairs_per_size for size in sampled_subgraphs
+    }
+    subgraphs: list[TopologySubgraphPlan] = []
+    subgraph_budget_by_size = {
+        int(size): len(subsets) for size, subsets in sampled_subgraphs.items()
+    }
+    labeled_budget_by_size: dict[int, int] = defaultdict(int)
+    for size, subsets in sampled_subgraphs.items():
+        for nodes in subsets:
+            labeled_budget_by_size[int(size)] += len(_all_local_pairs(tuple(nodes)))
+    active_sizes, skipped = active_node_sizes(
+        node_sizes=tuple(sorted(int(size) for size in sampled_subgraphs)),
+        graph_node_count=graph.number_of_nodes(),
+        subgraphs_per_size=subgraph_budget_by_size,
+        labeled_pairs_per_size=dict(labeled_budget_by_size),
+    )
+    for node_size in active_sizes:
+        for subgraph_index, raw_nodes in enumerate(sampled_subgraphs[node_size]):
+            nodes = tuple(sorted(raw_nodes))
+            subgraph_id = f"size={node_size}:index={subgraph_index}"
+            positives: list[TopologyPairSample] = []
+            negatives: list[tuple[int, int, str, str, str]] = []
+            for index_a, index_b, protein_a, protein_b, pair_id in _all_local_pairs(nodes):
+                if graph.has_edge(protein_a, protein_b):
+                    positives.append(
+                        TopologyPairSample(
+                            pair_id=pair_id,
+                            subgraph_id=subgraph_id,
+                            node_size=node_size,
+                            protein_a=protein_a,
+                            protein_b=protein_b,
+                            local_index_a=index_a,
+                            local_index_b=index_b,
+                            stratum=SamplingStratum.POSITIVE,
+                            pi_cand=1.0,
+                            pi_pool_given_cand=1.0,
+                            pi_epoch_given_pool=1.0,
+                            pi_total=1.0,
+                            target=1.0,
+                            scorer_probability=float(scorer_probabilities.get(pair_id, 1.0)),
+                        )
+                    )
+                else:
+                    negatives.append((index_a, index_b, protein_a, protein_b, pair_id))
+            candidate_count = min(
+                len(negatives), max(1, config.candidate_ratio * max(1, len(positives)))
+            )
+            if config.max_labeled_pairs_per_size > 0:
+                remaining_labeled_budget[node_size] -= len(positives)
+                size_cap = max(0, remaining_labeled_budget[node_size])
+                candidate_count = min(candidate_count, size_cap)
+                remaining_labeled_budget[node_size] = size_cap - candidate_count
+            candidate_rows = _draw_without_replacement(negatives, count=candidate_count, rng=rng)
+            pi_cand = (
+                1.0
+                if (not negatives or candidate_count == 0)
+                else candidate_count / float(len(negatives))
+            )
+            candidate_samples = [
+                TopologyPairSample(
+                    pair_id=pair_id,
+                    subgraph_id=subgraph_id,
+                    node_size=node_size,
+                    protein_a=protein_a,
+                    protein_b=protein_b,
+                    local_index_a=index_a,
+                    local_index_b=index_b,
+                    stratum=SamplingStratum.UNIFORM_NEGATIVE,
+                    pi_cand=pi_cand,
+                    pi_pool_given_cand=1.0,
+                    pi_epoch_given_pool=1.0,
+                    pi_total=pi_cand,
+                    target=0.0,
+                    scorer_probability=float(scorer_probabilities.get(pair_id, 0.0)),
+                )
+                for index_a, index_b, protein_a, protein_b, pair_id in candidate_rows
+            ]
+            sorted_candidates = tuple(
+                sorted(candidate_samples, key=lambda sample: sample.scorer_probability, reverse=True)
+            )
+            hard_count = min(
+                len(sorted_candidates),
+                max(1, int(round(len(sorted_candidates) * config.hard_stratum_fraction))),
+            )
+            hard_frame = sorted_candidates[:hard_count]
+            uniform_frame = sorted_candidates[hard_count:]
+            pool_per_pos = config.pool_ratio * max(1, len(positives))
+            hard_pool_count = min(
+                len(hard_frame), max(0, int(round(pool_per_pos * config.hard_fraction)))
+            )
+            uniform_pool_count = min(len(uniform_frame), max(0, pool_per_pos - hard_pool_count))
+            hard_pool_base = _draw_without_replacement(hard_frame, count=hard_pool_count, rng=rng)
+            uniform_pool_base = _draw_without_replacement(
+                uniform_frame, count=uniform_pool_count, rng=rng
+            )
+            hard_pi_pool = 1.0 if not hard_frame else hard_pool_count / float(len(hard_frame))
+            uniform_pi_pool = (
+                1.0 if not uniform_frame else uniform_pool_count / float(len(uniform_frame))
+            )
+            hard_pool = tuple(
+                _replace_sample_probability(
+                    sample,
+                    stratum=SamplingStratum.HARD_NEGATIVE,
+                    pi_pool_given_cand=hard_pi_pool,
+                    pi_epoch_given_pool=1.0,
+                )
+                for sample in hard_pool_base
+            )
+            uniform_pool = tuple(
+                _replace_sample_probability(
+                    sample,
+                    stratum=SamplingStratum.UNIFORM_NEGATIVE,
+                    pi_pool_given_cand=uniform_pi_pool,
+                    pi_epoch_given_pool=1.0,
+                )
+                for sample in uniform_pool_base
+            )
+            subgraphs.append(
+                TopologySubgraphPlan(
+                    subgraph_id=subgraph_id,
+                    node_size=node_size,
+                    nodes=nodes,
+                    positives=tuple(positives),
+                    candidate_negatives=tuple(candidate_samples),
+                    hard_pool=hard_pool,
+                    uniform_pool=uniform_pool,
+                )
+            )
+    return TopologySubsetPlan(
+        subgraphs=tuple(subgraphs),
+        active_sizes=active_sizes,
+        skipped_sizes=skipped,
+        total_positive_pairs=sum(len(subgraph.positives) for subgraph in subgraphs),
+        total_candidate_negatives=sum(len(subgraph.candidate_negatives) for subgraph in subgraphs),
+        total_pool_negatives=sum(
+            len(subgraph.hard_pool) + len(subgraph.uniform_pool) for subgraph in subgraphs
+        ),
+    )
+
+
+def sample_epoch_topology_subset(
+    *,
+    plan: TopologySubsetPlan,
+    epoch: int,
+    config: TopologySubsetSamplerConfig | None = None,
+) -> tuple[TopologyPairSample, ...]:
+    """Draw one epoch's topology pair subset from cached pools."""
+    cfg = config or TopologySubsetSamplerConfig()
+    cfg.validate()
+    rng = random.Random(cfg.seed + epoch)
+    selected: list[TopologyPairSample] = []
+    for subgraph in plan.subgraphs:
+        selected.extend(subgraph.positives)
+        positives = max(1, len(subgraph.positives))
+        epoch_negative_count = cfg.epoch_ratio * positives
+        hard_count = min(
+            len(subgraph.hard_pool), int(round(epoch_negative_count * cfg.hard_fraction))
+        )
+        uniform_count = min(len(subgraph.uniform_pool), max(0, epoch_negative_count - hard_count))
+        hard_draws = _draw_without_replacement(subgraph.hard_pool, count=hard_count, rng=rng)
+        uniform_draws = _draw_without_replacement(
+            subgraph.uniform_pool, count=uniform_count, rng=rng
+        )
+        hard_pi_epoch = 1.0 if not subgraph.hard_pool else hard_count / float(len(subgraph.hard_pool))
+        uniform_pi_epoch = (
+            1.0 if not subgraph.uniform_pool else uniform_count / float(len(subgraph.uniform_pool))
+        )
+        selected.extend(
+            _replace_sample_probability(
+                sample,
+                stratum=SamplingStratum.HARD_NEGATIVE,
+                pi_pool_given_cand=sample.pi_pool_given_cand,
+                pi_epoch_given_pool=hard_pi_epoch,
+            )
+            for sample in hard_draws
+        )
+        selected.extend(
+            _replace_sample_probability(
+                sample,
+                stratum=SamplingStratum.UNIFORM_NEGATIVE,
+                pi_pool_given_cand=sample.pi_pool_given_cand,
+                pi_epoch_given_pool=uniform_pi_epoch,
+            )
+            for sample in uniform_draws
+        )
+    for sample in selected:
+        sample.validate()
+    return tuple(selected)
