@@ -248,6 +248,7 @@ class SplitBundle:
     candidate_labels: list[int] | None = None
     loss_targets: list[int] | None = None
     graph_edges: list[tuple[str, str]] | None = None
+    extra_node_ids: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -263,6 +264,7 @@ class TrainRefinerRequest:
     validation_topology_plan: object | None = None
     train_topology: SplitBundle | None = None
     train_topology_plan: object | None = None
+    train_topology_diagnostic_full_space: Mapping[str, Mapping[str, float]] | None = None
 
 
 @dataclass(frozen=True)

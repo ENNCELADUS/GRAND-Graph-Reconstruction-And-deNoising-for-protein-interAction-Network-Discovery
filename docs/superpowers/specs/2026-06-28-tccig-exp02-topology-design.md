@@ -94,7 +94,11 @@ the product:
 - **Candidate stage** — per subgraph, draw a bounded negative candidate frame
   **uniformly without replacement** from the full negative frame (= all
   non-positive pairs of the subgraph). `π_cand` = (candidates drawn) / (negative
-  frame size). Only candidate-frame pairs are ever scored, so scoring is bounded.
+  frame size). Only candidate-frame pairs are scored for the training/pool
+  objective, so training scoring is bounded. Diagnostic-only capped full-space
+  scoring is a separate bounded cached exception for the smoke check and
+  production bias diagnostic; it never enters training graph edges, the subset
+  pair frame, or the topology objective.
 - **Hard stratum** is defined **within the scored candidate frame** = its top
   fraction by cached scorer score. The uniform stratum is the rest of the
   candidate frame.
@@ -190,8 +194,10 @@ Stops the 200-node bucket from dominating memory and objective.
   - **Uniform stratum** = the rest of the candidate frame.
   - Candidate, pool, and epoch draws are all **without replacement within their
     frame/stratum**, so every negative's three-stage `π_i` is a known ratio.
-  - Only candidate-frame pairs are ever scored → bounded, fully cacheable score
-    set (for the 200-node bucket, ≈ 20× positives instead of the full ~11.66M).
+  - Only candidate-frame pairs are scored for the training/pool objective →
+    bounded, fully cacheable score set (for the 200-node bucket, ≈ 20× positives
+    instead of the full ~11.66M). Diagnostic-only capped full-space scoring is
+    the separate exception.
 - The sampler emits, per epoch and per pair, the full record of §3.6
   (stratum, `pi_cand`, `pi_pool_given_cand`, `pi_epoch_given_pool`, `pi_total`,
   ids, local indices).
@@ -295,9 +301,15 @@ The implementation uses fork (b) unless review prefers (a).
 - **Score only the bounded candidate frame** (all positives + the uniformly
   sampled candidate negatives of §3.3, `candidate_ratio`×positives per subgraph),
   not the 12.79M full candidate space. The pool and per-epoch subset are drawn
-  from this already-scored frame, so no further scoring is ever needed.
-- **Batch embedding loads** to avoid per-endpoint `torch.load` thrash
-  (`tccig/train.py:801`).
+  from this already-scored frame, so no further training/pool scoring is needed.
+  The only exception is diagnostic-only capped full-space scoring for section
+  9/3.7: those probabilities are cached separately and used only for bias
+  logging, never for training graph edges, the subset pair frame, or the
+  topology objective.
+- **Batch embedding loads are intentionally out of scope** for this rerun. The
+  bounded candidate frame reduces scoring enough that `_collate_pair_score_batch`'s
+  existing per-endpoint `load_cached_embedding(...)` path is acceptable; any
+  embedding-cache rewrite should be a separate task with cache-correctness tests.
 - **Reuse existing `scores/train_topology.pt` only if** scorer SHA,
   embedding-index SHA, pair hash, **and pair order** all validate against the new
   manifest; otherwise score the new bounded pool from scratch. The run must be
@@ -337,7 +349,7 @@ training.
 | Component | Location (current) | Change |
 |---|---|---|
 | Topology plan / sampler | plan build in `tccig/train.py` + plan dataclasses | Per-size budget; bounded candidate frame + fixed pool + per-epoch resample; stochastic hard-stratum (50/50); emit full §3.6 record (`stratum`, `pi_cand`, `pi_pool_given_cand`, `pi_epoch_given_pool`, `pi_total`, ids, local indices) |
-| Pool scoring + cache | `tccig/train.py:283/373`, collate `:801` | Score pool only; batched embedding loads; SHA/hash/order-validated reuse; progress logging |
+| Pool scoring + cache | `tccig/train.py:283/373`, collate `:801` | Score bounded training/pool frame only; diagnostic full-space cache is separate; batch embedding loads deferred; SHA/hash/order-validated reuse; progress logging |
 | `topology_plan_loss` | `tccig/s2gae.py:469` | Consume per-epoch subset + `pi_total`; per-size aggregation over eligible sizes; subgraph sharding + per-chunk backward; `clustering` off |
 | Linear accumulators | `src/topology/finetune_losses.py` | Optional per-pair weight `w_i = 1/pi_total` on density/degree/GS sums |
 | Distributed step | `tccig/s2gae.py:806–833` | Shard by global index; detached-only all-reduce of loss_sum/count; per-chunk backward; manual grad all-reduce (fork b) |
@@ -383,7 +395,8 @@ training.
 - Objective: hybrid subset + **three-stage** IPW reweighting (§3.3).
 - Negatives: bounded candidate frame → fixed cached pool → per-epoch resample,
   **stochastic hard-stratum (50%) + uniform (50%)** — no deterministic top-k
-  (§3.3, §4). Only the candidate frame is ever scored.
+  (§3.3, §4). Only candidate-frame pairs are scored for the training/pool
+  objective; diagnostic-only capped full-space scoring is the separate exception.
 - `clustering` **disabled** for this re-run (§3.5).
 - Distributed reduction defaults to **fork (b)** (§6.2).
 - Per-size aggregation over **eligible** sizes only; zero-budget sizes dropped and

@@ -45,13 +45,6 @@ from torch.utils.data import DataLoader
 
 from tccig import s2gae
 from tccig import test as tccig_test
-from tccig.topology_subset import (
-    TopologySubsetPlan,
-    apply_per_size_subgraph_budget,
-    build_topology_subset_plan,
-    candidate_pairs_for_scoring,
-    scored_pairs_from_subset_plan,
-)
 from tccig.prepare import (
     CandidatePair,
     GraphRule,
@@ -69,6 +62,16 @@ from tccig.prepare import (
     score_cache_metadata,
     strict_reject_legacy_hooks,
     write_json,
+)
+from tccig.topology_subset import (
+    TopologySubgraphPlan,
+    _all_local_pairs,
+    apply_per_size_subgraph_budget,
+    build_topology_subset_plan,
+    candidate_pairs_for_scoring,
+    diagnostic_full_space_scoring_pairs,
+    scored_pairs_from_subset_plan,
+    select_diagnostic_subgraphs,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -219,7 +222,12 @@ def run_tccig_pipeline(
         cache_dir=cache_dir,
         pairwise_input_rule=pairwise_input_rule,
     )
-    train_topology, train_topology_plan, _train_topo_stats = _build_train_topology_bundle(
+    (
+        train_topology,
+        train_topology_plan,
+        train_topology_diagnostic_full_space,
+        _train_topo_stats,
+    ) = _build_train_topology_bundle(
         config=config,
         processed_dir=processed_dir,
         scorer_cfg=scorer_cfg,
@@ -239,6 +247,7 @@ def run_tccig_pipeline(
             validation_topology_plan=validation_topology_plan,
             train_topology=train_topology,
             train_topology_plan=train_topology_plan,
+            train_topology_diagnostic_full_space=train_topology_diagnostic_full_space,
         )
     )
     pairwise_metrics = tccig_test.run_pairwise_test(
@@ -590,11 +599,16 @@ def _build_train_topology_bundle(
     runtime: TCCIGRuntime,
     cache_dir: Path,
     pairwise_input_rule: GraphRule,
-) -> tuple[SplitBundle | None, object | None, dict[str, float | int]]:
+) -> tuple[
+    SplitBundle | None,
+    object | None,
+    dict[str, dict[str, float]] | None,
+    dict[str, float | int],
+]:
     refiner_cfg = _mapping_section(config, "refiner")
     topo_cfg = refiner_cfg.get("topology_training", {})
     if not isinstance(topo_cfg, Mapping) or not bool(topo_cfg.get("enabled", False)):
-        return None, None, {}
+        return None, None, None, {}
     split_path = processed_dir / "human_BFS_split.pkl"
     node_ids = load_split_node_ids(split_path=split_path, split_name="train")
     train_graph = build_pair_supervision_graph(
@@ -653,10 +667,14 @@ def _build_train_topology_bundle(
             )
 
         from src.topology.plan_cache import (
+            load_subset_diagnostic_cache,
             load_subset_plan_cache,
+            subset_diagnostic_payload_metadata,
             subset_plan_payload_metadata,
+            write_subset_diagnostic_cache,
             write_subset_plan_cache,
         )
+
         from tccig.topology_subset import payload_to_subset_plan, subset_plan_to_payload
 
         subset_metadata = subset_plan_payload_metadata(
@@ -735,6 +753,94 @@ def _build_train_topology_bundle(
                     payload=subset_plan_to_payload(subset_plan),
                 )
 
+        diagnostic_subgraphs = select_diagnostic_subgraphs(
+            subset_plan,
+            max_node_size=subset_cfg.bias_diagnostic_max_node_size,
+            max_subgraphs=subset_cfg.bias_diagnostic_max_subgraphs,
+        )
+        diagnostic_node_ids = sorted(
+            {node for subgraph in diagnostic_subgraphs for node in subgraph.nodes}
+        )
+        diagnostic_split = "train_topology_subset_diagnostic"
+        diagnostic_metadata = subset_diagnostic_payload_metadata(
+            split=diagnostic_split,
+            graph=train_graph,
+            node_sizes=node_sizes,
+            samples_per_size=samples_per_size,
+            seed=seed,
+            strategy=strategy,
+            coverage_augmentation=coverage_augmentation,
+            candidate_ratio=subset_cfg.candidate_ratio,
+            pool_ratio=subset_cfg.pool_ratio,
+            epoch_ratio=subset_cfg.epoch_ratio,
+            hard_fraction=subset_cfg.hard_fraction,
+            uniform_fraction=subset_cfg.uniform_fraction,
+            hard_stratum_fraction=subset_cfg.hard_stratum_fraction,
+            max_subgraphs_per_size=subset_cfg.max_subgraphs_per_size,
+            max_labeled_pairs_per_size=subset_cfg.max_labeled_pairs_per_size,
+            bias_diagnostic_max_node_size=subset_cfg.bias_diagnostic_max_node_size,
+            bias_diagnostic_max_subgraphs=subset_cfg.bias_diagnostic_max_subgraphs,
+            scorer_config=scorer_cfg,
+        )
+        diagnostic_full_space = load_subset_diagnostic_cache(
+            cache_dir=cache_dir,
+            split=diagnostic_split,
+            metadata=diagnostic_metadata,
+        )
+        if diagnostic_full_space is not None and not _diagnostic_full_space_complete(
+            diagnostic_subgraphs=diagnostic_subgraphs,
+            diagnostic_full_space=diagnostic_full_space,
+        ):
+            LOGGER.warning(
+                "ignoring incomplete topology subset diagnostic cache split=%s",
+                diagnostic_split,
+            )
+            diagnostic_full_space = None
+        if diagnostic_full_space is None:
+            diagnostic_rows = diagnostic_full_space_scoring_pairs(
+                subset_plan,
+                max_node_size=subset_cfg.bias_diagnostic_max_node_size,
+                max_subgraphs=subset_cfg.bias_diagnostic_max_subgraphs,
+            )
+            diagnostic_pairs = [
+                CandidatePair(protein_a, protein_b)
+                for _pair_id, protein_a, protein_b in diagnostic_rows
+            ]
+            diagnostic_scores = (
+                _score_split(
+                    split=diagnostic_split,
+                    pairs=diagnostic_pairs,
+                    scorer_cfg=scorer_cfg,
+                    runtime=runtime,
+                    cache_dir=cache_dir,
+                )
+                if diagnostic_pairs
+                else []
+            )
+            score_by_pair_id = {
+                pair_id: float(score)
+                for (pair_id, _protein_a, _protein_b), score in zip(
+                    diagnostic_rows, diagnostic_scores, strict=True
+                )
+            }
+            diagnostic_full_space = {
+                subgraph.subgraph_id: {
+                    pair_id: score_by_pair_id[pair_id]
+                    for _index_a, _index_b, _protein_a, _protein_b, pair_id in _all_local_pairs(
+                        subgraph.nodes
+                    )
+                }
+                for subgraph in diagnostic_subgraphs
+            }
+            if runtime.is_main_process:
+                write_subset_diagnostic_cache(
+                    cache_dir=cache_dir,
+                    split=diagnostic_split,
+                    metadata=diagnostic_metadata,
+                    payload=diagnostic_full_space,
+                )
+            _runtime_barrier(runtime)
+
         endpoints, probabilities = scored_pairs_from_subset_plan(subset_plan)
         pairs = [
             CandidatePair(protein_a, protein_b) for protein_a, protein_b in endpoints
@@ -750,8 +856,10 @@ def _build_train_topology_bundle(
                 pairs=pairs,
                 pairwise_probabilities=probabilities,
                 pairwise_graph_edges=pairwise_edges,
+                extra_node_ids=diagnostic_node_ids,
             ),
             subset_plan,
+            diagnostic_full_space,
             coverage_stats,
         )
 
@@ -819,8 +927,27 @@ def _build_train_topology_bundle(
             pairwise_graph_edges=pairwise_edges,
         ),
         plan,
+        None,
         coverage_stats,
     )
+
+
+def _diagnostic_full_space_complete(
+    *,
+    diagnostic_subgraphs: Sequence[TopologySubgraphPlan],
+    diagnostic_full_space: Mapping[str, Mapping[str, float]],
+) -> bool:
+    """Return whether cached diagnostic scores cover the selected full pair spaces."""
+    for subgraph in diagnostic_subgraphs:
+        scores = diagnostic_full_space.get(subgraph.subgraph_id)
+        if scores is None:
+            return False
+        for _index_a, _index_b, _protein_a, _protein_b, pair_id in _all_local_pairs(
+            subgraph.nodes
+        ):
+            if pair_id not in scores:
+                return False
+    return True
 
 
 def _build_validation_topology_bundle(

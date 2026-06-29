@@ -4,15 +4,26 @@ from __future__ import annotations
 
 import networkx as nx
 import pytest
-
 from tccig.topology_subset import (
     SamplingStratum,
     TopologyPairSample,
+    TopologySubgraphPlan,
+    TopologySubsetPlan,
     TopologySubsetSamplerConfig,
     active_node_sizes,
+    apply_per_size_subgraph_budget,
     build_topology_subset_plan,
+    candidate_pairs_for_scoring,
     canonical_pair_id,
+    compute_subset_bias_diagnostic,
+    diagnostic_full_space_scoring_pairs,
+    group_epoch_samples_by_subgraph,
+    payload_to_subset_plan,
+    relative_error,
     sample_epoch_topology_subset,
+    scored_pairs_from_subset_plan,
+    select_diagnostic_subgraphs,
+    subset_plan_to_payload,
 )
 
 
@@ -219,9 +230,6 @@ def test_max_labeled_pairs_per_size_caps_scored_candidates() -> None:
             assert 0.0 < sample.pi_cand <= 1.0
 
 
-from tccig.topology_subset import subset_plan_to_payload, payload_to_subset_plan
-
-
 def test_subset_plan_payload_round_trips() -> None:
     graph = _toy_graph()
     sampled = {4: [("a", "b", "c", "d")]}
@@ -234,9 +242,6 @@ def test_subset_plan_payload_round_trips() -> None:
     )
     restored = payload_to_subset_plan(subset_plan_to_payload(plan))
     assert restored == plan
-
-
-from tccig.topology_subset import candidate_pairs_for_scoring
 
 
 def test_candidate_pairs_for_scoring_are_unique_and_ordered() -> None:
@@ -252,9 +257,6 @@ def test_candidate_pairs_for_scoring_are_unique_and_ordered() -> None:
     pairs = candidate_pairs_for_scoring(plan)
     pair_ids = [pair_id for pair_id, _, _ in pairs]
     assert pair_ids == sorted(set(pair_ids))
-
-
-from tccig.topology_subset import apply_per_size_subgraph_budget
 
 
 def test_budget_distributes_coverage_and_reports_realized_coverage() -> None:
@@ -309,9 +311,6 @@ def test_budget_unbounded_is_passthrough_with_coverage() -> None:
     assert stats["positive_edge_coverage"] == 1.0
 
 
-from tccig.topology_subset import scored_pairs_from_subset_plan
-
-
 def test_scored_pairs_from_subset_plan_track_scorer_probability() -> None:
     graph = _toy_graph()
     sampled = {4: [("a", "b", "c", "d")]}
@@ -337,9 +336,6 @@ def test_scored_pairs_from_subset_plan_track_scorer_probability() -> None:
         assert prob == by_id[canonical_pair_id(a, b)]
 
 
-from tccig.topology_subset import group_epoch_samples_by_subgraph
-
-
 def test_group_epoch_samples_by_subgraph_preserves_size_and_weights() -> None:
     graph = _toy_graph()
     sampled = {4: [("a", "b", "c", "d")]}
@@ -356,9 +352,6 @@ def test_group_epoch_samples_by_subgraph_preserves_size_and_weights() -> None:
     assert chunk.node_size == 4
     assert len(chunk.samples) >= 2
     assert all(sample.pi_total > 0.0 for sample in chunk.samples)
-
-
-from tccig.topology_subset import compute_subset_bias_diagnostic, relative_error
 
 
 def test_relative_error_handles_zero_reference() -> None:
@@ -455,3 +448,79 @@ def test_select_diagnostic_subgraphs_spreads_across_size_mixture() -> None:
     )
     assert {sg.node_size for sg in capped} == {4}
     assert len(capped) == 3  # 0 == every eligible subgraph
+
+
+def test_select_diagnostic_subgraphs_is_deterministic_and_limited() -> None:
+    def _subgraph(size: int, index: int) -> TopologySubgraphPlan:
+        return TopologySubgraphPlan(
+            subgraph_id=f"size={size}:index={index}",
+            node_size=size,
+            nodes=tuple(f"n{size}_{index}_{j}" for j in range(size)),
+            positives=(),
+            candidate_negatives=(),
+            hard_pool=(),
+            uniform_pool=(),
+        )
+
+    plan = TopologySubsetPlan(
+        subgraphs=tuple(_subgraph(size, index) for size in (4, 8) for index in range(3)),
+        active_sizes=(4, 8),
+        skipped_sizes={},
+        total_positive_pairs=0,
+        total_candidate_negatives=0,
+        total_pool_negatives=0,
+    )
+
+    selected = select_diagnostic_subgraphs(plan, max_node_size=40, max_subgraphs=2)
+    assert [subgraph.subgraph_id for subgraph in selected] == [
+        "size=4:index=0",
+        "size=8:index=0",
+    ]
+    assert selected == select_diagnostic_subgraphs(
+        plan, max_node_size=40, max_subgraphs=2
+    )
+
+    capped = select_diagnostic_subgraphs(plan, max_node_size=4, max_subgraphs=0)
+    assert {subgraph.node_size for subgraph in capped} == {4}
+    assert len(capped) == 3
+
+
+def test_diagnostic_full_space_scoring_pairs_are_unique_and_ordered() -> None:
+    shared = TopologySubgraphPlan(
+        subgraph_id="size=4:index=0",
+        node_size=4,
+        nodes=("a", "b", "c", "d"),
+        positives=(),
+        candidate_negatives=(),
+        hard_pool=(),
+        uniform_pool=(),
+    )
+    overlapping = TopologySubgraphPlan(
+        subgraph_id="size=4:index=1",
+        node_size=4,
+        nodes=("a", "b", "c", "e"),
+        positives=(),
+        candidate_negatives=(),
+        hard_pool=(),
+        uniform_pool=(),
+    )
+    plan = TopologySubsetPlan(
+        subgraphs=(overlapping, shared),
+        active_sizes=(4,),
+        skipped_sizes={},
+        total_positive_pairs=0,
+        total_candidate_negatives=0,
+        total_pool_negatives=0,
+    )
+
+    rows = diagnostic_full_space_scoring_pairs(
+        plan,
+        max_node_size=40,
+        max_subgraphs=0,
+    )
+
+    pair_ids = [row[0] for row in rows]
+    assert pair_ids == sorted(pair_ids)
+    assert pair_ids == sorted(set(pair_ids))
+    assert len(rows) == 9
+    assert rows[0] == ("a||b", "a", "b")

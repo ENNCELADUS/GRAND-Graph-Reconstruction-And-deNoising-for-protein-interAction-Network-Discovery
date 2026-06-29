@@ -7,7 +7,6 @@ import json
 import logging
 import math
 import time
-from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +61,7 @@ from tccig.topology_subset import (
     compute_subset_bias_diagnostic,
     group_epoch_samples_by_subgraph,
     sample_epoch_topology_subset,
+    select_diagnostic_subgraphs,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -797,10 +797,17 @@ def _subgraph_bias_diagnostic(
     subgraph: TopologySubgraphPlan,
     chunk: TopologySubgraphEpochChunk,
     node_index: Mapping[str, int],
+    diagnostic_full_space: Mapping[str, Mapping[str, float]],
 ) -> dict[str, float] | None:
-    """IPW-vs-full-space bias diagnostic for ONE capped subgraph. No grad."""
-    nodes = tuple(subgraph.nodes)
-    full_pairs = _all_local_pairs(nodes)  # (idx_a, idx_b, protein_a, protein_b, pair_id)
+    """IPW-vs-full-space bias diagnostic for one pre-scored capped subgraph."""
+    scorer_probs = diagnostic_full_space.get(subgraph.subgraph_id)
+    if scorer_probs is None:
+        return None
+    full_pairs = _all_local_pairs(tuple(subgraph.nodes))
+    if any(row[4] not in scorer_probs for row in full_pairs):
+        return None
+    if any(row[2] not in node_index or row[3] not in node_index for row in full_pairs):
+        return None
     device = graph.node_features.device
     with torch.no_grad():
         hidden_states = refiner.encode(
@@ -817,12 +824,15 @@ def _subgraph_bias_diagnostic(
             .t()
             .contiguous()
         )
+        pairwise_probabilities = torch.tensor(
+            [float(scorer_probs[row[4]]) for row in full_pairs],
+            dtype=torch.float32,
+            device=device,
+        )
         refined_logits, _ = refiner.decode(
             hidden_states=hidden_states,
             pair_index=global_pairs,
-            pairwise_probabilities=graph.pairwise_probabilities[
-                _pair_lookup(graph.pair_index, global_pairs)
-            ],
+            pairwise_probabilities=pairwise_probabilities,
         )
         full_probabilities = torch.sigmoid(refined_logits).detach().cpu().tolist()
     full_space_probabilities = {
@@ -851,36 +861,23 @@ def _select_diagnostic_subgraphs(
     chunk_by_id: Mapping[str, TopologySubgraphEpochChunk],
     max_node_size: int,
     max_subgraphs: int,
+    diagnostic_full_space: Mapping[str, Mapping[str, float]] | None = None,
 ) -> list[TopologySubgraphPlan]:
-    """Pick eligible subgraphs spread across active sizes (smallest-first within size).
-
-    Round-robins one subgraph per active size before taking a second from any size, so a
-    tight `max_subgraphs` budget still samples the size MIXTURE rather than only the
-    smallest size. `max_subgraphs == 0` means every eligible subgraph.
-    """
-    by_size: dict[int, list[TopologySubgraphPlan]] = defaultdict(list)
-    for subgraph in plan.subgraphs:
-        if subgraph.node_size <= max_node_size and subgraph.subgraph_id in chunk_by_id:
-            by_size[subgraph.node_size].append(subgraph)
-    for size in by_size:
-        by_size[size].sort(key=lambda sg: sg.subgraph_id)
-    ordered_sizes = sorted(by_size)
-    selected: list[TopologySubgraphPlan] = []
-    cap = max_subgraphs if max_subgraphs > 0 else None
-    cursor = {size: 0 for size in ordered_sizes}
-    while ordered_sizes and (cap is None or len(selected) < cap):
-        progressed = False
-        for size in ordered_sizes:
-            if cap is not None and len(selected) >= cap:
-                break
-            index = cursor[size]
-            if index < len(by_size[size]):
-                selected.append(by_size[size][index])
-                cursor[size] = index + 1
-                progressed = True
-        if not progressed:
-            break
-    return selected
+    """Return shared-selector diagnostics that have epoch samples and scores."""
+    eligible_score_ids = (
+        set(diagnostic_full_space)
+        if diagnostic_full_space is not None
+        else {subgraph.subgraph_id for subgraph in plan.subgraphs}
+    )
+    return [
+        subgraph
+        for subgraph in select_diagnostic_subgraphs(
+            plan,
+            max_node_size=max_node_size,
+            max_subgraphs=max_subgraphs,
+        )
+        if subgraph.subgraph_id in chunk_by_id and subgraph.subgraph_id in eligible_score_ids
+    ]
 
 
 def _topology_bias_diagnostic_step(
@@ -890,6 +887,7 @@ def _topology_bias_diagnostic_step(
     plan: TopologySubsetPlan,
     chunks: Sequence[TopologySubgraphEpochChunk],
     node_index: Mapping[str, int],
+    diagnostic_full_space: Mapping[str, Mapping[str, float]],
     max_node_size: int,
     max_subgraphs: int,
 ) -> dict[str, float] | None:
@@ -909,6 +907,7 @@ def _topology_bias_diagnostic_step(
         chunk_by_id=chunk_by_id,
         max_node_size=max_node_size,
         max_subgraphs=max_subgraphs,
+        diagnostic_full_space=diagnostic_full_space,
     )
     diagnostics: list[dict[str, float]] = []
     for subgraph in targets:
@@ -918,6 +917,7 @@ def _topology_bias_diagnostic_step(
             subgraph=subgraph,
             chunk=chunk_by_id[subgraph.subgraph_id],
             node_index=node_index,
+            diagnostic_full_space=diagnostic_full_space,
         )
         if per_subgraph is not None:
             diagnostics.append(per_subgraph)
@@ -1067,7 +1067,11 @@ def load_mean_pooled_node_features(
 
 def _node_index_from_split_bundle(bundle: SplitBundle) -> dict[str, int]:
     """Map protein IDs to the node ordering used by ``_build_split_graph``."""
-    node_ids = _collect_node_ids(pairs=bundle.pairs, graph_edges=bundle.pairwise_graph_edges)
+    node_ids = _collect_node_ids(
+        pairs=bundle.pairs,
+        graph_edges=bundle.pairwise_graph_edges,
+        extra_node_ids=bundle.extra_node_ids,
+    )
     return {protein_id: index for index, protein_id in enumerate(node_ids)}
 
 
@@ -1222,6 +1226,9 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                             topology_weight=cfg.topology_training.topology_weight,
                         )
                         diag_cfg = cfg.topology_training.subset
+                        diagnostic_full_space = (
+                            request.train_topology_diagnostic_full_space or {}
+                        )
                         # §9 smoke sanity check: once, on epoch 1 (the first scaled step).
                         if (
                             isinstance(request.train_topology_plan, TopologySubsetPlan)
@@ -1234,6 +1241,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                                 plan=request.train_topology_plan,
                                 chunks=chunks,
                                 node_index=train_topology_node_index,
+                                diagnostic_full_space=diagnostic_full_space,
                                 max_node_size=diag_cfg.bias_diagnostic_max_node_size,
                                 max_subgraphs=diag_cfg.bias_diagnostic_max_subgraphs,
                             )
@@ -1269,6 +1277,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                                 plan=request.train_topology_plan,
                                 chunks=chunks,
                                 node_index=train_topology_node_index,
+                                diagnostic_full_space=diagnostic_full_space,
                                 max_node_size=diag_cfg.bias_diagnostic_max_node_size,
                                 max_subgraphs=diag_cfg.bias_diagnostic_max_subgraphs,
                             )
@@ -1515,6 +1524,7 @@ def _build_split_graph(
         pairs=bundle.pairs,
         pairwise_probabilities=bundle.pairwise_probabilities,
         pairwise_graph_edges=bundle.pairwise_graph_edges,
+        extra_node_ids=bundle.extra_node_ids,
         cfg=cfg,
         device=device,
     )
@@ -1540,12 +1550,17 @@ def _build_graph(
     pairs: Sequence[CandidatePair],
     pairwise_probabilities: Sequence[float],
     pairwise_graph_edges: Sequence[tuple[str, str]],
+    extra_node_ids: Sequence[str] | None = None,
     cfg: S2GAEConfig,
     device: torch.device,
 ) -> _SplitGraph:
     if len(pairs) != len(pairwise_probabilities):
         raise ValueError("pairs and pairwise_probabilities must have matching lengths")
-    node_ids = _collect_node_ids(pairs=pairs, graph_edges=pairwise_graph_edges)
+    node_ids = _collect_node_ids(
+        pairs=pairs,
+        graph_edges=pairwise_graph_edges,
+        extra_node_ids=extra_node_ids,
+    )
     node_to_index = {protein_id: index for index, protein_id in enumerate(node_ids)}
     node_features = load_mean_pooled_node_features(
         protein_ids=node_ids,
@@ -1601,6 +1616,7 @@ def _collect_node_ids(
     *,
     pairs: Sequence[CandidatePair],
     graph_edges: Sequence[tuple[str, str]],
+    extra_node_ids: Sequence[str] | None = None,
 ) -> list[str]:
     protein_ids: set[str] = set()
     for pair in pairs:
@@ -1609,6 +1625,8 @@ def _collect_node_ids(
     for protein_a, protein_b in graph_edges:
         protein_ids.add(protein_a)
         protein_ids.add(protein_b)
+    if extra_node_ids is not None:
+        protein_ids.update(str(node_id) for node_id in extra_node_ids)
     if not protein_ids:
         raise ValueError("S2GAE split graph requires at least one protein")
     return sorted(protein_ids)

@@ -113,7 +113,9 @@ class TopologyPairSample:
                 raise ValueError(f"{name} must be in (0, 1]")
         expected = self.pi_cand * self.pi_pool_given_cand * self.pi_epoch_given_pool
         if not isclose(self.pi_total, expected, rel_tol=1.0e-7, abs_tol=1.0e-9):
-            raise ValueError("pi_total must equal pi_cand * pi_pool_given_cand * pi_epoch_given_pool")
+            raise ValueError(
+                "pi_total must equal pi_cand * pi_pool_given_cand * pi_epoch_given_pool"
+            )
         if self.stratum is SamplingStratum.POSITIVE:
             if self.target != 1.0:
                 raise ValueError("positive samples must have target=1.0")
@@ -123,7 +125,9 @@ class TopologyPairSample:
                 1.0,
                 1.0,
             ):
-                raise ValueError("positive samples must have all inclusion probabilities equal to 1")
+                raise ValueError(
+                    "positive samples must have all inclusion probabilities equal to 1"
+                )
 
 
 def canonical_pair_id(protein_a: str, protein_b: str) -> str:
@@ -192,6 +196,60 @@ def _all_local_pairs(nodes: tuple[str, ...]) -> list[tuple[int, int, str, str, s
                 (index_a, index_b, protein_a, protein_b, canonical_pair_id(protein_a, protein_b))
             )
     return pairs
+
+
+def select_diagnostic_subgraphs(
+    plan: TopologySubsetPlan,
+    *,
+    max_node_size: int,
+    max_subgraphs: int,
+) -> tuple[TopologySubgraphPlan, ...]:
+    """Pick diagnostic subgraphs deterministically across the active size mixture."""
+    if max_node_size < 2:
+        return ()
+    by_size: dict[int, list[TopologySubgraphPlan]] = defaultdict(list)
+    for subgraph in plan.subgraphs:
+        if subgraph.node_size <= max_node_size:
+            by_size[subgraph.node_size].append(subgraph)
+    for rows in by_size.values():
+        rows.sort(key=lambda item: item.subgraph_id)
+    selected: list[TopologySubgraphPlan] = []
+    cap = max_subgraphs if max_subgraphs > 0 else None
+    cursors = dict.fromkeys(sorted(by_size), 0)
+    while cursors and (cap is None or len(selected) < cap):
+        progressed = False
+        for size in sorted(cursors):
+            if cap is not None and len(selected) >= cap:
+                break
+            index = cursors[size]
+            rows = by_size[size]
+            if index < len(rows):
+                selected.append(rows[index])
+                cursors[size] = index + 1
+                progressed = True
+        if not progressed:
+            break
+    return tuple(selected)
+
+
+def diagnostic_full_space_scoring_pairs(
+    plan: TopologySubsetPlan,
+    *,
+    max_node_size: int,
+    max_subgraphs: int,
+) -> tuple[tuple[str, str, str], ...]:
+    """Return unique full-space diagnostic rows as ``(pair_id, protein_a, protein_b)``."""
+    by_id: dict[str, tuple[str, str, str]] = {}
+    for subgraph in select_diagnostic_subgraphs(
+        plan,
+        max_node_size=max_node_size,
+        max_subgraphs=max_subgraphs,
+    ):
+        for _index_a, _index_b, protein_a, protein_b, pair_id in _all_local_pairs(
+            subgraph.nodes
+        ):
+            by_id.setdefault(pair_id, (pair_id, protein_a, protein_b))
+    return tuple(by_id[pair_id] for pair_id in sorted(by_id))
 
 
 def _draw_without_replacement(items: Sequence[T], *, count: int, rng: random.Random) -> list[T]:
@@ -319,7 +377,11 @@ def build_topology_subset_plan(
                 for index_a, index_b, protein_a, protein_b, pair_id in candidate_rows
             ]
             sorted_candidates = tuple(
-                sorted(candidate_samples, key=lambda sample: sample.scorer_probability, reverse=True)
+                sorted(
+                    candidate_samples,
+                    key=lambda sample: sample.scorer_probability,
+                    reverse=True,
+                )
             )
             hard_count = min(
                 len(sorted_candidates),
@@ -404,7 +466,9 @@ def sample_epoch_topology_subset(
         uniform_draws = _draw_without_replacement(
             subgraph.uniform_pool, count=uniform_count, rng=rng
         )
-        hard_pi_epoch = 1.0 if not subgraph.hard_pool else hard_count / float(len(subgraph.hard_pool))
+        hard_pi_epoch = (
+            1.0 if not subgraph.hard_pool else hard_count / float(len(subgraph.hard_pool))
+        )
         uniform_pi_epoch = (
             1.0 if not subgraph.uniform_pool else uniform_count / float(len(subgraph.uniform_pool))
         )

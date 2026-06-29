@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -455,8 +456,12 @@ def test_build_train_topology_bundle_uses_plan_cache(
         "pairwise_input_rule": tccig_train._resolve_refined_output_rule({}),
     }
 
-    bundle_first, plan_first, stats_first = tccig_train._build_train_topology_bundle(**common)
-    bundle_second, plan_second, stats_second = tccig_train._build_train_topology_bundle(**common)
+    bundle_first, plan_first, _diag_first, stats_first = (
+        tccig_train._build_train_topology_bundle(**common)
+    )
+    bundle_second, plan_second, _diag_second, stats_second = (
+        tccig_train._build_train_topology_bundle(**common)
+    )
 
     assert sample_calls["n"] == 1  # second run served from cache
     assert plan_first.total_pairs == plan_second.total_pairs
@@ -466,6 +471,144 @@ def test_build_train_topology_bundle_uses_plan_cache(
         "coverage_bucket_count",
         "positive_edge_coverage",
     }
+
+
+def test_build_train_topology_subset_scores_diagnostic_full_space_pairs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph = _coverage_graph()
+
+    monkeypatch.setattr(tccig_train, "load_split_node_ids", lambda **_: set(graph.nodes()))
+    monkeypatch.setattr(tccig_train, "build_pair_supervision_graph", lambda **_: graph)
+
+    calls: list[tuple[str, int]] = []
+
+    def fake_score_split(
+        *,
+        split: str,
+        pairs: Sequence[object],
+        scorer_cfg: object,
+        runtime: object,
+        cache_dir: object,
+    ) -> list[float]:
+        calls.append((split, len(pairs)))
+        return [0.5] * len(pairs)
+
+    monkeypatch.setattr(tccig_train, "_score_split", fake_score_split)
+
+    config = {
+        "refiner": {
+            "topology_training": {
+                "enabled": True,
+                "node_sizes": [4],
+                "samples_per_size": 1,
+                "strategy": "bfs",
+                "seed": 0,
+                "coverage_augmentation": False,
+                "subset": {
+                    "enabled": True,
+                    "candidate_ratio": 2,
+                    "pool_ratio": 1,
+                    "epoch_ratio": 1,
+                    "bias_diagnostic_max_node_size": 4,
+                    "bias_diagnostic_max_subgraphs": 1,
+                },
+            }
+        }
+    }
+
+    bundle, _plan, diagnostic_full_space, _stats = tccig_train._build_train_topology_bundle(
+        config=config,
+        processed_dir=tmp_path,
+        scorer_cfg={},
+        runtime=_fake_runtime(is_main_process=True),
+        cache_dir=tmp_path,
+        pairwise_input_rule=tccig_train._resolve_refined_output_rule({}),
+    )
+
+    diagnostic_calls = [
+        count for split, count in calls if split == "train_topology_subset_diagnostic"
+    ]
+    assert diagnostic_calls == [6]
+    assert diagnostic_full_space is not None
+    assert {len(rows) for rows in diagnostic_full_space.values()} == {6}
+    assert bundle is not None
+    assert bundle.extra_node_ids is not None
+
+
+def test_build_train_topology_subset_rescores_incomplete_diagnostic_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    graph = _coverage_graph()
+
+    monkeypatch.setattr(tccig_train, "load_split_node_ids", lambda **_: set(graph.nodes()))
+    monkeypatch.setattr(tccig_train, "build_pair_supervision_graph", lambda **_: graph)
+
+    calls: list[tuple[str, int]] = []
+
+    def fake_score_split(
+        *,
+        split: str,
+        pairs: Sequence[object],
+        scorer_cfg: object,
+        runtime: object,
+        cache_dir: object,
+    ) -> list[float]:
+        calls.append((split, len(pairs)))
+        return [0.5] * len(pairs)
+
+    monkeypatch.setattr(tccig_train, "_score_split", fake_score_split)
+    config = {
+        "refiner": {
+            "topology_training": {
+                "enabled": True,
+                "node_sizes": [4],
+                "samples_per_size": 1,
+                "strategy": "bfs",
+                "seed": 0,
+                "coverage_augmentation": False,
+                "subset": {
+                    "enabled": True,
+                    "candidate_ratio": 2,
+                    "pool_ratio": 1,
+                    "epoch_ratio": 1,
+                    "bias_diagnostic_max_node_size": 4,
+                    "bias_diagnostic_max_subgraphs": 1,
+                },
+            }
+        }
+    }
+    common = {
+        "config": config,
+        "processed_dir": tmp_path,
+        "scorer_cfg": {},
+        "runtime": _fake_runtime(is_main_process=True),
+        "cache_dir": tmp_path,
+        "pairwise_input_rule": tccig_train._resolve_refined_output_rule({}),
+    }
+
+    _bundle, _plan, diagnostic_full_space, _stats = tccig_train._build_train_topology_bundle(
+        **common
+    )
+    assert diagnostic_full_space is not None
+
+    cache_path = tmp_path / "plans" / "train_topology_subset_diagnostic.json"
+    document = json.loads(cache_path.read_text(encoding="utf-8"))
+    payload = document["payload"]
+    subgraph_id = next(iter(payload))
+    payload[subgraph_id].pop(next(iter(payload[subgraph_id])))
+    cache_path.write_text(json.dumps(document), encoding="utf-8")
+
+    _bundle, _plan, repaired_full_space, _stats = tccig_train._build_train_topology_bundle(
+        **common
+    )
+
+    diagnostic_calls = [
+        count for split, count in calls if split == "train_topology_subset_diagnostic"
+    ]
+    assert diagnostic_calls == [6, 6]
+    assert repaired_full_space is not None
+    assert {len(rows) for rows in repaired_full_space.values()} == {6}
 
 
 def test_coverage_stats_from_payload_extracts_numeric_keys() -> None:
@@ -502,6 +645,177 @@ def test_coverage_stats_from_payload_drops_non_numeric_values() -> None:
     }
     # Non-numeric values must not survive: the log path calls float() on them.
     assert _coverage_stats_from_payload(payload) == {"base_bucket_count": 3}
+
+
+def test_split_graph_extra_node_ids_get_features_but_not_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tccig.prepare import CandidatePair, SplitBundle
+    from tccig.s2gae import _build_split_graph, _node_index_from_split_bundle, _parse_config
+
+    def _fake_features(
+        *,
+        protein_ids: Sequence[str],
+        cache_dir: Path,
+        index_path: Path,
+        input_dim: int,
+        max_sequence_length: int | None,
+        device: torch.device,
+    ) -> torch.Tensor:
+        return torch.arange(
+            len(protein_ids) * input_dim,
+            dtype=torch.float32,
+            device=device,
+        ).reshape(len(protein_ids), input_dim)
+
+    monkeypatch.setattr("tccig.s2gae.load_mean_pooled_node_features", _fake_features)
+    cfg = _parse_config(_base_refiner_config())
+    bundle = SplitBundle(
+        split="train_topology",
+        pairs=[CandidatePair("a", "b")],
+        pairwise_probabilities=[0.8],
+        pairwise_graph_edges=[],
+        extra_node_ids=["c", "d"],
+    )
+
+    graph = _build_split_graph(bundle, cfg=cfg, device=torch.device("cpu"))
+    node_index = _node_index_from_split_bundle(bundle)
+
+    assert set(node_index) == {"a", "b", "c", "d"}
+    assert graph.node_features.shape[0] == 4
+    assert graph.pair_index.shape[1] == 1
+    assert graph.edge_index.numel() == 0
+
+
+def test_subgraph_bias_diagnostic_uses_supplied_full_space_probabilities() -> None:
+    from tccig.s2gae import _SplitGraph, _subgraph_bias_diagnostic
+    from tccig.topology_subset import (
+        SamplingStratum,
+        TopologyPairSample,
+        TopologySubgraphEpochChunk,
+        TopologySubgraphPlan,
+    )
+
+    class _IdentityRefiner:
+        def encode(
+            self,
+            *,
+            node_features: torch.Tensor,
+            edge_index: torch.Tensor,
+            edge_weight: torch.Tensor,
+        ) -> list[torch.Tensor]:
+            return [node_features]
+
+        def decode(
+            self,
+            *,
+            hidden_states: Sequence[torch.Tensor],
+            pair_index: torch.Tensor,
+            pairwise_probabilities: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            logits = torch.logit(pairwise_probabilities.clamp(1.0e-6, 1.0 - 1.0e-6))
+            return logits, torch.zeros_like(logits)
+
+    subgraph = TopologySubgraphPlan(
+        subgraph_id="size=4:index=0",
+        node_size=4,
+        nodes=("a", "b", "c", "d"),
+        positives=(),
+        candidate_negatives=(),
+        hard_pool=(),
+        uniform_pool=(),
+    )
+    chunk = TopologySubgraphEpochChunk(
+        subgraph_id=subgraph.subgraph_id,
+        node_size=subgraph.node_size,
+        samples=(
+            TopologyPairSample(
+                pair_id="a||b",
+                subgraph_id=subgraph.subgraph_id,
+                node_size=4,
+                protein_a="a",
+                protein_b="b",
+                local_index_a=0,
+                local_index_b=1,
+                stratum=SamplingStratum.POSITIVE,
+                pi_cand=1.0,
+                pi_pool_given_cand=1.0,
+                pi_epoch_given_pool=1.0,
+                pi_total=1.0,
+                target=1.0,
+                scorer_probability=0.8,
+            ),
+        ),
+    )
+    graph = _SplitGraph(
+        node_features=torch.ones((4, 2), dtype=torch.float32),
+        edge_index=torch.empty((2, 0), dtype=torch.long),
+        edge_weight=torch.empty((0,), dtype=torch.float32),
+        pair_index=torch.tensor([[0], [1]], dtype=torch.long),
+        pairwise_probabilities=torch.tensor([0.8], dtype=torch.float32),
+    )
+    diagnostic_full_space = {
+        subgraph.subgraph_id: {
+            "a||b": 0.8,
+            "a||c": 0.1,
+            "a||d": 0.2,
+            "b||c": 0.3,
+            "b||d": 0.4,
+            "c||d": 0.5,
+        }
+    }
+
+    diagnostic = _subgraph_bias_diagnostic(
+        refiner=_IdentityRefiner(),  # type: ignore[arg-type]
+        graph=graph,
+        subgraph=subgraph,
+        chunk=chunk,
+        node_index={"a": 0, "b": 1, "c": 2, "d": 3},
+        diagnostic_full_space=diagnostic_full_space,
+    )
+
+    assert diagnostic is not None
+    assert diagnostic["full_space_pairs"] == 6
+    assert diagnostic["subset_pairs"] == 1
+
+
+def test_subset_diagnostic_payload_metadata_changes_with_diagnostic_knobs() -> None:
+    from src.topology.plan_cache import subset_diagnostic_payload_metadata
+
+    graph = nx.Graph()
+    graph.add_edge("a", "b")
+    common = {
+        "split": "train_topology_subset_diagnostic",
+        "graph": graph,
+        "node_sizes": [4],
+        "samples_per_size": 1,
+        "seed": 7,
+        "strategy": "bfs",
+        "coverage_augmentation": True,
+        "candidate_ratio": 20,
+        "pool_ratio": 10,
+        "epoch_ratio": 5,
+        "hard_fraction": 0.5,
+        "uniform_fraction": 0.5,
+        "hard_stratum_fraction": 0.2,
+        "max_subgraphs_per_size": 0,
+        "max_labeled_pairs_per_size": 0,
+        "bias_diagnostic_max_node_size": 4,
+        "bias_diagnostic_max_subgraphs": 2,
+        "scorer_config": {},
+    }
+
+    baseline = subset_diagnostic_payload_metadata(**common)
+    changed_size = subset_diagnostic_payload_metadata(
+        **{**common, "bias_diagnostic_max_node_size": 8}
+    )
+    changed_count = subset_diagnostic_payload_metadata(
+        **{**common, "bias_diagnostic_max_subgraphs": 3}
+    )
+
+    assert baseline["pair_scope"] == "subset_diagnostic"
+    assert baseline != changed_size
+    assert baseline != changed_count
 
 
 def test_topology_subset_chunk_loss_uses_inclusion_weights() -> None:
@@ -638,8 +952,9 @@ def test_score_progress_pointer_fires_when_batch_overshoots_milestone() -> None:
 
 
 def test_balanced_subset_configs_parse() -> None:
-    import yaml
     from pathlib import Path
+
+    import yaml
     from tccig.s2gae import _parse_config
 
     for path in (
@@ -660,13 +975,14 @@ def test_smoke_config_engages_topology_in_epoch_one() -> None:
     # epoch 1, otherwise the smoke run silently exercises none of the new path.
     # train_refiner calls topology_loss_scale(epoch=epoch-1, ...), so epoch 1 uses
     # index 0. With warmup_epochs=0 and ramp_epochs=0 the scale must be > 0 there.
-    import yaml
     from pathlib import Path
-    from tccig.s2gae import _parse_config
+
+    import yaml
     from src.topology.finetune_losses import (
         TopologyLossWeightSchedule,
         topology_loss_scale,
     )
+    from tccig.s2gae import _parse_config
 
     config = yaml.safe_load(
         Path("configs/tccig/02_balanced_subset_smoke.yaml").read_text(encoding="utf-8")

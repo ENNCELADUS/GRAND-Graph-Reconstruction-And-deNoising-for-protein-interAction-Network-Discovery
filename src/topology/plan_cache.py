@@ -247,6 +247,52 @@ def subset_plan_payload_metadata(
     return metadata
 
 
+def subset_diagnostic_payload_metadata(
+    *,
+    split: str,
+    graph: nx.Graph,
+    node_sizes: Sequence[int],
+    samples_per_size: int,
+    seed: int,
+    strategy: str,
+    coverage_augmentation: bool,
+    candidate_ratio: int,
+    pool_ratio: int,
+    epoch_ratio: int,
+    hard_fraction: float,
+    uniform_fraction: float,
+    hard_stratum_fraction: float,
+    max_subgraphs_per_size: int,
+    max_labeled_pairs_per_size: int,
+    bias_diagnostic_max_node_size: int,
+    bias_diagnostic_max_subgraphs: int,
+    scorer_config: Mapping[str, object],
+) -> dict[str, object]:
+    """Build the cache key for diagnostic-only full-space scorer payloads."""
+    metadata = subset_plan_payload_metadata(
+        split=split,
+        graph=graph,
+        node_sizes=node_sizes,
+        samples_per_size=samples_per_size,
+        seed=seed,
+        strategy=strategy,
+        coverage_augmentation=coverage_augmentation,
+        candidate_ratio=candidate_ratio,
+        pool_ratio=pool_ratio,
+        epoch_ratio=epoch_ratio,
+        hard_fraction=hard_fraction,
+        uniform_fraction=uniform_fraction,
+        hard_stratum_fraction=hard_stratum_fraction,
+        max_subgraphs_per_size=max_subgraphs_per_size,
+        max_labeled_pairs_per_size=max_labeled_pairs_per_size,
+        pair_scope="subset_diagnostic",
+        scorer_config=scorer_config,
+    )
+    metadata["bias_diagnostic_max_node_size"] = int(bias_diagnostic_max_node_size)
+    metadata["bias_diagnostic_max_subgraphs"] = int(bias_diagnostic_max_subgraphs)
+    return metadata
+
+
 def _plan_path(cache_dir: Path, split: str) -> Path:
     return cache_dir / "plans" / f"{split}.json"
 
@@ -457,5 +503,69 @@ def write_subset_plan_cache(
     write_json(
         _plan_path(cache_dir, split),
         {"metadata": dict(metadata), "payload": dict(payload)},
+    )
+    write_json(_manifest_path(cache_dir, split), dict(metadata))
+
+
+def load_subset_diagnostic_cache(
+    *,
+    cache_dir: Path,
+    split: str,
+    metadata: Mapping[str, object],
+) -> dict[str, dict[str, float]] | None:
+    """Load diagnostic full-space scorer probabilities, or ``None`` on miss."""
+    path = _plan_path(cache_dir, split)
+    if not path.exists():
+        return None
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        LOGGER.warning("ignoring corrupt topology subset diagnostic cache at %s", path)
+        return None
+    if not isinstance(document, Mapping):
+        LOGGER.warning("ignoring malformed topology subset diagnostic cache at %s", path)
+        return None
+    if document.get("metadata") != dict(metadata):
+        return None
+    payload = document.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    result: dict[str, dict[str, float]] = {}
+    for subgraph_id, raw_pairs in payload.items():
+        if not isinstance(subgraph_id, str) or not isinstance(raw_pairs, Mapping):
+            LOGGER.warning("ignoring malformed topology subset diagnostic cache at %s", path)
+            return None
+        result[subgraph_id] = {}
+        for pair_id, probability in raw_pairs.items():
+            if not isinstance(pair_id, str) or isinstance(probability, bool):
+                LOGGER.warning("ignoring malformed topology subset diagnostic cache at %s", path)
+                return None
+            if not isinstance(probability, (int, float)):
+                LOGGER.warning("ignoring malformed topology subset diagnostic cache at %s", path)
+                return None
+            result[subgraph_id][pair_id] = float(probability)
+    return result
+
+
+def write_subset_diagnostic_cache(
+    *,
+    cache_dir: Path,
+    split: str,
+    metadata: Mapping[str, object],
+    payload: Mapping[str, Mapping[str, float]],
+) -> None:
+    """Persist diagnostic full-space scorer probabilities."""
+    write_json(
+        _plan_path(cache_dir, split),
+        {
+            "metadata": dict(metadata),
+            "payload": {
+                str(subgraph_id): {
+                    str(pair_id): float(probability)
+                    for pair_id, probability in pairs.items()
+                }
+                for subgraph_id, pairs in payload.items()
+            },
+        },
     )
     write_json(_manifest_path(cache_dir, split), dict(metadata))
