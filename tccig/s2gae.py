@@ -41,6 +41,7 @@ from tccig.prepare import (
     GraphRule,
     RefineRequest,
     SplitBundle,
+    TCCIGRuntime,
     TrainRefinerRequest,
     canonical_edge,
     classify_scorer_error_targets,
@@ -593,6 +594,190 @@ def topology_subset_chunk_loss(
         "sample_count": float(len(chunk.samples)),
     }
     return terms["total_topology"], components
+
+
+def _size_balanced_chunk_scales(node_sizes: Sequence[int]) -> list[float]:
+    """Return per-chunk scales for the mean-over-size, mean-over-subgraphs objective.
+
+    `node_sizes` MUST be the full (pre-shard) epoch chunk list so the per-size counts
+    are global. Each scale is `1 / (S * N_s)` with S = number of distinct sizes and
+    N_s = number of chunks of that size.
+    """
+    counts: dict[int, int] = {}
+    for size in node_sizes:
+        counts[int(size)] = counts.get(int(size), 0) + 1
+    active_size_count = len(counts)
+    if active_size_count == 0:
+        raise ValueError("topology subset chunk list must not be empty")
+    return [1.0 / float(active_size_count * counts[int(size)]) for size in node_sizes]
+
+
+def _shard_chunks_for_rank(
+    *,
+    node_sizes: Sequence[int],
+    rank: int,
+    world_size: int,
+) -> list[tuple[int, float]]:
+    """Return (global_index, global_scale) for the chunks owned by `rank`.
+
+    The full `node_sizes` list is identical on every rank (deterministic epoch
+    sampling), so global scales are computed here and the disjoint shard is taken by
+    strided global index. The union over ranks covers every chunk exactly once.
+    """
+    if world_size <= 0:
+        raise ValueError("world_size must be positive")
+    if not 0 <= rank < world_size:
+        raise ValueError("rank must be in [0, world_size)")
+    global_scales = _size_balanced_chunk_scales(node_sizes)
+    return [
+        (global_index, global_scales[global_index])
+        for global_index in range(len(node_sizes))
+        if global_index % world_size == rank
+    ]
+
+
+def _all_reduce_topology_gradients(refiner: S2GAERefiner, runtime: TCCIGRuntime) -> None:
+    """SUM topology gradients across ranks for the Accelerate-unwrapped refiner.
+
+    This is the ONLY custom collective in the topology path; everything else
+    (launcher, DDP wrapping, AMP scaler, optimizer.step) stays Accelerate-managed.
+    `refiner` is the object returned by `_unwrap_refiner` (i.e. `accelerator.unwrap_model`).
+
+    Every rank MUST reduce the SAME parameter set in the SAME order or the collective
+    deadlocks. A rank whose shard was empty this epoch has no `.grad`, so we materialize
+    a zero grad for every trainable parameter before reducing — making participation
+    uniform. SUM is correct (no `world_size` division) because the shards are disjoint and
+    the per-chunk scales are global. The grads may still be AMP-scaled here; that is fine
+    because the scale is identical across ranks and Accelerate unscales uniformly at
+    clip/step time.
+    """
+    if not runtime.is_distributed:
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+    for parameter in refiner.parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.grad is None:
+            parameter.grad = torch.zeros_like(parameter)
+        torch.distributed.all_reduce(parameter.grad, op=torch.distributed.ReduceOp.SUM)
+
+
+def _all_reduce_component_sums(
+    component_sums: dict[str, float], runtime: TCCIGRuntime
+) -> dict[str, float]:
+    """SUM-reduce rank-local topology component sums into global totals for logging.
+
+    Each rank accumulated only its own shard's (globally-scaled) component contributions,
+    so the per-rank dict is a partial sum of the full objective. A SUM all-reduce over the
+    fixed key order reconstructs the same totals every rank would log in single-process
+    mode. Detached scalars only — this never touches autograd or the optimizer. No-op when
+    not distributed (the local dict is already the full sum).
+    """
+    if not runtime.is_distributed:
+        return component_sums
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return component_sums
+    keys = sorted(component_sums)
+    buffer = torch.tensor(
+        [component_sums[key] for key in keys],
+        dtype=torch.float64,
+        device=runtime.device,
+    )
+    torch.distributed.all_reduce(buffer, op=torch.distributed.ReduceOp.SUM)
+    reduced = buffer.detach().cpu().tolist()
+    return {key: float(value) for key, value in zip(keys, reduced, strict=True)}
+
+
+def _topology_subset_backward_step(
+    *,
+    refiner: S2GAERefiner,
+    graph: _SplitGraph,
+    chunks: Sequence[TopologySubgraphEpochChunk],
+    node_index: Mapping[str, int],
+    weights: TopologyLossWeights,
+    runtime: TCCIGRuntime,
+    topology_scale: float,
+    topology_weight: float,
+) -> dict[str, float]:
+    """Run sharded, memory-bounded per-chunk topology backward; return component sums.
+
+    `chunks` is the FULL epoch chunk list, identical on every rank. This rank owns the
+    disjoint shard `chunks[rank::world_size]`; each owned chunk is scaled by its global
+    `1/(S*N_s)` scale and backpropagated immediately. The encode is recomputed inside the
+    loop so peak memory is one chunk's forward graph (see Step 4 constraint 2). Backward
+    runs through `runtime.accelerator.backward` so AMP stays managed; one explicit
+    all-reduce after the loop yields the exact full-objective gradient (constraint 1).
+    """
+    # NOTE: the component keys MUST match what the full-plan path produces so the shared
+    # epoch_history logging (`topology_components["clustering_mmd"]`, s2gae.py:920) does not
+    # KeyError. Training clustering is off (Task 8), so clustering_mmd is a constant 0.0.
+    if not chunks:
+        return {
+            "total": 0.0,
+            "graph_sim": 0.0,
+            "relative_density": 0.0,
+            "degree_mmd": 0.0,
+            "clustering_mmd": 0.0,
+        }
+    rank = runtime.rank if runtime.is_distributed else 0
+    world_size = runtime.world_size if runtime.is_distributed else 1
+    shard = _shard_chunks_for_rank(
+        node_sizes=[chunk.node_size for chunk in chunks],
+        rank=rank,
+        world_size=world_size,
+    )
+    component_sums = {
+        "total": 0.0,
+        "graph_sim": 0.0,
+        "relative_density": 0.0,
+        "degree_mmd": 0.0,
+        "clustering_mmd": 0.0,
+    }
+    for global_index, scale in shard:
+        chunk = chunks[global_index]
+        # Recompute encode INSIDE the chunk so its graph is freed by this chunk's
+        # backward; do NOT hoist this out of the loop (would need retain_graph -> OOM).
+        hidden_states = refiner.encode(
+            node_features=graph.node_features,
+            edge_index=graph.edge_index,
+            edge_weight=graph.edge_weight,
+        )
+        global_pairs = (
+            torch.tensor(
+                [
+                    [node_index[sample.protein_a], node_index[sample.protein_b]]
+                    for sample in chunk.samples
+                ],
+                dtype=torch.long,
+                device=graph.node_features.device,
+            )
+            .t()
+            .contiguous()
+        )
+        refined_logits, _ = refiner.decode(
+            hidden_states=hidden_states,
+            pair_index=global_pairs,
+            pairwise_probabilities=graph.pairwise_probabilities[
+                _pair_lookup(graph.pair_index, global_pairs)
+            ],
+        )
+        chunk_loss, components = topology_subset_chunk_loss(
+            refined_logits=refined_logits,
+            chunk=chunk,
+            weights=weights,
+        )
+        scaled = topology_scale * topology_weight * scale * chunk_loss
+        # Accelerate-managed backward (keeps AMP scaler); accumulates into refiner.grad.
+        runtime.accelerator.backward(scaled)
+        for key in component_sums:
+            component_sums[key] += components[key] * scale
+    _all_reduce_topology_gradients(refiner, runtime)
+    # component_sums are RANK-LOCAL: each rank only walked its own disjoint shard. The
+    # gradient is made global by the all-reduce above, but these detached scalars are not,
+    # so SUM-reduce them too — otherwise the logged train_topology_* values would report
+    # only this rank's shard. No-op in single-process mode.
+    return _all_reduce_component_sums(component_sums, runtime)
 
 
 def build_s2gae_optimizer(

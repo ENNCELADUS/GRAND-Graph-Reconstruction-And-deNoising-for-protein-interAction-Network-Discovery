@@ -561,3 +561,30 @@ def test_topology_subset_chunk_loss_uses_inclusion_weights() -> None:
     assert torch.isfinite(loss)
     assert refined_logits.grad is not None
     assert components["sample_count"] == 2.0
+
+
+def test_size_balanced_topology_normalizers_ignore_subgraph_imbalance() -> None:
+    from tccig.s2gae import _size_balanced_chunk_scales
+
+    scales = _size_balanced_chunk_scales([20, 20, 20, 200])
+    assert scales == pytest.approx([1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0, 1.0 / 2.0])
+
+
+def test_shard_chunks_partition_is_disjoint_and_complete() -> None:
+    from tccig.s2gae import _shard_chunks_for_rank
+
+    node_sizes = [20, 20, 20, 200, 200]
+    world_size = 2
+    seen: list[int] = []
+    for rank in range(world_size):
+        shard = _shard_chunks_for_rank(
+            node_sizes=node_sizes, rank=rank, world_size=world_size
+        )
+        # Global scale must use GLOBAL counts (S=2 sizes, N_20=3, N_200=2),
+        # not the per-rank counts, regardless of which chunks land on this rank.
+        for global_index, scale in shard:
+            expected_n = 3 if node_sizes[global_index] == 20 else 2
+            assert scale == pytest.approx(1.0 / (2 * expected_n))
+            seen.append(global_index)
+    # Disjoint and complete cover of every chunk index exactly once.
+    assert sorted(seen) == list(range(len(node_sizes)))
