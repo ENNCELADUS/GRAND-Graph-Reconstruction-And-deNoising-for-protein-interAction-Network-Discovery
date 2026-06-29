@@ -667,3 +667,31 @@ def apply_per_size_subgraph_budget(
         "positive_edge_coverage": coverage,
     }
     return budgeted, stats
+
+
+@dataclass(frozen=True)
+class TopologySubgraphEpochChunk:
+    """One differentiable topology chunk for a sampled subgraph in one epoch."""
+
+    subgraph_id: str
+    node_size: int
+    samples: tuple[TopologyPairSample, ...]
+
+
+def group_epoch_samples_by_subgraph(
+    samples: Sequence[TopologyPairSample],
+) -> dict[str, TopologySubgraphEpochChunk]:
+    """Group epoch samples into subgraph chunks."""
+    grouped: dict[str, list[TopologyPairSample]] = defaultdict(list)
+    size_by_id: dict[str, int] = {}
+    for sample in samples:
+        grouped[sample.subgraph_id].append(sample)
+        size_by_id[sample.subgraph_id] = sample.node_size
+    return {
+        subgraph_id: TopologySubgraphEpochChunk(
+            subgraph_id=subgraph_id,
+            node_size=size_by_id[subgraph_id],
+            samples=tuple(rows),
+        )
+        for subgraph_id, rows in sorted(grouped.items())
+    }

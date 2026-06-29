@@ -335,3 +335,24 @@ def test_scored_pairs_from_subset_plan_track_scorer_probability() -> None:
     }
     for (a, b), prob in zip(endpoints, probabilities, strict=True):
         assert prob == by_id[canonical_pair_id(a, b)]
+
+
+from tccig.topology_subset import group_epoch_samples_by_subgraph
+
+
+def test_group_epoch_samples_by_subgraph_preserves_size_and_weights() -> None:
+    graph = _toy_graph()
+    sampled = {4: [("a", "b", "c", "d")]}
+    cfg = TopologySubsetSamplerConfig(candidate_ratio=3, pool_ratio=2, epoch_ratio=1, seed=4)
+    plan = build_topology_subset_plan(
+        graph=graph,
+        sampled_subgraphs=sampled,
+        config=cfg,
+        scorer_probabilities={"a||c": 0.9, "a||d": 0.2, "b||d": 0.7, "c||d": 0.1},
+    )
+    grouped = group_epoch_samples_by_subgraph(sample_epoch_topology_subset(plan=plan, epoch=1))
+    assert list(grouped) == ["size=4:index=0"]
+    chunk = grouped["size=4:index=0"]
+    assert chunk.node_size == 4
+    assert len(chunk.samples) >= 2
+    assert all(sample.pi_total > 0.0 for sample in chunk.samples)
