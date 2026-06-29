@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+
 import networkx as nx
 import pytest
 from tccig.topology_subset import (
@@ -524,3 +526,52 @@ def test_diagnostic_full_space_scoring_pairs_are_unique_and_ordered() -> None:
     assert pair_ids == sorted(set(pair_ids))
     assert len(rows) == 9
     assert rows[0] == ("a||b", "a", "b")
+
+
+def test_three_stage_negative_inclusion_frequency_matches_pi_total() -> None:
+    graph = nx.Graph()
+    graph.add_nodes_from(["a", "b", "c", "d", "e"])
+    graph.add_edges_from([("a", "b"), ("b", "c")])
+    nodes = ("a", "b", "c", "d", "e")
+    cfg_template = {
+        "candidate_ratio": 2,
+        "pool_ratio": 1,
+        "epoch_ratio": 1,
+        "hard_fraction": 0.5,
+        "uniform_fraction": 0.5,
+        "hard_stratum_fraction": 0.5,
+    }
+    exposures: dict[str, float] = defaultdict(float)
+    draws: dict[str, int] = defaultdict(int)
+    trials = 0
+    for plan_seed in range(300):
+        cfg = TopologySubsetSamplerConfig(seed=plan_seed, **cfg_template)
+        plan = build_topology_subset_plan(
+            graph=graph,
+            sampled_subgraphs={5: [nodes]},
+            config=cfg,
+            scorer_probabilities={
+                "a||c": 0.9,
+                "a||d": 0.2,
+                "a||e": 0.1,
+                "b||d": 0.8,
+                "b||e": 0.3,
+                "c||d": 0.7,
+                "c||e": 0.4,
+                "d||e": 0.6,
+            },
+        )
+        for epoch in range(20):
+            trials += 1
+            sampled = sample_epoch_topology_subset(plan=plan, epoch=epoch, config=cfg)
+            for subgraph in plan.subgraphs:
+                for candidate in subgraph.candidate_negatives:
+                    exposures[candidate.pair_id] += candidate.pi_total
+            for sample in sampled:
+                if sample.target == 0.0:
+                    draws[sample.pair_id] += 1
+                else:
+                    assert sample.pi_total == 1.0
+    observed_total = sum(draws.values()) / float(trials)
+    expected_total = sum(exposures.values()) / float(trials)
+    assert observed_total == pytest.approx(expected_total, rel=0.02)
