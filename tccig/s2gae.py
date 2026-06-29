@@ -51,7 +51,7 @@ from tccig.prepare import (
     sample_epoch_edge_targets,
     write_json,
 )
-from tccig.topology_subset import TopologySubsetSamplerConfig
+from tccig.topology_subset import TopologySubgraphEpochChunk, TopologySubsetSamplerConfig
 
 LOGGER = logging.getLogger(__name__)
 
@@ -549,6 +549,50 @@ def topology_plan_loss(
         totals = {key: value / bucket_count for key, value in totals.items()}
     components = {**totals, "total": float(total_loss.detach().item())}
     return total_loss, components
+
+
+def topology_subset_chunk_loss(
+    *,
+    refined_logits: torch.Tensor,
+    chunk: TopologySubgraphEpochChunk,
+    weights: TopologyLossWeights,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Compute weighted topology loss for one epoch subgraph chunk."""
+    device = refined_logits.device
+    pred = torch.sigmoid(refined_logits)
+    pair_a = torch.tensor(
+        [sample.local_index_a for sample in chunk.samples], dtype=torch.long, device=device
+    )
+    pair_b = torch.tensor(
+        [sample.local_index_b for sample in chunk.samples], dtype=torch.long, device=device
+    )
+    target = torch.tensor(
+        [sample.target for sample in chunk.samples], dtype=torch.float32, device=device
+    )
+    pair_weights = torch.tensor(
+        [1.0 / sample.pi_total for sample in chunk.samples],
+        dtype=torch.float32,
+        device=device,
+    )
+    terms = compute_topology_losses(
+        weights=weights,
+        num_nodes=chunk.node_size,
+        pair_index_a=pair_a,
+        pair_index_b=pair_b,
+        pred_pair_probabilities=pred,
+        target_pair_probabilities=target,
+        pair_weights=pair_weights,
+        include_clustering_mmd=False,
+    )
+    components = {
+        "graph_sim": float(terms["graph_similarity"].detach().cpu().item()),
+        "relative_density": float(terms["relative_density"].detach().cpu().item()),
+        "degree_mmd": float(terms["degree_mmd"].detach().cpu().item()),
+        "clustering_mmd": 0.0,
+        "total": float(terms["total_topology"].detach().cpu().item()),
+        "sample_count": float(len(chunk.samples)),
+    }
+    return terms["total_topology"], components
 
 
 def build_s2gae_optimizer(

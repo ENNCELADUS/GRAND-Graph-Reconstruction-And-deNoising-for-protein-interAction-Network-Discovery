@@ -502,3 +502,62 @@ def test_coverage_stats_from_payload_drops_non_numeric_values() -> None:
     }
     # Non-numeric values must not survive: the log path calls float() on them.
     assert _coverage_stats_from_payload(payload) == {"base_bucket_count": 3}
+
+
+def test_topology_subset_chunk_loss_uses_inclusion_weights() -> None:
+    from src.topology.finetune_losses import TopologyLossWeights
+    from tccig.s2gae import topology_subset_chunk_loss
+    from tccig.topology_subset import (
+        SamplingStratum,
+        TopologyPairSample,
+        TopologySubgraphEpochChunk,
+    )
+
+    chunk = TopologySubgraphEpochChunk(
+        subgraph_id="size=3:index=0",
+        node_size=3,
+        samples=(
+            TopologyPairSample(
+                pair_id="a||b",
+                subgraph_id="size=3:index=0",
+                node_size=3,
+                protein_a="a",
+                protein_b="b",
+                local_index_a=0,
+                local_index_b=1,
+                stratum=SamplingStratum.POSITIVE,
+                pi_cand=1.0,
+                pi_pool_given_cand=1.0,
+                pi_epoch_given_pool=1.0,
+                pi_total=1.0,
+                target=1.0,
+                scorer_probability=0.9,
+            ),
+            TopologyPairSample(
+                pair_id="b||c",
+                subgraph_id="size=3:index=0",
+                node_size=3,
+                protein_a="b",
+                protein_b="c",
+                local_index_a=1,
+                local_index_b=2,
+                stratum=SamplingStratum.UNIFORM_NEGATIVE,
+                pi_cand=0.5,
+                pi_pool_given_cand=1.0,
+                pi_epoch_given_pool=1.0,
+                pi_total=0.5,
+                target=0.0,
+                scorer_probability=0.2,
+            ),
+        ),
+    )
+    refined_logits = torch.tensor([2.0, -1.0], requires_grad=True)
+    loss, components = topology_subset_chunk_loss(
+        refined_logits=refined_logits,
+        chunk=chunk,
+        weights=TopologyLossWeights(alpha=1.0, beta=1.0, gamma=1.0, delta=0.0),
+    )
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert refined_logits.grad is not None
+    assert components["sample_count"] == 2.0
