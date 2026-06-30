@@ -27,14 +27,19 @@ surfaced **two distinct, independent failures**:
    | signal | epoch 3 | epoch 40 |
    |---|---:|---:|
    | `train_topology_loss` | 9.707 | 12.172 |
+   | `train_topo_graph_sim` (loss component) | 0.705 | 0.746 |
    | `train_topo_relative_density` | 1.088 | 1.386 |
    | `train_topo_degree_mmd` | 0.589 | 0.672 |
    | `train_bce_loss` | 0.992 | 0.746 |
    | `val_auprc` | 0.685 | 0.739 |
    | selected edges @0.5 | 237,773 | 357,008 |
 
-   Density dominates the loss (~91% at epoch 40: `0.746 + 8·1.386 + 0.5·0.672 =
-   12.17`). `train_topology_loss` correlates ~0.9999 with selected edges. BCE
+   Density dominates the loss (~91% at epoch 40, with weights `α=1, β=8, γ=0.5`:
+   `1·0.746 (graph_sim) + 8·1.386 (density) + 0.5·0.672 (degree) = 12.17`, where
+   the `8·1.386 = 11.09` density term is 91.1% of the total). Note the graph-sim
+   loss component (`0.746`) coincidentally equals `train_bce_loss` at epoch 40;
+   BCE is **not** part of `train_topology_loss`. `train_topology_loss` correlates
+   ~0.9999 with selected edges. BCE
    falls and AUPRC rises while topology, edges, and density all worsen: the BCE
    direction (補 FN — train targets are FN:FP ≈ 5.26×) pushes the refiner into
    an edge-adder, and the topology objective is not winning. The asymmetric
@@ -102,6 +107,15 @@ graph_selection:
   Other values raise a clear `ValueError`.
 - `grid` is a fixed coarse list of probabilities in `[0, 1]`; required when
   `type: calibrated`.
+- **Calibrated mode requires a coherent topology-monitor setup.** Because
+  calibrated selection minimizes `val_topology_loss` and that quantity also
+  drives checkpoint selection, the parser raises a clear `ValueError` unless
+  both hold: `refiner.topology_validation.enabled: true` (so per-epoch topology
+  metrics exist to calibrate against) and `refiner.monitor_metric:
+  val_topology_loss` (so the calibrated minimum, not AUPRC, picks the
+  checkpoint). Without these guards calibrated thresholding could run while the
+  checkpoint still follows AUPRC, or while no topology rule is available — an
+  incoherent state. Validate at config-parse time, not mid-training.
 
 ### Validation (per epoch)
 
@@ -172,6 +186,14 @@ actual threshold chosen each epoch so the calibration trajectory is reviewable.
 The best epoch's `selected_rule` continues to be persisted in the summary and
 checkpoint as it is today.
 
+**Type widening required.** The `selected_rule` value is a nested dict, but the
+current history typing is `list[dict[str, float | int]]` (`s2gae.py:1147`) and
+`epoch_history: dict[str, float | int]` (`s2gae.py:1375`). The implementation
+must widen these to admit the nested rule object (e.g. a `JsonValue`/
+`dict[str, object]` value type), otherwise the new field is a `mypy` mismatch.
+The CSV writer is unchanged (no CSV columns added), so its row-dict typing is
+unaffected.
+
 ## Part B — Topology-only epochs (gated diagnostic)
 
 ### Config schema
@@ -190,18 +212,24 @@ Semantics are **inclusive** (`epoch >= N`).
 
 ### Mechanics
 
-Within each epoch, the BCE per-batch loop (`s2gae.py:1166-1189`) and the
-topology backward step (`s2gae.py:1193+`) are already separate sequential
-phases. On a topo-only epoch:
+Within each epoch, the BCE phase (`s2gae.py:1152-1189`) and the topology
+backward step (`s2gae.py:1193+`) are already separate sequential phases. On a
+topo-only epoch:
 
-- Skip the BCE per-batch loop entirely. The topology backward step is
-  self-contained (its own `zero_grad`/`step`) and runs unchanged.
+- Skip the **entire** BCE phase, not just the per-batch loop: skip
+  `sample_epoch_edge_targets` (`s2gae.py:1152`) and the `DataLoader`
+  construction/`prepare` (`s2gae.py:1157-1163`) as well. Otherwise topo-only
+  epochs would still pay the sampling + loader cost and log a nonzero
+  `sampled_edge_targets` despite running no BCE step.
+- The topology backward step is self-contained (its own `zero_grad`/`step`) and
+  runs unchanged.
 - The asymmetric residual anchor lives inside the BCE loop, so it is dropped on
   topo-only epochs along with BCE. This yields a clean "does the topology
   gradient *alone* reduce topology loss?" probe.
-- `train_bce_loss` (and residual-anchor terms) log `0.0` for the epoch;
-  `train_topology_loss` logs its real value. `epoch_denominator = max(1, count)`
-  already guards the zero-BCE division, so no metric divides by zero.
+- `train_bce_loss` (and residual-anchor terms) log `0.0` for the epoch, and
+  `sampled_edge_targets` logs `0`; `train_topology_loss` logs its real value.
+  `epoch_denominator = max(1, count)` already guards the zero-BCE division, so
+  no metric divides by zero.
 
 Default (`null`) → existing behavior unchanged.
 
@@ -222,6 +250,9 @@ Unit tests (TDD):
 - Calibrated parsing: `type: calibrated` requires `grid` + valid `objective`;
   invalid objective and missing grid raise clear errors; `type: threshold` /
   absent preserves the existing fixed rule.
+- Calibrated guards: `type: calibrated` with `topology_validation.enabled:
+  false` or `monitor_metric != val_topology_loss` raises a clear `ValueError` at
+  parse time.
 - Per-epoch calibration picks the grid `argmin val_topology_loss` and writes the
   chosen `selected_rule` (with `source: validation_calibration`) into the epoch
   history.
@@ -239,7 +270,7 @@ Commands (run inside the project venv):
 source /Users/richardwang/Documents/grand/.venv/bin/activate
 uv run python -m pytest
 uv run ruff check tccig/s2gae.py tccig/train.py tccig/test.py tccig/prepare.py
-uv run mypy src
+uv run mypy tccig src
 ```
 
 ## Expected outcome
