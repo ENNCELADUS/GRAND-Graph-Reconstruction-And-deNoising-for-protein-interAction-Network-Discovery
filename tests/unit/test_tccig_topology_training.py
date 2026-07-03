@@ -73,6 +73,19 @@ def test_parse_config_reads_residual_anchor_and_topology_training() -> None:
     assert cfg.topology_training.ramp_epochs == 10
 
 
+def test_parse_config_reads_topology_only_epoch_boundary() -> None:
+    from tccig.s2gae import _parse_config
+
+    config = _base_refiner_config()
+    topology_training = config["topology_training"]
+    assert isinstance(topology_training, dict)
+    topology_training["topo_only_after_epoch"] = 7
+
+    cfg = _parse_config(config)
+
+    assert cfg.topology_training.topo_only_after_epoch == 7
+
+
 def test_parse_config_defaults_topology_training_disabled() -> None:
     from tccig.s2gae import _parse_config
 
@@ -82,6 +95,92 @@ def test_parse_config_defaults_topology_training_disabled() -> None:
     cfg = _parse_config(config)
     assert cfg.topology_training.enabled is False
     assert cfg.residual_anchor.form == "symmetric"
+
+
+def test_parse_config_defaults_topology_only_epoch_boundary_off() -> None:
+    from tccig.s2gae import _parse_config
+
+    cfg = _parse_config(_base_refiner_config())
+
+    assert cfg.topology_training.topo_only_after_epoch is None
+
+
+def test_parse_config_ignores_topology_only_epoch_boundary_when_disabled() -> None:
+    from tccig.s2gae import _parse_config
+
+    config = _base_refiner_config()
+    topology_training = config["topology_training"]
+    assert isinstance(topology_training, dict)
+    topology_training["enabled"] = False
+    topology_training["topo_only_after_epoch"] = 1
+
+    cfg = _parse_config(config)
+
+    assert cfg.topology_training.enabled is False
+    assert cfg.topology_training.topo_only_after_epoch is None
+
+
+def test_parse_config_rejects_topology_only_epoch_boundary_with_zero_scale() -> None:
+    from tccig.s2gae import _parse_config
+
+    config = _base_refiner_config()
+    topology_training = config["topology_training"]
+    assert isinstance(topology_training, dict)
+    topology_training["topo_only_after_epoch"] = 1
+    topology_training["schedule"] = {"warmup_epochs": 5, "ramp_epochs": 10, "schedule": "linear"}
+
+    with pytest.raises(ValueError, match="topo_only_after_epoch.*topology loss scale"):
+        _parse_config(config)
+
+
+def test_parse_config_rejects_topology_only_epoch_boundary_with_zero_weight() -> None:
+    from tccig.s2gae import _parse_config
+
+    config = _base_refiner_config()
+    topology_training = config["topology_training"]
+    assert isinstance(topology_training, dict)
+    topology_training["topo_only_after_epoch"] = 1
+    topology_training["topology_weight"] = 0.0
+    topology_training["schedule"] = {"warmup_epochs": 0, "ramp_epochs": 0, "schedule": "linear"}
+
+    with pytest.raises(ValueError, match="topo_only_after_epoch.*topology_weight"):
+        _parse_config(config)
+
+
+def test_parse_config_rejects_topology_only_epoch_boundary_with_zero_loss_weights() -> None:
+    from tccig.s2gae import _parse_config
+
+    config = _base_refiner_config()
+    topology_training = config["topology_training"]
+    assert isinstance(topology_training, dict)
+    topology_training["topo_only_after_epoch"] = 1
+    topology_training["topology_weight"] = 1.0
+    topology_training["weights"] = {"alpha": 0.0, "beta": 0.0, "gamma": 0.0, "delta": 0.0}
+    topology_training["schedule"] = {"warmup_epochs": 0, "ramp_epochs": 0, "schedule": "linear"}
+
+    with pytest.raises(
+        ValueError,
+        match="topo_only_after_epoch.*active topology loss component weights",
+    ):
+        _parse_config(config)
+
+
+def test_parse_config_rejects_topology_only_epoch_boundary_with_delta_only_weight() -> None:
+    from tccig.s2gae import _parse_config
+
+    config = _base_refiner_config()
+    topology_training = config["topology_training"]
+    assert isinstance(topology_training, dict)
+    topology_training["topo_only_after_epoch"] = 1
+    topology_training["topology_weight"] = 1.0
+    topology_training["weights"] = {"alpha": 0.0, "beta": 0.0, "gamma": 0.0, "delta": 1.0}
+    topology_training["schedule"] = {"warmup_epochs": 0, "ramp_epochs": 0, "schedule": "linear"}
+
+    with pytest.raises(
+        ValueError,
+        match="topo_only_after_epoch.*active topology loss component weights",
+    ):
+        _parse_config(config)
 
 
 def test_parse_config_reads_topology_subset_sampler() -> None:

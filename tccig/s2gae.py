@@ -37,6 +37,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from tccig.prepare import (
     CandidatePair,
     EdgeSamplingConfig,
+    EdgeTarget,
     EdgeTargetDataset,
     GraphRule,
     RefineRequest,
@@ -194,6 +195,7 @@ class S2GAETopologyTrainingConfig:
     warmup_epochs: int
     ramp_epochs: int
     schedule: str
+    topo_only_after_epoch: int | None
     subset: TopologySubsetSamplerConfig
 
 
@@ -1149,44 +1151,51 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
     for epoch in range(1, cfg.epochs + 1):
         epoch_start = time.perf_counter()
         train_step_model.train()
-        epoch_targets = sample_epoch_edge_targets(
-            quadrants=quadrants,
-            sampling=cfg.edge_sampling,
-            epoch=epoch,
+        topo_only_epoch = (
+            cfg.topology_training.enabled
+            and cfg.topology_training.topo_only_after_epoch is not None
+            and epoch >= cfg.topology_training.topo_only_after_epoch
         )
-        loader = DataLoader(
-            EdgeTargetDataset(epoch_targets),
-            batch_size=cfg.batch_size,
-            shuffle=False,
-            collate_fn=collate_edge_targets,
-        )
-        prepared_loader = request.runtime.accelerator.prepare(loader)
+        epoch_targets: list[EdgeTarget] = []
         local_loss_sums = torch.zeros(5, dtype=torch.float64, device=device)
         gradient_norm = 0.0
-        for batch in cast(Iterable[Mapping[str, torch.Tensor]], prepared_loader):
-            optimizer.zero_grad(set_to_none=True)
-            batch_loss, batch_sums = cast(
-                tuple[torch.Tensor, torch.Tensor],
-                train_step_model(
-                    graph=train_graph,
-                    pair_indices=batch["pair_index"].to(device),
-                    labels=batch["label"].to(device),
-                    mask_input_edges=batch["mask_input_edge"].to(device),
-                ),
+        if not topo_only_epoch:
+            epoch_targets = sample_epoch_edge_targets(
+                quadrants=quadrants,
+                sampling=cfg.edge_sampling,
+                epoch=epoch,
             )
-            request.runtime.accelerator.backward(batch_loss)
-            if cfg.optimization.gradient_clip_norm is None:
-                gradient_norm = apply_gradient_clipping(
-                    model=train_step_model, gradient_clip_norm=None
+            loader = DataLoader(
+                EdgeTargetDataset(epoch_targets),
+                batch_size=cfg.batch_size,
+                shuffle=False,
+                collate_fn=collate_edge_targets,
+            )
+            prepared_loader = request.runtime.accelerator.prepare(loader)
+            for batch in cast(Iterable[Mapping[str, torch.Tensor]], prepared_loader):
+                optimizer.zero_grad(set_to_none=True)
+                batch_loss, batch_sums = cast(
+                    tuple[torch.Tensor, torch.Tensor],
+                    train_step_model(
+                        graph=train_graph,
+                        pair_indices=batch["pair_index"].to(device),
+                        labels=batch["label"].to(device),
+                        mask_input_edges=batch["mask_input_edge"].to(device),
+                    ),
                 )
-            else:
-                clipped = request.runtime.accelerator.clip_grad_norm_(
-                    train_step_model.parameters(),
-                    cfg.optimization.gradient_clip_norm,
-                )
-                gradient_norm = float(clipped.detach().cpu().item())
-            optimizer.step()
-            local_loss_sums += batch_sums.detach()
+                request.runtime.accelerator.backward(batch_loss)
+                if cfg.optimization.gradient_clip_norm is None:
+                    gradient_norm = apply_gradient_clipping(
+                        model=train_step_model, gradient_clip_norm=None
+                    )
+                else:
+                    clipped = request.runtime.accelerator.clip_grad_norm_(
+                        train_step_model.parameters(),
+                        cfg.optimization.gradient_clip_norm,
+                    )
+                    gradient_norm = float(clipped.detach().cpu().item())
+                optimizer.step()
+                local_loss_sums += batch_sums.detach()
         topology_components: dict[str, float] | None = None
         topology_bias_history: dict[str, float | int] = {}
         topology_scale = 0.0
@@ -1320,10 +1329,20 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                         request.runtime.accelerator.backward(scaled)
                 finally:
                     topology_refiner.train(topology_was_training)
+                topology_gradient_norm = 0.0
                 if cfg.optimization.gradient_clip_norm is not None:
-                    request.runtime.accelerator.clip_grad_norm_(
-                        train_step_model.parameters(), cfg.optimization.gradient_clip_norm
+                    clipped = request.runtime.accelerator.clip_grad_norm_(
+                        train_step_model.parameters(),
+                        cfg.optimization.gradient_clip_norm,
                     )
+                    topology_gradient_norm = float(clipped.detach().cpu().item())
+                else:
+                    topology_gradient_norm = apply_gradient_clipping(
+                        model=train_step_model,
+                        gradient_clip_norm=None,
+                    )
+                if topo_only_epoch:
+                    gradient_norm = topology_gradient_norm
                 optimizer.step()
         validation_model = _unwrap_refiner(train_step_model, request.runtime.accelerator)
         global_loss_sums = request.runtime.accelerator.reduce(local_loss_sums, reduction="sum")
@@ -2292,6 +2311,7 @@ def _config_to_json(cfg: S2GAEConfig) -> dict[str, object]:
                 "ramp_epochs": cfg.topology_training.ramp_epochs,
                 "schedule": cfg.topology_training.schedule,
             },
+            "topo_only_after_epoch": cfg.topology_training.topo_only_after_epoch,
             "subset": {
                 "enabled": cfg.topology_training.subset.enabled,
                 "candidate_ratio": cfg.topology_training.subset.candidate_ratio,
@@ -2507,6 +2527,7 @@ def _parse_topology_training_config(raw: object) -> S2GAETopologyTrainingConfig:
             warmup_epochs=0,
             ramp_epochs=0,
             schedule="linear",
+            topo_only_after_epoch=None,
             subset=TopologySubsetSamplerConfig(enabled=False),
         )
     raw_weights = raw.get("weights", {})
@@ -2515,8 +2536,57 @@ def _parse_topology_training_config(raw: object) -> S2GAETopologyTrainingConfig:
     raw_schedule = raw.get("schedule", {})
     if not isinstance(raw_schedule, Mapping):
         raise ValueError("refiner.topology_training.schedule must be a mapping")
+    enabled = _bool(raw.get("enabled", False), "refiner.topology_training.enabled")
+    topology_weight = _non_negative_float(
+        raw.get("topology_weight", 1.0), "refiner.topology_training.topology_weight"
+    )
+    topology_weights = TopologyLossWeights(
+        alpha=_non_negative_float(raw_weights.get("alpha", 1.0), "...alpha"),
+        beta=_non_negative_float(raw_weights.get("beta", 8.0), "...beta"),
+        gamma=_non_negative_float(raw_weights.get("gamma", 0.5), "...gamma"),
+        delta=_non_negative_float(raw_weights.get("delta", 0.1), "...delta"),
+    )
+    warmup_epochs = _non_negative_int(raw_schedule.get("warmup_epochs", 0), "...warmup_epochs")
+    ramp_epochs = _non_negative_int(raw_schedule.get("ramp_epochs", 0), "...ramp_epochs")
+    schedule = str(raw_schedule.get("schedule", "linear"))
+    topo_only_after_epoch = (
+        _optional_positive_int(
+            raw.get("topo_only_after_epoch"),
+            "refiner.topology_training.topo_only_after_epoch",
+        )
+        if enabled
+        else None
+    )
+    if topo_only_after_epoch is not None:
+        if topology_weight <= 0.0:
+            raise ValueError(
+                "refiner.topology_training.topo_only_after_epoch requires active "
+                "topology loss: topology_weight must be > 0.0"
+            )
+        if (
+            topology_weights.alpha <= 0.0
+            and topology_weights.beta <= 0.0
+            and topology_weights.gamma <= 0.0
+        ):
+            raise ValueError(
+                "refiner.topology_training.topo_only_after_epoch requires active "
+                "topology loss component weights"
+            )
+        topo_only_scale = topology_loss_scale(
+            epoch=topo_only_after_epoch - 1,
+            schedule=TopologyLossWeightSchedule(
+                warmup_epochs=warmup_epochs,
+                ramp_epochs=ramp_epochs,
+                schedule=schedule,
+            ),
+        )
+        if topo_only_scale <= 0.0:
+            raise ValueError(
+                "refiner.topology_training.topo_only_after_epoch requires active "
+                "topology loss scale at the boundary"
+            )
     return S2GAETopologyTrainingConfig(
-        enabled=_bool(raw.get("enabled", False), "refiner.topology_training.enabled"),
+        enabled=enabled,
         node_sizes=tuple(
             _int_sequence(
                 raw.get("node_sizes", list(TOPOLOGY_EVAL_NODE_SIZES)),
@@ -2532,18 +2602,12 @@ def _parse_topology_training_config(raw: object) -> S2GAETopologyTrainingConfig:
             raw.get("coverage_augmentation", True),
             "refiner.topology_training.coverage_augmentation",
         ),
-        topology_weight=_non_negative_float(
-            raw.get("topology_weight", 1.0), "refiner.topology_training.topology_weight"
-        ),
-        weights=TopologyLossWeights(
-            alpha=_non_negative_float(raw_weights.get("alpha", 1.0), "...alpha"),
-            beta=_non_negative_float(raw_weights.get("beta", 8.0), "...beta"),
-            gamma=_non_negative_float(raw_weights.get("gamma", 0.5), "...gamma"),
-            delta=_non_negative_float(raw_weights.get("delta", 0.1), "...delta"),
-        ),
-        warmup_epochs=_non_negative_int(raw_schedule.get("warmup_epochs", 0), "...warmup_epochs"),
-        ramp_epochs=_non_negative_int(raw_schedule.get("ramp_epochs", 0), "...ramp_epochs"),
-        schedule=str(raw_schedule.get("schedule", "linear")),
+        topology_weight=topology_weight,
+        weights=topology_weights,
+        warmup_epochs=warmup_epochs,
+        ramp_epochs=ramp_epochs,
+        schedule=schedule,
+        topo_only_after_epoch=topo_only_after_epoch,
         subset=_parse_topology_subset_config(raw.get("subset")),
     )
 
@@ -2618,6 +2682,12 @@ def _positive_int(value: object, field_name: str) -> int:
     if parsed <= 0:
         raise ValueError(f"{field_name} must be a positive integer")
     return parsed
+
+
+def _optional_positive_int(value: object, field_name: str) -> int | None:
+    if value is None:
+        return None
+    return _positive_int(value, field_name)
 
 
 def _positive_float(value: object, field_name: str) -> float:

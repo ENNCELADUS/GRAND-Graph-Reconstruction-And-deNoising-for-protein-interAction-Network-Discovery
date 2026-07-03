@@ -7,6 +7,7 @@ import pickle
 from pathlib import Path
 
 import networkx as nx
+import pytest
 import torch
 import yaml
 from src.pipeline.stages.train import build_model
@@ -239,3 +240,56 @@ def test_topology_training_run_deletes_edges_and_logs_topology_loss(tmp_path: Pa
     assert any("train_topology_loss" in entry for entry in history)
     # warmup_epochs=0, ramp_epochs=1 -> epoch 1 scale 0.0, final epoch ramps to 1.0.
     assert history[-1]["train_topology_scale"] == 1.0
+
+
+def test_topology_only_epochs_skip_bce_sampling_and_log_zero_bce(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tccig.s2gae as s2gae_module
+
+    config = _topology_training_config(tmp_path, "02_topology_only")
+    refiner_config = config["refiner"]
+    assert isinstance(refiner_config, dict)
+    refiner_config["epochs"] = 1
+    topology_training = refiner_config["topology_training"]
+    assert isinstance(topology_training, dict)
+    topology_training["topo_only_after_epoch"] = 1
+    topology_training["schedule"] = {"warmup_epochs": 0, "ramp_epochs": 0, "schedule": "linear"}
+
+    def fail_sample_epoch_edge_targets(**_kwargs: object) -> list[object]:
+        raise AssertionError("sample_epoch_edge_targets must not run on topo-only epochs")
+
+    step_calls = 0
+    original_step = torch.optim.AdamW.step
+
+    def counting_step(self: torch.optim.AdamW, *args: object, **kwargs: object) -> object:
+        nonlocal step_calls
+        step_calls += 1
+        return original_step(self, *args, **kwargs)
+
+    monkeypatch.setattr(s2gae_module, "sample_epoch_edge_targets", fail_sample_epoch_edge_targets)
+    monkeypatch.setattr(torch.optim.AdamW, "step", counting_step)
+
+    run_tccig_pipeline(config)
+
+    summary = json.loads(
+        (
+            tmp_path
+            / "logs"
+            / "tccig"
+            / "02_topology_only"
+            / "training_summary.json"
+        ).read_text(encoding="utf-8")
+    )
+    row = summary["history"][0]
+
+    assert step_calls >= 1
+    assert row["sampled_edge_targets"] == 0
+    assert row["train_loss"] == 0.0
+    assert row["train_bce_loss"] == 0.0
+    assert row["train_residual_anchor_loss"] == 0.0
+    assert row["train_weighted_residual_anchor_loss"] == 0.0
+    assert row["train_topology_scale"] == 1.0
+    assert "train_gradient_norm" in row
+    assert "train_topology_loss" in row
