@@ -8,6 +8,7 @@ import logging
 import math
 import random
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
@@ -78,6 +79,18 @@ LOGGER = logging.getLogger(__name__)
 
 DEFAULT_GRAPH_THRESHOLD = 0.5
 AcceleratorFactory = Callable[[], object]
+
+
+@dataclass(frozen=True)
+class RefinedOutputRuleConfig:
+    """Parsed refined-output rule config for validation/test graph assembly."""
+
+    calibrated: bool
+    fixed_rule: GraphRule
+    validation_rules: tuple[GraphRule, ...]
+    objective: str | None
+    selected_rule_source: str | None
+    configured_payload: dict[str, object]
 
 
 def parse_rules(raw_rules: object) -> list[GraphRule]:
@@ -1096,22 +1109,75 @@ def _resolve_pairwise_input_rule(
     )
 
 
-def _resolve_refined_output_rule(config: Mapping[str, object]) -> GraphRule:
+def _resolve_refined_output_rule_config(config: Mapping[str, object]) -> RefinedOutputRuleConfig:
     raw_rule = _graph_selection(config).get(
         "refined_output_rule",
         {"type": "threshold", "value": DEFAULT_GRAPH_THRESHOLD},
     )
     if not isinstance(raw_rule, Mapping):
         raise ValueError("graph_selection.refined_output_rule must be a mapping")
-    if str(raw_rule.get("type", "threshold")).lower() != "threshold":
-        raise ValueError("graph_selection.refined_output_rule only supports threshold")
-    return GraphRule(
-        type="threshold",
-        value=_probability(
+    rule_type = str(raw_rule.get("type", raw_rule.get("mode", "threshold"))).lower()
+    if rule_type == "threshold":
+        value = _probability(
             raw_rule.get("value", DEFAULT_GRAPH_THRESHOLD),
             "graph_selection.refined_output_rule.value",
-        ),
-    )
+        )
+        rule = GraphRule(type="threshold", value=value)
+        return RefinedOutputRuleConfig(
+            calibrated=False,
+            fixed_rule=rule,
+            validation_rules=(rule,),
+            objective=None,
+            selected_rule_source=None,
+            configured_payload=rule.to_dict(),
+        )
+    if rule_type == "calibrated":
+        _validate_calibrated_refined_output_setup(config)
+        objective = str(raw_rule.get("objective", "")).lower()
+        if objective != "val_topology_loss":
+            raise ValueError(
+                "graph_selection.refined_output_rule.objective must be val_topology_loss"
+            )
+        grid = _probability_sequence(
+            raw_rule.get("grid"),
+            "graph_selection.refined_output_rule.grid",
+        )
+        validation_rules = tuple(GraphRule(type="threshold", value=value) for value in grid)
+        return RefinedOutputRuleConfig(
+            calibrated=True,
+            fixed_rule=validation_rules[0],
+            validation_rules=validation_rules,
+            objective=objective,
+            selected_rule_source="validation_calibration",
+            configured_payload={
+                "type": "calibrated",
+                "objective": objective,
+                "grid": list(grid),
+            },
+        )
+    raise ValueError("graph_selection.refined_output_rule.type must be threshold or calibrated")
+
+
+def _resolve_refined_output_rule(config: Mapping[str, object]) -> GraphRule:
+    return _resolve_refined_output_rule_config(config).fixed_rule
+
+
+def _validate_calibrated_refined_output_setup(config: Mapping[str, object]) -> None:
+    refiner_cfg = _mapping_section(config, "refiner")
+    monitor_metric = str(refiner_cfg.get("monitor_metric", "val_auprc"))
+    if monitor_metric != "val_topology_loss":
+        raise ValueError(
+            "graph_selection.refined_output_rule.type=calibrated requires "
+            "refiner.monitor_metric: val_topology_loss"
+        )
+    topology_validation = refiner_cfg.get("topology_validation", {})
+    if not isinstance(topology_validation, Mapping):
+        raise ValueError("refiner.topology_validation must be a mapping")
+    if topology_validation.get("enabled") is not True:
+        raise ValueError(
+            "graph_selection.refined_output_rule.type=calibrated requires "
+            "refiner.topology_validation.enabled: true"
+        )
 
 
 def _collate_pair_score_batch(
@@ -1365,6 +1431,15 @@ def _probability(value: object, field_name: str) -> float:
         raise ValueError(f"{field_name} must be in [0, 1]") from error
     if math.isnan(parsed) or parsed < 0.0 or parsed > 1.0:
         raise ValueError(f"{field_name} must be in [0, 1]")
+    return parsed
+
+
+def _probability_sequence(value: object, field_name: str) -> tuple[float, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise ValueError(f"{field_name} must be a sequence")
+    parsed = tuple(_probability(item, field_name) for item in value)
+    if not parsed:
+        raise ValueError(f"{field_name} must not be empty")
     return parsed
 
 

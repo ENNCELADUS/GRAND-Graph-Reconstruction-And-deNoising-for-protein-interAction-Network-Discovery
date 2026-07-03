@@ -105,6 +105,127 @@ def test_parse_config_reads_topology_subset_sampler() -> None:
     assert cfg.topology_validation.compute_clustering_mmd is True
 
 
+def _calibrated_pipeline_config() -> dict[str, object]:
+    return {
+        "refiner": {
+            "monitor_metric": "val_topology_loss",
+            "topology_validation": {"enabled": True},
+        },
+        "graph_selection": {
+            "refined_output_rule": {
+                "type": "calibrated",
+                "objective": "val_topology_loss",
+                "grid": [0.5, 0.9, 0.97],
+            }
+        },
+    }
+
+
+def test_resolve_refined_output_rule_config_accepts_calibrated_grid() -> None:
+    parsed = tccig_train._resolve_refined_output_rule_config(_calibrated_pipeline_config())
+
+    assert parsed.calibrated is True
+    assert parsed.objective == "val_topology_loss"
+    assert parsed.selected_rule_source == "validation_calibration"
+    assert [rule.type for rule in parsed.validation_rules] == [
+        "threshold",
+        "threshold",
+        "threshold",
+    ]
+    assert [float(rule.value) for rule in parsed.validation_rules] == [0.5, 0.9, 0.97]
+    assert parsed.fixed_rule.value == pytest.approx(0.5)
+
+
+def test_resolve_refined_output_rule_config_accepts_calibrated_mode_alias() -> None:
+    config = _calibrated_pipeline_config()
+    graph_selection = config["graph_selection"]
+    assert isinstance(graph_selection, dict)
+    refined_rule = graph_selection["refined_output_rule"]
+    assert isinstance(refined_rule, dict)
+    del refined_rule["type"]
+    refined_rule["mode"] = "calibrated"
+
+    parsed = tccig_train._resolve_refined_output_rule_config(config)
+
+    assert parsed.calibrated is True
+    assert [float(rule.value) for rule in parsed.validation_rules] == [0.5, 0.9, 0.97]
+
+
+def test_resolve_refined_output_rule_config_preserves_threshold_default() -> None:
+    parsed = tccig_train._resolve_refined_output_rule_config({})
+
+    assert parsed.calibrated is False
+    assert parsed.objective is None
+    assert parsed.selected_rule_source is None
+    assert len(parsed.validation_rules) == 1
+    assert parsed.validation_rules[0].to_dict() == {"type": "threshold", "value": 0.5}
+    assert parsed.fixed_rule.to_dict() == {"type": "threshold", "value": 0.5}
+
+
+def test_resolve_refined_output_rule_config_rejects_invalid_calibrated_objective() -> None:
+    config = _calibrated_pipeline_config()
+    graph_selection = config["graph_selection"]
+    assert isinstance(graph_selection, dict)
+    refined_rule = graph_selection["refined_output_rule"]
+    assert isinstance(refined_rule, dict)
+    refined_rule["objective"] = "val_auprc"
+
+    with pytest.raises(ValueError, match="objective must be val_topology_loss"):
+        tccig_train._resolve_refined_output_rule_config(config)
+
+
+def test_resolve_refined_output_rule_config_rejects_empty_calibrated_grid() -> None:
+    config = _calibrated_pipeline_config()
+    graph_selection = config["graph_selection"]
+    assert isinstance(graph_selection, dict)
+    refined_rule = graph_selection["refined_output_rule"]
+    assert isinstance(refined_rule, dict)
+    refined_rule["grid"] = []
+
+    with pytest.raises(ValueError, match="grid must not be empty"):
+        tccig_train._resolve_refined_output_rule_config(config)
+
+
+def test_resolve_refined_output_rule_config_rejects_out_of_range_calibrated_grid() -> None:
+    config = _calibrated_pipeline_config()
+    graph_selection = config["graph_selection"]
+    assert isinstance(graph_selection, dict)
+    refined_rule = graph_selection["refined_output_rule"]
+    assert isinstance(refined_rule, dict)
+    refined_rule["grid"] = [0.5, 1.1]
+
+    with pytest.raises(ValueError, match="grid must be in \\[0, 1\\]"):
+        tccig_train._resolve_refined_output_rule_config(config)
+
+
+def test_resolve_refined_output_rule_config_requires_topology_monitor_setup() -> None:
+    no_topology = _calibrated_pipeline_config()
+    refiner = no_topology["refiner"]
+    assert isinstance(refiner, dict)
+    refiner["topology_validation"] = {"enabled": False}
+
+    with pytest.raises(ValueError, match="topology_validation.enabled"):
+        tccig_train._resolve_refined_output_rule_config(no_topology)
+
+    wrong_monitor = _calibrated_pipeline_config()
+    refiner = wrong_monitor["refiner"]
+    assert isinstance(refiner, dict)
+    refiner["monitor_metric"] = "val_auprc"
+
+    with pytest.raises(ValueError, match="monitor_metric"):
+        tccig_train._resolve_refined_output_rule_config(wrong_monitor)
+
+
+def test_resolve_refined_output_rule_config_requires_literal_topology_enabled_true() -> None:
+    config = _calibrated_pipeline_config()
+    refiner = config["refiner"]
+    assert isinstance(refiner, dict)
+    refiner["topology_validation"] = {"enabled": "false"}
+
+    with pytest.raises(ValueError, match="topology_validation.enabled"):
+        tccig_train._resolve_refined_output_rule_config(config)
+
+
 def test_coverage_augmentation_covers_isolated_positive_edge() -> None:
     import networkx as nx
     from tccig.train import augment_plan_for_positive_edge_coverage
