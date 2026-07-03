@@ -1561,3 +1561,25 @@ def test_training_summary_artifact_persists_topology_subset_block(tmp_path: Path
     assert summary["config"]["topology_training"]["subset"] == _config_to_json(cfg)[
         "topology_training"
     ]["subset"]
+
+
+def test_exp02_balanced_subset_config_uses_calibrated_rule_and_topology_only_probe() -> None:
+    import yaml
+
+    raw = yaml.safe_load(
+        Path("configs/tccig/02_balanced_subset.yaml").read_text(encoding="utf-8")
+    )
+
+    graph_selection = raw["graph_selection"]
+    refined_rule = graph_selection["refined_output_rule"]
+    assert refined_rule == {
+        "type": "calibrated",
+        "objective": "val_topology_loss",
+        "grid": [0.5, 0.7, 0.8, 0.85, 0.9, 0.925, 0.95, 0.96, 0.97, 0.98, 0.99],
+    }
+    assert graph_selection["rules"] == [{"type": "threshold", "value": 0.5}]
+
+    topology_training = raw["refiner"]["topology_training"]
+    assert topology_training["topo_only_after_epoch"] == 7
+    assert raw["refiner"]["monitor_metric"] == "val_topology_loss"
+    assert raw["refiner"]["topology_validation"]["enabled"] is True
