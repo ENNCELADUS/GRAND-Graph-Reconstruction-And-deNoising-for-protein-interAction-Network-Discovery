@@ -260,6 +260,8 @@ class TrainRefinerRequest:
     runtime: TCCIGRuntime
     config: Mapping[str, object]
     graph_rule: GraphRule
+    validation_graph_rules: Sequence[GraphRule] | None = None
+    selected_rule_source: str | None = None
     validation_topology: SplitBundle | None = None
     validation_topology_plan: object | None = None
     train_topology: SplitBundle | None = None

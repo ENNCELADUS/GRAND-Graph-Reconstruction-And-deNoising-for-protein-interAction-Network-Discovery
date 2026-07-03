@@ -226,6 +226,71 @@ def test_resolve_refined_output_rule_config_requires_literal_topology_enabled_tr
         tccig_train._resolve_refined_output_rule_config(config)
 
 
+def test_validation_topology_evaluation_selects_grid_argmin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from tccig import s2gae
+    from tccig.prepare import CandidatePair, GraphRule
+
+    prediction_calls = 0
+
+    def fake_prediction_probabilities(**_kwargs: object) -> list[float]:
+        nonlocal prediction_calls
+        prediction_calls += 1
+        return [0.2, 0.8]
+
+    def fake_validation_topology_metrics(**kwargs: object) -> dict[str, float | int]:
+        rule = kwargs["rule"]
+        assert isinstance(rule, GraphRule)
+        losses = {0.5: 10.0, 0.9: 2.0, 0.97: 5.0}
+        return {
+            "val_topology_loss": losses[float(rule.value)],
+            "graph_sim": 0.1 + float(rule.value),
+            "relative_density": 1.0,
+            "deg_dist_mmd": 0.0,
+            "cc_mmd": 0.0,
+            "positive_edges": int(float(rule.value) * 100),
+            "val_auprc": 0.42,
+        }
+
+    monkeypatch.setattr(s2gae, "_prediction_probabilities", fake_prediction_probabilities)
+    monkeypatch.setattr(s2gae, "_validation_topology_metrics", fake_validation_topology_metrics)
+
+    cfg = SimpleNamespace(
+        topology_validation=SimpleNamespace(inference_batch_size=8),
+    )
+
+    result = s2gae._evaluate_validation_topology_rules(
+        model=object(),  # type: ignore[arg-type]
+        graph=object(),  # type: ignore[arg-type]
+        pairs=[
+            CandidatePair(protein_a="A", protein_b="B"),
+            CandidatePair(protein_a="C", protein_b="D"),
+        ],
+        validation_plan=object(),  # type: ignore[arg-type]
+        rules=(
+            GraphRule(type="threshold", value=0.5),
+            GraphRule(type="threshold", value=0.9),
+            GraphRule(type="threshold", value=0.97),
+        ),
+        validation_auprc=0.42,
+        cfg=cfg,  # type: ignore[arg-type]
+        runtime=object(),
+        rule_payload_source="validation_calibration",
+    )
+
+    assert prediction_calls == 1
+    assert result.rule.to_dict() == {"type": "threshold", "value": 0.9}
+    assert result.validation_metrics["val_topology_loss"] == pytest.approx(2.0)
+    assert result.rule_payload == {
+        "type": "threshold",
+        "value": 0.9,
+        "source": "validation_calibration",
+    }
+
+
 def test_coverage_augmentation_covers_isolated_positive_edge() -> None:
     import networkx as nx
     from tccig.train import augment_plan_for_positive_edge_coverage
@@ -304,6 +369,180 @@ def test_train_refiner_request_accepts_train_topology_fields() -> None:
     )
     assert request.train_topology is None
     assert request.train_topology_plan is None
+
+
+def test_train_refiner_fixed_rule_fallback_persists_selected_rule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tccig import s2gae
+    from tccig.prepare import CandidatePair, GraphRule, SplitBundle, TCCIGRuntime
+
+    class TinyAccelerator:
+        def __init__(self) -> None:
+            self.saved_payload: dict[str, object] | None = None
+
+        def prepare(self, *components: object) -> object:
+            if len(components) == 1:
+                return components[0]
+            return components
+
+        def backward(self, loss: torch.Tensor) -> None:
+            loss.backward()
+
+        def reduce(self, value: torch.Tensor, reduction: str = "sum") -> torch.Tensor:
+            assert reduction == "sum"
+            return value
+
+        def wait_for_everyone(self) -> None:
+            return None
+
+        def unwrap_model(self, model: torch.nn.Module) -> torch.nn.Module:
+            return model
+
+        def save(
+            self,
+            obj: object,
+            f: str | Path,
+            safe_serialization: bool = False,
+        ) -> None:
+            assert safe_serialization is False
+            assert isinstance(obj, dict)
+            self.saved_payload = obj
+            torch.save(obj, f)
+
+    def fake_node_features(
+        *,
+        protein_ids: Sequence[str],
+        cache_dir: Path,
+        index_path: Path,
+        input_dim: int,
+        max_sequence_length: int | None,
+        device: torch.device,
+    ) -> torch.Tensor:
+        del cache_dir, index_path, max_sequence_length
+        rows = []
+        for index, _protein_id in enumerate(protein_ids):
+            rows.append([float(index + 1), float((index + 1) * 2)])
+        return torch.tensor(rows, dtype=torch.float32, device=device)[:, :input_dim]
+
+    fixed_rule = GraphRule(type="threshold", value=0.5)
+    observed_rules: list[tuple[GraphRule, ...]] = []
+
+    def fake_evaluate_validation_topology_rules(**kwargs: object) -> object:
+        rules = kwargs["rules"]
+        assert isinstance(rules, tuple)
+        observed_rules.append(rules)
+        payload = dict(rules[0].to_dict())
+        return s2gae.ValidationTopologyRuleEvaluation(
+            rule=rules[0],
+            validation_metrics={
+                "val_topology_loss": 3.0,
+                "graph_sim": 0.7,
+                "relative_density": 1.0,
+                "deg_dist_mmd": 0.0,
+                "cc_mmd": 0.0,
+                "positive_edges": 2,
+                "val_auprc": 0.42,
+            },
+            rule_payload=payload,
+        )
+
+    monkeypatch.setattr(s2gae, "load_mean_pooled_node_features", fake_node_features)
+    monkeypatch.setattr(s2gae, "_validation_auprc", lambda **_kwargs: 0.42)
+    monkeypatch.setattr(
+        s2gae,
+        "_evaluate_validation_topology_rules",
+        fake_evaluate_validation_topology_rules,
+    )
+
+    pairs = [
+        CandidatePair("A", "B"),
+        CandidatePair("A", "C"),
+        CandidatePair("B", "C"),
+        CandidatePair("C", "D"),
+    ]
+    split = SplitBundle(
+        split="train",
+        pairs=pairs,
+        pairwise_probabilities=[0.9, 0.8, 0.2, 0.1],
+        pairwise_graph_edges=[("A", "B"), ("A", "C")],
+        candidate_labels=[1, 0, 1, 0],
+        loss_targets=[1, 0, 1, 0],
+    )
+    validation_topology = SplitBundle(
+        split="validation_topology",
+        pairs=pairs[:2],
+        pairwise_probabilities=[0.9, 0.8],
+        pairwise_graph_edges=[("A", "B")],
+        candidate_labels=[1, 0],
+    )
+    accelerator = TinyAccelerator()
+    runtime = TCCIGRuntime(
+        accelerator=accelerator,  # type: ignore[arg-type]
+        device="cpu",
+        backend="single",
+        mixed_precision="no",
+        is_distributed=False,
+        rank=0,
+        local_rank=0,
+        world_size=1,
+        is_main_process=True,
+    )
+
+    state = s2gae.train_refiner(
+        s2gae.TrainRefinerRequest(
+            train=split,
+            validation=split,
+            runtime=runtime,
+            config={
+                "input_dim": 2,
+                "hidden_dim": 4,
+                "num_layers": 1,
+                "decoder_hidden_dim": 4,
+                "decoder_layers": 1,
+                "dropout": 0.0,
+                "epochs": 1,
+                "batch_size": 4,
+                "embedding_cache_dir": str(tmp_path / "embeddings"),
+                "monitor_metric": "val_topology_loss",
+                "topology_validation": {
+                    "enabled": True,
+                    "inference_batch_size": 4,
+                    "compute_clustering_mmd": False,
+                },
+                "topology_training": {"enabled": False},
+                "optimizer": {"type": "adamw", "lr": 0.001},
+                "scheduler": {"type": "none"},
+                "optimization": {"gradient_clip_norm": None},
+                "log_dir": str(tmp_path / "logs"),
+                "checkpoint_path": str(tmp_path / "model.pt"),
+            },
+            graph_rule=fixed_rule,
+            validation_topology=validation_topology,
+            validation_topology_plan=object(),
+        )
+    )
+
+    expected_payload = {"type": "threshold", "value": 0.5}
+    assert observed_rules == [(fixed_rule,)]
+    assert state.selected_rule_payload == expected_payload
+    assert accelerator.saved_payload is not None
+    assert accelerator.saved_payload["selected_rule"] == expected_payload
+
+    summary = json.loads(
+        (tmp_path / "logs" / "training_summary.json").read_text(encoding="utf-8")
+    )
+    assert summary["history"][0]["selected_rule"] == expected_payload
+    assert summary["selected_rule"] == expected_payload
+
+    csv_header = (
+        (tmp_path / "logs" / "tccig_train_step.csv")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert csv_header.split(",") == s2gae.TCCIG_TRAIN_CSV_COLUMNS
+    assert "selected_rule" not in csv_header
 
 
 @pytest.fixture

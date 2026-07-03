@@ -10,7 +10,7 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import SupportsFloat, cast
+from typing import SupportsFloat, SupportsInt, cast
 
 import networkx as nx
 import torch
@@ -1144,7 +1144,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
     best_selected_rule_payload: dict[str, object] | None = None
     best_validation_auprc = -math.inf
     best_monitor_value = _initial_monitor_value(cfg.monitor_metric)
-    history: list[dict[str, float | int]] = []
+    history: list[dict[str, object]] = []
     _prepare_tccig_train_csv(csv_path=cfg.log_dir / "tccig_train_step.csv", request=request)
     for epoch in range(1, cfg.epochs + 1):
         epoch_start = time.perf_counter()
@@ -1350,15 +1350,21 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 or request.validation_topology_plan is None
             ):
                 raise RuntimeError("Validation topology graph was not initialized")
+            validation_rules = (
+                tuple(request.validation_graph_rules)
+                if request.validation_graph_rules is not None
+                else (request.graph_rule,)
+            )
             topology_evaluation = _evaluate_validation_topology_rules(
                 model=validation_model,
                 graph=validation_topology_graph,
                 pairs=request.validation_topology.pairs,
                 validation_plan=cast(InternalValidationPlan, request.validation_topology_plan),
-                rule=request.graph_rule,
+                rules=validation_rules,
                 validation_auprc=validation_auprc,
                 cfg=cfg,
                 runtime=request.runtime,
+                rule_payload_source=request.selected_rule_source,
             )
             selected_epoch_rule = topology_evaluation.rule
             selected_epoch_rule_payload = dict(topology_evaluation.rule_payload)
@@ -1372,7 +1378,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         else:
             monitor_value = validation_auprc
         epoch_denominator = max(1, global_train_count)
-        epoch_history: dict[str, float | int] = {
+        epoch_history: dict[str, object] = {
             "epoch": epoch,
             "train_loss": total_loss / epoch_denominator,
             "train_bce_loss": total_bce_loss / epoch_denominator,
@@ -1401,6 +1407,11 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                     "internal_val_deg_dist_mmd": float(metrics["deg_dist_mmd"]),
                     "internal_val_cc_mmd": float(metrics["cc_mmd"]),
                     "selected_rule_positive_edges": float(metrics["positive_edges"]),
+                    "selected_rule": (
+                        None
+                        if selected_epoch_rule_payload is None
+                        else dict(selected_epoch_rule_payload)
+                    ),
                 }
             )
         epoch_history["train_topology_scale"] = topology_scale
@@ -1777,11 +1788,14 @@ def _evaluate_validation_topology_rules(
     graph: _SplitGraph,
     pairs: Sequence[CandidatePair],
     validation_plan: InternalValidationPlan,
-    rule: GraphRule,
+    rules: Sequence[GraphRule],
     validation_auprc: float,
     cfg: S2GAEConfig,
     runtime: object,
+    rule_payload_source: str | None = None,
 ) -> ValidationTopologyRuleEvaluation:
+    if not rules:
+        raise ValueError("validation topology requires at least one graph rule")
     refined_probabilities = _prediction_probabilities(
         model=model,
         graph=graph,
@@ -1791,18 +1805,29 @@ def _evaluate_validation_topology_rules(
     if len(refined_probabilities) != len(pairs):
         raise ValueError("validation topology probabilities must match candidate pairs")
 
-    metrics = _validation_topology_metrics(
-        validation_plan=validation_plan,
-        pairs=pairs,
-        probabilities=refined_probabilities,
-        rule=rule,
-        validation_auprc=validation_auprc,
-        cfg=cfg,
-    )
-    return ValidationTopologyRuleEvaluation(
-        rule=rule,
-        validation_metrics=metrics,
-        rule_payload=rule.to_dict(),
+    evaluations: list[ValidationTopologyRuleEvaluation] = []
+    for rule in rules:
+        metrics = _validation_topology_metrics(
+            validation_plan=validation_plan,
+            pairs=pairs,
+            probabilities=refined_probabilities,
+            rule=rule,
+            validation_auprc=validation_auprc,
+            cfg=cfg,
+        )
+        payload: dict[str, object] = dict(rule.to_dict())
+        if rule_payload_source is not None:
+            payload["source"] = rule_payload_source
+        evaluations.append(
+            ValidationTopologyRuleEvaluation(
+                rule=rule,
+                validation_metrics=metrics,
+                rule_payload=payload,
+            )
+        )
+    return min(
+        evaluations,
+        key=lambda item: float(item.validation_metrics["val_topology_loss"]),
     )
 
 
@@ -1935,10 +1960,18 @@ def _prepare_tccig_train_csv(*, csv_path: Path, request: TrainRefinerRequest) ->
     _runtime_barrier(request.runtime)
 
 
+def _epoch_float(epoch_history: Mapping[str, object], key: str) -> float:
+    return float(cast(SupportsFloat, epoch_history[key]))
+
+
+def _epoch_int(epoch_history: Mapping[str, object], key: str) -> int:
+    return int(cast(SupportsInt, epoch_history[key]))
+
+
 def _append_tccig_train_csv_row(
     *,
     csv_path: Path,
-    epoch_history: Mapping[str, float | int],
+    epoch_history: Mapping[str, object],
     selected_rule: GraphRule | None,
     monitor_metric: str,
     epoch_time_s: float,
@@ -1947,16 +1980,18 @@ def _append_tccig_train_csv_row(
         writer = csv.DictWriter(handle, fieldnames=TCCIG_TRAIN_CSV_COLUMNS)
         writer.writerow(
             {
-                "Epoch": int(epoch_history["epoch"]),
+                "Epoch": _epoch_int(epoch_history, "epoch"),
                 "Epoch Time": epoch_time_s,
-                "Train Loss": float(epoch_history["train_loss"]),
-                "Train BCE Loss": float(epoch_history["train_bce_loss"]),
-                "Train Residual Anchor Loss": float(epoch_history["train_residual_anchor_loss"]),
-                "Train Weighted Residual Anchor Loss": float(
-                    epoch_history["train_weighted_residual_anchor_loss"]
+                "Train Loss": _epoch_float(epoch_history, "train_loss"),
+                "Train BCE Loss": _epoch_float(epoch_history, "train_bce_loss"),
+                "Train Residual Anchor Loss": _epoch_float(
+                    epoch_history, "train_residual_anchor_loss"
                 ),
-                "Train Gradient Norm": float(epoch_history["train_gradient_norm"]),
-                "Val auprc": float(epoch_history["val_auprc"]),
+                "Train Weighted Residual Anchor Loss": _epoch_float(
+                    epoch_history, "train_weighted_residual_anchor_loss"
+                ),
+                "Train Gradient Norm": _epoch_float(epoch_history, "train_gradient_norm"),
+                "Val auprc": _epoch_float(epoch_history, "val_auprc"),
                 "Val Topology Loss": epoch_history.get("val_topology_loss", ""),
                 "Internal Val graph_sim": epoch_history.get("internal_val_graph_sim", ""),
                 "Internal Val relative_density": epoch_history.get(
@@ -1974,16 +2009,16 @@ def _append_tccig_train_csv_row(
                     "",
                 ),
                 "Monitor Metric": monitor_metric,
-                "Monitor Value": float(epoch_history["monitor_value"]),
-                "Peak GPU Mem MB": float(epoch_history["peak_gpu_mem_mb"]),
-                "Learning Rate": float(epoch_history["learning_rate"]),
+                "Monitor Value": _epoch_float(epoch_history, "monitor_value"),
+                "Peak GPU Mem MB": _epoch_float(epoch_history, "peak_gpu_mem_mb"),
+                "Learning Rate": _epoch_float(epoch_history, "learning_rate"),
             }
         )
 
 
 def _log_epoch_summary(
     *,
-    epoch_history: Mapping[str, float | int],
+    epoch_history: Mapping[str, object],
     selected_rule: GraphRule | None,
     monitor_metric: str,
     epoch_time_s: float,
@@ -1995,17 +2030,17 @@ def _log_epoch_summary(
             "train_bce=%.6f val_auprc=%.6f monitor[%s]=%.6f "
             "val_topology_loss=%s rule=%s lr=%.6g peak_gpu_mem_mb=%.1f"
         ),
-        int(epoch_history["epoch"]),
+        _epoch_int(epoch_history, "epoch"),
         epoch_time_s,
-        float(epoch_history["train_loss"]),
-        float(epoch_history["train_bce_loss"]),
-        float(epoch_history["val_auprc"]),
+        _epoch_float(epoch_history, "train_loss"),
+        _epoch_float(epoch_history, "train_bce_loss"),
+        _epoch_float(epoch_history, "val_auprc"),
         monitor_metric,
-        float(epoch_history["monitor_value"]),
+        _epoch_float(epoch_history, "monitor_value"),
         _format_optional_epoch_value(epoch_history.get("val_topology_loss")),
         "none" if selected_rule is None else selected_rule.type,
-        float(epoch_history["learning_rate"]),
-        float(epoch_history["peak_gpu_mem_mb"]),
+        _epoch_float(epoch_history, "learning_rate"),
+        _epoch_float(epoch_history, "peak_gpu_mem_mb"),
     )
 
 
@@ -2022,7 +2057,7 @@ def _write_training_summary(
     best_validation_auprc: float,
     best_selected_rule_payload: dict[str, object] | None,
     optimizer: Optimizer,
-    history: Sequence[Mapping[str, float | int]],
+    history: Sequence[Mapping[str, object]],
 ) -> None:
     write_json(
         cfg.log_dir / "training_summary.json",
