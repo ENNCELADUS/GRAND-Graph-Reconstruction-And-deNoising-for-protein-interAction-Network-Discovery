@@ -304,11 +304,12 @@ def run_tccig_pipeline(
         score_split_fn=_score_split,
     )
 
+    refined_output_payload: dict[str, object] = dict(refined_output_rule.to_dict())
     manifest: dict[str, object] = {
         "run_id": run_id,
         "self_pair_rows_dropped": {split: table.self_pair_rows for split, table in tables.items()},
         "pairwise_input_threshold": pairwise_input_payload,
-        "refined_output_rule": refined_output_rule.to_dict(),
+        "refined_output_rule": refined_output_payload,
     }
     if refined_rule_config.calibrated:
         manifest["configured_refined_output_rule"] = dict(refined_rule_config.configured_payload)
@@ -324,7 +325,7 @@ def run_tccig_pipeline(
     return TCCIGPipelineResult(
         manifest=manifest,
         pairwise_input_threshold=pairwise_input_payload,
-        refined_output_rule=refined_output_rule.to_dict(),
+        refined_output_rule=refined_output_payload,
         pairwise_metrics=pairwise_metrics,
         topology_metrics=topology_metrics,
     )
@@ -1145,13 +1146,14 @@ def _resolve_refined_output_rule_config(config: Mapping[str, object]) -> Refined
             "graph_selection.refined_output_rule.value",
         )
         rule = GraphRule(type="threshold", value=value)
+        configured_payload: dict[str, object] = dict(rule.to_dict())
         return RefinedOutputRuleConfig(
             calibrated=False,
             fixed_rule=rule,
             validation_rules=(rule,),
             objective=None,
             selected_rule_source=None,
-            configured_payload=rule.to_dict(),
+            configured_payload=configured_payload,
         )
     if rule_type == "calibrated":
         _validate_calibrated_refined_output_setup(config)
