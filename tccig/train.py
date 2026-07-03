@@ -209,11 +209,19 @@ def run_tccig_pipeline(
         validation_scores=validation_scores,
         validation_labels=tables["validation"].labels,
     )
-    refined_output_rule = _resolve_refined_output_rule(config)
-    parsed_rules = parse_rules(
-        _graph_selection(config).get("rules", [refined_output_rule.to_dict()])
-    )
-    graph_rule = parsed_rules[0]
+    refined_rule_config = _resolve_refined_output_rule_config(config)
+    if refined_rule_config.calibrated:
+        validation_graph_rules = refined_rule_config.validation_rules
+        graph_rule = validation_graph_rules[0]
+    else:
+        parsed_rules = parse_rules(
+            _graph_selection(config).get(
+                "rules",
+                [refined_rule_config.fixed_rule.to_dict()],
+            )
+        )
+        graph_rule = parsed_rules[0]
+        validation_graph_rules = None
 
     train_bundle = _bundle_from_table(
         table=tables["train"],
@@ -261,7 +269,13 @@ def run_tccig_pipeline(
             train_topology=train_topology,
             train_topology_plan=train_topology_plan,
             train_topology_diagnostic_full_space=train_topology_diagnostic_full_space,
+            validation_graph_rules=validation_graph_rules,
+            selected_rule_source=refined_rule_config.selected_rule_source,
         )
+    )
+    refined_output_rule = _effective_refined_output_rule(
+        refined_rule_config=refined_rule_config,
+        refiner_state=refiner_state,
     )
     pairwise_metrics = tccig_test.run_pairwise_test(
         table=tables["pairwise_test"],
@@ -290,12 +304,20 @@ def run_tccig_pipeline(
         score_split_fn=_score_split,
     )
 
-    manifest = {
+    manifest: dict[str, object] = {
         "run_id": run_id,
         "self_pair_rows_dropped": {split: table.self_pair_rows for split, table in tables.items()},
         "pairwise_input_threshold": pairwise_input_payload,
         "refined_output_rule": refined_output_rule.to_dict(),
     }
+    if refined_rule_config.calibrated:
+        manifest["configured_refined_output_rule"] = dict(refined_rule_config.configured_payload)
+        ignored_legacy_rules = _ignored_legacy_rules_payload(
+            config=config,
+            refined_rule_config=refined_rule_config,
+        )
+        if ignored_legacy_rules is not None:
+            manifest["ignored_legacy_rules"] = ignored_legacy_rules
     if runtime.is_main_process:
         write_json(log_dir / "manifest.json", manifest)
     _runtime_barrier(runtime)
@@ -1160,6 +1182,39 @@ def _resolve_refined_output_rule_config(config: Mapping[str, object]) -> Refined
 
 def _resolve_refined_output_rule(config: Mapping[str, object]) -> GraphRule:
     return _resolve_refined_output_rule_config(config).fixed_rule
+
+
+def _effective_refined_output_rule(
+    *,
+    refined_rule_config: RefinedOutputRuleConfig,
+    refiner_state: object,
+) -> GraphRule:
+    if not refined_rule_config.calibrated:
+        return refined_rule_config.fixed_rule
+    selected_rule = getattr(refiner_state, "selected_rule", None)
+    if not isinstance(selected_rule, GraphRule):
+        raise RuntimeError("Calibrated refined-output mode requires refiner_state.selected_rule")
+    return selected_rule
+
+
+def _ignored_legacy_rules_payload(
+    *,
+    config: Mapping[str, object],
+    refined_rule_config: RefinedOutputRuleConfig,
+) -> list[dict[str, object]] | None:
+    if not refined_rule_config.calibrated:
+        return None
+    raw_rules = _graph_selection(config).get("rules")
+    if raw_rules is None:
+        return None
+    if not isinstance(raw_rules, Sequence) or isinstance(raw_rules, (str, bytes)):
+        raise ValueError("graph_selection.rules must be a sequence")
+    payload: list[dict[str, object]] = []
+    for raw_rule in raw_rules:
+        if not isinstance(raw_rule, Mapping):
+            raise ValueError("graph_selection.rules entries must be mappings")
+        payload.append(dict(raw_rule))
+    return payload
 
 
 def _validate_calibrated_refined_output_setup(config: Mapping[str, object]) -> None:

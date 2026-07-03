@@ -10,6 +10,7 @@ import pickle
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import networkx as nx
 import pytest
@@ -276,6 +277,222 @@ def test_tccig_orchestrator_runs_validation_topology_with_pring_train_test_split
         / "manifests"
         / "validation_topology.json"
     ).exists()
+
+
+def test_threshold_pipeline_uses_first_legacy_rule_without_validation_sweep(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tccig.test as tccig_test
+    from tccig.prepare import GraphRule
+
+    config = _tiny_config(tmp_path, "threshold_legacy_rules")
+    refiner_config = config["refiner"]
+    assert isinstance(refiner_config, dict)
+    refiner_config["monitor_metric"] = "val_topology_loss"
+    refiner_config["topology_validation"] = {
+        "enabled": True,
+        "node_sizes": [2],
+        "samples_per_size": 1,
+        "strategy": "mixed",
+        "seed": 0,
+        "inference_batch_size": 4,
+        "compute_clustering_mmd": False,
+        "losses": {"alpha": 1.0, "beta": 1.0, "gamma": 0.0, "delta": 0.0},
+    }
+    graph_selection = config["graph_selection"]
+    assert isinstance(graph_selection, dict)
+    graph_selection["rules"] = [
+        {"type": "threshold", "value": 0.5},
+        {"type": "threshold", "value": 0.97},
+    ]
+
+    captured: dict[str, object] = {}
+
+    def fake_train_refiner(request: object) -> object:
+        graph_rule = request.graph_rule  # type: ignore[attr-defined]
+        assert isinstance(graph_rule, GraphRule)
+        validation_graph_rules = request.validation_graph_rules  # type: ignore[attr-defined]
+        captured["graph_rule"] = graph_rule.to_dict()
+        captured["validation_graph_rules"] = (
+            None
+            if validation_graph_rules is None
+            else [rule.to_dict() for rule in validation_graph_rules]
+        )
+        captured["selected_rule_source"] = request.selected_rule_source  # type: ignore[attr-defined]
+        return SimpleNamespace(
+            selected_rule=GraphRule(type="threshold", value=0.97),
+            selected_rule_payload=None,
+            best_validation_auprc=0.0,
+            best_monitor_value=0.0,
+        )
+
+    def fake_pairwise_test(**_kwargs: object) -> dict[str, float]:
+        return {"auprc": 1.0, "auroc": 1.0, "f1": 1.0, "threshold": 0.5}
+
+    def fake_topology_test(**_kwargs: object) -> dict[str, float]:
+        return {
+            "graph_sim": 1.0,
+            "relative_density": 1.0,
+            "deg_dist_mmd": 0.0,
+            "cc_mmd": 0.0,
+            "laplacian_eigen_mmd": 0.0,
+        }
+
+    monkeypatch.setattr(s2gae, "train_refiner", fake_train_refiner)
+    monkeypatch.setattr(tccig_test, "run_pairwise_test", fake_pairwise_test)
+    monkeypatch.setattr(tccig_test, "run_topology_test", fake_topology_test)
+
+    result = run_tccig_pipeline(config)
+
+    assert captured["graph_rule"] == {"type": "threshold", "value": 0.5}
+    assert captured["validation_graph_rules"] is None
+    assert captured["selected_rule_source"] is None
+    assert result.refined_output_rule == {"type": "threshold", "value": 0.5}
+
+    manifest = json.loads(
+        (tmp_path / "logs" / "tccig" / "threshold_legacy_rules" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert "configured_refined_output_rule" not in manifest
+    assert "ignored_legacy_rules" not in manifest
+
+
+def test_calibrated_pipeline_uses_selected_rule_for_test_paths_and_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tccig.test as tccig_test
+    from tccig.prepare import GraphRule
+
+    config = _tiny_config(tmp_path, "calibrated_plumbing")
+    refiner_config = config["refiner"]
+    assert isinstance(refiner_config, dict)
+    refiner_config["monitor_metric"] = "val_topology_loss"
+    refiner_config["topology_validation"] = {
+        "enabled": True,
+        "node_sizes": [2],
+        "samples_per_size": 1,
+        "strategy": "mixed",
+        "seed": 0,
+        "inference_batch_size": 4,
+        "compute_clustering_mmd": False,
+        "losses": {"alpha": 1.0, "beta": 1.0, "gamma": 0.0, "delta": 0.0},
+    }
+    graph_selection = config["graph_selection"]
+    assert isinstance(graph_selection, dict)
+    graph_selection["refined_output_rule"] = {
+        "type": "calibrated",
+        "objective": "val_topology_loss",
+        "grid": [0.5, 0.97],
+    }
+    graph_selection["rules"] = [{"type": "threshold", "value": 0.5}]
+
+    captured: dict[str, object] = {}
+    selected_rule = GraphRule(type="threshold", value=0.97)
+
+    def fake_train_refiner(request: object) -> object:
+        captured["validation_graph_rules"] = [
+            rule.to_dict() for rule in request.validation_graph_rules  # type: ignore[attr-defined]
+        ]
+        captured["selected_rule_source"] = request.selected_rule_source  # type: ignore[attr-defined]
+        return SimpleNamespace(
+            selected_rule=selected_rule,
+            selected_rule_payload={
+                "type": "threshold",
+                "value": 0.97,
+                "source": "validation_calibration",
+            },
+            best_validation_auprc=0.0,
+            best_monitor_value=0.0,
+        )
+
+    def fake_pairwise_test(**kwargs: object) -> dict[str, float]:
+        rule = kwargs["refined_output_rule"]
+        assert isinstance(rule, GraphRule)
+        captured["pairwise_rule"] = rule.to_dict()
+        return {"auprc": 1.0, "auroc": 1.0, "f1": 1.0, "threshold": float(rule.value)}
+
+    def fake_topology_test(**kwargs: object) -> dict[str, float]:
+        rule = kwargs["refined_output_rule"]
+        assert isinstance(rule, GraphRule)
+        captured["topology_rule"] = rule.to_dict()
+        return {
+            "graph_sim": 1.0,
+            "relative_density": 1.0,
+            "deg_dist_mmd": 0.0,
+            "cc_mmd": 0.0,
+            "laplacian_eigen_mmd": 0.0,
+        }
+
+    monkeypatch.setattr(s2gae, "train_refiner", fake_train_refiner)
+    monkeypatch.setattr(tccig_test, "run_pairwise_test", fake_pairwise_test)
+    monkeypatch.setattr(tccig_test, "run_topology_test", fake_topology_test)
+
+    result = run_tccig_pipeline(config)
+
+    assert captured["validation_graph_rules"] == [
+        {"type": "threshold", "value": 0.5},
+        {"type": "threshold", "value": 0.97},
+    ]
+    assert captured["selected_rule_source"] == "validation_calibration"
+    assert captured["pairwise_rule"] == {"type": "threshold", "value": 0.97}
+    assert captured["topology_rule"] == {"type": "threshold", "value": 0.97}
+    assert result.refined_output_rule == {"type": "threshold", "value": 0.97}
+
+    manifest = json.loads(
+        (tmp_path / "logs" / "tccig" / "calibrated_plumbing" / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert manifest["refined_output_rule"] == {"type": "threshold", "value": 0.97}
+    assert manifest["configured_refined_output_rule"] == {
+        "type": "calibrated",
+        "objective": "val_topology_loss",
+        "grid": [0.5, 0.97],
+    }
+    assert manifest["ignored_legacy_rules"] == [{"type": "threshold", "value": 0.5}]
+
+
+def test_calibrated_pipeline_persists_epoch_selected_rule_history(tmp_path: Path) -> None:
+    config = _tiny_config(tmp_path, "calibrated_history")
+    refiner_config = config["refiner"]
+    assert isinstance(refiner_config, dict)
+    refiner_config["monitor_metric"] = "val_topology_loss"
+    refiner_config["topology_validation"] = {
+        "enabled": True,
+        "node_sizes": [2],
+        "samples_per_size": 1,
+        "strategy": "mixed",
+        "seed": 0,
+        "inference_batch_size": 4,
+        "compute_clustering_mmd": False,
+        "losses": {"alpha": 1.0, "beta": 1.0, "gamma": 0.0, "delta": 0.0},
+    }
+    graph_selection = config["graph_selection"]
+    assert isinstance(graph_selection, dict)
+    graph_selection["refined_output_rule"] = {
+        "type": "calibrated",
+        "objective": "val_topology_loss",
+        "grid": [0.5, 0.97],
+    }
+    graph_selection["rules"] = [{"type": "threshold", "value": 0.5}]
+
+    run_tccig_pipeline(config)
+
+    summary_path = tmp_path / "logs" / "tccig" / "calibrated_history" / "training_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    row = summary["history"][0]
+
+    assert row["selected_rule"]["type"] == "threshold"
+    assert row["selected_rule"]["source"] == "validation_calibration"
+    assert row["selected_rule"]["value"] in {0.5, 0.97}
+    assert summary["selected_rule"] == row["selected_rule"]
+
+    checkpoint_path = tmp_path / "models" / "tccig" / "calibrated_history" / "best_model.pt"
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    assert checkpoint["selected_rule"] == summary["selected_rule"]
 
 
 def test_tccig_orchestrator_rejects_removed_hook_config(tmp_path: Path) -> None:

@@ -226,6 +226,53 @@ def test_resolve_refined_output_rule_config_requires_literal_topology_enabled_tr
         tccig_train._resolve_refined_output_rule_config(config)
 
 
+def test_effective_refined_output_rule_uses_checkpoint_rule_for_calibrated() -> None:
+    from types import SimpleNamespace
+
+    from tccig.prepare import GraphRule
+
+    config = tccig_train._resolve_refined_output_rule_config(_calibrated_pipeline_config())
+    state = SimpleNamespace(selected_rule=GraphRule(type="threshold", value=0.97))
+
+    effective = tccig_train._effective_refined_output_rule(
+        refined_rule_config=config,
+        refiner_state=state,
+    )
+
+    assert effective.to_dict() == {"type": "threshold", "value": 0.97}
+
+
+def test_effective_refined_output_rule_rejects_missing_calibrated_selected_rule() -> None:
+    from types import SimpleNamespace
+
+    config = tccig_train._resolve_refined_output_rule_config(_calibrated_pipeline_config())
+    state = SimpleNamespace(selected_rule=None)
+
+    with pytest.raises(RuntimeError, match="selected_rule"):
+        tccig_train._effective_refined_output_rule(
+            refined_rule_config=config,
+            refiner_state=state,
+        )
+
+
+def test_effective_refined_output_rule_keeps_fixed_threshold_config() -> None:
+    from types import SimpleNamespace
+
+    from tccig.prepare import GraphRule
+
+    config = tccig_train._resolve_refined_output_rule_config(
+        {"graph_selection": {"refined_output_rule": {"type": "threshold", "value": 0.75}}}
+    )
+    state = SimpleNamespace(selected_rule=GraphRule(type="threshold", value=0.97))
+
+    effective = tccig_train._effective_refined_output_rule(
+        refined_rule_config=config,
+        refiner_state=state,
+    )
+
+    assert effective.to_dict() == {"type": "threshold", "value": 0.75}
+
+
 def test_validation_topology_evaluation_selects_grid_argmin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
