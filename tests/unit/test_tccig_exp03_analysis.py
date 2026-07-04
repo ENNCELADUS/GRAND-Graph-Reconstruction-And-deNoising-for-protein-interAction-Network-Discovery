@@ -10,6 +10,7 @@ import pytest
 from tccig.analyze_exp03 import (
     EXP02_REFERENCE_RUN_ID,
     PHASE_A_RUN_IDS,
+    PHASE_B_CONFIG_RUN_IDS,
     collect_run_row,
     main,
     write_exp03_report,
@@ -328,5 +329,39 @@ def test_main_requires_raw_baseline_run_id_for_locked_reports(tmp_path: Path) ->
                 str(tmp_path / "analysis"),
                 "--locked-run-id",
                 "03_a5_bce_full_topology",
+            ]
+        )
+
+
+def test_main_rejects_unknown_locked_run_id(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="Locked run IDs are not active: 03_typo"):
+        main(
+            [
+                "--log-root",
+                str(tmp_path / "logs"),
+                "--output-dir",
+                str(tmp_path / "analysis"),
+                "--locked-run-id",
+                "03_typo",
+                "--raw-baseline-run-id",
+                "03_raw_baseline",
+            ]
+        )
+
+
+def test_main_rejects_phase_b_locked_run_without_phase_b_flag(tmp_path: Path) -> None:
+    locked_run_id = PHASE_B_CONFIG_RUN_IDS[0]
+
+    with pytest.raises(ValueError, match=f"Locked run IDs are not active: {locked_run_id}"):
+        main(
+            [
+                "--log-root",
+                str(tmp_path / "logs"),
+                "--output-dir",
+                str(tmp_path / "analysis"),
+                "--locked-run-id",
+                locked_run_id,
+                "--raw-baseline-run-id",
+                "03_raw_baseline",
             ]
         )

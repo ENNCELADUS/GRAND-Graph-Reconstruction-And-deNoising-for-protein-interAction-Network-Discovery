@@ -170,6 +170,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     locked_run_ids = set(cast(list[str], args.locked_run_id))
+    run_ids = list(PHASE_A_RUN_IDS)
+    if args.include_phase_b:
+        run_ids.extend(PHASE_B_CONFIG_RUN_IDS)
+    active_run_ids = set(run_ids)
+    unknown_locked_run_ids = sorted(locked_run_ids - active_run_ids)
+    if unknown_locked_run_ids:
+        raise ValueError(f"Locked run IDs are not active: {', '.join(unknown_locked_run_ids)}")
     if locked_run_ids and not args.raw_baseline_run_id:
         raise ValueError("--raw-baseline-run-id is required when --locked-run-id is provided")
     rows: list[dict[str, object]] = []
@@ -182,9 +189,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             )
         )
 
-    run_ids = list(PHASE_A_RUN_IDS)
-    if args.include_phase_b:
-        run_ids.extend(PHASE_B_CONFIG_RUN_IDS)
     for run_id in run_ids:
         run_dir = args.log_root / run_id
         if not run_dir.exists():
