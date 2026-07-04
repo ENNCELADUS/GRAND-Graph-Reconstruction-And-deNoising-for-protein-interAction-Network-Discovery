@@ -232,7 +232,10 @@ def test_write_exp03_report_outputs_json_csv_and_markdown(tmp_path: Path) -> Non
     )
     assert candidate["gate_non_worse_reference_metrics"] is True
     assert candidate["sampled_edge_targets"] == 300
-    csv_rows = list(csv.DictReader(outputs["csv"].open("r", encoding="utf-8")))
+    csv_reader = csv.DictReader(outputs["csv"].open("r", encoding="utf-8"))
+    assert csv_reader.fieldnames is not None
+    assert not any(name.startswith("heldout_") for name in csv_reader.fieldnames)
+    csv_rows = list(csv_reader)
     assert csv_rows[1]["sampled_edge_targets"] == "300"
     assert csv_rows[1]["train_bce_loss_epoch_1"] == "0.3"
     assert csv_rows[1]["train_topology_loss_epoch_1"] == "4.5"
@@ -244,3 +247,23 @@ def test_write_exp03_report_outputs_json_csv_and_markdown(tmp_path: Path) -> Non
     markdown = outputs["markdown"].read_text(encoding="utf-8")
     assert markdown.startswith("# Validation-first exp03 summary")
     assert "Held-out metrics were not included" in markdown
+
+
+def test_write_exp03_report_includes_heldout_csv_headers_when_present(tmp_path: Path) -> None:
+    run_dir = _write_run_fixture(tmp_path / "logs", "03_locked", with_heldout=True)
+    raw_baseline_artifact_dir = _write_raw_baseline_fixture(
+        tmp_path / "logs" / "03_locked_raw_pairwise_baseline"
+    )
+    row = collect_run_row(
+        run_id="03_locked",
+        run_dir=run_dir,
+        include_heldout=True,
+        raw_baseline_artifact_dir=raw_baseline_artifact_dir,
+    )
+
+    outputs = write_exp03_report(rows=[row], output_dir=tmp_path / "analysis")
+
+    csv_reader = csv.DictReader(outputs["csv"].open("r", encoding="utf-8"))
+    assert csv_reader.fieldnames is not None
+    assert "heldout_refined_precision" in csv_reader.fieldnames
+    assert "heldout_raw_topology_relative_density" in csv_reader.fieldnames

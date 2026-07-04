@@ -84,9 +84,12 @@ HELDOUT_COLUMNS = (
     "heldout_raw_protocol_candidate_universe",
     "heldout_raw_protocol_test_labels_visible_to_model",
 )
-COLUMNS = (
+NON_HELDOUT_COLUMNS = (
     *BASE_COLUMNS,
     *(f"{metric}_epoch_{epoch}" for epoch in EPOCH_COLUMNS for metric in EPOCH_METRIC_NAMES),
+)
+COLUMNS = (
+    *NON_HELDOUT_COLUMNS,
     *HELDOUT_COLUMNS,
 )
 
@@ -384,8 +387,12 @@ def _attach_reference_fields(rows: Sequence[Mapping[str, object]]) -> list[dict[
 
 
 def _write_csv(path: Path, rows: Sequence[Mapping[str, object]]) -> None:
-    extra_columns = sorted({key for row in rows for key in row if key not in COLUMNS})
-    columns = [*COLUMNS, *extra_columns]
+    has_heldout = any(any(key.startswith("heldout_") for key in row) for row in rows)
+    standard_columns = (
+        (*NON_HELDOUT_COLUMNS, *HELDOUT_COLUMNS) if has_heldout else NON_HELDOUT_COLUMNS
+    )
+    extra_columns = sorted({key for row in rows for key in row if key not in standard_columns})
+    columns = [*standard_columns, *extra_columns]
     with path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()
