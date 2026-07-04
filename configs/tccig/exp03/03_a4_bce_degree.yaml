@@ -1,0 +1,146 @@
+run:
+  run_id: 03_a4_bce_degree
+  log_root: logs
+data:
+  processed_dir: data/PRING/human/BFS
+device:
+  device: cuda
+  backend: ddp
+  mixed_precision: bf16
+  find_unused_parameters: false
+pairwise_scorer:
+  model_config_path: configs/v3-1/0517/pair_context_gated_abba_no_cross_s47.yaml
+  checkpoint_path: models/v3.1/train/pair_context_gated_abba_no_cross_s47/best_model.pth
+  embedding_cache_dir: data/embeddings/esm3_1024
+  batch_size: 512
+  max_sequence_length: 1024
+  score_cache:
+    enabled: true
+refiner:
+  encoder: graphconv
+  input_dim: 1536
+  hidden_dim: 128
+  num_layers: 2
+  decoder_hidden_dim: 256
+  decoder_layers: 2
+  dropout: 0.2
+  encoder_aggr: mean
+  layer_norm: true
+  residual_scale: 4.0
+  epochs: 40
+  batch_size: 4096
+  edge_sampling:
+    hard_fraction: 0.7
+    easy_anchor_fraction: 0.3
+    seed: 0
+    reshuffle_easy_each_epoch: true
+  loss:
+    type: bce_with_logits
+    pos_weight: 1.0
+    label_smoothing: 0.02
+  optimizer:
+    type: adamw
+    lr: 0.0001
+    weight_decay: 0.0001
+    beta1: 0.9
+    beta2: 0.999
+    eps: 1.0e-08
+  scheduler:
+    type: none
+  optimization:
+    gradient_clip_norm: 1.0
+  residual_anchor:
+    form: asymmetric_relu
+    weight: 0.0001
+  topology_training:
+    enabled: true
+    node_sizes:
+    - 20
+    - 40
+    - 60
+    - 80
+    - 100
+    - 120
+    - 140
+    - 160
+    - 180
+    - 200
+    samples_per_size: 20
+    strategy: mixed
+    seed: 0
+    coverage_augmentation: true
+    topology_weight: 1.0
+    topo_only_after_epoch: null
+    subset:
+      enabled: true
+      candidate_ratio: 20
+      pool_ratio: 10
+      epoch_ratio: 5
+      hard_fraction: 0.5
+      uniform_fraction: 0.5
+      hard_stratum_fraction: 0.2
+      max_subgraphs_per_size: 20
+      max_labeled_pairs_per_size: 0
+      bias_diagnostic_every_n_epochs: 5
+      bias_diagnostic_max_node_size: 40
+      seed: 0
+    weights:
+      alpha: 0.0
+      beta: 0.0
+      gamma: 0.5
+      delta: 0.0
+    schedule:
+      warmup_epochs: 1
+      ramp_epochs: 5
+      schedule: linear
+  monitor_metric: val_topology_loss
+  topology_validation:
+    enabled: true
+    node_sizes:
+    - 20
+    - 40
+    - 60
+    - 80
+    - 100
+    - 120
+    - 140
+    - 160
+    - 180
+    - 200
+    samples_per_size: 20
+    strategy: mixed
+    seed: 0
+    inference_batch_size: 4096
+    compute_clustering_mmd: true
+    losses:
+      alpha: 1.0
+      beta: 8.0
+      gamma: 0.5
+      delta: 0.0
+  embedding_cache_dir: data/embeddings/esm3_1024
+  embedding_index_path: data/embeddings/esm3_1024/index.json
+  max_sequence_length: 1024
+  checkpoint_path: models/tccig/s2gae/03_a4_bce_degree/best_model.pt
+graph_selection:
+  pairwise_input_threshold:
+    mode: target_precision
+    target_precision: 0.8
+    split: validation
+  refined_output_rule:
+    type: calibrated
+    objective: val_topology_loss
+    grid:
+    - 0.5
+    - 0.7
+    - 0.8
+    - 0.85
+    - 0.9
+    - 0.925
+    - 0.95
+    - 0.96
+    - 0.97
+    - 0.98
+    - 0.99
+  rules:
+  - type: threshold
+    value: 0.5
