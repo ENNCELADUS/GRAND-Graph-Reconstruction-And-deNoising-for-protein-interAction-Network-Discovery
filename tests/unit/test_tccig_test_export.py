@@ -140,3 +140,40 @@ def test_run_raw_pairwise_topology_baseline_exports_artifacts(tmp_path: Path) ->
     payload = json.loads((topology_dir / "topology_metrics.json").read_text(encoding="utf-8"))
     assert payload["raw_output_rule"] == {"type": "threshold", "value": 0.5}
     assert (topology_dir / "topology_metrics.csv").exists()
+
+
+def test_run_raw_pairwise_topology_baseline_can_write_separate_output_dir(
+    tmp_path: Path,
+) -> None:
+    table = _pair_table()
+    processed_dir = tmp_path / "processed"
+    processed_dir.mkdir()
+    graph = nx.Graph()
+    graph.add_nodes_from(["A", "B", "C", "D"])
+    graph.add_edge("A", "B")
+    graph.add_edge("B", "C")
+    with (processed_dir / "human_test_graph.pkl").open("wb") as handle:
+        pickle.dump(graph, handle)
+    with (processed_dir / "test_sampled_nodes.pkl").open("wb") as handle:
+        pickle.dump({3: [["A", "B", "C"], ["A", "C", "D"]]}, handle)
+
+    def _fake_score_split(**_kwargs: object) -> list[float]:
+        return [0.95, 0.10, 0.80, 0.20]
+
+    log_dir = tmp_path / "logs"
+    output_dir = log_dir / "raw_pairwise_topology_baseline"
+    run_raw_pairwise_topology_baseline(
+        table=table,
+        processed_dir=processed_dir,
+        scorer_cfg={},
+        runtime=_runtime(),
+        cache_dir=tmp_path / "cache",
+        log_dir=log_dir,
+        output_dir=output_dir,
+        raw_output_rule=GraphRule(type="threshold", value=0.5),
+        score_split_fn=_fake_score_split,
+    )
+
+    assert (output_dir / "all_test_ppi_pred.txt").exists()
+    assert (output_dir / "topology_metrics.json").exists()
+    assert not (log_dir / "topology_test" / "topology_metrics.json").exists()

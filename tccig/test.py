@@ -280,6 +280,7 @@ def run_raw_pairwise_topology_baseline(
     log_dir: Path,
     raw_output_rule: GraphRule,
     score_split_fn: ScoreSplitFn,
+    output_dir: Path | None = None,
 ) -> dict[str, float]:
     """Write topology-test artifacts for the frozen raw pairwise scorer."""
     pairwise_scores = score_split_fn(
@@ -310,7 +311,7 @@ def run_raw_pairwise_topology_baseline(
     )
     summary = {key: float(value) for key, value in topology_result["summary"].items()}
     if runtime.is_main_process:
-        topology_dir = log_dir / "topology_test"
+        topology_dir = output_dir if output_dir is not None else log_dir / "topology_test"
         _write_topology_predictions(
             output_path=topology_dir / "all_test_ppi_pred.txt",
             pairs=table.pairs,

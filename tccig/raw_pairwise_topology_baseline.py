@@ -52,6 +52,7 @@ def run_baseline(
         runtime=runtime,
         cache_dir=cache_dir,
         log_dir=log_dir,
+        output_dir=log_dir / "raw_pairwise_topology_baseline",
         raw_output_rule=output_rule,
         score_split_fn=_score_split,
     )
@@ -62,6 +63,7 @@ def run_baseline(
                 "run_id": output_run_id,
                 "source_run_id": cache_run_id,
                 "score_cache_dir": str(cache_dir),
+                "artifact_dir": str(log_dir / "raw_pairwise_topology_baseline"),
                 "raw_output_rule": output_rule.to_dict(),
                 "self_pair_rows_dropped": {"topology_test": tables["topology_test"].self_pair_rows},
             },
