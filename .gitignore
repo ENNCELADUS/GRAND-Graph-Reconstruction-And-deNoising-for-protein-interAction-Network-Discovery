@@ -202,3 +202,4 @@ Thumbs.db
 
 # Local experiment debug artifacts
 /artifacts/
+human_test_ppi_pred.csv
