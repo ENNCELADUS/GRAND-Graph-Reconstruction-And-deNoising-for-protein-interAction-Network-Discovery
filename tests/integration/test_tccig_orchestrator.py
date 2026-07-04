@@ -242,6 +242,21 @@ def test_tccig_orchestrator_runs_concrete_pipeline_and_writes_artifacts(tmp_path
     assert (tmp_path / "tccig_cache" / "score_cache" / "tiny" / "manifests" / "train.json").exists()
 
 
+def test_tccig_orchestrator_can_skip_heldout_test_artifacts(tmp_path: Path) -> None:
+    config = _tiny_config(tmp_path, "tiny_validation_only")
+
+    result = run_tccig_pipeline(config, run_test_splits=False)
+
+    run_log_dir = tmp_path / "logs" / "tccig" / "tiny_validation_only"
+    manifest = json.loads((run_log_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert result.pairwise_metrics == {}
+    assert result.topology_metrics == {}
+    assert manifest["test_splits_skipped"] is True
+    assert (run_log_dir / "training_summary.json").exists()
+    assert not (run_log_dir / "pairwise_test").exists()
+    assert not (run_log_dir / "topology_test").exists()
+
+
 def test_tccig_orchestrator_runs_validation_topology_with_pring_train_test_split(
     tmp_path: Path,
 ) -> None:

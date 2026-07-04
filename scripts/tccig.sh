@@ -48,6 +48,11 @@ else
   NGPUS="$REQUESTED_GPUS"
 fi
 
+TRAIN_EXTRA_ARGS=()
+if [ "${GRAND_TCCIG_SKIP_TEST_SPLITS:-0}" = "1" ]; then
+  TRAIN_EXTRA_ARGS+=(--skip-test-splits)
+fi
+
 if [ "$NGPUS" -gt 0 ]; then
   echo "Detected $DETECTED_GPUS GPUs; launching TCCIG with $NGPUS process(es)"
   srun uv run --locked --no-sync --offline accelerate launch \
@@ -56,8 +61,10 @@ if [ "$NGPUS" -gt 0 ]; then
     --mixed_precision bf16 \
     --dynamo_backend no \
     tccig/train.py \
-    --config "$CONFIG_PATH"
+    --config "$CONFIG_PATH" \
+    ${TRAIN_EXTRA_ARGS[@]+"${TRAIN_EXTRA_ARGS[@]}"}
 else
   echo "No GPUs detected; running TCCIG in a single process"
-  uv run --locked --no-sync --offline python -m tccig.train --config "$CONFIG_PATH"
+  uv run --locked --no-sync --offline python -m tccig.train --config "$CONFIG_PATH" \
+    ${TRAIN_EXTRA_ARGS[@]+"${TRAIN_EXTRA_ARGS[@]}"}
 fi

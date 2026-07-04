@@ -173,6 +173,7 @@ def run_tccig_pipeline(
     config: Mapping[str, object],
     *,
     build_accelerator_fn: AcceleratorFactory | None = None,
+    run_test_splits: bool = True,
 ) -> TCCIGPipelineResult:
     """Run the concrete scorer -> S2GAE refiner -> test-artifact TCCIG pipeline."""
     strict_reject_legacy_hooks(config)
@@ -277,32 +278,35 @@ def run_tccig_pipeline(
         refined_rule_config=refined_rule_config,
         refiner_state=refiner_state,
     )
-    pairwise_metrics = tccig_test.run_pairwise_test(
-        table=tables["pairwise_test"],
-        scorer_cfg=scorer_cfg,
-        refiner_cfg=refiner_cfg,
-        runtime=runtime,
-        cache_dir=cache_dir,
-        log_dir=log_dir,
-        refiner_state=refiner_state,
-        pairwise_input_rule=pairwise_input_rule,
-        refined_output_rule=refined_output_rule,
-        score_split_fn=_score_split,
-    )
-    topology_metrics = tccig_test.run_topology_test(
-        table=tables["topology_test"],
-        processed_dir=processed_dir,
-        scorer_cfg=scorer_cfg,
-        refiner_cfg=refiner_cfg,
-        runtime=runtime,
-        cache_dir=cache_dir,
-        log_dir=log_dir,
-        refiner_state=refiner_state,
-        pairwise_input_rule=pairwise_input_rule,
-        refined_output_rule=refined_output_rule,
-        pairwise_input_payload=pairwise_input_rule.to_dict(),
-        score_split_fn=_score_split,
-    )
+    pairwise_metrics: dict[str, float] = {}
+    topology_metrics: dict[str, float] = {}
+    if run_test_splits:
+        pairwise_metrics = tccig_test.run_pairwise_test(
+            table=tables["pairwise_test"],
+            scorer_cfg=scorer_cfg,
+            refiner_cfg=refiner_cfg,
+            runtime=runtime,
+            cache_dir=cache_dir,
+            log_dir=log_dir,
+            refiner_state=refiner_state,
+            pairwise_input_rule=pairwise_input_rule,
+            refined_output_rule=refined_output_rule,
+            score_split_fn=_score_split,
+        )
+        topology_metrics = tccig_test.run_topology_test(
+            table=tables["topology_test"],
+            processed_dir=processed_dir,
+            scorer_cfg=scorer_cfg,
+            refiner_cfg=refiner_cfg,
+            runtime=runtime,
+            cache_dir=cache_dir,
+            log_dir=log_dir,
+            refiner_state=refiner_state,
+            pairwise_input_rule=pairwise_input_rule,
+            refined_output_rule=refined_output_rule,
+            pairwise_input_payload=pairwise_input_rule.to_dict(),
+            score_split_fn=_score_split,
+        )
 
     refined_output_payload: dict[str, object] = dict(refined_output_rule.to_dict())
     manifest: dict[str, object] = {
@@ -310,6 +314,7 @@ def run_tccig_pipeline(
         "self_pair_rows_dropped": {split: table.self_pair_rows for split, table in tables.items()},
         "pairwise_input_threshold": pairwise_input_payload,
         "refined_output_rule": refined_output_payload,
+        "test_splits_skipped": not run_test_splits,
     }
     if refined_rule_config.calibrated:
         manifest["configured_refined_output_rule"] = dict(refined_rule_config.configured_payload)
@@ -418,8 +423,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     """CLI entrypoint for ``python -m tccig.train --config ...``."""
     parser = argparse.ArgumentParser(description="Run the concrete TCCIG pipeline")
     parser.add_argument("--config", required=True, help="Path to a TCCIG YAML config")
+    parser.add_argument(
+        "--skip-test-splits",
+        action="store_true",
+        help="train and validate only; do not generate held-out pairwise/topology test artifacts",
+    )
     args = parser.parse_args(argv)
-    run_tccig_pipeline(_load_yaml_config(Path(args.config)))
+    run_tccig_pipeline(
+        _load_yaml_config(Path(args.config)),
+        run_test_splits=not bool(args.skip_test_splits),
+    )
 
 
 def _score_progress_events(*, total_pairs: int, interval_pairs: int) -> list[int]:
