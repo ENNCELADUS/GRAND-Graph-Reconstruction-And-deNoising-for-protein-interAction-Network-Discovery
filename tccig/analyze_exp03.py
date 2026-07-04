@@ -88,10 +88,6 @@ NON_HELDOUT_COLUMNS = (
     *BASE_COLUMNS,
     *(f"{metric}_epoch_{epoch}" for epoch in EPOCH_COLUMNS for metric in EPOCH_METRIC_NAMES),
 )
-COLUMNS = (
-    *NON_HELDOUT_COLUMNS,
-    *HELDOUT_COLUMNS,
-)
 
 
 def collect_run_row(
@@ -190,6 +186,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     for run_id in run_ids:
         run_dir = args.log_root / run_id
         if not run_dir.exists():
+            if run_id in PHASE_A_RUN_IDS:
+                raise FileNotFoundError(f"Missing required Phase A run directory: {run_dir}")
             continue
         raw_baseline_dir = None
         if run_id in locked_run_ids and args.raw_baseline_run_id:
@@ -325,7 +323,7 @@ def _attach_heldout_metrics(
         return
     raw_topology_path = raw_baseline_artifact_dir / "topology_metrics.json"
     if not raw_topology_path.exists():
-        return
+        raise FileNotFoundError(f"Missing raw topology baseline metrics: {raw_topology_path}")
     raw_topology = _read_mapping(raw_topology_path)
     _attach_topology_summary(
         row,
@@ -429,6 +427,40 @@ def _render_markdown(rows: Sequence[Mapping[str, object]]) -> str:
                 eligible=_markdown_value(row.get("eligible_for_locked_test")),
             )
         )
+    if has_heldout:
+        lines.extend(
+            (
+                "",
+                "## Held-out protocol",
+                "",
+                "| run_id | heldout_protocol_candidate_universe | "
+                "heldout_protocol_test_labels_visible_to_model | "
+                "heldout_raw_protocol_candidate_universe | "
+                "heldout_raw_protocol_test_labels_visible_to_model |",
+                "| --- | --- | --- | --- | --- |",
+            )
+        )
+        for row in rows:
+            if not any(key.startswith("heldout_") for key in row):
+                continue
+            lines.append(
+                "| {run_id} | {candidate_universe} | {labels_visible} | "
+                "{raw_candidate_universe} | {raw_labels_visible} |".format(
+                    run_id=row.get("run_id", ""),
+                    candidate_universe=_markdown_value(
+                        row.get("heldout_protocol_candidate_universe")
+                    ),
+                    labels_visible=_markdown_value(
+                        row.get("heldout_protocol_test_labels_visible_to_model")
+                    ),
+                    raw_candidate_universe=_markdown_value(
+                        row.get("heldout_raw_protocol_candidate_universe")
+                    ),
+                    raw_labels_visible=_markdown_value(
+                        row.get("heldout_raw_protocol_test_labels_visible_to_model")
+                    ),
+                )
+            )
     return "\n".join(lines) + "\n"
 
 

@@ -6,7 +6,14 @@ import csv
 import json
 from pathlib import Path
 
-from tccig.analyze_exp03 import EXP02_REFERENCE_RUN_ID, collect_run_row, write_exp03_report
+import pytest
+from tccig.analyze_exp03 import (
+    EXP02_REFERENCE_RUN_ID,
+    PHASE_A_RUN_IDS,
+    collect_run_row,
+    main,
+    write_exp03_report,
+)
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -202,6 +209,22 @@ def test_collect_run_row_includes_heldout_only_when_enabled(tmp_path: Path) -> N
     assert row["heldout_edges_deleted"] == 2.0
 
 
+def test_collect_run_row_fails_when_requested_raw_baseline_metrics_missing(
+    tmp_path: Path,
+) -> None:
+    run_dir = _write_run_fixture(tmp_path, "03_locked", with_heldout=True)
+    raw_baseline_artifact_dir = tmp_path / "missing_raw_baseline"
+    raw_baseline_artifact_dir.mkdir()
+
+    with pytest.raises(FileNotFoundError, match="Missing raw topology baseline metrics"):
+        collect_run_row(
+            run_id="03_locked",
+            run_dir=run_dir,
+            include_heldout=True,
+            raw_baseline_artifact_dir=raw_baseline_artifact_dir,
+        )
+
+
 def test_write_exp03_report_outputs_json_csv_and_markdown(tmp_path: Path) -> None:
     run_dir = _write_run_fixture(tmp_path / "logs", "03_a5_bce_full_topology", with_heldout=False)
     reference_dir = _write_run_fixture(
@@ -267,3 +290,26 @@ def test_write_exp03_report_includes_heldout_csv_headers_when_present(tmp_path: 
     assert csv_reader.fieldnames is not None
     assert "heldout_refined_precision" in csv_reader.fieldnames
     assert "heldout_raw_topology_relative_density" in csv_reader.fieldnames
+    markdown = outputs["markdown"].read_text(encoding="utf-8")
+    assert "## Held-out protocol" in markdown
+    assert "heldout_protocol_candidate_universe" in markdown
+    assert "heldout_protocol_test_labels_visible_to_model" in markdown
+    assert "heldout_raw_protocol_candidate_universe" in markdown
+    assert "heldout_raw_protocol_test_labels_visible_to_model" in markdown
+    assert "all_test_ppi.txt" in markdown
+    assert "False" in markdown
+
+
+def test_main_fails_when_phase_a_run_directory_is_missing(tmp_path: Path) -> None:
+    with pytest.raises(
+        FileNotFoundError,
+        match=f"Missing required Phase A run directory: .*{PHASE_A_RUN_IDS[0]}",
+    ):
+        main(
+            [
+                "--log-root",
+                str(tmp_path / "logs"),
+                "--output-dir",
+                str(tmp_path / "analysis"),
+            ]
+        )
