@@ -556,6 +556,33 @@ def test_tccig_script_uses_cpu_fallback_when_nvidia_smi_is_absent(tmp_path: Path
         "configs/tccig/01.yaml",
     ]
 
+    subprocess.run(
+        ["/bin/bash", str(repo_root / "scripts" / "tccig.sh")],
+        cwd=repo_root,
+        env={
+            "GRAND_REPO_ROOT": str(tmp_path),
+            "GRAND_UV_ARGS_OUT": str(uv_args_path),
+            "GRAND_TCCIG_SKIP_TEST_SPLITS": "1",
+            "HOME": str(tmp_path),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+        },
+        check=True,
+        timeout=30,
+    )
+
+    assert uv_args_path.read_text(encoding="utf-8").splitlines() == [
+        "run",
+        "--locked",
+        "--no-sync",
+        "--offline",
+        "python",
+        "-m",
+        "tccig.train",
+        "--config",
+        "configs/tccig/01.yaml",
+        "--skip-test-splits",
+    ]
+
 
 def test_tccig_script_launches_accelerate_with_detected_gpu_count(tmp_path: Path) -> None:
     repo_root = Path(__file__).resolve().parents[2]
@@ -608,6 +635,42 @@ def test_tccig_script_launches_accelerate_with_detected_gpu_count(tmp_path: Path
         "tccig/train.py",
         "--config",
         "configs/tccig/01.yaml",
+    ]
+
+    subprocess.run(
+        ["/bin/bash", str(repo_root / "scripts" / "tccig.sh")],
+        cwd=repo_root,
+        env={
+            "GRAND_REPO_ROOT": str(tmp_path),
+            "GRAND_SRUN_ARGS_OUT": str(srun_args_path),
+            "GRAND_TCCIG_SKIP_TEST_SPLITS": "1",
+            "HOME": str(tmp_path),
+            "PATH": f"{fake_bin}:/usr/bin:/bin",
+        },
+        check=True,
+        timeout=30,
+    )
+
+    assert srun_args_path.read_text(encoding="utf-8").splitlines() == [
+        "uv",
+        "run",
+        "--locked",
+        "--no-sync",
+        "--offline",
+        "accelerate",
+        "launch",
+        "--num_processes",
+        "2",
+        "--num_machines",
+        "1",
+        "--mixed_precision",
+        "bf16",
+        "--dynamo_backend",
+        "no",
+        "tccig/train.py",
+        "--config",
+        "configs/tccig/01.yaml",
+        "--skip-test-splits",
     ]
 
 
