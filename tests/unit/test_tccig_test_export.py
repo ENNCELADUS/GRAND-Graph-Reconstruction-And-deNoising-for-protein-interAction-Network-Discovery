@@ -176,4 +176,66 @@ def test_run_raw_pairwise_topology_baseline_can_write_separate_output_dir(
 
     assert (output_dir / "all_test_ppi_pred.txt").exists()
     assert (output_dir / "topology_metrics.json").exists()
-    assert not (log_dir / "topology_test" / "topology_metrics.json").exists()
+    assert not (log_dir / "topology_test").exists()
+
+
+def test_run_baseline_writes_manifest_inside_raw_artifact_dir(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    import tccig.raw_pairwise_topology_baseline as baseline_module
+
+    table = _pair_table()
+    processed_dir = tmp_path / "processed"
+    log_root = tmp_path / "logs"
+    cache_root = tmp_path / "cache"
+    output_run_id = "refined_run"
+    log_dir = log_root / "tccig" / output_run_id
+    artifact_dir = log_dir / "raw_pairwise_topology_baseline"
+    log_dir.mkdir(parents=True)
+    top_level_manifest = log_dir / "manifest.json"
+    top_level_manifest.write_text('{"kind": "refined"}', encoding="utf-8")
+
+    monkeypatch.setattr(baseline_module, "strict_reject_legacy_hooks", lambda _config: None)
+    monkeypatch.setattr(
+        baseline_module,
+        "_build_runtime",
+        lambda *, config, build_accelerator_fn: _runtime(),
+    )
+    monkeypatch.setattr(baseline_module, "_configure_logging", lambda _runtime_arg: None)
+    monkeypatch.setattr(baseline_module, "set_seed", lambda _seed: None)
+    monkeypatch.setattr(baseline_module, "_sampling_seed", lambda _config: 123)
+    monkeypatch.setattr(baseline_module, "_run_id", lambda _config: "source_run")
+    monkeypatch.setattr(
+        baseline_module,
+        "_mapping_section",
+        lambda _config, section: {"processed_dir": processed_dir}
+        if section == "data"
+        else {"scorer": "cfg"},
+    )
+    monkeypatch.setattr(baseline_module, "_required_path", lambda _section, _key: processed_dir)
+    monkeypatch.setattr(
+        baseline_module,
+        "load_pring_tables",
+        lambda _path: {"topology_test": table},
+    )
+    monkeypatch.setattr(baseline_module, "_cache_root", lambda _config: cache_root)
+    monkeypatch.setattr(baseline_module, "_log_root", lambda _config: log_root)
+
+    def _fake_run_raw_pairwise_topology_baseline(**kwargs: object) -> dict[str, float]:
+        assert kwargs["output_dir"] == artifact_dir
+        return {"graph_sim": 1.0}
+
+    monkeypatch.setattr(
+        baseline_module,
+        "run_raw_pairwise_topology_baseline",
+        _fake_run_raw_pairwise_topology_baseline,
+    )
+
+    metrics = baseline_module.run_baseline({}, output_run_id=output_run_id, threshold=0.25)
+
+    assert metrics == {"graph_sim": 1.0}
+    assert json.loads(top_level_manifest.read_text(encoding="utf-8")) == {"kind": "refined"}
+    payload = json.loads((artifact_dir / "manifest.json").read_text(encoding="utf-8"))
+    assert payload["artifact_dir"] == str(artifact_dir)
+    assert payload["raw_output_rule"] == {"type": "threshold", "value": 0.25}

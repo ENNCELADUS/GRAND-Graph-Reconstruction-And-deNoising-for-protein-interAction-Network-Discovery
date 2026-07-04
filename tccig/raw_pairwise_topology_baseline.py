@@ -43,6 +43,7 @@ def run_baseline(
     scorer_cfg = _mapping_section(config, "pairwise_scorer")
     cache_dir = _cache_root(config) / "score_cache" / cache_run_id
     log_dir = _log_root(config) / "tccig" / output_run_id
+    artifact_dir = log_dir / "raw_pairwise_topology_baseline"
     output_rule = GraphRule(type="threshold", value=threshold)
 
     metrics = run_raw_pairwise_topology_baseline(
@@ -52,18 +53,18 @@ def run_baseline(
         runtime=runtime,
         cache_dir=cache_dir,
         log_dir=log_dir,
-        output_dir=log_dir / "raw_pairwise_topology_baseline",
+        output_dir=artifact_dir,
         raw_output_rule=output_rule,
         score_split_fn=_score_split,
     )
     if runtime.is_main_process:
         write_json(
-            log_dir / "manifest.json",
+            artifact_dir / "manifest.json",
             {
                 "run_id": output_run_id,
                 "source_run_id": cache_run_id,
                 "score_cache_dir": str(cache_dir),
-                "artifact_dir": str(log_dir / "raw_pairwise_topology_baseline"),
+                "artifact_dir": str(artifact_dir),
                 "raw_output_rule": output_rule.to_dict(),
                 "self_pair_rows_dropped": {"topology_test": tables["topology_test"].self_pair_rows},
             },
