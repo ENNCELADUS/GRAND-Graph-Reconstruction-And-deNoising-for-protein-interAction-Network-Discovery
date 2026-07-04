@@ -365,3 +365,30 @@ def test_main_rejects_phase_b_locked_run_without_phase_b_flag(tmp_path: Path) ->
                 "03_raw_baseline",
             ]
         )
+
+
+def test_main_fails_when_locked_phase_b_run_directory_is_missing(tmp_path: Path) -> None:
+    log_root = tmp_path / "logs"
+    for run_id in PHASE_A_RUN_IDS:
+        _write_run_fixture(log_root, run_id, with_heldout=False)
+    locked_run_id = PHASE_B_CONFIG_RUN_IDS[0]
+
+    with pytest.raises(
+        ValueError,
+        match=f"Missing locked run directory: .*{locked_run_id}",
+    ):
+        main(
+            [
+                "--log-root",
+                str(log_root),
+                "--exp02-reference-dir",
+                str(tmp_path / "missing_reference"),
+                "--output-dir",
+                str(tmp_path / "analysis"),
+                "--include-phase-b",
+                "--locked-run-id",
+                locked_run_id,
+                "--raw-baseline-run-id",
+                "03_raw_baseline",
+            ]
+        )

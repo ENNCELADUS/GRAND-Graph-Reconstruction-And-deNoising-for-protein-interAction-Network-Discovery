@@ -192,6 +192,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     for run_id in run_ids:
         run_dir = args.log_root / run_id
         if not run_dir.exists():
+            if run_id in locked_run_ids:
+                raise ValueError(f"Missing locked run directory: {run_dir}")
             if run_id in PHASE_A_RUN_IDS:
                 raise FileNotFoundError(f"Missing required Phase A run directory: {run_dir}")
             continue
