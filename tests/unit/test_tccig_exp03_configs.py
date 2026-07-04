@@ -87,6 +87,8 @@ def test_phase_a_training_knobs_match_exp03_matrix() -> None:
     a1 = _topology_training(configs["03_a1_bce_only"])
     assert a1["enabled"] is False
     assert a1["topo_only_after_epoch"] is None
+    assert a1["topology_weight"] == pytest.approx(0.0)
+    assert a1["weights"] == FIXED_VALIDATION_LOSSES
     assert _loss(configs["03_a1_bce_only"])["pos_weight"] == pytest.approx(1.0)
 
     expected_weights = {
@@ -101,6 +103,7 @@ def test_phase_a_training_knobs_match_exp03_matrix() -> None:
         assert topology_training["topo_only_after_epoch"] is None
         assert topology_training["topology_weight"] == pytest.approx(1.0)
         assert topology_training["weights"] == weights
+        assert _loss(configs[run_id])["pos_weight"] == pytest.approx(1.0)
 
 
 def test_phase_b_config_only_levers_are_named_and_bounded() -> None:
@@ -119,12 +122,36 @@ def test_phase_b_config_only_levers_are_named_and_bounded() -> None:
         "gamma": 0.5,
         "delta": 0.0,
     }
+    assert (
+        _topology_training(configs["03_b3_topology_weight_0p5"])["weights"]
+        == FIXED_VALIDATION_LOSSES
+    )
+    assert (
+        _topology_training(configs["03_b4_topology_weight_2p0"])["weights"]
+        == FIXED_VALIDATION_LOSSES
+    )
+    assert (
+        _topology_training(configs["03_b5_bce_pos_weight_0p5"])["weights"]
+        == FIXED_VALIDATION_LOSSES
+    )
+    assert _topology_training(configs["03_b1_beta2"])["topology_weight"] == pytest.approx(1.0)
+    assert _topology_training(configs["03_b2_beta4"])["topology_weight"] == pytest.approx(1.0)
     assert _topology_training(configs["03_b3_topology_weight_0p5"])[
         "topology_weight"
     ] == pytest.approx(0.5)
     assert _topology_training(configs["03_b4_topology_weight_2p0"])[
         "topology_weight"
     ] == pytest.approx(2.0)
+    assert _topology_training(configs["03_b5_bce_pos_weight_0p5"])[
+        "topology_weight"
+    ] == pytest.approx(1.0)
+    for run_id in (
+        "03_b1_beta2",
+        "03_b2_beta4",
+        "03_b3_topology_weight_0p5",
+        "03_b4_topology_weight_2p0",
+    ):
+        assert _loss(configs[run_id])["pos_weight"] == pytest.approx(1.0)
     assert _loss(configs["03_b5_bce_pos_weight_0p5"])["pos_weight"] == pytest.approx(0.5)
 
 
