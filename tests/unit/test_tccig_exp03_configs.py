@@ -17,6 +17,7 @@ from tccig.exp03_configs import (
 from tccig.s2gae import _parse_config
 
 BASE_CONFIG = Path("configs/tccig/02_balanced_subset.yaml")
+COMMITTED_CONFIG_DIR = Path("configs/tccig/exp03")
 FIXED_VALIDATION_LOSSES = {"alpha": 1.0, "beta": 8.0, "gamma": 0.5, "delta": 0.0}
 
 
@@ -218,3 +219,28 @@ def test_generated_exp03_configs_parse_existing_tccig_helpers(tmp_path: Path) ->
         parsed_refiner = _parse_config(refiner_config)
         assert parsed_refiner.monitor_metric == "val_topology_loss"
         assert parsed_refiner.topology_validation.losses.beta == pytest.approx(8.0)
+
+
+def test_committed_exp03_configs_match_generator_output(tmp_path: Path) -> None:
+    output_dir = tmp_path / "configs"
+    generated_paths = write_exp03_configs(
+        base_config_path=BASE_CONFIG,
+        output_dir=output_dir,
+        include_phase_b=True,
+    )
+
+    generated_by_name = {path.name: path for path in generated_paths}
+    for run_id in (*PHASE_A_RUN_IDS, *PHASE_B_CONFIG_RUN_IDS):
+        file_name = f"{run_id}.yaml"
+        generated_path = generated_by_name[file_name]
+        committed_path = COMMITTED_CONFIG_DIR / file_name
+
+        with generated_path.open("r", encoding="utf-8") as handle:
+            generated_payload = yaml.safe_load(handle)
+        with committed_path.open("r", encoding="utf-8") as handle:
+            committed_payload = yaml.safe_load(handle)
+
+        assert committed_payload == generated_payload
+        assert committed_path.read_text(encoding="utf-8") == generated_path.read_text(
+            encoding="utf-8"
+        )
