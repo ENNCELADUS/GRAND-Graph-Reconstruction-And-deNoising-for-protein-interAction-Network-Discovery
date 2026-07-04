@@ -150,14 +150,20 @@ def test_collect_run_row_uses_training_and_threshold_grid_without_heldout(tmp_pa
     assert row["best_epoch"] == 40
     assert row["selected_threshold"] == 0.96
     assert row["validation_selected_edges"] == 120
+    assert row["validation_selected_edges_min"] == 120
+    assert row["validation_selected_edges_max"] == 140
+    assert row["validation_selected_edges_range"] == 20
+    assert row["sampled_edge_targets"] == 300
     assert row["train_topology_loss_epoch_1"] == 4.5
+    assert row["train_topology_loss_epoch_7"] is None
     assert row["train_topology_loss_epoch_40"] == 3.0
     assert row["threshold_grid_rows"] == 2
+    assert row["threshold_grid_best_epoch"] == 40
     assert row["gate_val_auprc_ok"] is True
     assert row["gate_selected_edges_stable"] is True
     assert row["gate_density_closer_than_exp02"] is True
     assert row["eligible_for_locked_test"] is True
-    assert "heldout_refined_precision" not in row
+    assert not any(key.startswith("heldout_") for key in row)
 
 
 def test_collect_run_row_includes_heldout_only_when_enabled(tmp_path: Path) -> None:
@@ -174,12 +180,24 @@ def test_collect_run_row_includes_heldout_only_when_enabled(tmp_path: Path) -> N
     )
 
     assert row["heldout_refined_precision"] == 0.9
+    assert row["heldout_refined_recall"] == 0.2
+    assert row["heldout_refined_f1"] == 0.33
     assert row["heldout_refined_auprc"] == 0.7
+    assert row["heldout_refined_auroc"] == 0.8
     assert row["heldout_raw_auprc"] == 0.69
+    assert row["heldout_raw_auroc"] == 0.79
     assert row["heldout_topology_relative_density"] == 0.95
+    assert row["heldout_topology_graph_sim"] == 0.8
+    assert row["heldout_topology_deg_dist_mmd"] == 0.1
+    assert row["heldout_topology_cc_mmd"] == 0.05
     assert row["heldout_raw_topology_relative_density"] == 0.88
+    assert row["heldout_raw_topology_graph_sim"] == 0.77
+    assert row["heldout_raw_topology_deg_dist_mmd"] == 0.12
+    assert row["heldout_raw_topology_cc_mmd"] == 0.07
     assert row["heldout_protocol_candidate_universe"] == "all_test_ppi.txt"
     assert row["heldout_protocol_test_labels_visible_to_model"] is False
+    assert row["heldout_raw_protocol_candidate_universe"] == "all_test_ppi.txt"
+    assert row["heldout_raw_protocol_test_labels_visible_to_model"] is False
     assert row["heldout_edges_added"] == 1.0
     assert row["heldout_edges_deleted"] == 2.0
 
@@ -213,8 +231,16 @@ def test_write_exp03_report_outputs_json_csv_and_markdown(tmp_path: Path) -> Non
         item for item in payload["rows"] if item["run_id"] == "03_a5_bce_full_topology"
     )
     assert candidate["gate_non_worse_reference_metrics"] is True
+    assert candidate["sampled_edge_targets"] == 300
     csv_rows = list(csv.DictReader(outputs["csv"].open("r", encoding="utf-8")))
+    assert csv_rows[1]["sampled_edge_targets"] == "300"
+    assert csv_rows[1]["train_bce_loss_epoch_1"] == "0.3"
+    assert csv_rows[1]["train_topology_loss_epoch_1"] == "4.5"
+    assert csv_rows[1]["train_bce_loss_epoch_7"] == ""
+    assert csv_rows[1]["train_topology_loss_epoch_7"] == ""
+    assert csv_rows[1]["train_bce_loss_epoch_40"] == "0.25"
+    assert csv_rows[1]["train_topology_loss_epoch_40"] == "3.0"
     assert csv_rows[1]["run_id"] == "03_a5_bce_full_topology"
     markdown = outputs["markdown"].read_text(encoding="utf-8")
-    assert "Validation-first exp03 summary" in markdown
+    assert markdown.startswith("# Validation-first exp03 summary")
     assert "Held-out metrics were not included" in markdown
