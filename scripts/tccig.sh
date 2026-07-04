@@ -22,7 +22,17 @@ if [ -f "$HOME/.bashrc" ]; then
   source "$HOME/.bashrc"
 fi
 
-CONFIG_PATH="${1:-configs/tccig/01.yaml}"
+if [ "$#" -gt 0 ]; then
+  CONFIG_PATHS=("$@")
+else
+  CONFIG_PATHS=(
+    configs/tccig/exp03/03_a1_bce_only.yaml
+    configs/tccig/exp03/03_a2_bce_graph_sim.yaml
+    configs/tccig/exp03/03_a3_bce_density.yaml
+    configs/tccig/exp03/03_a4_bce_degree.yaml
+    configs/tccig/exp03/03_a5_bce_full_topology.yaml
+  )
+fi
 
 if [ ! -d ".venv" ]; then
   echo "Missing .venv. Run 'uv sync --group dev --locked' before running TCCIG."
@@ -53,18 +63,22 @@ if [ "${GRAND_TCCIG_SKIP_TEST_SPLITS:-0}" = "1" ]; then
   TRAIN_EXTRA_ARGS+=(--skip-test-splits)
 fi
 
-if [ "$NGPUS" -gt 0 ]; then
-  echo "Detected $DETECTED_GPUS GPUs; launching TCCIG with $NGPUS process(es)"
-  srun uv run --locked --no-sync --offline accelerate launch \
-    --num_processes "$NGPUS" \
-    --num_machines 1 \
-    --mixed_precision bf16 \
-    --dynamo_backend no \
-    tccig/train.py \
-    --config "$CONFIG_PATH" \
-    ${TRAIN_EXTRA_ARGS[@]+"${TRAIN_EXTRA_ARGS[@]}"}
-else
-  echo "No GPUs detected; running TCCIG in a single process"
-  uv run --locked --no-sync --offline python -m tccig.train --config "$CONFIG_PATH" \
-    ${TRAIN_EXTRA_ARGS[@]+"${TRAIN_EXTRA_ARGS[@]}"}
-fi
+for CONFIG_PATH in "${CONFIG_PATHS[@]}"; do
+  echo "Starting TCCIG config: $CONFIG_PATH"
+  if [ "$NGPUS" -gt 0 ]; then
+    echo "Detected $DETECTED_GPUS GPUs; launching TCCIG with $NGPUS process(es)"
+    srun uv run --locked --no-sync --offline accelerate launch \
+      --num_processes "$NGPUS" \
+      --num_machines 1 \
+      --mixed_precision bf16 \
+      --dynamo_backend no \
+      tccig/train.py \
+      --config "$CONFIG_PATH" \
+      ${TRAIN_EXTRA_ARGS[@]+"${TRAIN_EXTRA_ARGS[@]}"}
+  else
+    echo "No GPUs detected; running TCCIG in a single process"
+    uv run --locked --no-sync --offline python -m tccig.train --config "$CONFIG_PATH" \
+      ${TRAIN_EXTRA_ARGS[@]+"${TRAIN_EXTRA_ARGS[@]}"}
+  fi
+  echo "Finished TCCIG config: $CONFIG_PATH"
+done
