@@ -435,6 +435,38 @@ def test_validation_topology_evaluation_selects_grid_argmin(
         "value": 0.9,
         "source": "validation_calibration",
     }
+    assert result.rule_grid == (
+        {
+            "rule": {"type": "threshold", "value": 0.5, "source": "validation_calibration"},
+            "val_topology_loss": 10.0,
+            "graph_sim": 0.6,
+            "relative_density": 1.0,
+            "deg_dist_mmd": 0.0,
+            "cc_mmd": 0.0,
+            "positive_edges": 50,
+            "val_auprc": 0.42,
+        },
+        {
+            "rule": {"type": "threshold", "value": 0.9, "source": "validation_calibration"},
+            "val_topology_loss": 2.0,
+            "graph_sim": 1.0,
+            "relative_density": 1.0,
+            "deg_dist_mmd": 0.0,
+            "cc_mmd": 0.0,
+            "positive_edges": 90,
+            "val_auprc": 0.42,
+        },
+        {
+            "rule": {"type": "threshold", "value": 0.97, "source": "validation_calibration"},
+            "val_topology_loss": 5.0,
+            "graph_sim": 1.07,
+            "relative_density": 1.0,
+            "deg_dist_mmd": 0.0,
+            "cc_mmd": 0.0,
+            "positive_edges": 97,
+            "val_auprc": 0.42,
+        },
+    )
 
 
 def test_coverage_augmentation_covers_isolated_positive_edge() -> None:
@@ -592,6 +624,7 @@ def test_train_refiner_fixed_rule_fallback_persists_selected_rule(
                 "val_auprc": 0.42,
             },
             rule_payload=payload,
+            rule_grid=(),
         )
 
     monkeypatch.setattr(s2gae, "load_mean_pooled_node_features", fake_node_features)

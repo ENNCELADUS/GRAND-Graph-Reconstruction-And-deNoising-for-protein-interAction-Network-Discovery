@@ -236,6 +236,7 @@ class ValidationTopologyRuleEvaluation:
     rule: GraphRule
     validation_metrics: dict[str, float | int]
     rule_payload: Mapping[str, object]
+    rule_grid: tuple[dict[str, object], ...]
 
 
 class S2GAERefiner(nn.Module):
@@ -1361,6 +1362,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
         )
         selected_epoch_rule: GraphRule | None = None
         selected_epoch_rule_payload: dict[str, object] | None = None
+        selected_epoch_threshold_grid: tuple[dict[str, object], ...] | None = None
         selected_epoch_topology_metrics: dict[str, float | int] | None = None
         if cfg.topology_validation.enabled:
             if (
@@ -1387,6 +1389,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
             )
             selected_epoch_rule = topology_evaluation.rule
             selected_epoch_rule_payload = dict(topology_evaluation.rule_payload)
+            selected_epoch_threshold_grid = topology_evaluation.rule_grid
             selected_epoch_topology_metrics = dict(topology_evaluation.validation_metrics)
             selected_epoch_topology_metrics["epoch"] = epoch
             monitor_value = _resolve_monitor_value(
@@ -1431,6 +1434,7 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                         if selected_epoch_rule_payload is None
                         else dict(selected_epoch_rule_payload)
                     ),
+                    "threshold_grid_path": str(_threshold_grid_relative_path(epoch)),
                 }
             )
         epoch_history["train_topology_scale"] = topology_scale
@@ -1462,11 +1466,31 @@ def train_refiner(request: TrainRefinerRequest) -> S2GAERefinerState:
                 epoch_time_s=epoch_time_s,
             )
 
-        if best_state_dict is None or _is_better_monitor(
+        is_best_epoch = best_state_dict is None or _is_better_monitor(
             value=monitor_value,
             best_value=best_monitor_value,
             monitor_metric=cfg.monitor_metric,
-        ):
+        )
+        if request.runtime.is_main_process and selected_epoch_threshold_grid is not None:
+            relative_path = _threshold_grid_relative_path(epoch)
+            assert selected_epoch_rule_payload is not None
+            _write_threshold_grid_artifact(
+                log_dir=cfg.log_dir,
+                relative_path=relative_path,
+                epoch=epoch,
+                selected_rule_payload=selected_epoch_rule_payload,
+                rows=selected_epoch_threshold_grid,
+            )
+            if is_best_epoch:
+                _write_threshold_grid_artifact(
+                    log_dir=cfg.log_dir,
+                    relative_path=Path("threshold_grid") / "best_epoch.json",
+                    epoch=epoch,
+                    selected_rule_payload=selected_epoch_rule_payload,
+                    rows=selected_epoch_threshold_grid,
+                )
+
+        if is_best_epoch:
             best_monitor_value = monitor_value
             best_validation_auprc = validation_auprc
             best_selected_rule = selected_epoch_rule
@@ -1825,6 +1849,7 @@ def _evaluate_validation_topology_rules(
         raise ValueError("validation topology probabilities must match candidate pairs")
 
     evaluations: list[ValidationTopologyRuleEvaluation] = []
+    grid_rows: list[dict[str, object]] = []
     for rule in rules:
         metrics = _validation_topology_metrics(
             validation_plan=validation_plan,
@@ -1837,16 +1862,26 @@ def _evaluate_validation_topology_rules(
         payload: dict[str, object] = dict(rule.to_dict())
         if rule_payload_source is not None:
             payload["source"] = rule_payload_source
+        row: dict[str, object] = {"rule": dict(payload)}
+        row.update(metrics)
+        grid_rows.append(row)
         evaluations.append(
             ValidationTopologyRuleEvaluation(
                 rule=rule,
                 validation_metrics=metrics,
                 rule_payload=payload,
+                rule_grid=(),
             )
         )
-    return min(
+    selected = min(
         evaluations,
         key=lambda item: float(item.validation_metrics["val_topology_loss"]),
+    )
+    return ValidationTopologyRuleEvaluation(
+        rule=selected.rule,
+        validation_metrics=selected.validation_metrics,
+        rule_payload=selected.rule_payload,
+        rule_grid=tuple(grid_rows),
     )
 
 
@@ -2093,6 +2128,28 @@ def _write_training_summary(
             "optimization": _optimization_config_to_json(cfg.optimization),
             "current_learning_rate": _current_learning_rate(optimizer),
             "history": list(history),
+        },
+    )
+
+
+def _threshold_grid_relative_path(epoch: int) -> Path:
+    return Path("threshold_grid") / f"epoch_{epoch:03d}.json"
+
+
+def _write_threshold_grid_artifact(
+    *,
+    log_dir: Path,
+    relative_path: Path,
+    epoch: int,
+    selected_rule_payload: Mapping[str, object],
+    rows: Sequence[Mapping[str, object]],
+) -> None:
+    write_json(
+        log_dir / relative_path,
+        {
+            "epoch": int(epoch),
+            "selected_rule": dict(selected_rule_payload),
+            "rows": [dict(row) for row in rows],
         },
     )
 

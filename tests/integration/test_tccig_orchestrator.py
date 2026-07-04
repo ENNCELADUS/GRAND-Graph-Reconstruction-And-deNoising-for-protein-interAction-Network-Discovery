@@ -510,6 +510,52 @@ def test_calibrated_pipeline_persists_epoch_selected_rule_history(tmp_path: Path
     assert checkpoint["selected_rule"] == summary["selected_rule"]
 
 
+def test_calibrated_pipeline_writes_threshold_grid_artifacts(tmp_path: Path) -> None:
+    config = _tiny_config(tmp_path, "calibrated_grid_artifacts")
+    refiner_config = config["refiner"]
+    assert isinstance(refiner_config, dict)
+    refiner_config["monitor_metric"] = "val_topology_loss"
+    refiner_config["topology_validation"] = {
+        "enabled": True,
+        "node_sizes": [2],
+        "samples_per_size": 1,
+        "strategy": "mixed",
+        "seed": 0,
+        "inference_batch_size": 4,
+        "compute_clustering_mmd": False,
+        "losses": {"alpha": 1.0, "beta": 1.0, "gamma": 0.0, "delta": 0.0},
+    }
+    graph_selection = config["graph_selection"]
+    assert isinstance(graph_selection, dict)
+    graph_selection["refined_output_rule"] = {
+        "type": "calibrated",
+        "objective": "val_topology_loss",
+        "grid": [0.5, 0.97],
+    }
+
+    run_tccig_pipeline(config)
+
+    grid_dir = tmp_path / "logs" / "tccig" / "calibrated_grid_artifacts" / "threshold_grid"
+    epoch_payload = json.loads((grid_dir / "epoch_001.json").read_text(encoding="utf-8"))
+    best_payload = json.loads((grid_dir / "best_epoch.json").read_text(encoding="utf-8"))
+    summary = json.loads(
+        (
+            tmp_path
+            / "logs"
+            / "tccig"
+            / "calibrated_grid_artifacts"
+            / "training_summary.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    assert epoch_payload["epoch"] == 1
+    assert len(epoch_payload["rows"]) == 2
+    assert {row["rule"]["value"] for row in epoch_payload["rows"]} == {0.5, 0.97}
+    assert epoch_payload["selected_rule"] == summary["history"][0]["selected_rule"]
+    assert best_payload == epoch_payload
+    assert summary["history"][0]["threshold_grid_path"] == "threshold_grid/epoch_001.json"
+
+
 def test_tccig_orchestrator_rejects_removed_hook_config(tmp_path: Path) -> None:
     config = _tiny_config(tmp_path, "legacy")
     config["pairwise_scorer"] = {"target": "legacy.module:score"}
