@@ -313,3 +313,20 @@ def test_main_fails_when_phase_a_run_directory_is_missing(tmp_path: Path) -> Non
                 str(tmp_path / "analysis"),
             ]
         )
+
+
+def test_main_requires_raw_baseline_run_id_for_locked_reports(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError,
+        match="--raw-baseline-run-id is required when --locked-run-id is provided",
+    ):
+        main(
+            [
+                "--log-root",
+                str(tmp_path / "logs"),
+                "--output-dir",
+                str(tmp_path / "analysis"),
+                "--locked-run-id",
+                "03_a5_bce_full_topology",
+            ]
+        )

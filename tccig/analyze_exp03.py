@@ -170,6 +170,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     locked_run_ids = set(cast(list[str], args.locked_run_id))
+    if locked_run_ids and not args.raw_baseline_run_id:
+        raise ValueError("--raw-baseline-run-id is required when --locked-run-id is provided")
     rows: list[dict[str, object]] = []
     if args.exp02_reference_dir.exists():
         rows.append(
